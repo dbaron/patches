@@ -1,0 +1,183 @@
+diff -r db75d698fb32 Makefile.in
+--- a/Makefile.in	Wed Jan 10 19:52:59 2007 -0800
++++ b/Makefile.in	Thu Jan 11 13:21:27 2007 -0800
+@@ -92,8 +92,8 @@ include $(topsrcdir)/config/rules.mk
+ 
+ # After we build tier toolkit, go back and build the tools from previous dirs
+ tier_toolkit::
++	$(MAKE) tools_tier_xpcom
+ 	$(MAKE) tools_tier_js
+-	$(MAKE) tools_tier_xpcom
+ 	$(MAKE) tools_tier_necko
+ 	$(MAKE) tools_tier_gecko
+ 	$(MAKE) tools_tier_toolkit
+diff -r db75d698fb32 js/src/Makefile.in
+--- a/js/src/Makefile.in	Wed Jan 10 19:52:59 2007 -0800
++++ b/js/src/Makefile.in	Thu Jan 11 13:21:28 2007 -0800
+@@ -162,7 +162,7 @@ DASH_R		= -r
+ 
+ include $(topsrcdir)/config/config.mk
+ 
+-EXTRA_DSO_LDOPTS += $(NSPR_LIBS)
++EXTRA_DSO_LDOPTS += $(NSPR_LIBS) $(XPCOM_LIBS)
+ 
+ # When using gcc the assembly is inlined in the C-file (see jslock.c)
+ ifeq ($(OS_ARCH),SunOS)
+diff -r db75d698fb32 js/src/jsgc.c
+--- a/js/src/jsgc.c	Wed Jan 10 19:52:59 2007 -0800
++++ b/js/src/jsgc.c	Thu Jan 11 13:21:28 2007 -0800
+@@ -72,6 +72,10 @@
+ #include "jsscope.h"
+ #include "jsscript.h"
+ #include "jsstr.h"
++
++#ifdef MOZILLA_CLIENT
++#include "nsTraceRefcnt.h"
++#endif
+ 
+ #if JS_HAS_XML_SUPPORT
+ #include "jsxml.h"
+@@ -1544,6 +1548,11 @@ js_NewGCThing(JSContext *cx, uintN flags
+ #ifdef JS_THREADSAFE
+   success:
+ #endif
++
++#if defined(TOO_MUCH_GC) && defined(MOZILLA_CLIENT)
++    NS_LogCtor(thing, "JSGCThing", sizeof(JSGCThing));
++#endif
++
+     lrs = cx->localRootStack;
+     if (lrs) {
+         /*
+@@ -1569,10 +1578,20 @@ js_NewGCThing(JSContext *cx, uintN flags
+          * depending on a pigeon-hole newborn per type per context.
+          */
+         cx->newborn[flags & GCF_TYPEMASK] = thing;
++/* XXXldb Should this be checked in? */
++#ifdef WAY_TOO_MUCH_GC
++        rt->gcPoke = JS_TRUE;
++#endif
+     }
+ 
+     /* We can't fail now, so update flags. */
+     *flagp = (uint8)flags;
++
++#ifdef MOZILLA_CLIENT
++    if (flags & GCF_LOCK) {
++        NS_LOG_ADDREF(thing, 1, "js_LockGCThing", 1);
++    }
++#endif
+ 
+     /*
+      * Clear thing before unlocking in case a GC run is about to scan it,
+@@ -1706,7 +1725,15 @@ js_LockGCThingRT(JSRuntime *rt, void *th
+             JS_ASSERT(lhe->count >= 1);
+             lhe->count++;
+         }
+-    }
++#ifdef MOZILLA_CLIENT
++        NS_LOG_ADDREF(thing, lhe->count, "js_LockGCThing", 1);
++#endif
++    }
++#ifdef MOZILLA_CLIENT
++    else {
++        NS_LOG_ADDREF(thing, 1, "js_LockGCThing", 1);
++    }
++#endif
+ 
+     *flagp = (uint8)(flags | GCF_LOCK);
+     METER(rt->gcStats.lock++);
+@@ -1737,8 +1764,14 @@ js_UnlockGCThingRT(JSRuntime *rt, void *
+              JS_DHASH_ENTRY_IS_FREE(&lhe->hdr))) {
+             /* Shallow GC-thing with an implicit lock count of 1. */
+             JS_ASSERT(!GC_THING_IS_DEEP(flags & GCF_TYPEMASK, thing));
++#ifdef MOZILLA_CLIENT
++            NS_LOG_RELEASE(thing, 0, "js_LockGCThing");
++#endif
+         } else {
+             /* Basis or nested unlock of a deep thing, or nested of shallow. */
++#ifdef MOZILLA_CLIENT
++            NS_LOG_RELEASE(thing, lhe->count - 1, "js_LockGCThing");
++#endif
+             if (--lhe->count != 0)
+                 goto out;
+             JS_DHashTableOperate(rt->gcLocksHash, thing, JS_DHASH_REMOVE);
+@@ -1927,7 +1960,8 @@ gc_dump_thing(JSContext *cx, JSGCThing *
+       {
+         JSXMLNamespace *ns = (JSXMLNamespace *)thing;
+         fprintf(fp, "namespace %s:%s",
+-                JS_GetStringBytes(ns->prefix), JS_GetStringBytes(ns->uri));
++                ns->prefix ? JS_GetStringBytes(ns->prefix) : "undefined",
++                JS_GetStringBytes(ns->uri));
+         break;
+       }
+       case GCX_QNAME:
+@@ -2075,6 +2109,7 @@ MarkGCThingChildren(JSContext *cx, void 
+     METER(if (++rt->gcStats.depth > rt->gcStats.maxdepth)
+               rt->gcStats.maxdepth = rt->gcStats.depth);
+ #ifdef GC_MARK_DEBUG
++    js_DumpGCHeap = stdout;
+     if (js_DumpGCHeap)
+         gc_dump_thing(cx, thing, js_DumpGCHeap);
+ #endif
+@@ -2884,6 +2919,10 @@ restart:
+     JS_ASSERT(!rt->gcUnscannedArenaStackTop);
+     JS_ASSERT(rt->gcUnscannedBagSize == 0);
+ 
++#ifdef DEBUG_dbaron_off
++    printf("Doing JS GC.\n");
++#endif
++
+     /*
+      * Mark phase.
+      */
+@@ -3057,6 +3096,11 @@ restart:
+                 if (flags & GCF_MARK) {
+                     *flagp &= ~GCF_MARK;
+                 } else if (!(flags & (GCF_LOCK | GCF_FINAL))) {
++#if defined(TOO_MUCH_GC) && defined(MOZILLA_CLIENT)
++                    NS_LogDtor(firstPage + offset,
++                               "JSGCThing", sizeof(JSGCThing));
++#endif
++
+                     /* Call the finalizer with GCF_FINAL ORed into flags. */
+                     type = flags & GCF_TYPEMASK;
+                     finalizer = gc_finalizers[type];
+diff -r db75d698fb32 js/src/jsgc.h
+--- a/js/src/jsgc.h	Wed Jan 10 19:52:59 2007 -0800
++++ b/js/src/jsgc.h	Thu Jan 11 13:21:28 2007 -0800
+@@ -45,6 +45,10 @@
+ #include "jsprvtd.h"
+ #include "jspubtd.h"
+ #include "jsdhash.h"
++
++#ifdef DEBUG_dbaron_off
++#define GC_MARK_DEBUG
++#endif
+ 
+ JS_BEGIN_EXTERN_C
+ 
+@@ -344,6 +348,10 @@ struct JSGCArenaList {
+ #define TOO_MUCH_GC 1
+ #endif
+ 
++#ifdef DEBUG_dbaron_off
++#define WAY_TOO_MUCH_GC 1
++#endif
++
+ #ifdef WAY_TOO_MUCH_GC
+ #define TOO_MUCH_GC 1
+ #endif
+diff -r db75d698fb32 toolkit/toolkit-tiers.mk
+--- a/toolkit/toolkit-tiers.mk	Wed Jan 10 19:52:59 2007 -0800
++++ b/toolkit/toolkit-tiers.mk	Thu Jan 11 13:21:28 2007 -0800
+@@ -40,8 +40,8 @@ endif
+ endif
+ 
+ include $(topsrcdir)/config/nspr/build.mk
++include $(topsrcdir)/xpcom/build.mk
+ include $(topsrcdir)/js/src/build.mk
+-include $(topsrcdir)/xpcom/build.mk
+ include $(topsrcdir)/netwerk/build.mk
+ 
+ TIERS += \
