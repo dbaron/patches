@@ -1,0 +1,2087 @@
+Change the bulk of ascent (baseline) computation to happen on a virtual method on nsIFrame, and remove the redundant descent member from nsHTMLReflowMetrics, primarily to support having both first-line and last-line baselines.  b=367332
+
+diff -r b0bd358fa4b7 layout/base/nsFrameTraversal.cpp
+--- a/layout/base/nsFrameTraversal.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/base/nsFrameTraversal.cpp	Thu Jan 18 10:46:26 2007 -0800
+@@ -565,4 +565,4 @@ nsVisualIterator::GetPrevSiblingInner(ns
+     return nsnull;
+   nsFrameList list(parent->GetFirstChild(nsnull));
+   return list.GetPrevVisualFor(aFrame);
+-}
+\ No newline at end of file
++}
+diff -r b0bd358fa4b7 layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/base/nsLayoutUtils.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -59,6 +59,7 @@
+ #include "nsRegion.h"
+ #include "nsFrameManager.h"
+ #include "nsBlockFrame.h"
++#include "nsTableFrame.h"
+ 
+ #ifdef MOZ_SVG_FOREIGNOBJECT
+ #include "nsSVGForeignObjectFrame.h"
+@@ -1674,8 +1675,8 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
+ }
+ 
+ /* static */ nscoord
+-nsLayoutUtils::MinWidthFromInline(nsIFrame *aFrame,
+-                                  nsIRenderingContext *aRenderingContext)
++nsLayoutUtils::MinWidthFromInline(nsIFrame* aFrame,
++                                  nsIRenderingContext* aRenderingContext)
+ {
+   nsIFrame::InlineMinWidthData data;
+   DISPLAY_MIN_WIDTH(aFrame, data.prevLines);
+@@ -1685,8 +1686,8 @@ nsLayoutUtils::MinWidthFromInline(nsIFra
+ }
+ 
+ /* static */ nscoord
+-nsLayoutUtils::PrefWidthFromInline(nsIFrame *aFrame,
+-                                   nsIRenderingContext *aRenderingContext)
++nsLayoutUtils::PrefWidthFromInline(nsIFrame* aFrame,
++                                   nsIRenderingContext* aRenderingContext)
+ {
+   nsIFrame::InlinePrefWidthData data;
+   DISPLAY_PREF_WIDTH(aFrame, data.prevLines);
+@@ -1694,3 +1695,75 @@ nsLayoutUtils::PrefWidthFromInline(nsIFr
+   data.Break(aRenderingContext);
+   return data.prevLines;
+ }
++
++/* static */ PRBool
++nsLayoutUtils::GetFirstLineBaseline(const nsIFrame* aFrame, nscoord* aResult)
++{
++  const nsBlockFrame* block;
++  if (NS_FAILED(NS_CONST_CAST(nsIFrame*, aFrame)->
++                  QueryInterface(kBlockFrameCID, (void**)&block))) {
++    // For the first-line baseline we also have to check for a table, and if
++    // so, use the baseline of its first row.
++    if (aFrame->GetType() == nsGkAtoms::tableOuterFrame) {
++      nsTableFrame *table = NS_STATIC_CAST(nsTableFrame*,
++        aFrame->GetFirstChild(nsnull));
++      *aResult = table->GetBaseline() + table->GetPosition().y;
++      return PR_TRUE;
++    }
++
++    // No baseline.  (We intentionally don't descend into scroll frames.)
++    return PR_FALSE;
++  }
++
++  for (nsBlockFrame::const_line_iterator line = block->begin_lines(),
++                                     line_end = block->end_lines();
++       line != line_end; ++line) {
++    if (line->IsBlock()) {
++      nsIFrame *kid = line->mFirstChild;
++      nscoord kidBaseline;
++      if (GetFirstLineBaseline(kid, &kidBaseline)) {
++        *aResult = kidBaseline + kid->GetPosition().y;
++        return PR_TRUE;
++      }
++    } else {
++      // XXX Is this the right test?  We have some bogus empty lines
++      // floating around, but IsEmpty is perhaps too weak.
++      if (line->GetHeight() != 0 || !line->IsEmpty()) {
++        *aResult = line->mBounds.y + line->GetAscent();
++        return PR_TRUE;
++      }
++    }
++  }
++  return PR_FALSE;
++}
++
++/* static */ PRBool
++nsLayoutUtils::GetLastLineBaseline(const nsIFrame* aFrame, nscoord* aResult)
++{
++  const nsBlockFrame* block;
++  if (NS_FAILED(NS_CONST_CAST(nsIFrame*, aFrame)->
++                  QueryInterface(kBlockFrameCID, (void**)&block)))
++    // No baseline.  (We intentionally don't descend into scroll frames.)
++    return PR_FALSE;
++
++  for (nsBlockFrame::const_reverse_line_iterator line = block->rbegin_lines(),
++                                             line_end = block->rend_lines();
++       line != line_end; ++line) {
++    if (line->IsBlock()) {
++      nsIFrame *kid = line->mFirstChild;
++      nscoord kidBaseline;
++      if (GetLastLineBaseline(kid, &kidBaseline)) {
++        *aResult = kidBaseline + kid->GetPosition().y;
++        return PR_TRUE;
++      }
++    } else {
++      // XXX Is this the right test?  We have some bogus empty lines
++      // floating around, but IsEmpty is perhaps too weak.
++      if (line->GetHeight() != 0 || !line->IsEmpty()) {
++        *aResult = line->mBounds.y + line->GetAscent();
++        return PR_TRUE;
++      }
++    }
++  }
++  return PR_FALSE;
++}
+diff -r b0bd358fa4b7 layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/base/nsLayoutUtils.h	Thu Jan 18 10:46:27 2007 -0800
+@@ -549,6 +549,26 @@ public:
+   // Implement nsIFrame::GetMinWidth in terms of nsIFrame::AddInlineMinWidth
+   static nscoord MinWidthFromInline(nsIFrame* aFrame,
+                                     nsIRenderingContext* aRenderingContext);
++
++  /**
++   * Derive a baseline of |aFrame| (measured from its top border edge)
++   * from its first in-flow line box (not descending into anything with
++   * 'overflow' not 'visible', potentially including aFrame itself).
++   *
++   * Returns true if a baseline was found (and fills in aResult).
++   * Otherwise returns false.
++   */
++  static PRBool GetFirstLineBaseline(const nsIFrame* aFrame, nscoord* aResult);
++
++  /**
++   * Derive a baseline of |aFrame| (measured from its top border edge)
++   * from its last in-flow line box (not descending into anything with
++   * 'overflow' not 'visible', potentially including aFrame itself).
++   *
++   * Returns true if a baseline was found (and fills in aResult).
++   * Otherwise returns false.
++   */
++  static PRBool GetLastLineBaseline(const nsIFrame* aFrame, nscoord* aResult);
+ };
+ 
+ #endif // nsLayoutUtils_h__
+diff -r b0bd358fa4b7 layout/forms/nsFieldSetFrame.cpp
+--- a/layout/forms/nsFieldSetFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/forms/nsFieldSetFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -637,8 +637,6 @@ nsFieldSetFrame::Reflow(nsPresContext*  
+       aDesiredSize.height = min;
+   }
+   aDesiredSize.width = contentRect.width + borderPadding.left + borderPadding.right;
+-  aDesiredSize.ascent  = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+   aDesiredSize.mOverflowArea = nsRect(0, 0, aDesiredSize.width, aDesiredSize.height);
+   if (mLegendFrame)
+     ConsiderChildOverflow(aDesiredSize.mOverflowArea, mLegendFrame);
+diff -r b0bd358fa4b7 layout/forms/nsHTMLButtonControlFrame.cpp
+--- a/layout/forms/nsHTMLButtonControlFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/forms/nsHTMLButtonControlFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -341,7 +341,6 @@ nsHTMLButtonControlFrame::Reflow(nsPresC
+ 
+   aDesiredSize.ascent +=
+     aReflowState.mComputedBorderPadding.top + focusPadding.top;
+-  aDesiredSize.descent = aDesiredSize.height - aDesiredSize.ascent;
+ 
+   aDesiredSize.mOverflowArea =
+     nsRect(0, 0, aDesiredSize.width, aDesiredSize.height);
+@@ -413,7 +412,10 @@ nsHTMLButtonControlFrame::ReflowButtonCo
+     yoff = (minInternalHeight - aDesiredSize.height) / 2;
+   }
+ 
+-  // Adjust the ascent by our offset (since we moved the child's
++  if (aDesiredSize.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE)
++    aDesiredSize.ascent = aFirstKid->GetBaseline();
++
++  // Adjust the baseline by our offset (since we moved the child's
+   // baseline by that much).
+   aDesiredSize.ascent += yoff;
+   
+diff -r b0bd358fa4b7 layout/generic/nsBRFrame.cpp
+--- a/layout/generic/nsBRFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsBRFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -115,7 +115,6 @@ BRFrame::Reflow(nsPresContext* aPresCont
+                        // However, it's not always 0.  See below.
+   aMetrics.width = 0;
+   aMetrics.ascent = 0;
+-  aMetrics.descent = 0;
+ 
+   // Only when the BR is operating in a line-layout situation will it
+   // behave like a BR.
+@@ -155,8 +154,6 @@ BRFrame::Reflow(nsPresContext* aPresCont
+         nscoord leading = logicalHeight - ascent - descent;
+         aMetrics.height = logicalHeight;
+         aMetrics.ascent = ascent + (leading/2);
+-        aMetrics.descent = logicalHeight - aMetrics.ascent;
+-                      // = descent + (leading/2), but without rounding error
+       }
+       else {
+         aMetrics.ascent = aMetrics.height = 0;
+diff -r b0bd358fa4b7 layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsBlockFrame.cpp	Thu Jan 18 10:51:06 2007 -0800
+@@ -499,6 +499,18 @@ nsBlockFrame::InvalidateInternal(const n
+   nsBlockFrameSuper::InvalidateInternal(aDamageRect, aX, aY, aForChild, aImmediate);
+ }
+ 
++nscoord
++nsBlockFrame::GetBaseline() const
++{
++  NS_ASSERTION(!(GetStateBits() & (NS_FRAME_IS_DIRTY |
++                                   NS_FRAME_HAS_DIRTY_CHILDREN)),
++               "frame must not be dirty");
++  nscoord result;
++  if (nsLayoutUtils::GetLastLineBaseline(this, &result))
++    return result;
++  return nsFrame::GetBaseline();
++}
++
+ /////////////////////////////////////////////////////////////////////////////
+ // Child frame enumeration
+ 
+@@ -993,6 +1005,40 @@ nsBlockFrame::Reflow(nsPresContext*     
+ 
+   CheckFloats(state);
+ 
++  // Place the "marker" (bullet) frame if it is placed next to a block
++  // child.
++  //
++  // According to the CSS2 spec, section 12.6.1, the "marker" box
++  // participates in the height calculation of the list-item box's
++  // first line box.
++  //
++  // There are exactly two places a bullet can be placed: near the
++  // first or second line. It's only placed on the second line in a
++  // rare case: an empty first line followed by a second line that
++  // contains a block (example: <LI>\n<P>... ). This is where
++  // the second case can happen.
++  if (mBullet && HaveOutsideBullet() &&
++      (mLines.empty() ||
++       mLines.front()->IsBlock() ||
++       0 == mLines.front()->mBounds.height)) {
++    // Reflow the bullet
++    nsHTMLReflowMetrics metrics;
++    ReflowBullet(state, metrics);
++
++    nscoord baseline;
++    if (!nsLayoutUtils::GetFirstLineBaseline(this, &baseline)) {
++      baseline = 0;
++    }
++    
++    // Doing the alignment using the baseline will also cater for
++    // bullets that are placed next to a child block (bug 92896)
++    
++    // Tall bullets won't look particularly nice here...
++    nsRect bbox = mBullet->GetRect();
++    bbox.y = baseline - metrics.ascent;
++    mBullet->SetRect(bbox);
++  }
++
+   // Compute our final size
+   ComputeFinalSize(aReflowState, state, aMetrics);
+ 
+@@ -1295,13 +1341,6 @@ nsBlockFrame::ComputeFinalSize(const nsH
+     autoHeight += borderPadding.top + borderPadding.bottom;
+     aMetrics.height = autoHeight;
+   }
+-
+-  // XXXbernd this should be revised when inline-blocks are implemented
+-  if (GetFirstChild(nsnull))
+-    aMetrics.ascent = mAscent;
+-  else 
+-    aMetrics.ascent = aMetrics.height;
+-  aMetrics.descent = aMetrics.height - aMetrics.ascent;
+ 
+ #ifdef DEBUG_blocks
+   if (CRAZY_WIDTH(aMetrics.width) || CRAZY_HEIGHT(aMetrics.height)) {
+@@ -1657,9 +1696,6 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+   PRUint8 inlineFloatBreakType = NS_STYLE_CLEAR_NONE;
+ 
+   line_iterator line = begin_lines(), line_end = end_lines();
+-
+-  if (line == line_end)
+-    mAscent=0; // there are no lines, reset the previously computed ascent
+ 
+   // Reflow the lines that are already ours
+   for ( ; line != line_end; ++line, aState.AdvanceToNextLine()) {
+@@ -3003,47 +3039,6 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+                brc.GetCarriedOutBottomMargin(), collapsedBottomMargin.get(),
+                aState.mPrevBottomMargin);
+ #endif
+-        
+-        // If the block frame that we just reflowed happens to be our
+-        // first block, then its computed ascent is ours
+-        if (frame == GetTopBlockChild(aState.mPresContext)) {
+-          const nsHTMLReflowMetrics& metrics = brc.GetMetrics();
+-          mAscent = metrics.ascent;
+-        }
+-        
+-        // Place the "marker" (bullet) frame.
+-        //
+-        // According to the CSS2 spec, section 12.6.1, the "marker" box
+-        // participates in the height calculation of the list-item box's
+-        // first line box.
+-        //
+-        // There are exactly two places a bullet can be placed: near the
+-        // first or second line. It's only placed on the second line in a
+-        // rare case: an empty first line followed by a second line that
+-        // contains a block (example: <LI>\n<P>... ). This is where
+-        // the second case can happen.
+-        if (mBullet && HaveOutsideBullet() &&
+-            ((aLine == mLines.front()) ||
+-             ((0 == mLines.front()->mBounds.height) &&
+-              (aLine == begin_lines().next())))) {
+-          // Reflow the bullet
+-          nsHTMLReflowMetrics metrics;
+-          ReflowBullet(aState, metrics);
+-          
+-          // Doing the alignment using |mAscent| will also cater for bullets
+-          // that are placed next to a child block (bug 92896)
+-          // (Note that mAscent should be set by now, otherwise why would
+-          // we be placing the bullet yet?)
+-          
+-          // Tall bullets won't look particularly nice here...
+-          nsRect bbox = mBullet->GetRect();
+-          nscoord bulletTopMargin = applyTopMargin
+-            ? collapsedBottomMargin.get()
+-            : 0;
+-          bbox.y = aState.BorderPadding().top + mAscent -
+-            metrics.ascent + bulletTopMargin;
+-          mBullet->SetRect(bbox);
+-        }
+       }
+       else {
+         // None of the block fits. Determine the correct reflow status.
+@@ -3828,11 +3823,6 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+     addedBullet = PR_TRUE;
+   }
+   aLineLayout.VerticalAlignLine(aLine);
+-  // Our ascent is the ascent of our first line (but if this line is all
+-  // whitespace we'll correct things in |ReflowBlockFrame|).
+-  if (aLine == mLines.front()) {
+-    mAscent = aLine->mBounds.y + aLine->GetAscent();
+-  }
+ 
+ #ifdef DEBUG
+   {
+@@ -3910,11 +3900,6 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+                    ? -aState.mPrevBottomMargin.get() : 0;
+     newY = aState.mY + dy;
+     aLine->SlideBy(dy); // XXXldb Do we really want to do this?
+-    // keep our ascent in sync
+-    // XXXldb If it's empty, shouldn't the next line control the ascent?
+-    if (mLines.front() == aLine) {
+-      mAscent += dy;
+-    }
+   }
+ 
+   // See if the line fit. If it doesn't we need to push it. Our first
+diff -r b0bd358fa4b7 layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsBlockFrame.h	Thu Jan 18 10:46:27 2007 -0800
+@@ -174,6 +174,7 @@ public:
+                           nsIFrame*       aOldFrame);
+   virtual nsIFrame* GetFirstChild(nsIAtom* aListName) const;
+   NS_IMETHOD  SetParent(const nsIFrame* aParent);
++  virtual nscoord GetBaseline() const;
+   virtual nsIAtom* GetAdditionalChildListName(PRInt32 aIndex) const;
+   virtual void Destroy();
+   virtual nsSplittableType GetSplittableType() const;
+@@ -263,8 +264,6 @@ public:
+ 
+   static nsresult GetCurrentLine(nsBlockReflowState *aState, nsLineBox **aOutCurrentLine);
+ 
+-  inline nscoord GetAscent() { return mAscent; }
+-
+   // Create a contination for aPlaceholder and its out of flow frame and
+   // add it to the list of overflow floats
+   nsresult SplitPlaceholder(nsBlockReflowState& aState, nsIFrame* aPlaceholder);
+@@ -564,9 +563,6 @@ protected:
+   void VerifyOverflowSituation();
+   PRInt32 GetDepth() const;
+ #endif
+-
+-  // Ascent of our first line to support 'vertical-align: baseline' in table-cells
+-  nscoord mAscent;
+ 
+   nscoord mMinWidth, mPrefWidth;
+ 
+diff -r b0bd358fa4b7 layout/generic/nsBlockReflowContext.cpp
+--- a/layout/generic/nsBlockReflowContext.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsBlockReflowContext.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -365,8 +365,6 @@ nsBlockReflowContext::ReflowBlock(const 
+ #ifdef DEBUG
+   mMetrics.width = nscoord(0xdeadbeef);
+   mMetrics.height = nscoord(0xdeadbeef);
+-  mMetrics.ascent = nscoord(0xdeadbeef);
+-  mMetrics.descent = nscoord(0xdeadbeef);
+ #endif
+ 
+   mOuterReflowState.mSpaceManager->Translate(tx, ty);
+@@ -381,14 +379,10 @@ nsBlockReflowContext::ReflowBlock(const 
+       printf(" metrics=%d,%d!\n", mMetrics.width, mMetrics.height);
+     }
+     if ((mMetrics.width == nscoord(0xdeadbeef)) ||
+-        (mMetrics.height == nscoord(0xdeadbeef)) ||
+-        (mMetrics.ascent == nscoord(0xdeadbeef)) ||
+-        (mMetrics.descent == nscoord(0xdeadbeef))) {
++        (mMetrics.height == nscoord(0xdeadbeef))) {
+       printf("nsBlockReflowContext: ");
+       nsFrame::ListTag(stdout, mFrame);
+-      printf(" didn't set whad %d,%d,%d,%d!\n",
+-             mMetrics.width, mMetrics.height,
+-             mMetrics.ascent, mMetrics.descent);
++      printf(" didn't set w/h %d,%d!\n", mMetrics.width, mMetrics.height);
+     }
+   }
+ #endif
+diff -r b0bd358fa4b7 layout/generic/nsBulletFrame.cpp
+--- a/layout/generic/nsBulletFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsBulletFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -1439,10 +1439,7 @@ nsBulletFrame::GetDesiredSize(nsPresCont
+ #endif
+ 
+       aMetrics.width = mComputedSize.width;
+-      aMetrics.height = mComputedSize.height;
+-
+-      aMetrics.ascent = aMetrics.height;
+-      aMetrics.descent = 0;
++      aMetrics.ascent = aMetrics.height = mComputedSize.height;
+ 
+       return;
+     }
+@@ -1466,9 +1463,7 @@ nsBulletFrame::GetDesiredSize(nsPresCont
+   switch (myList->mListStyleType) {
+     case NS_STYLE_LIST_STYLE_NONE:
+       aMetrics.width = 0;
+-      aMetrics.height = 0;
+-      aMetrics.ascent = 0;
+-      aMetrics.descent = 0;
++      aMetrics.ascent = aMetrics.height = 0;
+       break;
+ 
+     case NS_STYLE_LIST_STYLE_DISC:
+@@ -1485,9 +1480,7 @@ nsBulletFrame::GetDesiredSize(nsPresCont
+       bulletSize = NSIntPixelsToTwips(bulletSize, p2t);
+       mPadding.bottom = NSIntPixelsToTwips((nscoord) NSToIntRound((float)ascent / (8.0f * p2t)),p2t);
+       aMetrics.width = mPadding.right + bulletSize;
+-      aMetrics.height = mPadding.bottom + bulletSize;
+-      aMetrics.ascent = mPadding.bottom + bulletSize;
+-      aMetrics.descent = 0;
++      aMetrics.ascent = aMetrics.height = mPadding.bottom + bulletSize;
+       break;
+ 
+     default:
+@@ -1548,7 +1541,6 @@ nsBulletFrame::GetDesiredSize(nsPresCont
+       aRenderingContext->GetWidth(text, aMetrics.width);
+       aMetrics.width += mPadding.right;
+       fm->GetMaxAscent(aMetrics.ascent);
+-      fm->GetMaxDescent(aMetrics.descent);
+       break;
+   }
+ }
+@@ -1571,7 +1563,6 @@ nsBulletFrame::Reflow(nsPresContext* aPr
+   aMetrics.width += borderPadding.left + borderPadding.right;
+   aMetrics.height += borderPadding.top + borderPadding.bottom;
+   aMetrics.ascent += borderPadding.top;
+-  aMetrics.descent += borderPadding.bottom;
+ 
+   aStatus = NS_FRAME_COMPLETE;
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aMetrics);
+diff -r b0bd358fa4b7 layout/generic/nsColumnSetFrame.cpp
+--- a/layout/generic/nsColumnSetFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsColumnSetFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -589,8 +589,6 @@ nsColumnSetFrame::ReflowChildren(nsHTMLR
+   aDesiredSize.height = borderPadding.top + contentSize.height +
+     borderPadding.bottom;
+   aDesiredSize.width = contentSize.width + borderPadding.left + borderPadding.right;
+-  aDesiredSize.ascent  = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+   overflowRect.UnionRect(overflowRect, nsRect(0, 0, aDesiredSize.width, aDesiredSize.height));
+   aDesiredSize.mOverflowArea = overflowRect;
+   
+diff -r b0bd358fa4b7 layout/generic/nsFirstLetterFrame.cpp
+--- a/layout/generic/nsFirstLetterFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsFirstLetterFrame.cpp	Thu Jan 18 10:46:27 2007 -0800
+@@ -283,7 +283,6 @@ nsFirstLetterFrame::Reflow(nsPresContext
+   aMetrics.width += lr;
+   aMetrics.height += tb;
+   aMetrics.ascent += bp.top;
+-  aMetrics.descent += bp.bottom;
+ 
+   // Create a continuation or remove existing continuations based on
+   // the reflow completion status.
+diff -r b0bd358fa4b7 layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsFrame.cpp	Thu Jan 18 10:49:29 2007 -0800
+@@ -794,6 +794,17 @@ nsFrame::SetAdditionalStyleContext(PRInt
+   NS_PRECONDITION(aIndex >= 0, "invalid index number");
+ }
+ 
++nscoord
++nsFrame::GetBaseline() const
++{
++  NS_ASSERTION(!(GetStateBits() & (NS_FRAME_IS_DIRTY |
++                                   NS_FRAME_HAS_DIRTY_CHILDREN)),
++               "frame must not be dirty");
++  // Default to the bottom margin edge, per CSS2.1's definition of the
++  // 'baseline' value of 'vertical-align'.
++  return mRect.height + GetUsedMargin().bottom;
++}
++
+ // Child frame enumeration
+ 
+ nsIAtom*
+@@ -3247,8 +3258,6 @@ nsFrame::Reflow(nsPresContext*          
+   DO_GLOBAL_REFLOW_COUNT("nsFrame");
+   aDesiredSize.width = 0;
+   aDesiredSize.height = 0;
+-  aDesiredSize.ascent = 0;
+-  aDesiredSize.descent = 0;
+   aStatus = NS_FRAME_COMPLETE;
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aDesiredSize);
+   return NS_OK;
+@@ -3745,7 +3754,6 @@ nsFrame::IsFrameTreeTooDeep(const nsHTML
+     aMetrics.width = 0;
+     aMetrics.height = 0;
+     aMetrics.ascent = 0;
+-    aMetrics.descent = 0;
+     aMetrics.mCarriedOutBottomMargin.Zero();
+     aMetrics.mOverflowArea.x = 0;
+     aMetrics.mOverflowArea.y = 0;
+@@ -5803,7 +5811,12 @@ nsFrame::RefreshSizeCache(nsBoxLayoutSta
+ 
+     metrics->mBlockPrefSize.height = metrics->mBlockMinSize.height;
+ 
+-    metrics->mBlockAscent = desiredSize.ascent;
++    if (desiredSize.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE) {
++      if (!nsLayoutUtils::GetFirstLineBaseline(this, &metrics->mBlockAscent))
++        metrics->mBlockAscent = GetBaseline();
++    } else {
++      metrics->mBlockAscent = desiredSize.ascent;
++    }
+ 
+ #ifdef DEBUG_adaptor
+     printf("min=(%d,%d), pref=(%d,%d), ascent=%d\n", metrics->mBlockMinSize.width,
+@@ -6174,7 +6187,11 @@ nsFrame::BoxReflow(nsBoxLayoutState&    
+     if (isCollapsed) {
+       metrics->mAscent = 0;
+     } else {
+-      metrics->mAscent = aDesiredSize.ascent;
++      if (aDesiredSize.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE) {
++        if (!nsLayoutUtils::GetFirstLineBaseline(this, &metrics->mAscent))
++          metrics->mAscent = GetBaseline();
++      } else
++        metrics->mAscent = aDesiredSize.ascent;
+     }
+ 
+    // printf("width: %d, height: %d\n", aDesiredSize.mCombinedArea.width, aDesiredSize.mCombinedArea.height);
+diff -r b0bd358fa4b7 layout/generic/nsFrame.h
+--- a/layout/generic/nsFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsFrame.h	Thu Jan 18 10:46:27 2007 -0800
+@@ -181,6 +181,7 @@ public:
+   virtual void SetAdditionalStyleContext(PRInt32 aIndex,
+                                          nsStyleContext* aStyleContext);
+   NS_IMETHOD  SetParent(const nsIFrame* aParent);
++  virtual nscoord GetBaseline() const;
+   virtual nsIAtom* GetAdditionalChildListName(PRInt32 aIndex) const;
+   virtual nsIFrame* GetFirstChild(nsIAtom* aListName) const;
+   NS_IMETHOD  HandleEvent(nsPresContext* aPresContext, 
+diff -r b0bd358fa4b7 layout/generic/nsFrameSetFrame.cpp
+--- a/layout/generic/nsFrameSetFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsFrameSetFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -723,8 +723,6 @@ nsHTMLFramesetFrame::GetDesiredSize(nsPr
+     aDesiredSize.width  = size.width;
+     aDesiredSize.height = size.height;
+   } 
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+ }
+ 
+ 
+diff -r b0bd358fa4b7 layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsGfxScrollFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -249,8 +249,6 @@ struct ScrollReflowState {
+   nsRect mScrollPortRect;
+   // The size of the inside-border area
+   nsSize mInsideBorderSize;
+-  // Taken from kid metrics; ascent from the inner-border top edge
+-  nscoord mAscent;
+   // Whether we decided to show the horizontal scrollbar
+   PRPackedBool mShowHScrollbar;
+   // Whether we decided to show the vertical scrollbar
+@@ -411,7 +409,6 @@ nsHTMLScrollFrame::TryLayout(ScrollReflo
+     scrollPortOrigin.x += vScrollbarActualWidth;
+   }
+   aState->mScrollPortRect = nsRect(scrollPortOrigin, scrollPortSize);
+-  aState->mAscent = aKidMetrics.ascent;
+   return PR_TRUE;
+ }
+ 
+@@ -768,10 +765,7 @@ nsHTMLScrollFrame::Reflow(nsPresContext*
+     state.mComputedBorder.LeftRight();
+   aDesiredSize.height = state.mInsideBorderSize.height +
+     state.mComputedBorder.TopBottom();
+-  aDesiredSize.ascent =
+-    state.mAscent + aReflowState.mComputedBorderPadding.top;
+-
+-  aDesiredSize.descent = aDesiredSize.height - aDesiredSize.ascent;
++
+   aDesiredSize.mOverflowArea = nsRect(0, 0, aDesiredSize.width, aDesiredSize.height);
+   FinishAndStoreOverflow(&aDesiredSize);
+ 
+diff -r b0bd358fa4b7 layout/generic/nsHTMLCanvasFrame.cpp
+--- a/layout/generic/nsHTMLCanvasFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsHTMLCanvasFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -145,9 +145,6 @@ nsHTMLCanvasFrame::Reflow(nsPresContext*
+     aMetrics.height = PR_MAX(0, aMetrics.height);
+   }
+ 
+-  aMetrics.ascent  = aMetrics.height;
+-  aMetrics.descent = 0;
+-
+   aMetrics.mOverflowArea.SetRect(0, 0, aMetrics.width, aMetrics.height);
+   FinishAndStoreOverflow(&aMetrics);
+ 
+diff -r b0bd358fa4b7 layout/generic/nsHTMLFrame.cpp
+--- a/layout/generic/nsHTMLFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsHTMLFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -566,8 +566,6 @@ CanvasFrame::Reflow(nsPresContext*      
+   if (mFrames.IsEmpty()) {
+     // We have no child frame, so return an empty size
+     aDesiredSize.width = aDesiredSize.height = 0;
+-    aDesiredSize.ascent = aDesiredSize.descent = 0;
+-
+   } else {
+     nsIFrame* kidFrame = mFrames.FirstChild();
+     PRBool kidDirty = (kidFrame->GetStateBits() & NS_FRAME_IS_DIRTY) != 0;
+@@ -613,9 +611,6 @@ CanvasFrame::Reflow(nsPresContext*      
+         nsPoint(kidReflowState.mComputedMargin.left,
+                 kidReflowState.mComputedMargin.top));
+     FinishAndStoreOverflow(&aDesiredSize);
+-
+-    aDesiredSize.ascent = aDesiredSize.height;
+-    aDesiredSize.descent = 0;
+   }
+ 
+   NS_FRAME_TRACE_REFLOW_OUT("CanvasFrame::Reflow", aStatus);
+diff -r b0bd358fa4b7 layout/generic/nsHTMLReflowMetrics.h
+--- a/layout/generic/nsHTMLReflowMetrics.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsHTMLReflowMetrics.h	Thu Jan 18 10:46:28 2007 -0800
+@@ -139,8 +139,10 @@ struct nsCollapsingMargin {
+  * @see #Reflow()
+  */
+ struct nsHTMLReflowMetrics {
+-  nscoord width, height;        // [OUT] desired width and height
+-  nscoord ascent, descent;      // [OUT] ascent and descent information
++  nscoord width, height;    // [OUT] desired width and height (border-box)
++  nscoord ascent;           // [OUT] baseline (from top), or ASK_FOR_BASELINE
++
++  enum { ASK_FOR_BASELINE = nscoord_MAX };
+ 
+ #ifdef MOZ_MATHML
+   // Metrics that _exactly_ enclose the text to allow precise MathML placements.
+@@ -185,7 +187,7 @@ struct nsHTMLReflowMetrics {
+     // initialized, but there are some bad frame classes that aren't
+     // properly setting them when returning from Reflow()...
+     width = height = 0;
+-    ascent = descent = 0;
++    ascent = ASK_FOR_BASELINE;
+   }
+ 
+   nsHTMLReflowMetrics& operator=(const nsHTMLReflowMetrics& aOther)
+@@ -203,7 +205,6 @@ struct nsHTMLReflowMetrics {
+     width = aOther.width;
+     height = aOther.height;
+     ascent = aOther.ascent;
+-    descent = aOther.descent;
+     return *this;
+   }
+ 
+diff -r b0bd358fa4b7 layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsIFrame.h	Thu Jan 18 10:46:28 2007 -0800
+@@ -100,10 +100,10 @@ typedef class nsIFrame nsIBox;
+ typedef class nsIFrame nsIBox;
+ 
+ // IID for the nsIFrame interface 
+-// c822dca6-310c-433d-a1d0-d5b5b1cdce1f
++// f02b2868-ac80-4e38-978c-02df6477d294
+ #define NS_IFRAME_IID \
+-{ 0xc822dca6, 0x310c, 0x433d, \
+-  { 0xa1, 0xd0, 0xd5, 0xb5, 0xb1, 0xcd, 0xce, 0x1f } }
++{ 0xf02b2868, 0xac80, 0x4e38, \
++  { 0x97, 0x8c, 0x02, 0xdf, 0x64, 0x77, 0xd2, 0x94 } }
+ 
+ /**
+  * Indication of how the frame can be split. This is used when doing runaround
+@@ -713,6 +713,14 @@ public:
+   nsRect GetContentRect() const;
+ 
+   /**
++   * Get the position of the frame's baseline, relative to the top of
++   * the frame (its top border edge).  Only valid when Reflow is not
++   * needed and when the frame returned nsHTMLReflowMetrics::
++   * ASK_FOR_ASCENT as ascent in its reflow metrics.
++   */
++  virtual nscoord GetBaseline() const = 0;
++
++  /**
+    * Used to iterate the list of additional child list names. Returns the atom
+    * name for the additional child list at the specified 0-based index, or a
+    * NULL pointer if there are no more named child lists.
+diff -r b0bd358fa4b7 layout/generic/nsImageFrame.cpp
+--- a/layout/generic/nsImageFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsImageFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -881,8 +881,6 @@ nsImageFrame::Reflow(nsPresContext*     
+       aStatus = NS_FRAME_NOT_COMPLETE;
+     }
+   }
+-  aMetrics.ascent  = aMetrics.height;
+-  aMetrics.descent = 0;
+ 
+   aMetrics.mOverflowArea.SetRect(0, 0, aMetrics.width, aMetrics.height);
+   FinishAndStoreOverflow(&aMetrics);
+diff -r b0bd358fa4b7 layout/generic/nsInlineFrame.cpp
+--- a/layout/generic/nsInlineFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsInlineFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -463,7 +463,6 @@ nsInlineFrame::ReflowFrames(nsPresContex
+     aMetrics.width = 0;
+     aMetrics.height = 0;
+     aMetrics.ascent = 0;
+-    aMetrics.descent = 0;
+   }
+   else {
+     // Compute final width
+@@ -493,14 +492,12 @@ nsInlineFrame::ReflowFrames(nsPresContex
+       // and bottom border and padding. The height of children do not
+       // affect our height.
+       fm->GetMaxAscent(aMetrics.ascent);
+-      fm->GetMaxDescent(aMetrics.descent);
+       fm->GetHeight(aMetrics.height);
+     } else {
+       NS_WARNING("Cannot get font metrics - defaulting sizes to 0");
+-      aMetrics.ascent = aMetrics.descent = aMetrics.height = 0;
++      aMetrics.ascent = aMetrics.height = 0;
+     }
+     aMetrics.ascent += aReflowState.mComputedBorderPadding.top;
+-    aMetrics.descent += aReflowState.mComputedBorderPadding.bottom;
+     aMetrics.height += aReflowState.mComputedBorderPadding.top +
+       aReflowState.mComputedBorderPadding.bottom;
+   }
+@@ -511,8 +508,8 @@ nsInlineFrame::ReflowFrames(nsPresContex
+ 
+ #ifdef NOISY_FINAL_SIZE
+   ListTag(stdout);
+-  printf(": metrics=%d,%d ascent=%d descent=%d\n",
+-         aMetrics.width, aMetrics.height, aMetrics.ascent, aMetrics.descent);
++  printf(": metrics=%d,%d ascent=%d\n",
++         aMetrics.width, aMetrics.height, aMetrics.ascent);
+ #endif
+ 
+   return rv;
+diff -r b0bd358fa4b7 layout/generic/nsLeafFrame.cpp
+--- a/layout/generic/nsLeafFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsLeafFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -135,8 +135,6 @@ nsLeafFrame::AddBordersAndPadding(const 
+ {
+   aMetrics.width += aReflowState.mComputedBorderPadding.LeftRight();
+   aMetrics.height += aReflowState.mComputedBorderPadding.TopBottom();
+-  aMetrics.ascent = aMetrics.height;
+-  aMetrics.descent = 0;
+ }
+ 
+ void
+@@ -145,8 +143,6 @@ nsLeafFrame::SizeToAvailSize(const nsHTM
+ {
+   aDesiredSize.width  = aReflowState.availableWidth; // FRAME
+   aDesiredSize.height = aReflowState.availableHeight;
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+   aDesiredSize.mOverflowArea =
+     nsRect(0, 0, aDesiredSize.width, aDesiredSize.height);
+   FinishAndStoreOverflow(&aDesiredSize);  
+diff -r b0bd358fa4b7 layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsLineLayout.cpp	Thu Jan 18 10:50:45 2007 -0800
+@@ -785,8 +785,6 @@ nsLineLayout::ReflowFrame(nsIFrame* aFra
+ #ifdef DEBUG
+   metrics.width = nscoord(0xdeadbeef);
+   metrics.height = nscoord(0xdeadbeef);
+-  metrics.ascent = nscoord(0xdeadbeef);
+-  metrics.descent = nscoord(0xdeadbeef);
+ #endif
+   nscoord tx = x - psd->mReflowState->mComputedBorderPadding.left;
+   nscoord ty = y - psd->mReflowState->mComputedBorderPadding.top;
+@@ -900,13 +898,10 @@ nsLineLayout::ReflowFrame(nsIFrame* aFra
+       printf(" metrics=%d,%d!\n", metrics.width, metrics.height);
+     }
+     if ((metrics.width == nscoord(0xdeadbeef)) ||
+-        (metrics.height == nscoord(0xdeadbeef)) ||
+-        (metrics.ascent == nscoord(0xdeadbeef)) ||
+-        (metrics.descent == nscoord(0xdeadbeef))) {
++        (metrics.height == nscoord(0xdeadbeef))) {
+       printf("nsLineLayout: ");
+       nsFrame::ListTag(stdout, aFrame);
+-      printf(" didn't set whad %d,%d,%d,%d!\n", metrics.width, metrics.height,
+-             metrics.ascent, metrics.descent);
++      printf(" didn't set w/h %d,%d!\n", metrics.width, metrics.height);
+     }
+   }
+ #endif
+@@ -1231,8 +1226,10 @@ nsLineLayout::PlaceFrame(PerFrameData* p
+   }
+ 
+   // Record ascent and update max-ascent and max-descent values
+-  pfd->mAscent = aMetrics.ascent;
+-  pfd->mDescent = aMetrics.descent;
++  if (aMetrics.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE)
++    pfd->mAscent = pfd->mFrame->GetBaseline();
++  else
++    pfd->mAscent = aMetrics.ascent;
+ 
+   // If the band was updated during the reflow of that frame then we
+   // need to adjust any prior frames that were reflowed.
+@@ -1280,8 +1277,10 @@ nsLineLayout::AddBulletFrame(nsIFrame* a
+     pfd->mFrameType = NS_FRAME_REPLACED(NS_CSS_FRAME_TYPE_INLINE);
+     pfd->mFlags = 0;  // all flags default to false
+     pfd->SetFlag(PFD_ISBULLET, PR_TRUE);
+-    pfd->mAscent = aMetrics.ascent;
+-    pfd->mDescent = aMetrics.descent;
++    if (aMetrics.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE)
++      pfd->mAscent = aFrame->GetBaseline();
++    else
++      pfd->mAscent = aMetrics.ascent;
+ 
+     // Note: y value will be updated during vertical alignment
+     pfd->mBounds = aFrame->GetRect();
+@@ -1392,7 +1391,6 @@ nsLineLayout::VerticalAlignLine(nsLineBo
+   rootPFD.mFrame = mBlockReflowState->frame;
+   rootPFD.mFrameType = mBlockReflowState->mFrameType;
+   rootPFD.mAscent = 0;
+-  rootPFD.mDescent = 0;
+   mRootSpan->mFrame = &rootPFD;
+   mLineBox = aLineBox;
+ 
+@@ -2060,8 +2058,8 @@ nsLineLayout::VerticalAlignFrames(PerSpa
+         if (yTop < minY) minY = yTop;
+         if (yBottom > maxY) maxY = yBottom;
+ #ifdef NOISY_VERTICAL_ALIGN
+-        printf("     [frame]raw: a=%d d=%d h=%d bp=%d,%d logical: h=%d leading=%d y=%d minY=%d maxY=%d\n",
+-               pfd->mAscent, pfd->mDescent, pfd->mBounds.height,
++        printf("     [frame]raw: a=%d h=%d bp=%d,%d logical: h=%d leading=%d y=%d minY=%d maxY=%d\n",
++               pfd->mAscent, pfd->mBounds.height,
+                pfd->mBorderPadding.top, pfd->mBorderPadding.bottom,
+                logicalHeight,
+                pfd->mSpan ? topLeading : 0,
+@@ -2165,9 +2163,9 @@ nsLineLayout::VerticalAlignFrames(PerSpa
+   if ((psd != mRootSpan) && (psd->mZeroEffectiveSpanBox)) {
+ #ifdef NOISY_VERTICAL_ALIGN
+     printf("   [span]adjusting for zeroEffectiveSpanBox\n");
+-    printf("     Original: minY=%d, maxY=%d, height=%d, ascent=%d, descent=%d, logicalHeight=%d, topLeading=%d, bottomLeading=%d\n",
++    printf("     Original: minY=%d, maxY=%d, height=%d, ascent=%d, logicalHeight=%d, topLeading=%d, bottomLeading=%d\n",
+            minY, maxY, spanFramePFD->mBounds.height,
+-           spanFramePFD->mAscent, spanFramePFD->mDescent,
++           spanFramePFD->mAscent,
+            psd->mLogicalHeight, psd->mTopLeading, psd->mBottomLeading);
+ #endif
+     nscoord goodMinY = spanFramePFD->mBorderPadding.top - psd->mTopLeading;
+@@ -2205,13 +2203,12 @@ nsLineLayout::VerticalAlignFrames(PerSpa
+     if (maxY < spanFramePFD->mBounds.height) {
+       nscoord adjust = spanFramePFD->mBounds.height - maxY;
+       spanFramePFD->mBounds.height -= adjust; // move the bottom up
+-      spanFramePFD->mDescent -= adjust;
+       psd->mBottomLeading += adjust;
+     }
+ #ifdef NOISY_VERTICAL_ALIGN
+-    printf("     New: minY=%d, maxY=%d, height=%d, ascent=%d, descent=%d, logicalHeight=%d, topLeading=%d, bottomLeading=%d\n",
++    printf("     New: minY=%d, maxY=%d, height=%d, ascent=%d, logicalHeight=%d, topLeading=%d, bottomLeading=%d\n",
+            minY, maxY, spanFramePFD->mBounds.height,
+-           spanFramePFD->mAscent, spanFramePFD->mDescent,
++           spanFramePFD->mAscent,
+            psd->mLogicalHeight, psd->mTopLeading, psd->mBottomLeading);
+ #endif
+   }
+diff -r b0bd358fa4b7 layout/generic/nsLineLayout.h
+--- a/layout/generic/nsLineLayout.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsLineLayout.h	Thu Jan 18 10:46:28 2007 -0800
+@@ -461,7 +461,7 @@ protected:
+     nsCSSFrameType mFrameType;
+ 
+     // From metrics
+-    nscoord mAscent, mDescent;
++    nscoord mAscent;
+     nsRect mBounds;
+     nsRect mCombinedArea;
+ 
+diff -r b0bd358fa4b7 layout/generic/nsObjectFrame.cpp
+--- a/layout/generic/nsObjectFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsObjectFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -627,8 +627,6 @@ nsObjectFrame::GetDesiredSize(nsPresCont
+   // By default, we have no area
+   aMetrics.width = 0;
+   aMetrics.height = 0;
+-  aMetrics.ascent = 0;
+-  aMetrics.descent = 0;
+ 
+   if (IsHidden(PR_FALSE)) {
+     return;
+@@ -686,9 +684,6 @@ nsObjectFrame::GetDesiredSize(nsPresCont
+   // paint borders, though!  At that point, we will need to adjust the desired
+   // size either here or in Reflow....  Further, we will need to fix Paint() to
+   // call the superclass in all cases.
+-  
+-  // ascent
+-  aMetrics.ascent = aMetrics.height;
+ }
+ 
+ NS_IMETHODIMP
+diff -r b0bd358fa4b7 layout/generic/nsPageContentFrame.cpp
+--- a/layout/generic/nsPageContentFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsPageContentFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -130,8 +130,6 @@ NS_IMETHODIMP nsPageContentFrame::Reflow
+   if (aReflowState.availableHeight != NS_UNCONSTRAINEDSIZE) {
+     aDesiredSize.height = aReflowState.availableHeight;
+   }
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+ 
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aDesiredSize);
+   return NS_OK;
+diff -r b0bd358fa4b7 layout/generic/nsPageFrame.cpp
+--- a/layout/generic/nsPageFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsPageFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -169,8 +169,6 @@ NS_IMETHODIMP nsPageFrame::Reflow(nsPres
+   if (aReflowState.availableHeight != NS_UNCONSTRAINEDSIZE) {
+     aDesiredSize.height = aReflowState.availableHeight;
+   }
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+   PR_PL(("PageFrame::Reflow %p ", this));
+   PR_PL(("[%d,%d]\n", aReflowState.availableWidth, aReflowState.availableHeight));
+ 
+@@ -643,7 +641,6 @@ nsPageBreakFrame::Reflow(nsPresContext* 
+   // round the height down to the nearest pixel
+   aDesiredSize.height -=
+     aDesiredSize.height % GetPresContext()->IntScaledPixelsToTwips(1);
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
+ 
+   // Note: not using NS_FRAME_FIRST_REFLOW here, since it's not clear whether
+   // DidReflow will always get called before the next Reflow() call.
+diff -r b0bd358fa4b7 layout/generic/nsPlaceholderFrame.cpp
+--- a/layout/generic/nsPlaceholderFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsPlaceholderFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -116,8 +116,6 @@ nsPlaceholderFrame::Reflow(nsPresContext
+   DISPLAY_REFLOW(aPresContext, this, aReflowState, aDesiredSize, aStatus);
+   aDesiredSize.width = 0;
+   aDesiredSize.height = 0;
+-  aDesiredSize.ascent = 0;
+-  aDesiredSize.descent = 0;
+ 
+   aStatus = NS_FRAME_COMPLETE;
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aDesiredSize);
+diff -r b0bd358fa4b7 layout/generic/nsSimplePageSequence.cpp
+--- a/layout/generic/nsSimplePageSequence.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsSimplePageSequence.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -208,8 +208,6 @@ nsSimplePageSequenceFrame::Reflow(nsPres
+     // Return our desired size
+     aDesiredSize.height  = mSize.height;
+     aDesiredSize.width   = mSize.width;
+-    aDesiredSize.ascent  = aDesiredSize.height;
+-    aDesiredSize.descent = 0;
+     aDesiredSize.mOverflowArea = nsRect(0, 0, aDesiredSize.width,
+                                         aDesiredSize.height);
+     FinishAndStoreOverflow(&aDesiredSize);
+@@ -373,8 +371,6 @@ nsSimplePageSequenceFrame::Reflow(nsPres
+   // Return our desired size
+   aDesiredSize.height  = y; // includes page heights and dead space
+   aDesiredSize.width   = x + availSize.width + deadSpaceGap;
+-  aDesiredSize.ascent  = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+ 
+   aDesiredSize.mOverflowArea = nsRect(0, 0, aDesiredSize.width,
+                                       aDesiredSize.height);
+diff -r b0bd358fa4b7 layout/generic/nsSpacerFrame.cpp
+--- a/layout/generic/nsSpacerFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsSpacerFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -130,8 +130,6 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+   // By default, we have no area
+   aMetrics.width = 0;
+   aMetrics.height = 0;
+-  aMetrics.ascent = 0;
+-  aMetrics.descent = 0;
+ 
+   const nsStylePosition* position = GetStylePosition();
+ 
+@@ -144,7 +142,6 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+     if (eStyleUnit_Coord == position->mHeight.GetUnit()) {
+       aMetrics.height = position->mHeight.GetCoordValue();
+     }
+-    aMetrics.ascent = aMetrics.height;
+     break;
+ 
+   case TYPE_IMAGE:
+@@ -169,8 +166,6 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+       float factor = position->mHeight.GetPercentValue();
+       aMetrics.width = NSToCoordRound(factor * aPercentBase.height);
+     }
+-    // accent
+-    aMetrics.ascent = aMetrics.height;
+     break;
+   }
+ 
+diff -r b0bd358fa4b7 layout/generic/nsTextFrame.cpp
+--- a/layout/generic/nsTextFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsTextFrame.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -5892,7 +5892,6 @@ nsTextFrame::Reflow(nsPresContext*      
+     aMetrics.width = 0;
+     aMetrics.height = 0;
+     aMetrics.ascent = 0;
+-    aMetrics.descent = 0;
+ #ifdef MOZ_MATHML
+     if (NS_REFLOW_CALC_BOUNDING_METRICS & aMetrics.mFlags)
+       aMetrics.mBoundingMetrics.Clear();
+@@ -6068,12 +6067,10 @@ nsTextFrame::Reflow(nsPresContext*      
+   if ((0 == textData.mX) && !ts.mPreformatted) {
+     aMetrics.height = 0;
+     aMetrics.ascent = 0;
+-    aMetrics.descent = 0;
+   }
+   else {
+     aMetrics.ascent = textData.mAscent;
+-    aMetrics.descent = textData.mDescent;
+-    aMetrics.height = aMetrics.ascent + aMetrics.descent;
++    aMetrics.height = textData.mAscent + textData.mDescent;
+   }
+   mAscent = aMetrics.ascent;
+ 
+@@ -6119,7 +6116,7 @@ nsTextFrame::Reflow(nsPresContext*      
+       else {
+         // Things didn't turn out well, just return the reflow metrics.
+         aMetrics.mBoundingMetrics.ascent = aMetrics.ascent;
+-        aMetrics.mBoundingMetrics.descent = aMetrics.descent;
++        aMetrics.mBoundingMetrics.descent = aMetrics.height - aMetrics.ascent;
+         aMetrics.mBoundingMetrics.width = aMetrics.width;
+         aMetrics.mBoundingMetrics.rightBearing = aMetrics.width;
+       }
+@@ -6168,8 +6165,8 @@ nsTextFrame::Reflow(nsPresContext*      
+ 
+ #ifdef NOISY_REFLOW
+   ListTag(stdout);
+-  printf(": desiredSize=%d,%d(a=%d/d=%d) status=%x\n",
+-         aMetrics.width, aMetrics.height, aMetrics.ascent, aMetrics.descent,
++  printf(": desiredSize=%d,%d(b=%d) status=%x\n",
++         aMetrics.width, aMetrics.height, aMetrics.ascent,
+          aStatus);
+ #endif
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aMetrics);
+diff -r b0bd358fa4b7 layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsTextFrameThebes.cpp	Thu Jan 18 10:46:28 2007 -0800
+@@ -1637,7 +1637,6 @@ static void ClearMetrics(nsHTMLReflowMet
+   aMetrics.width = 0;
+   aMetrics.height = 0;
+   aMetrics.ascent = 0;
+-  aMetrics.descent = 0;
+ #ifdef MOZ_MATHML
+   aMetrics.mBoundingMetrics.Clear();
+ #endif
+@@ -4762,10 +4761,9 @@ nsTextFrame::Reflow(nsPresContext*      
+   // Disallow negative widths
+   aMetrics.width = NSToCoordCeil(PR_MAX(0, textMetrics.mAdvanceWidth));
+   aMetrics.ascent = NSToCoordCeil(textMetrics.mAscent);
+-  aMetrics.descent = NSToCoordCeil(textMetrics.mDescent);
+-  aMetrics.height = aMetrics.ascent + aMetrics.descent;
++  aMetrics.height = aMetrics.ascent + NSToCoordCeil(textMetrics.mDescent);
+   NS_ASSERTION(aMetrics.ascent >= 0, "Negative ascent???");
+-  NS_ASSERTION(aMetrics.descent >= 0, "Negative ascent???");
++  NS_ASSERTION(aMetrics.height - aMetrics.ascent >= 0, "Negative descent???");
+ 
+   mAscent = aMetrics.ascent;
+ 
+@@ -4864,8 +4862,8 @@ nsTextFrame::Reflow(nsPresContext*      
+ 
+ #ifdef NOISY_REFLOW
+   ListTag(stdout);
+-  printf(": desiredSize=%d,%d(a=%d/d=%d) status=%x\n",
+-         aMetrics.width, aMetrics.height, aMetrics.ascent, aMetrics.descent,
++  printf(": desiredSize=%d,%d(b=%d) status=%x\n",
++         aMetrics.width, aMetrics.height, aMetrics.ascent,
+          aStatus);
+ #endif
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aMetrics);
+diff -r b0bd358fa4b7 layout/generic/nsViewportFrame.cpp
+--- a/layout/generic/nsViewportFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/generic/nsViewportFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -304,8 +304,6 @@ ViewportFrame::Reflow(nsPresContext*    
+   aDesiredSize.height = aReflowState.availableHeight != NS_UNCONSTRAINEDSIZE
+                           ? aReflowState.availableHeight
+                           : kidRect.height;
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+ 
+   // Make a copy of the reflow state and change the computed width and height
+   // to reflect the available space for the fixed items
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLContainerFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLContainerFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLContainerFrame.cpp	Thu Jan 18 10:52:16 2007 -0800
+@@ -104,7 +104,7 @@ nsMathMLContainerFrame::ReflowError(nsIR
+   if (NS_FAILED(rv)) {
+     NS_WARNING("GetBoundingMetrics failed");
+     aDesiredSize.width = aDesiredSize.height = 0;
+-    aDesiredSize.ascent = aDesiredSize.descent = 0;
++    aDesiredSize.ascent = 0;
+     return NS_OK;
+   }
+ 
+@@ -112,8 +112,9 @@ nsMathMLContainerFrame::ReflowError(nsIR
+   nsCOMPtr<nsIFontMetrics> fm;
+   aRenderingContext.GetFontMetrics(*getter_AddRefs(fm));
+   fm->GetMaxAscent(aDesiredSize.ascent);
+-  fm->GetMaxDescent(aDesiredSize.descent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  nscoord descent;
++  fm->GetMaxDescent(descent);
++  aDesiredSize.height = aDesiredSize.ascent + descent;
+   aDesiredSize.width = mBoundingMetrics.width;
+ 
+   // Also return our bounding metrics
+@@ -178,10 +179,10 @@ nsMathMLContainerFrame::GetReflowAndBoun
+   // for the frame's ascent and descent information
+ 
+   nsRect rect = aFrame->GetRect();
+-  aReflowMetrics.descent = rect.x;
+   aReflowMetrics.ascent  = rect.y;
+   aReflowMetrics.width   = rect.width;
+   aReflowMetrics.height  = rect.height;
++  nscoord descent = aReflowMetrics.height - aReflowMetrics.ascent;
+ 
+   if (aFrame->IsFrameOfType(nsIFrame::eMathML)) {
+     nsIMathMLFrame* mathMLFrame;
+@@ -196,7 +197,7 @@ nsMathMLContainerFrame::GetReflowAndBoun
+   }
+ 
+  // aFrame is not a MathML frame, just return the reflow metrics
+- aBoundingMetrics.descent = aReflowMetrics.descent;
++ aBoundingMetrics.descent = descent;
+  aBoundingMetrics.ascent  = aReflowMetrics.ascent;
+  aBoundingMetrics.width   = aReflowMetrics.width;
+  aBoundingMetrics.rightBearing = aReflowMetrics.width;
+@@ -361,7 +362,7 @@ nsMathMLContainerFrame::Stretch(nsIRende
+                              mEmbellishData.direction, containerSize, childSize);
+ 
+         // store the updated metrics
+-        childFrame->SetRect(nsRect(childSize.descent, childSize.ascent,
++        childFrame->SetRect(nsRect(0, childSize.ascent,
+                                    childSize.width, childSize.height));
+ 
+         // Remember the siblings which were _deferred_.
+@@ -389,7 +390,7 @@ nsMathMLContainerFrame::Stretch(nsIRende
+                 mathMLFrame->Stretch(aRenderingContext, stretchDir,
+                                      containerSize, childSize);
+                 // store the updated metrics
+-                childFrame->SetRect(nsRect(childSize.descent, childSize.ascent,
++                childFrame->SetRect(nsRect(0, childSize.ascent,
+                                            childSize.width, childSize.height));
+               }
+             }
+@@ -946,7 +947,7 @@ nsMathMLContainerFrame::ReflowChild(nsIF
+                                     nsReflowStatus&          aStatus)
+ {
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   aDesiredSize.mBoundingMetrics.Clear();
+   aDesiredSize.mFlags |= NS_REFLOW_CALC_BOUNDING_METRICS;
+ 
+@@ -994,7 +995,7 @@ nsMathMLContainerFrame::ReflowForeignChi
+ 
+   // make up the bounding metrics from the reflow metrics.
+   aDesiredSize.mBoundingMetrics.ascent = aDesiredSize.ascent;
+-  aDesiredSize.mBoundingMetrics.descent = aDesiredSize.descent;
++  aDesiredSize.mBoundingMetrics.descent = aDesiredSize.height - aDesiredSize.ascent;
+   aDesiredSize.mBoundingMetrics.width = aDesiredSize.width;
+   aDesiredSize.mBoundingMetrics.rightBearing = aDesiredSize.width;
+ 
+@@ -1014,7 +1015,7 @@ nsMathMLContainerFrame::Reflow(nsPresCon
+ {
+   nsresult rv;
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   aDesiredSize.mBoundingMetrics.Clear();
+ 
+   /////////////
+@@ -1037,7 +1038,7 @@ nsMathMLContainerFrame::Reflow(nsPresCon
+     // At this stage, the origin points of the children have no use, so we will use the
+     // origins as placeholders to store the child's ascent and descent. Later on,
+     // we should set the origins so as to overwrite what we are storing there now.
+-    childFrame->SetRect(nsRect(childDesiredSize.descent, childDesiredSize.ascent,
++    childFrame->SetRect(nsRect(0, childDesiredSize.ascent,
+                                childDesiredSize.width, childDesiredSize.height));
+     childFrame = childFrame->GetNextSibling();
+   }
+@@ -1080,7 +1081,7 @@ nsMathMLContainerFrame::Reflow(nsPresCon
+         mathMLFrame->Stretch(*aReflowState.rendContext, stretchDir,
+                              containerSize, childDesiredSize);
+         // store the updated metrics
+-        childFrame->SetRect(nsRect(childDesiredSize.descent, childDesiredSize.ascent,
++        childFrame->SetRect(nsRect(0, childDesiredSize.ascent,
+                                    childDesiredSize.width, childDesiredSize.height));
+       }
+       childFrame = childFrame->GetNextSibling();
+@@ -1215,7 +1216,7 @@ nsMathMLContainerFrame::Place(nsIRenderi
+ {
+   // these are needed in case this frame is empty (i.e., we don't enter the loop)
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   mBoundingMetrics.Clear();
+ 
+   // cache away thinspace
+@@ -1232,12 +1233,13 @@ nsMathMLContainerFrame::Place(nsIRenderi
+   eMathMLFrameType childFrameType;
+ 
+   nsIFrame* childFrame = mFrames.FirstChild();
++  nscoord ascent = 0, descent = 0;
+   while (childFrame) {
+     GetReflowAndBoundingMetricsFor(childFrame, childSize, bmChild, &childFrameType);
+     GetItalicCorrection(bmChild, leftCorrection, italicCorrection);
+     if (0 == count) {
+-      aDesiredSize.ascent = childSize.ascent;
+-      aDesiredSize.descent = childSize.descent;
++      ascent = childSize.ascent;
++      descent = childSize.height - ascent;
+       mBoundingMetrics = bmChild;
+       // update to include the left correction
+       // but leave <msqrt> alone because the sqrt glyph itself is there first
+@@ -1248,10 +1250,11 @@ nsMathMLContainerFrame::Place(nsIRenderi
+         mBoundingMetrics.leftBearing += leftCorrection;
+     }
+     else {
+-      if (aDesiredSize.descent < childSize.descent)
+-        aDesiredSize.descent = childSize.descent;
+-      if (aDesiredSize.ascent < childSize.ascent)
+-        aDesiredSize.ascent = childSize.ascent;
++      nscoord childDescent = childSize.height - childSize.ascent;
++      if (descent < childDescent)
++        descent = childDescent;
++      if (ascent < childSize.ascent)
++        ascent = childSize.ascent;
+       // add inter frame spacing
+       nscoord space = GetInterFrameSpacing(mPresentationData.scriptLevel,
+         prevFrameType, childFrameType, &fromFrameType, &carrySpace);
+@@ -1274,7 +1277,8 @@ nsMathMLContainerFrame::Place(nsIRenderi
+     childFrame = childFrame->GetNextSibling();
+   }
+   aDesiredSize.width = mBoundingMetrics.width;
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = ascent + descent;
++  aDesiredSize.ascent = ascent;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+   mReference.x = 0;
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLForeignFrameWrapper.cpp
+--- a/layout/mathml/base/src/nsMathMLForeignFrameWrapper.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLForeignFrameWrapper.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -80,7 +80,7 @@ nsMathMLForeignFrameWrapper::Reflow(nsPr
+   // just make-up a bounding metrics
+   mBoundingMetrics.Clear();
+   mBoundingMetrics.ascent = aDesiredSize.ascent;
+-  mBoundingMetrics.descent = aDesiredSize.descent;
++  mBoundingMetrics.descent = aDesiredSize.height - aDesiredSize.ascent;
+   mBoundingMetrics.width = aDesiredSize.width;
+   mBoundingMetrics.leftBearing = 0;
+   mBoundingMetrics.rightBearing = aDesiredSize.width;
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLTokenFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLTokenFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLTokenFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -127,7 +127,7 @@ nsMathMLTokenFrame::Reflow(nsPresContext
+ 
+   // initializations needed for empty markup like <mtag></mtag>
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   aDesiredSize.mBoundingMetrics.Clear();
+ 
+   // ask our children to compute their bounding metrics
+@@ -145,7 +145,7 @@ nsMathMLTokenFrame::Reflow(nsPresContext
+     if (NS_FAILED(rv)) return rv;
+ 
+     // origins are used as placeholders to store the child's ascent and descent.
+-    childFrame->SetRect(nsRect(childDesiredSize.descent, childDesiredSize.ascent,
++    childFrame->SetRect(nsRect(0, childDesiredSize.ascent,
+                                childDesiredSize.width, childDesiredSize.height));
+     // compute and cache the bounding metrics
+     if (0 == count)
+@@ -190,8 +190,8 @@ nsMathMLTokenFrame::Place(nsIRenderingCo
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.ascent = PR_MAX(mBoundingMetrics.ascent, ascent);
+-  aDesiredSize.descent = PR_MAX(mBoundingMetrics.descent, descent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++                        PR_MAX(mBoundingMetrics.descent, descent);
+ 
+   if (aPlaceOrigin) {
+     nscoord dy, dx = 0;
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmactionFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmactionFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmactionFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -279,7 +279,7 @@ nsMathMLmactionFrame::Reflow(nsPresConte
+   nsresult rv = NS_OK;
+   aStatus = NS_FRAME_COMPLETE;
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   mBoundingMetrics.Clear();
+   nsIFrame* childFrame = GetSelectedFrame();
+   if (childFrame) {
+@@ -288,7 +288,7 @@ nsMathMLmactionFrame::Reflow(nsPresConte
+                                        childFrame, availSize);
+     rv = ReflowChild(childFrame, aPresContext, aDesiredSize,
+                      childReflowState, aStatus);
+-    childFrame->SetRect(nsRect(aDesiredSize.descent,aDesiredSize.ascent,
++    childFrame->SetRect(nsRect(0,aDesiredSize.ascent,
+                         aDesiredSize.width,aDesiredSize.height));
+     mBoundingMetrics = aDesiredSize.mBoundingMetrics;
+   }
+@@ -304,7 +304,7 @@ nsMathMLmactionFrame::Place(nsIRendering
+                             nsHTMLReflowMetrics& aDesiredSize)
+ {
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   mBoundingMetrics.Clear();
+   nsIFrame* childFrame = GetSelectedFrame();
+   if (childFrame) {
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmfencedFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmfencedFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmfencedFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -255,7 +255,7 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+ {
+   nsresult rv;
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+   aDesiredSize.mBoundingMetrics.Clear();
+ 
+   nsMathMLContainerFrame* mathMLFrame =
+@@ -290,11 +290,12 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+                       aDesiredSize.mFlags | NS_REFLOW_CALC_BOUNDING_METRICS);
+   nsIFrame* firstChild = aForFrame->GetFirstChild(nsnull);
+   nsIFrame* childFrame = firstChild;
++  nscoord ascent = 0, descent = 0;
+   if (firstChild || aOpenChar || aCloseChar || aSeparatorsCount > 0) {
+     // We use the ASCII metrics to get our minimum height. This way, if we have
+     // borders or a background, they will fit better with other elements on the line
+-    fm->GetMaxAscent(aDesiredSize.ascent);
+-    fm->GetMaxDescent(aDesiredSize.descent);
++    fm->GetMaxAscent(ascent);
++    fm->GetMaxDescent(descent);
+   }
+   while (childFrame) {
+     nsHTMLReflowState childReflowState(aPresContext, aReflowState,
+@@ -307,14 +308,15 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+     // At this stage, the origin points of the children have no use, so we will use the
+     // origins as placeholders to store the child's ascent and descent. Later on,
+     // we should set the origins so as to overwrite what we are storing there now.
+-    childFrame->SetRect(nsRect(childDesiredSize.descent, childDesiredSize.ascent,
++    childFrame->SetRect(nsRect(0, childDesiredSize.ascent,
+                                childDesiredSize.width, childDesiredSize.height));
+ 
+     // compute the bounding metrics right now for mfrac
+-    if (aDesiredSize.descent < childDesiredSize.descent)
+-      aDesiredSize.descent = childDesiredSize.descent;
+-    if (aDesiredSize.ascent < childDesiredSize.ascent)
+-      aDesiredSize.ascent = childDesiredSize.ascent;
++    nscoord childDescent = childDesiredSize.height - childDesiredSize.ascent;
++    if (descent < childDescent)
++      descent = childDescent;
++    if (ascent < childDesiredSize.ascent)
++      ascent = childDesiredSize.ascent;
+     if (0 == count++)
+       aDesiredSize.mBoundingMetrics  = childDesiredSize.mBoundingMetrics;
+     else
+@@ -351,13 +353,14 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+         mathmlChild->Stretch(*aReflowState.rendContext, 
+                              stretchDir, containerSize, childDesiredSize);
+         // store the updated metrics
+-        childFrame->SetRect(nsRect(childDesiredSize.descent, childDesiredSize.ascent,
++        childFrame->SetRect(nsRect(0, childDesiredSize.ascent,
+                                    childDesiredSize.width, childDesiredSize.height));
+ 
+-        if (aDesiredSize.descent < childDesiredSize.descent)
+-          aDesiredSize.descent = childDesiredSize.descent;
+-        if (aDesiredSize.ascent < childDesiredSize.ascent)
+-          aDesiredSize.ascent = childDesiredSize.ascent;
++        nscoord childDescent = childDesiredSize.height - childDesiredSize.ascent;
++        if (descent < childDescent)
++          descent = childDescent;
++        if (ascent < childDesiredSize.ascent)
++          ascent = childDesiredSize.ascent;
+       }
+       childFrame = childFrame->GetNextSibling();
+     }
+@@ -383,19 +386,19 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+   // opening fence ...
+   ReflowChar(aPresContext, *aReflowState.rendContext, aOpenChar,
+              NS_MATHML_OPERATOR_FORM_PREFIX, presentationData.scriptLevel, 
+-             axisHeight, leading, em, containerSize, aDesiredSize);
++             axisHeight, leading, em, containerSize, ascent, descent);
+   /////////////////
+   // separators ...
+   for (i = 0; i < aSeparatorsCount; i++) {
+     ReflowChar(aPresContext, *aReflowState.rendContext, &aSeparatorsChar[i],
+                NS_MATHML_OPERATOR_FORM_INFIX, presentationData.scriptLevel,
+-               axisHeight, leading, em, containerSize, aDesiredSize);
++               axisHeight, leading, em, containerSize, ascent, descent);
+   }
+   /////////////////
+   // closing fence ...
+   ReflowChar(aPresContext, *aReflowState.rendContext, aCloseChar,
+              NS_MATHML_OPERATOR_FORM_POSTFIX, presentationData.scriptLevel,
+-             axisHeight, leading, em, containerSize, aDesiredSize);
++             axisHeight, leading, em, containerSize, ascent, descent);
+ 
+   //////////////////
+   // Adjust the origins of each child.
+@@ -406,7 +409,7 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+   nsBoundingMetrics bm;
+   PRBool firstTime = PR_TRUE;
+   if (aOpenChar) {
+-    PlaceChar(aOpenChar, aDesiredSize.ascent, bm, dx);
++    PlaceChar(aOpenChar, ascent, bm, dx);
+     aDesiredSize.mBoundingMetrics = bm;
+     firstTime = PR_FALSE;
+   }
+@@ -423,11 +426,11 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+       aDesiredSize.mBoundingMetrics += bm;
+ 
+     mathMLFrame->FinishReflowChild(childFrame, aPresContext, nsnull, childSize, 
+-                                   dx, aDesiredSize.ascent - childSize.ascent, 0);
++                                   dx, ascent - childSize.ascent, 0);
+     dx += childSize.width;
+ 
+     if (i < aSeparatorsCount) {
+-      PlaceChar(&aSeparatorsChar[i], aDesiredSize.ascent, bm, dx);
++      PlaceChar(&aSeparatorsChar[i], ascent, bm, dx);
+       aDesiredSize.mBoundingMetrics += bm;
+     }
+     i++;
+@@ -436,7 +439,7 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+   }
+ 
+   if (aCloseChar) {
+-    PlaceChar(aCloseChar, aDesiredSize.ascent, bm, dx);
++    PlaceChar(aCloseChar, ascent, bm, dx);
+     if (firstTime)
+       aDesiredSize.mBoundingMetrics  = bm;
+     else  
+@@ -444,7 +447,8 @@ nsMathMLmfencedFrame::doReflow(nsPresCon
+   }
+ 
+   aDesiredSize.width = aDesiredSize.mBoundingMetrics.width;
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = ascent + descent;
++  aDesiredSize.ascent = ascent;
+ 
+   mathMLFrame->SetBoundingMetrics(aDesiredSize.mBoundingMetrics);
+   mathMLFrame->SetReference(nsPoint(0, aDesiredSize.ascent));
+@@ -468,7 +472,8 @@ nsMathMLmfencedFrame::ReflowChar(nsPresC
+                                  nscoord              leading,
+                                  nscoord              em,
+                                  nsBoundingMetrics&   aContainerSize,
+-                                 nsHTMLReflowMetrics& aDesiredSize)
++                                 nscoord&             aAscent,
++                                 nscoord&             aDescent)
+ {
+   if (aMathMLChar && 0 < aMathMLChar->Length()) {
+     nsOperatorFlags flags = 0;
+@@ -514,10 +519,10 @@ nsMathMLmfencedFrame::ReflowChar(nsPresC
+       }
+     }
+ 
+-    if (aDesiredSize.ascent < charSize.ascent + leading) 
+-      aDesiredSize.ascent = charSize.ascent + leading;
+-    if (aDesiredSize.descent < charSize.descent + leading) 
+-      aDesiredSize.descent = charSize.descent + leading;
++    if (aAscent < charSize.ascent + leading) 
++      aAscent = charSize.ascent + leading;
++    if (aDescent < charSize.descent + leading) 
++      aDescent = charSize.descent + leading;
+ 
+     // account the spacing
+     charSize.width += NSToCoordRound((leftSpace + rightSpace) * em);
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmfencedFrame.h
+--- a/layout/mathml/base/src/nsMathMLmfencedFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmfencedFrame.h	Thu Jan 18 10:46:29 2007 -0800
+@@ -110,7 +110,8 @@ public:
+              nscoord              leading,
+              nscoord              em,
+              nsBoundingMetrics&   aContainerSize,
+-             nsHTMLReflowMetrics& aDesiredSize);
++             nscoord&             aAscent,
++             nscoord&             aDescent);
+ 
+   static void
+   PlaceChar(nsMathMLChar*      aMathMLChar,
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmfracFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmfracFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmfracFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -423,8 +423,8 @@ nsMathMLmfracFrame::Place(nsIRenderingCo
+   mBoundingMetrics.width = width;
+ 
+   aDesiredSize.ascent = sizeNum.ascent + numShift;
+-  aDesiredSize.descent = sizeDen.descent + denShift;
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++                        sizeDen.height - sizeDen.ascent + denShift;
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmmultiscriptsFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmmultiscriptsFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmmultiscriptsFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -258,7 +258,7 @@ nsMathMLmmultiscriptsFrame::Place(nsIRen
+ 
+   mBoundingMetrics.width = 0;
+   mBoundingMetrics.ascent = mBoundingMetrics.descent = -0x7FFFFFFF;
+-  aDesiredSize.ascent = aDesiredSize.descent = -0x7FFFFFFF;
++  nscoord ascent = -0x7FFFFFFF, descent = -0x7FFFFFFF;
+   aDesiredSize.width = aDesiredSize.height = 0;
+ 
+   nsIFrame* childFrame = mFrames.FirstChild();
+@@ -302,8 +302,7 @@ nsMathMLmmultiscriptsFrame::Place(nsIRen
+           trySubScriptShift = PR_MAX(minSubScriptShift,subScriptShift);
+           mBoundingMetrics.descent =
+             PR_MAX(mBoundingMetrics.descent,bmSubScript.descent);
+-          aDesiredSize.descent =
+-            PR_MAX(aDesiredSize.descent,subScriptSize.descent);
++          descent = PR_MAX(descent,subScriptSize.height - subScriptSize.ascent);
+           width = bmSubScript.width + scriptSpace;
+           rightBearing = bmSubScript.rightBearing;
+         }
+@@ -323,8 +322,7 @@ nsMathMLmmultiscriptsFrame::Place(nsIRen
+             PR_MAX(minSupScriptShift,PR_MAX(minShiftFromXHeight,supScriptShift));
+           mBoundingMetrics.ascent =
+             PR_MAX(mBoundingMetrics.ascent,bmSupScript.ascent);
+-          aDesiredSize.ascent =
+-            PR_MAX(aDesiredSize.ascent,supScriptSize.ascent);
++          ascent = PR_MAX(ascent,supScriptSize.ascent);
+           width = PR_MAX(width, bmSupScript.width + scriptSpace);
+           rightBearing = PR_MAX(rightBearing, bmSupScript.rightBearing);
+ 
+@@ -394,10 +392,9 @@ nsMathMLmmultiscriptsFrame::Place(nsIRen
+ 
+   // get the reflow metrics ...
+   aDesiredSize.ascent =
+-    PR_MAX(aDesiredSize.ascent+maxSupScriptShift,baseSize.ascent);
+-  aDesiredSize.descent =
+-    PR_MAX(aDesiredSize.descent+maxSubScriptShift,baseSize.descent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++    PR_MAX(ascent+maxSupScriptShift,baseSize.ascent);
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(descent+maxSubScriptShift,baseSize.height - baseSize.ascent);
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmoFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmoFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmoFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -818,7 +818,7 @@ nsMathMLmoFrame::Stretch(nsIRenderingCon
+     // see bug 188467 for what is going on here
+     nscoord dy = aDesiredStretchSize.ascent - (mBoundingMetrics.ascent + leading);
+     aDesiredStretchSize.ascent = mBoundingMetrics.ascent + leading;
+-    aDesiredStretchSize.descent = mBoundingMetrics.descent;
++    aDesiredStretchSize.height = aDesiredStretchSize.ascent + mBoundingMetrics.descent;
+ 
+     firstChild->SetPosition(firstChild->GetPosition() - nsPoint(0, dy));
+   }
+@@ -827,9 +827,9 @@ nsMathMLmoFrame::Stretch(nsIRenderingCon
+     fm->GetMaxAscent(ascent);
+     fm->GetMaxDescent(descent);
+     aDesiredStretchSize.ascent = PR_MAX(mBoundingMetrics.ascent + leading, ascent);
+-    aDesiredStretchSize.descent = PR_MAX(mBoundingMetrics.descent + leading, descent);
+-  }
+-  aDesiredStretchSize.height = aDesiredStretchSize.ascent + aDesiredStretchSize.descent;
++    aDesiredStretchSize.height = aDesiredStretchSize.ascent +
++                                 PR_MAX(mBoundingMetrics.descent + leading, descent);
++  }
+   aDesiredStretchSize.width = mBoundingMetrics.width;
+   aDesiredStretchSize.mBoundingMetrics = mBoundingMetrics;
+   mReference.x = 0;
+@@ -940,7 +940,6 @@ nsMathMLmoFrame::Reflow(nsPresContext*  
+     aDesiredSize.width = 0;
+     aDesiredSize.height = 0;
+     aDesiredSize.ascent = 0;
+-    aDesiredSize.descent = 0;
+     aDesiredSize.mBoundingMetrics.Clear();
+     aStatus = NS_FRAME_COMPLETE;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmoverFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmoverFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmoverFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -389,11 +389,11 @@ nsMathMLmoverFrame::Place(nsIRenderingCo
+   mBoundingMetrics.rightBearing = 
+     PR_MAX(dxBase + bmBase.rightBearing, dxOver + bmOver.rightBearing);
+ 
+-  aDesiredSize.descent = baseSize.descent;
+   aDesiredSize.ascent = 
+     PR_MAX(mBoundingMetrics.ascent + delta2,
+            overSize.ascent + bmOver.descent + delta1 + bmBase.ascent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    baseSize.height - baseSize.ascent;
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmpaddedFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmpaddedFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmpaddedFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -436,9 +436,8 @@ nsMathMLmpaddedFrame::Reflow(nsPresConte
+   mBoundingMetrics.descent = depth;
+ 
+   aDesiredSize.ascent += dy;
+-  aDesiredSize.descent += depth - mBoundingMetrics.descent;
+   aDesiredSize.width = mBoundingMetrics.width;
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height += dy + depth - mBoundingMetrics.descent;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+   // combine our tweaked size and our natural size to get our real estate
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmrootFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmrootFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmrootFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -166,7 +166,7 @@ nsMathMLmrootFrame::Reflow(nsPresContext
+   nsReflowStatus childStatus;
+ 
+   aDesiredSize.width = aDesiredSize.height = 0;
+-  aDesiredSize.ascent = aDesiredSize.descent = 0;
++  aDesiredSize.ascent = 0;
+ 
+   nsBoundingMetrics bmSqr, bmBase, bmIndex;
+   nsIRenderingContext& renderingContext = *aReflowState.rendContext;
+@@ -283,9 +283,9 @@ nsMathMLmrootFrame::Reflow(nsPresContext
+     PR_MAX(bmBase.width, bmBase.rightBearing); // take also care of the rule
+ 
+   aDesiredSize.ascent = mBoundingMetrics.ascent + leading;
+-  aDesiredSize.descent =
+-    PR_MAX(baseSize.descent, (mBoundingMetrics.descent + ruleThickness));
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(baseSize.height - baseSize.ascent,
++           mBoundingMetrics.descent + ruleThickness);
+   aDesiredSize.width = mBoundingMetrics.width;
+ 
+   /////////////
+@@ -303,8 +303,9 @@ nsMathMLmrootFrame::Reflow(nsPresContext
+     indexClearance = 
+       indexRaisedAscent - mBoundingMetrics.ascent; // excess gap introduced by a tall index 
+     mBoundingMetrics.ascent = indexRaisedAscent;
++    nscoord descent = aDesiredSize.height - aDesiredSize.ascent;
+     aDesiredSize.ascent = mBoundingMetrics.ascent + leading;
+-    aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++    aDesiredSize.height = aDesiredSize.ascent + descent;
+   }
+ 
+   // the index is tucked in closer to the radical while making sure
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmspaceFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmspaceFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmspaceFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -135,9 +135,8 @@ nsMathMLmspaceFrame::Reflow(nsPresContex
+   mBoundingMetrics.rightBearing = mWidth;
+ 
+   aDesiredSize.ascent = mHeight;
+-  aDesiredSize.descent = mDepth;
+   aDesiredSize.width = mWidth;
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent + mDepth;
+   // Also return our bounding metrics
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmsqrtFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmsqrtFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmsqrtFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -259,9 +259,9 @@ nsMathMLmsqrtFrame::Reflow(nsPresContext
+     PR_MAX(bmBase.width, bmBase.rightBearing); // take also care of the rule
+ 
+   aDesiredSize.ascent = mBoundingMetrics.ascent + leading;
+-  aDesiredSize.descent =
+-    PR_MAX(baseSize.descent, (mBoundingMetrics.descent + ruleThickness));
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(baseSize.height - baseSize.ascent,
++           mBoundingMetrics.descent + ruleThickness);
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmsubFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmsubFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmsubFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -200,9 +200,9 @@ nsMathMLmsubFrame::PlaceSubScript (nsPre
+   // reflow metrics
+   aDesiredSize.ascent = 
+     PR_MAX(baseSize.ascent, subScriptSize.ascent - actualSubScriptShift);
+-  aDesiredSize.descent = 
+-    PR_MAX(baseSize.descent, subScriptSize.descent + actualSubScriptShift);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(baseSize.height - baseSize.ascent,
++           subScriptSize.height - subScriptSize.ascent + actualSubScriptShift);
+   aDesiredSize.width = boundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = boundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmsubsupFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmsubsupFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmsubsupFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -332,11 +332,10 @@ nsMathMLmsubsupFrame::PlaceSubSupScript(
+     PR_MAX(baseSize.ascent, 
+        PR_MAX(subScriptSize.ascent - subScriptShift,
+               supScriptSize.ascent + supScriptShift));
+-  aDesiredSize.descent =
+-    PR_MAX(baseSize.descent,
+-       PR_MAX(subScriptSize.descent + subScriptShift, 
+-              supScriptSize.descent - supScriptShift));
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(baseSize.height - baseSize.ascent,
++       PR_MAX(subScriptSize.height - subScriptSize.ascent + subScriptShift, 
++              supScriptSize.height - subScriptSize.ascent - supScriptShift));
+   aDesiredSize.width = boundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = boundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmsupFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmsupFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmsupFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -238,9 +238,9 @@ nsMathMLmsupFrame::PlaceSuperScript(nsPr
+   // reflow metrics
+   aDesiredSize.ascent =
+     PR_MAX(baseSize.ascent, (supScriptSize.ascent + actualSupScriptShift));
+-  aDesiredSize.descent =
+-    PR_MAX(baseSize.descent, (supScriptSize.descent - actualSupScriptShift));
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++  aDesiredSize.height = aDesiredSize.ascent +
++    PR_MAX(baseSize.height - baseSize.ascent,
++           (supScriptSize.height - supScriptSize.ascent - actualSupScriptShift));
+   aDesiredSize.width = boundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = boundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmtableFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmtableFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmtableFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -632,7 +632,6 @@ nsMathMLmtableOuterFrame::Reflow(nsPresC
+       aDesiredSize.ascent = dy + height/2 + axisHeight;
+     }
+   }
+-  aDesiredSize.descent = aDesiredSize.height - aDesiredSize.ascent;
+ 
+   mReference.x = 0;
+   mReference.y = aDesiredSize.ascent;
+@@ -640,7 +639,7 @@ nsMathMLmtableOuterFrame::Reflow(nsPresC
+   // just make-up a bounding metrics
+   mBoundingMetrics.Clear();
+   mBoundingMetrics.ascent = aDesiredSize.ascent;
+-  mBoundingMetrics.descent = aDesiredSize.descent;
++  mBoundingMetrics.descent = aDesiredSize.height - aDesiredSize.ascent;
+   mBoundingMetrics.width = aDesiredSize.width;
+   mBoundingMetrics.leftBearing = 0;
+   mBoundingMetrics.rightBearing = aDesiredSize.width;
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmunderFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmunderFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmunderFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -343,10 +343,10 @@ nsMathMLmunderFrame::Place(nsIRenderingC
+     PR_MAX(dxBase + bmBase.rightBearing, dxUnder + bmUnder.rightBearing);
+ 
+   aDesiredSize.ascent = baseSize.ascent;
+-  aDesiredSize.descent = 
++  aDesiredSize.height = aDesiredSize.ascent +
+     PR_MAX(mBoundingMetrics.descent + delta2,
+-           bmBase.descent + delta1 + bmUnder.ascent + underSize.descent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++           bmBase.descent + delta1 + bmUnder.ascent +
++             underSize.height - underSize.ascent);
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/mathml/base/src/nsMathMLmunderoverFrame.cpp
+--- a/layout/mathml/base/src/nsMathMLmunderoverFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/mathml/base/src/nsMathMLmunderoverFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -464,10 +464,10 @@ nsMathMLmunderoverFrame::Place(nsIRender
+     PR_MAX(dxAnonymousBase + bmAnonymousBase.rightBearing, dxUnder + bmUnder.rightBearing);
+ 
+   aDesiredSize.ascent = ascentAnonymousBase;
+-  aDesiredSize.descent = 
++  aDesiredSize.height = aDesiredSize.ascent +
+     PR_MAX(mBoundingMetrics.descent + underDelta2,
+-           bmAnonymousBase.descent + underDelta1 + bmUnder.ascent + underSize.descent);
+-  aDesiredSize.height = aDesiredSize.ascent + aDesiredSize.descent;
++           bmAnonymousBase.descent + underDelta1 + bmUnder.ascent +
++             underSize.height - underSize.ascent);
+   aDesiredSize.width = mBoundingMetrics.width;
+   aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+ 
+diff -r b0bd358fa4b7 layout/svg/base/src/nsSVGOuterSVGFrame.cpp
+--- a/layout/svg/base/src/nsSVGOuterSVGFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/svg/base/src/nsSVGOuterSVGFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -344,9 +344,6 @@ nsSVGOuterSVGFrame::Reflow(nsPresContext
+   aDesiredSize.width = (int)(width*twipsPerPx);
+   aDesiredSize.height = (int)(height*twipsPerPx);
+ 
+-  aDesiredSize.ascent = aDesiredSize.height;
+-  aDesiredSize.descent = 0;
+-  
+   // XXX add in CSS borders ??
+ 
+   aStatus = NS_FRAME_COMPLETE;
+diff -r b0bd358fa4b7 layout/tables/nsTableCellFrame.cpp
+--- a/layout/tables/nsTableCellFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableCellFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -556,7 +556,7 @@ void nsTableCellFrame::VerticallyAlignCh
+     case NS_STYLE_VERTICAL_ALIGN_BASELINE:
+       // Align the baselines of the child frame with the baselines of 
+       // other children in the same row which have 'vertical-align: baseline'
+-      kidYTop = topInset + aMaxAscent - GetDesiredAscent();
++      kidYTop = topInset + aMaxAscent - GetCellBaseline();
+     break;
+ 
+     case NS_STYLE_VERTICAL_ALIGN_TOP:
+@@ -618,6 +618,16 @@ nsTableCellFrame::HasVerticalAlignBaseli
+   return PR_TRUE;
+ }
+ 
++nscoord
++nsTableCellFrame::GetCellBaseline() const
++{
++  nsIFrame *inner = mFrames.FirstChild();
++  nscoord result;
++  if (nsLayoutUtils::GetFirstLineBaseline(inner, &result))
++    return result;
++  return inner->GetContentRect().YMost() - inner->GetPosition().y;
++}
++
+ PRInt32 nsTableCellFrame::GetRowSpan()
+ {  
+   PRInt32 rowSpan=1;
+@@ -781,7 +791,7 @@ NS_METHOD nsTableCellFrame::Reflow(nsPre
+     availSize.height = 1;
+ 
+   nsHTMLReflowMetrics kidSize(aDesiredSize.mFlags);
+-  kidSize.width=kidSize.height=kidSize.ascent=kidSize.descent=0;
++  kidSize.width = kidSize.height = 0;
+   SetPriorAvailWidth(aReflowState.availableWidth);
+   nsIFrame* firstKid = mFrames.FirstChild();
+   NS_ASSERTION(firstKid, "Frame construction error, a table cell always has an inner cell frame");
+@@ -855,12 +865,7 @@ NS_METHOD nsTableCellFrame::Reflow(nsPre
+   // set the cell's desired size and max element size
+   aDesiredSize.width   = cellWidth;
+   aDesiredSize.height  = cellHeight;
+-  aDesiredSize.ascent  = topInset;
+-  aDesiredSize.descent = bottomInset;
+-
+-  aDesiredSize.ascent  += kidSize.ascent;
+-  aDesiredSize.descent += kidSize.descent;
+-  
++
+   // the overflow area will be computed when the child will be vertically aligned
+ 
+   if (aReflowState.mFlags.mSpecialHeightReflow) {
+diff -r b0bd358fa4b7 layout/tables/nsTableCellFrame.h
+--- a/layout/tables/nsTableCellFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableCellFrame.h	Thu Jan 18 10:46:29 2007 -0800
+@@ -157,6 +157,8 @@ public:
+ 
+   PRBool HasVerticalAlignBaseline();
+ 
++  nscoord GetCellBaseline() const;
++
+   /**
+    * return the cell's specified row span. this is what was specified in the
+    * content model or in the style info, and is always >= 1.
+@@ -192,17 +194,16 @@ public:
+   void SetColIndex(PRInt32 aColIndex);
+ 
+   /** return the available width given to this frame during its last reflow */
+-  virtual nscoord GetPriorAvailWidth();
++  inline nscoord GetPriorAvailWidth();
+   
+   /** set the available width given to this frame during its last reflow */
+-  virtual void SetPriorAvailWidth(nscoord aPriorAvailWidth);
++  inline void SetPriorAvailWidth(nscoord aPriorAvailWidth);
+ 
+   /** return the desired size returned by this frame during its last reflow */
+-  virtual nsSize GetDesiredSize();
+-  virtual nscoord GetDesiredAscent();
++  inline nsSize GetDesiredSize();
+ 
+   /** set the desired size returned by this frame during its last reflow */
+-  virtual void SetDesiredSize(const nsHTMLReflowMetrics & aDesiredSize);
++  inline void SetDesiredSize(const nsHTMLReflowMetrics & aDesiredSize);
+ 
+   PRBool GetContentEmpty();
+   void SetContentEmpty(PRBool aContentEmpty);
+@@ -251,7 +252,6 @@ protected:
+ 
+   nscoord      mPriorAvailWidth;      // the avail width during the last reflow
+   nsSize       mDesiredSize;          // the last desired width & height
+-  nscoord      mDesiredAscent;        // the last desired ascent
+ };
+ 
+ inline nscoord nsTableCellFrame::GetPriorAvailWidth()
+@@ -262,15 +262,11 @@ inline void nsTableCellFrame::SetPriorAv
+ 
+ inline nsSize nsTableCellFrame::GetDesiredSize()
+ { return mDesiredSize; }
+-
+-inline nscoord nsTableCellFrame::GetDesiredAscent()
+-{ return mDesiredAscent; }
+ 
+ inline void nsTableCellFrame::SetDesiredSize(const nsHTMLReflowMetrics & aDesiredSize)
+ { 
+   mDesiredSize.width = aDesiredSize.width;
+   mDesiredSize.height = aDesiredSize.height;
+-  mDesiredAscent = aDesiredSize.ascent;
+ }
+ 
+ inline PRBool nsTableCellFrame::GetContentEmpty()
+diff -r b0bd358fa4b7 layout/tables/nsTableColGroupFrame.cpp
+--- a/layout/tables/nsTableColGroupFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableColGroupFrame.cpp	Thu Jan 18 10:46:29 2007 -0800
+@@ -384,8 +384,6 @@ NS_METHOD nsTableColGroupFrame::Reflow(n
+ 
+   aDesiredSize.width=0;
+   aDesiredSize.height=0;
+-  aDesiredSize.ascent=aDesiredSize.height;
+-  aDesiredSize.descent=0;
+   aStatus = NS_FRAME_COMPLETE;
+   NS_FRAME_SET_TRUNCATION(aStatus, aReflowState, aDesiredSize);
+   return rv;
+diff -r b0bd358fa4b7 layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -2799,7 +2799,7 @@ nsTableFrame::ReflowChildren(nsTableRefl
+       nsRect oldKidRect = kidFrame->GetRect();
+ 
+       nsHTMLReflowMetrics desiredSize;
+-      desiredSize.width = desiredSize.height = desiredSize.ascent = desiredSize.descent = 0;
++      desiredSize.width = desiredSize.height = 0;
+   
+       // Reflow the child into the available space
+       nsHTMLReflowState kidReflowState(presContext, aReflowState.reflowState,
+@@ -3441,7 +3441,8 @@ nscoord nsTableFrame::GetCellSpacingY()
+ }
+ 
+ 
+-nscoord nsTableFrame::GetAscent()
++/* virtual */ nscoord
++nsTableFrame::GetBaseline() const
+ {
+   nscoord ascent = 0;
+   nsAutoVoidArray orderedRowGroups;
+@@ -3452,7 +3453,7 @@ nscoord nsTableFrame::GetAscent()
+     nsTableRowGroupFrame* rgFrame = GetRowGroupFrame((nsIFrame*)orderedRowGroups.ElementAt(rgIndex));
+     if (rgFrame->GetRowCount()) {
+       firstRow = rgFrame->GetFirstRow(); 
+-      ascent = rgFrame->GetRect().y + firstRow->GetRect().y + firstRow->GetAscent();
++      ascent = rgFrame->GetRect().y + firstRow->GetRect().y + firstRow->GetRowBaseline();
+       break;
+     }
+   }
+diff -r b0bd358fa4b7 layout/tables/nsTableFrame.h
+--- a/layout/tables/nsTableFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableFrame.h	Thu Jan 18 10:46:30 2007 -0800
+@@ -348,7 +348,7 @@ public:
+   /** helper to get the cell spacing Y style value */
+   virtual nscoord GetCellSpacingY();
+  
+-  nscoord GetAscent();
++  virtual nscoord GetBaseline() const;
+   /** return the row span of a cell, taking into account row span magic at the bottom
+     * of a table. The row span equals the number of rows spanned by aCell starting at
+     * aStartRowIndex, and can be smaller if aStartRowIndex is greater than the row
+diff -r b0bd358fa4b7 layout/tables/nsTableOuterFrame.cpp
+--- a/layout/tables/nsTableOuterFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableOuterFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -1260,8 +1260,6 @@ NS_METHOD nsTableOuterFrame::Reflow(nsPr
+   UpdateReflowMetrics(captionSide, aDesiredSize, innerMargin, captionMargin);
+   
+   // Return our desired rect
+-  aDesiredSize.ascent  = mInnerTableFrame->GetAscent();
+-  aDesiredSize.descent = aDesiredSize.height - aDesiredSize.ascent;
+ 
+   NS_FRAME_SET_TRUNCATION(aStatus, aOuterRS, aDesiredSize);
+   return rv;
+diff -r b0bd358fa4b7 layout/tables/nsTableRowFrame.cpp
+--- a/layout/tables/nsTableRowFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableRowFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -385,7 +385,7 @@ nscoord nsTableRowFrame::GetMaxCellAscen
+   return mMaxCellAscent;
+ }
+ 
+-nscoord nsTableRowFrame::GetAscent()
++nscoord nsTableRowFrame::GetRowBaseline()
+ {
+   if(mMaxCellAscent)
+     return mMaxCellAscent;
+@@ -526,7 +526,7 @@ nsTableRowFrame::CalcHeight(const nsHTML
+        if (!kidFrame->GetFirstChild(nsnull)->GetFirstChild(nsnull))
+          ascent = desSize.height;
+        else
+-         ascent = ((nsTableCellFrame *)kidFrame)->GetDesiredAscent();
++         ascent = ((nsTableCellFrame *)kidFrame)->GetCellBaseline();
+       nscoord descent = desSize.height - ascent;
+       UpdateHeight(desSize.height, ascent, descent, tableFrame, (nsTableCellFrame*)kidFrame);
+     }
+@@ -979,7 +979,7 @@ nsTableRowFrame::ReflowChildren(nsPresCo
+         if (!kidFrame->GetFirstChild(nsnull)->GetFirstChild(nsnull))
+           ascent = desiredSize.height;
+         else
+-          ascent = ((nsTableCellFrame *)kidFrame)->GetDesiredAscent();
++          ascent = ((nsTableCellFrame *)kidFrame)->GetCellBaseline();
+         nscoord descent = desiredSize.height - ascent;
+         UpdateHeight(desiredSize.height, ascent, descent, &aTableFrame, cellFrame);
+       }
+diff -r b0bd358fa4b7 layout/tables/nsTableRowFrame.h
+--- a/layout/tables/nsTableRowFrame.h	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableRowFrame.h	Thu Jan 18 10:46:30 2007 -0800
+@@ -147,7 +147,7 @@ public:
+ 
+   /* return the row ascent
+    */
+-  nscoord GetAscent();
++  nscoord GetRowBaseline();
+  
+   /** returns the ordinal position of this row in its table */
+   virtual PRInt32 GetRowIndex() const;
+diff -r b0bd358fa4b7 layout/tables/nsTableRowGroupFrame.cpp
+--- a/layout/tables/nsTableRowGroupFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/tables/nsTableRowGroupFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -397,7 +397,7 @@ nsTableRowGroupFrame::ReflowChildren(nsP
+       // XXXldb We used to only pass aDesiredSize.mFlags through for the
+       // incremental reflow codepath.
+       nsHTMLReflowMetrics desiredSize(aDesiredSize.mFlags);
+-      desiredSize.width = desiredSize.height = desiredSize.ascent = desiredSize.descent = 0;
++      desiredSize.width = desiredSize.height = 0;
+   
+       // Reflow the child into the available space, giving it as much height as
+       // it wants. We'll deal with splitting later after we've computed the row
+@@ -677,7 +677,8 @@ nsTableRowGroupFrame::CalculateRowHeight
+               // to ensure that a spanning cell with a long descender doesn't
+               // collide with the next row, we need to take into account the shift
+               // that will be done to align the cell on the baseline of the row.
+-              cellFrameSize.height += rowFrame->GetMaxCellAscent() - cellFrame->GetDesiredAscent();
++              cellFrameSize.height += rowFrame->GetMaxCellAscent() -
++                                      cellFrame->GetCellBaseline();
+             }
+   
+             if (heightOfAreaSpanned < cellFrameSize.height) {
+diff -r b0bd358fa4b7 layout/xul/base/src/nsBoxFrame.cpp
+--- a/layout/xul/base/src/nsBoxFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/xul/base/src/nsBoxFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -801,7 +801,6 @@ nsBoxFrame::Reflow(nsPresContext*       
+   aDesiredSize.width  = mRect.width;
+   aDesiredSize.height = mRect.height;
+   aDesiredSize.ascent = ascent;
+-  aDesiredSize.descent = mRect.height - ascent;
+ 
+   // NS_FRAME_OUTSIDE_CHILDREN is set in SetBounds() above
+   if (mState & NS_FRAME_OUTSIDE_CHILDREN) {
+diff -r b0bd358fa4b7 layout/xul/base/src/nsLeafBoxFrame.cpp
+--- a/layout/xul/base/src/nsLeafBoxFrame.cpp	Wed Jan 17 17:01:11 2007 -0800
++++ b/layout/xul/base/src/nsLeafBoxFrame.cpp	Thu Jan 18 10:46:30 2007 -0800
+@@ -352,7 +352,6 @@ nsLeafBoxFrame::Reflow(nsPresContext*   
+   aDesiredSize.width  = mRect.width;
+   aDesiredSize.height = mRect.height;
+   aDesiredSize.ascent = ascent;
+-  aDesiredSize.descent = 0;
+ 
+   // NS_FRAME_OUTSIDE_CHILDREN is set in SetBounds() above
+   if (mState & NS_FRAME_OUTSIDE_CHILDREN) {
