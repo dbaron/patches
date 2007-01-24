@@ -1,0 +1,111 @@
+Fix valgrind warning about writing uninitialized memory to disk cache.  b=368119
+
+diff -r 7a40c6d08f73 netwerk/cache/src/nsDiskCacheDevice.cpp
+--- a/netwerk/cache/src/nsDiskCacheDevice.cpp	Wed Jan 24 13:35:09 2007 -0800
++++ b/netwerk/cache/src/nsDiskCacheDevice.cpp	Wed Jan 24 15:12:51 2007 -0800
+@@ -130,8 +130,8 @@ nsDiskCacheEvictor::VisitRecord(nsDiskCa
+     
+         // Compare clientID's without malloc
+         if ((diskEntry->mKeySize <= mClientIDSize) ||
+-            (diskEntry->mKeyStart[mClientIDSize] != ':') ||
+-            (memcmp(diskEntry->mKeyStart, mClientID, mClientIDSize) != 0)) {
++            (diskEntry->Key()[mClientIDSize] != ':') ||
++            (memcmp(diskEntry->Key(), mClientID, mClientIDSize) != 0)) {
+             delete [] (char *)diskEntry;
+             return kVisitNextRecord;  // clientID doesn't match, skip it
+         }
+@@ -422,7 +422,7 @@ nsDiskCacheDevice::FindEntry(nsCString *
+     if (NS_FAILED(rv))  return nsnull;
+     
+     // compare key to be sure
+-    if (strcmp(diskEntry->mKeyStart, key->get()) == 0) {
++    if (strcmp(diskEntry->Key(), key->get()) == 0) {
+         entry = diskEntry->CreateCacheEntry(this);
+     } else {
+         *collision = PR_TRUE;
+diff -r 7a40c6d08f73 netwerk/cache/src/nsDiskCacheEntry.cpp
+--- a/netwerk/cache/src/nsDiskCacheEntry.cpp	Wed Jan 24 13:35:09 2007 -0800
++++ b/netwerk/cache/src/nsDiskCacheEntry.cpp	Wed Jan 24 15:11:59 2007 -0800
+@@ -60,7 +60,7 @@ nsDiskCacheEntry::CreateCacheEntry(nsCac
+ nsDiskCacheEntry::CreateCacheEntry(nsCacheDevice *  device)
+ {
+     nsCacheEntry * entry = nsnull;
+-    nsresult       rv = nsCacheEntry::Create(mKeyStart,
++    nsresult       rv = nsCacheEntry::Create(Key(),
+                                              nsICache::STREAM_BASED,
+                                              nsICache::STORE_ON_DISK,
+                                              device,
+@@ -75,7 +75,7 @@ nsDiskCacheEntry::CreateCacheEntry(nsCac
+     // XXX why does nsCacheService have to fill out device in BindEntry()?
+     entry->SetDataSize(mDataSize);
+     
+-    rv = entry->UnflattenMetaData(&mKeyStart[mKeySize], mMetaDataSize);
++    rv = entry->UnflattenMetaData(MetaData(), mMetaDataSize);
+     if (NS_FAILED(rv)) {
+         delete entry;
+         return nsnull;
+@@ -115,9 +115,9 @@ CreateDiskCacheEntry(nsDiskCacheBinding 
+     diskEntry->mKeySize         = keySize;
+     diskEntry->mMetaDataSize    = metaSize;
+     
+-    memcpy(diskEntry->mKeyStart, entry->Key()->get(),keySize);
++    memcpy(diskEntry->Key(), entry->Key()->get(),keySize);
+     
+-    nsresult rv = entry->FlattenMetaData(&diskEntry->mKeyStart[keySize], metaSize);
++    nsresult rv = entry->FlattenMetaData(diskEntry->MetaData(), metaSize);
+     if (NS_FAILED(rv)) {
+         delete [] (char *)diskEntry;
+         return nsnull;
+@@ -136,7 +136,7 @@ NS_IMETHODIMP nsDiskCacheEntryInfo::GetC
+ NS_IMETHODIMP nsDiskCacheEntryInfo::GetClientID(char ** clientID)
+ {
+     NS_ENSURE_ARG_POINTER(clientID);
+-    return ClientIDFromCacheKey(nsDependentCString(mDiskEntry->mKeyStart), clientID);
++    return ClientIDFromCacheKey(nsDependentCString(mDiskEntry->Key()), clientID);
+ }
+ 
+ extern const char DISK_CACHE_DEVICE_ID[];
+@@ -150,7 +150,7 @@ NS_IMETHODIMP nsDiskCacheEntryInfo::GetD
+ 
+ NS_IMETHODIMP nsDiskCacheEntryInfo::GetKey(nsACString &clientKey)
+ {
+-    return ClientKeyFromCacheKey(nsDependentCString(mDiskEntry->mKeyStart), clientKey);
++    return ClientKeyFromCacheKey(nsDependentCString(mDiskEntry->Key()), clientKey);
+ }
+ 
+ NS_IMETHODIMP nsDiskCacheEntryInfo::GetFetchCount(PRInt32 *aFetchCount)
+diff -r 7a40c6d08f73 netwerk/cache/src/nsDiskCacheEntry.h
+--- a/netwerk/cache/src/nsDiskCacheEntry.h	Wed Jan 24 13:35:09 2007 -0800
++++ b/netwerk/cache/src/nsDiskCacheEntry.h	Wed Jan 24 15:19:02 2007 -0800
+@@ -60,12 +60,19 @@ struct nsDiskCacheEntry {
+     PRUint32        mDataSize;
+     PRUint32        mKeySize;       // includes terminating null byte
+     PRUint32        mMetaDataSize;  // includes terminating null byte
+-    char            mKeyStart[1];   // start of key data
+-    //              mMetaDataStart = mKeyStart[mKeySize];
++    // followed by key data (mKeySize bytes)
++    // followed by meta data (mMetaDataSize bytes)
+ 
+-    PRUint32        Size()    { return offsetof(nsDiskCacheEntry,mKeyStart) + 
++    PRUint32        Size()    { return sizeof(nsDiskCacheEntry) + 
+                                     mKeySize + mMetaDataSize;
+                               }
++
++    char*           Key()     { return NS_REINTERPRET_CAST(char*const, this) + 
++                                    sizeof(nsDiskCacheEntry);
++                              }
++
++    char*           MetaData()
++                              { return Key() + mKeySize; }
+ 
+     nsCacheEntry *  CreateCacheEntry(nsCacheDevice *  device);
+ 
+@@ -121,7 +128,7 @@ public:
+ 
+     virtual ~nsDiskCacheEntryInfo() {}
+     
+-    const char* Key() { return mDiskEntry->mKeyStart; }
++    const char* Key() { return mDiskEntry->Key(); }
+     
+ private:
+     const char *        mDeviceID;
