@@ -2,15 +2,16 @@ Make SVG foreignObject, rather than its child, be the reflow root, so that the c
 
 diff -r 7a281a348267 layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp	Tue Jan 23 15:03:56 2007 -0800
-+++ b/layout/base/nsCSSFrameConstructor.cpp	Tue Jan 23 18:10:49 2007 -0800
-@@ -7337,12 +7337,12 @@ nsCSSFrameConstructor::ConstructSVGFrame
++++ b/layout/base/nsCSSFrameConstructor.cpp	Tue Jan 23 18:15:11 2007 -0800
+@@ -7337,12 +7337,13 @@ nsCSSFrameConstructor::ConstructSVGFrame
          ResolvePseudoStyleFor(aContent,
                                nsCSSAnonBoxes::mozSVGForeignContent, aStyleContext);
      
 -      nsIFrame* blockFrame = NS_NewBlockFrame(mPresShell, innerPseudoStyle);
 +      nsIFrame* blockFrame = NS_NewBlockFrame(mPresShell, innerPseudoStyle,
 +                                              NS_BLOCK_SPACE_MGR |
-+                                                NS_BLOCK_MARGIN_ROOT);
++                                                NS_BLOCK_MARGIN_ROOT |
++                                                NS_FRAME_REFLOW_ROOT);
        if (NS_UNLIKELY(!blockFrame))
          return NS_ERROR_OUT_OF_MEMORY;
      
@@ -21,22 +22,37 @@ diff -r 7a281a348267 layout/base/nsCSSFrameConstructor.cpp
        nsFrameConstructorSaveState saveState;
 diff -r 7a281a348267 layout/base/nsPresShell.cpp
 --- a/layout/base/nsPresShell.cpp	Tue Jan 23 15:03:56 2007 -0800
-+++ b/layout/base/nsPresShell.cpp	Tue Jan 23 18:12:24 2007 -0800
-@@ -6046,6 +6046,13 @@ PresShell::ProcessReflowCommands(PRBool 
++++ b/layout/base/nsPresShell.cpp	Tue Jan 23 18:31:55 2007 -0800
+@@ -6046,7 +6046,27 @@ PresShell::ProcessReflowCommands(PRBool 
          else
            size = target->GetSize();
  
+-        nsHTMLReflowState reflowState(mPresContext, target, rcx, size);
 +        NS_ASSERTION(!target->GetNextInFlow() && !target->GetPrevInFlow(),
 +                     "reflow roots should never split");
 +
-+        // XXX This probably shouldn't pass a constrained height, since
-+        // that implies pagination.  It should instead pass an
-+        // unconstrained height and then fix the resulting computed
-+        // height.
-         nsHTMLReflowState reflowState(mPresContext, target, rcx, size);
++        // Don't pass size directly to the reflow state, since a
++        // constrained height implies page/column breaking.
++        nsHTMLReflowState reflowState(mPresContext, target, rcx,
++                                      nsSize(size.width, NS_UNCONSTRAINEDSIZE));
++        
++        // fix the computed height
++        NS_ASSERTION(reflowState.mComputedMargin == nsMargin(0, 0, 0, 0),
++                     "reflow state should not set margin for reflow roots");
++        reflowState.mComputedHeight =
++          size.height - reflowState.mComputedBorderPadding.TopBottom();
++        NS_ASSERTION(reflowState.mComputedWidth ==
++                       size.width -
++                         reflowState.mComputedBorderPadding.LeftRight(),
++                     "reflow state computed incorrect width");
++
++        // except the viewport frame does want availableHeight set
++        if (target == root)
++          reflowState.availableHeight = size.height;
  
          nsReflowStatus status;
-@@ -6058,6 +6065,12 @@ PresShell::ProcessReflowCommands(PRBool 
+         target->Reflow(mPresContext, desiredSize, reflowState, status);
+@@ -6058,6 +6078,12 @@ PresShell::ProcessReflowCommands(PRBool 
                        desiredSize.height == size.height),
                       "non-root frame's desired size changed during an "
                       "incremental reflow");
@@ -65,50 +81,8 @@ diff -r 7a281a348267 layout/generic/nsViewportFrame.cpp
    return rv; 
 diff -r 7a281a348267 layout/svg/base/src/nsSVGForeignObjectFrame.cpp
 --- a/layout/svg/base/src/nsSVGForeignObjectFrame.cpp	Tue Jan 23 15:03:56 2007 -0800
-+++ b/layout/svg/base/src/nsSVGForeignObjectFrame.cpp	Tue Jan 23 18:10:49 2007 -0800
-@@ -82,6 +82,7 @@ nsSVGForeignObjectFrame::nsSVGForeignObj
-   : nsSVGForeignObjectFrameBase(aContext),
-     mPropagateTransform(PR_TRUE), mInReflow(PR_FALSE)
- {
-+  AddStateBits(NS_FRAME_REFLOW_ROOT);
- }
- 
- //----------------------------------------------------------------------
-@@ -142,6 +143,33 @@ nsSVGForeignObjectFrame::DidSetStyleCont
-   nsSVGUtils::StyleEffects(this);
-   return NS_OK;
- }
-+
-+NS_IMETHODIMP
-+nsSVGForeignObjectFrame::Reflow(nsPresContext*           aPresContext,
-+                                nsHTMLReflowMetrics&     aDesiredSize,
-+                                const nsHTMLReflowState& aReflowState,
-+                                nsReflowStatus&          aStatus)
-+{
-+  NS_ASSERTION(!aReflowState.parentReflowState,
-+               "should only get reflow from being reflow root");
-+  NS_ASSERTION(aReflowState.availableWidth == GetSize().width &&
-+               aReflowState.availableHeight == GetSize().height,
-+               "reflow roots should be reflown at existing size");
-+  NS_ASSERTION(aReflowState.mComputedWidth == GetSize().width &&
-+               aReflowState.mComputedHeight == GetSize().height,
-+               "svg.css should ensure we have no padding/border/margin");
-+
-+  DoReflow();
-+
-+  aDesiredSize.width = aReflowState.availableWidth;
-+  aDesiredSize.height = aReflowState.availableHeight;
-+  aDesiredSize.mOverflowArea =
-+    nsRect(nsPoint(0, 0), nsSize(aDesiredSize.width, aDesiredSize.height));
-+  aStatus = NS_FRAME_COMPLETE;
-+
-+  return NS_OK;
-+}
-+
- 
- //----------------------------------------------------------------------
- // nsISVGValueObserver methods:
-@@ -517,11 +545,21 @@ nsSVGForeignObjectFrame::DoReflow()
++++ b/layout/svg/base/src/nsSVGForeignObjectFrame.cpp	Tue Jan 23 18:30:43 2007 -0800
+@@ -517,11 +517,21 @@ nsSVGForeignObjectFrame::DoReflow()
  
    mInReflow = PR_TRUE;
  
@@ -132,21 +106,6 @@ diff -r 7a281a348267 layout/svg/base/src/nsSVGForeignObjectFrame.cpp
    
    ReflowChild(kid, presContext, desiredSize, reflowState, 0, 0,
                NS_FRAME_NO_MOVE_FRAME, status);
-diff -r 7a281a348267 layout/svg/base/src/nsSVGForeignObjectFrame.h
---- a/layout/svg/base/src/nsSVGForeignObjectFrame.h	Tue Jan 23 15:03:56 2007 -0800
-+++ b/layout/svg/base/src/nsSVGForeignObjectFrame.h	Tue Jan 23 18:10:49 2007 -0800
-@@ -79,6 +79,11 @@ public:
- 
-   NS_IMETHOD DidSetStyleContext();
- 
-+  NS_IMETHOD Reflow(nsPresContext*           aPresContext,
-+                    nsHTMLReflowMetrics&     aDesiredSize,
-+                    const nsHTMLReflowState& aReflowState,
-+                    nsReflowStatus&          aStatus);
-+
-   /**
-    * Get the "type" of the frame
-    *
 diff -r 7a281a348267 layout/svg/base/src/nsSVGOuterSVGFrame.cpp
 --- a/layout/svg/base/src/nsSVGOuterSVGFrame.cpp	Tue Jan 23 15:03:56 2007 -0800
 +++ b/layout/svg/base/src/nsSVGOuterSVGFrame.cpp	Tue Jan 23 17:18:39 2007 -0800
@@ -158,6 +117,16 @@ diff -r 7a281a348267 layout/svg/base/src/nsSVGOuterSVGFrame.cpp
    if (aReflowState.availableWidth != NS_INTRINSICSIZE)
      maxRect->width = aReflowState.availableWidth;
    else if (aReflowState.parentReflowState &&
+diff -r 7a281a348267 layout/svg/base/src/svg.css
+--- a/layout/svg/base/src/svg.css	Tue Jan 23 15:03:56 2007 -0800
++++ b/layout/svg/base/src/svg.css	Tue Jan 23 18:16:06 2007 -0800
+@@ -72,4 +72,6 @@ foreignObject {
+ *|*::-moz-svg-foreign-content {
+   display: block !important;
+   position: static !important;
++  /* so we don't report overflow that confuses the reflow root code */
++  overflow: -moz-hidden-unscrollable ! important;
+ }
 diff -r 7a281a348267 layout/xul/base/src/nsBoxFrame.cpp
 --- a/layout/xul/base/src/nsBoxFrame.cpp	Tue Jan 23 15:03:56 2007 -0800
 +++ b/layout/xul/base/src/nsBoxFrame.cpp	Tue Jan 23 17:49:28 2007 -0800
