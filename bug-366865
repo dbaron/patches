@@ -1,8 +1,8 @@
 Subtract allocated parts before repeating division used for allocation to avoid rounding error of total.  b=366865
 
-diff -r e66c40457c98 layout/tables/BasicTableLayoutStrategy.cpp
---- a/layout/tables/BasicTableLayoutStrategy.cpp	Thu Feb 01 22:20:05 2007 -0800
-+++ b/layout/tables/BasicTableLayoutStrategy.cpp	Thu Feb 01 22:20:08 2007 -0800
+diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
+--- a/layout/tables/BasicTableLayoutStrategy.cpp	Fri Feb 02 20:06:10 2007 -0800
++++ b/layout/tables/BasicTableLayoutStrategy.cpp	Fri Feb 02 20:32:18 2007 -0800
 @@ -337,8 +337,8 @@ BasicTableLayoutStrategy::ComputeColumnI
  
              // Before looping over the spanned columns to distribute
@@ -14,15 +14,121 @@ diff -r e66c40457c98 layout/tables/BasicTableLayoutStrategy.cpp
  
              // Accumulate information about the spanned columns, and
              // subtract the already-used space from |info|.
-@@ -383,6 +383,7 @@ BasicTableLayoutStrategy::ComputeColumnI
+@@ -381,17 +381,6 @@ BasicTableLayoutStrategy::ComputeColumnI
+             if (info.prefPercent < 0.0f)
+                 info.prefPercent = 0.0f;
  
-             // Compute the ratios used to distribute this cell's width
-             // appropriately among the spanned columns.
-+            // XXX MOVE DOWN
-             float pctRatio = 0.0f;
-             if (nonPctCount && info.prefPercent > 0.0f) {
-                 if (totalSNonPctPref > 0) {
-@@ -748,6 +749,8 @@ BasicTableLayoutStrategy::ComputeColumnW
+-            // Compute the ratios used to distribute this cell's width
+-            // appropriately among the spanned columns.
+-            float pctRatio = 0.0f;
+-            if (nonPctCount && info.prefPercent > 0.0f) {
+-                if (totalSNonPctPref > 0) {
+-                    pctRatio = info.prefPercent / float(totalSNonPctPref);
+-                } else {
+-                    pctRatio = info.prefPercent / float(nonPctCount);
+-                }
+-            }
+-
+             // The min-width of this cell that fits inside the
+             // pref-width of the spanned columns gets distributed
+             // according to different ratios.
+@@ -399,6 +388,10 @@ BasicTableLayoutStrategy::ComputeColumnI
+                 PR_MIN(info.minCoord, totalSPref - totalSMin);
+             NS_ASSERTION(minWithinPref >= 0, "neither value can be negative");
+             info.minCoord -= minWithinPref;
++
++            // Loop invariants
++            const PRBool spanHasNonPctPref = totalSNonPctPref > 0;
++            const PRBool spanHasPref = totalSPref > 0;
+ 
+             // ... and actually do the distribution of the widths of
+             // this cell exceeding the totals already in the spanned
+@@ -416,11 +409,20 @@ BasicTableLayoutStrategy::ComputeColumnI
+                 // the existing pref widths)
+                 if (scolFrame->GetPrefPercent() == 0.0f) {
+                     float spp;
+-                    if (totalSNonPctPref > 0) {
+-                        spp = pctRatio * scolFrame->GetPrefCoord();
++                    if (spanHasNonPctPref) {
++                        nscoord scolPref = scolFrame->GetPrefCoord();
++                        if (scolPref == 0) {
++                            // We might have already subtracted all of
++                            // totalSNonPctPref.
++                            spp = 0.0f;
++                        } else {
++                            spp = info.prefPercent *
++                                  float(scolFrame->GetPrefCoord()) /
++                                  float(totalSNonPctPref);
++                        }
+                     } else {
+                         // distribute equally when all pref widths are 0
+-                        spp = pctRatio;
++                        spp = info.prefPercent / float(nonPctCount);
+                     }
+                     scolFrame->AddSpanPrefPercent(spp);
+                 }
+@@ -437,9 +439,15 @@ BasicTableLayoutStrategy::ComputeColumnI
+                 // the rest of the min width, and the pref width (in
+                 // proportion to the existing pref widths)
+                 float coordRatio; // for both min and pref
+-                if (totalSPref > 0) {
+-                    coordRatio = float(scolFrame->GetPrefCoord()) /
+-                                 float(totalSPref);
++                if (spanHasPref) {
++                    if (scolFrame->GetPrefCoord() == 0) {
++                        // We might have already subtracted all of
++                        // totalSPref.
++                        coordRatio = 0.0f;
++                    } else {
++                        coordRatio = float(scolFrame->GetPrefCoord()) /
++                                     float(totalSPref);
++                    }
+                 } else {
+                     // distribute equally when all pref widths are 0
+                     coordRatio = 1.0f / float(colSpan);
+@@ -447,12 +455,35 @@ BasicTableLayoutStrategy::ComputeColumnI
+ 
+                 // combine the two min-width distributions, and record
+                 // min and pref
+-                scolFrame->AddSpanMinCoord(NSToCoordRound(
+-                               float(info.minCoord) * coordRatio +
+-                               float(minWithinPref) * minRatio));
+-                scolFrame->AddSpanPrefCoord(NSToCoordRound(
+-                               float(info.prefCoord) * coordRatio));
+-            }
++                nscoord allocatedMinWithinPref =
++                    NSToCoordRound(float(minWithinPref) * minRatio);
++                nscoord allocatedMinOutsidePref =
++                    NSToCoordRound(float(info.minCoord) * coordRatio);
++                scolFrame->AddSpanMinCoord(allocatedMinWithinPref +
++                                           allocatedMinOutsidePref);
++                nscoord allocatedPref =
++                    NSToCoordRound(float(info.prefCoord) * coordRatio)
++                scolFrame->AddSpanPrefCoord(allocatedPref);
++
++                // To avoid accumulating rounding error from division,
++                // subtract everything to do with the column we've
++                // passed from the totals.
++                minWithinPref -= allocatedMinWithinPref;
++                info.minCoord -= allocatedMinOutsidePref;
++                info.prefCoord -= allocatedPref;
++                totalSPref -= scolFrame->GetPrefCoord();
++                totalSMin -= scolFrame->GetMinCoord();
++                if (scolFrame->GetPrefPercent() == 0.0f) {
++                    totalSNonPctPref -= scolFrame->GetPrefCoord();
++                    --nonPctCount;
++                }
++            }
++
++            NS_ASSERTION(totalSPref == 0 && totalSMin == 0 &&
++                         totalSNonPctPref == 0 && nonPctCount == 0 &&
++                         info.minCoord == 0 && minWithinPref == 0 &&
++                         info.prefCoord == 0 && info.prefPercent == 0.0f,
++                         "didn't subtract all that we added");
+         } while ((item = item->next));
+ 
+         // Combine the results of the span analysis into the main results,
+@@ -748,6 +779,8 @@ BasicTableLayoutStrategy::ComputeColumnW
      };
  
      Loop2Type l2t;
