@@ -2,7 +2,7 @@ Subtract allocated parts before repeating division used for allocation to avoid 
 
 diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
 --- a/layout/tables/BasicTableLayoutStrategy.cpp	Fri Feb 02 20:06:10 2007 -0800
-+++ b/layout/tables/BasicTableLayoutStrategy.cpp	Fri Feb 02 20:51:07 2007 -0800
++++ b/layout/tables/BasicTableLayoutStrategy.cpp	Fri Feb 02 21:02:35 2007 -0800
 @@ -337,8 +337,8 @@ BasicTableLayoutStrategy::ComputeColumnI
  
              // Before looping over the spanned columns to distribute
@@ -128,7 +128,7 @@ diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
          } while ((item = item->next));
  
          // Combine the results of the span analysis into the main results,
-@@ -748,46 +779,51 @@ BasicTableLayoutStrategy::ComputeColumnW
+@@ -748,46 +779,54 @@ BasicTableLayoutStrategy::ComputeColumnW
      };
  
      Loop2Type l2t;
@@ -136,8 +136,11 @@ diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
 +    // These are constants (over columns) for each case's math.  We use
 +    // a pair of nscoords rather than a float so that we can subtract
 +    // each column's allocation so we avoid accumulating rounding error.
-+    nscoord space, // the amount of extra width to allocate
-+            basis; // the sum of the statistic over columns to divide it
++    nscoord space; // the amount of extra width to allocate
++    union {
++        nscoord c;
++        float f;
++    } basis; // the sum of the statistic over columns to divide it
      if (width < guess_pref) {
          NS_ASSERTION(width >= guess_min, "bad width");
          if (width < guess_min_pct) {
@@ -145,38 +148,38 @@ diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
 -            c = float(width - guess_min) /
 -                float(guess_min_pct - guess_min);
 +            space = width - guess_min;
-+            basis = guess_min_pct - guess_min;
++            basis.c = guess_min_pct - guess_min;
          } else if (width < guess_min_spec) {
              l2t = FLEX_FIXED_SMALL;
 -            c = float(width - guess_min_pct) /
 -                float(guess_min_spec - guess_min_pct);
 +            space = width - guess_min_pct;
-+            basis = guess_min_spec - guess_min_pct;
++            basis.c = guess_min_spec - guess_min_pct;
          } else {
              l2t = FLEX_FLEX_SMALL;
 -            c = float(width - guess_min_spec) /
 -                float(guess_pref - guess_min_spec);
 +            space = width - guess_min_spec;
-+            basis = guess_pref - guess_min_spec;
++            basis.c = guess_pref - guess_min_spec;
          }
      } else {
 +        space = width - guess_pref;
          if (total_flex_pref > 0) {
              l2t = FLEX_FLEX_LARGE;
 -            c = float(width - guess_pref) / float(total_flex_pref);
-+            basis = total_flex_pref;
++            basis.c = total_flex_pref;
          } else if (total_fixed_pref > 0) {
              l2t = FLEX_FIXED_LARGE;
 -            c = float(width - guess_pref) / float(total_fixed_pref);
-+            basis = total_fixed_pref;
++            basis.c = total_fixed_pref;
          } else if (total_pct > 0.0f) {
              l2t = FLEX_PCT_LARGE;
 -            c = float(width - guess_pref) / float(total_pct);
-+            basis = total_pct;
++            basis.f = total_pct;
          } else {
              l2t = FLEX_ALL_LARGE;
 -            c = 1.0f / float(colCount);
-+            basis = colCount;
++            basis.c = colCount;
          }
      }
  
@@ -184,29 +187,94 @@ diff -r d8221286f0ba layout/tables/BasicTableLayoutStrategy.cpp
      printf("ComputeColumnWidths: %d columns in width %d,\n"
             "  guesses=[%d,%d,%d,%d], totals=[%d,%d,%f],\n"
 -           "  l2t=%d, c=%f\n",
-+           "  l2t=%d, space=%d, basis=%d\n",
++           "  l2t=%d, space=%d, basis.c=%d\n",
             colCount, width,
             guess_min, guess_min_pct, guess_min_spec, guess_pref,
             total_flex_pref, total_fixed_pref, total_pct,
 -           l2t, c);
-+           l2t, space, basis);
++           l2t, space, basis.c);
  #endif
  
      for (col = 0; col < colCount; ++col) {
-@@ -808,6 +844,7 @@ BasicTableLayoutStrategy::ComputeColumnW
-             col_width = colFrame->GetPrefCoord();
-         }
- 
-+        float c = float(space) / float(basis);
-         switch (l2t) {
+@@ -812,10 +851,12 @@ BasicTableLayoutStrategy::ComputeColumnW
              case FLEX_PCT_SMALL:
                  col_width = colFrame->GetMinCoord();
-@@ -865,7 +902,7 @@ BasicTableLayoutStrategy::ComputeColumnW
+                 if (pct != 0.0f) {
+-                    nscoord width_from_pct = nscoord(float(width) * pct);
+-                    if (width_from_pct > col_width) {
+-                        col_width += NSToCoordRound(
+-                            float(width_from_pct - col_width) * c);
++                    nscoord pct_minus_min =
++                        nscoord(float(width) * pct) - col_width;
++                    if (pct_minus_min > 0) {
++                        float c = float(space) / float(basis.c);
++                        basis.c -= pct_minus_min;
++                        col_width += NSToCoordRound(float(pct_minus_min) * c);
+                     }
+                 }
+                 break;
+@@ -824,9 +865,12 @@ BasicTableLayoutStrategy::ComputeColumnW
+                     NS_ASSERTION(col_width == colFrame->GetPrefCoord(),
+                                  "wrong width assigned");
+                     if (colFrame->GetHasSpecifiedCoord()) {
++                        float c = float(space) / float(basis.c);
+                         nscoord col_min = colFrame->GetMinCoord();
++                        nscoord pref_minus_min = col_width - col_min;
++                        basis.c -= pref_minus_min;
+                         col_width = col_min + NSToCoordRound(
+-                            float(col_width - col_min) * c);
++                            float(pref_minus_min) * c);
+                     } else
+                         col_width = colFrame->GetMinCoord();
+                 }
+@@ -836,9 +880,12 @@ BasicTableLayoutStrategy::ComputeColumnW
+                     !colFrame->GetHasSpecifiedCoord()) {
+                     NS_ASSERTION(col_width == colFrame->GetPrefCoord(),
+                                  "wrong width assigned");
++                    float c = float(space) / float(basis.c);
+                     nscoord col_min = colFrame->GetMinCoord();
++                    nscoord pref_minus_min = col_width - col_min;
++                    basis.c -= pref_minus_min;
+                     col_width = col_min + NSToCoordRound(
+-                        float(col_width - col_min) * c);
++                        float(pref_minus_min) * c);
+                 }
+                 break;
+             case FLEX_FLEX_LARGE:
+@@ -846,6 +893,8 @@ BasicTableLayoutStrategy::ComputeColumnW
+                     !colFrame->GetHasSpecifiedCoord()) {
+                     NS_ASSERTION(col_width == colFrame->GetPrefCoord(),
+                                  "wrong width assigned");
++                    float c = float(space) / float(basis.c);
++                    basis.c -= col_width;
+                     col_width += NSToCoordRound(float(col_width) * c);
+                 }
+                 break;
+@@ -856,18 +905,26 @@ BasicTableLayoutStrategy::ComputeColumnW
+                     NS_ASSERTION(colFrame->GetHasSpecifiedCoord() ||
+                                  colFrame->GetPrefCoord() == 0,
+                                  "wrong case");
++                    float c = float(space) / float(basis.c);
++                    basis.c -= col_width;
+                     col_width += NSToCoordRound(float(col_width) * c);
+                 }
+                 break;
+             case FLEX_PCT_LARGE:
+                 NS_ASSERTION(pct != 0.0f || colFrame->GetPrefCoord() == 0,
+                              "wrong case");
++                float c = float(space) / basis.f;
                  col_width += NSToCoordRound(pct * c);
++                basis.f -= pct;
                  break;
              case FLEX_ALL_LARGE:
 -                col_width += NSToCoordRound(float(width - guess_pref) * c);
++                float c = float(space) / float(basis.c);
 +                col_width += NSToCoordRound(c);
++                --basis.c;
                  break;
          }
++
++        space -= col_width;
  
+         NS_ASSERTION(col_width >= colFrame->GetMinCoord(),
+                      "assigned width smaller than min");
