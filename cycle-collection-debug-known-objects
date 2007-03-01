@@ -46,7 +46,7 @@ diff -r 01cc967aebe9 dom/src/base/nsGlobalWindow.cpp
  //*****************************************************************************
 diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 14:02:41 2007 -0800
-+++ b/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 14:57:51 2007 -0800
++++ b/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 15:34:02 2007 -0800
 @@ -289,7 +289,11 @@ struct PtrInfo
  };
  
@@ -78,12 +78,13 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
      void MarkRoots();
      void ScanRoots();
      void CollectWhite();
-@@ -495,6 +499,12 @@ struct nsCycleCollector
+@@ -495,6 +499,13 @@ struct nsCycleCollector
      void Freed(void *n);
      void Collect();
      void Shutdown();
 +
 +#ifdef DEBUG
++    void ExplainLiveExpectedGarbage();
 +    void ShouldBeFreed(nsISupports *n);
 +    void WasFreed(nsISupports *n);
 +    PointerSet mExpectedGarbage;
@@ -91,7 +92,7 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
  };
  
  
-@@ -1125,14 +1135,12 @@ struct graphVizWalker : public GraphWalk
+@@ -1125,14 +1136,12 @@ struct graphVizWalker : public GraphWalk
  
      PRBool ShouldVisitNode(void *p, PtrInfo const & pi)  
      { 
@@ -108,7 +109,7 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
          mParent = p;
          fprintf(mStream, 
                  "n%p [label=\"%s\\n%p\\n%u/%u refs found\", "
-@@ -1360,6 +1368,9 @@ nsCycleCollector::nsCycleCollector() :
+@@ -1360,6 +1369,9 @@ nsCycleCollector::nsCycleCollector() :
      mPtrLog(nsnull)
  {
      mGraph.Init();
@@ -118,11 +119,112 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
  
      for (PRUint32 i = 0; i <= nsIProgrammingLanguage::MAX; ++i) {
          mRuntimes[i] = nsnull;
-@@ -1693,6 +1704,19 @@ nsCycleCollector::Shutdown()
+@@ -1662,6 +1674,13 @@ nsCycleCollector::Collect()
+             MaybeDrawGraphs();
+             CollectWhite();
+             ForgetAll();
++
++#ifdef DEBUG
++            if (mParams.mScanDelay == 0) {
++                // In shutdown or scan delay set to 0 by environment variable.
++                ExplainLiveExpectedGarbage();
++            }
++#endif
+             
+             // Some additional book-keeping.
+             
+@@ -1693,6 +1712,106 @@ nsCycleCollector::Shutdown()
      mParams.mDoNothing = PR_TRUE;
  }
  
 +#ifdef DEBUG
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++AddExpectedGarbage(nsClearingVoidPtrHashKey *p, void *arg)
++{
++    nsCycleCollector *c = NS_STATIC_CAST(nsCycleCollector*, arg);
++    c->mBufs[0]->Push(NS_CONST_CAST(void*, p->GetKey()));
++    return PL_DHASH_NEXT;
++}
++
++struct explainWalker : public GraphWalker
++{
++    explainWalker(GCTable &tab,
++                  nsCycleCollectionLanguageRuntime **runtimes)
++        : GraphWalker(tab, runtimes) 
++    {}
++
++    PRBool ShouldVisitNode(void *p, PtrInfo const & pi) 
++    { 
++        // We set them back to gray as we explain problems.
++        return pi.mColor != grey; 
++    }
++
++    void VisitNode(void *p, PtrInfo & pi, size_t refcount) 
++    {
++        if (pi.mColor == grey)
++            Fault("scanning grey node", p);
++
++        if (pi.mColor == white) {
++            printf("nsCycleCollector: %s %p was not collected due to\n"
++                   "  missing call to suspect\n",
++                   pi.mName, p);
++        }
++
++        if (pi.mInternalRefs != refcount) {
++            // Note that the external references may have been external
++            // to a different node in the cycle collection that just
++            // happened, if that different node was purple and then
++            // black.
++            printf("nsCycleCollector: %s %p was not collected due to %d\n"
++                   "  external references\n",
++                   pi.mName, p, refcount - pi.mInternalRefs);
++        }
++
++        pi.mColor = grey;
++
++        mGraph.Put(p, pi);
++    }
++    void NoteChild(void *c, PtrInfo & childpi) {}
++};
++
++void
++nsCycleCollector::ExplainLiveExpectedGarbage()
++{
++    // This function must be called during Collect, when the runtimes
++    // are capable of doing traversal, but we don't have a way to assert
++    // that.
++    // XXX Are they really still capable of doing proper traversal after
++    // there's been Unlink-ing?  I'd think probably not...
++
++    if (mScanInProgress || mCollectionInProgress)
++        Fault("can't explain expected garbage during collection itself");
++
++    mGraph.Clear();
++
++    mBufs[0]->Empty();
++    mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, this);
++    MarkRoots();
++
++    for (int i = 0; i < mBufs[0]->GetSize(); ++i) {
++        nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0]->ObjectAt(i));
++        s = canonicalize(s);
++        scanWalker(mGraph, mRuntimes).Walk(s); 
++    }
++
++    // Sanity check: scan should have colored all grey nodes black or
++    // white. So we ensure we have no grey nodes at this point.
++    mGraph.Enumerate(NoGreyCallback, this);
++
++    for (int i = 0; i < mBufs[0]->GetSize(); ++i) {
++        nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0]->ObjectAt(i));
++        s = canonicalize(s);
++        explainWalker(mGraph, mRuntimes).Walk(s); 
++    }
++
++    mGraph.Clear();
++}
++
 +void
 +nsCycleCollector::ShouldBeFreed(nsISupports *n)
 +{
@@ -138,7 +240,7 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
  
  ////////////////////////////////////////////////////////////////////////
  // Module public API (exported in nsCycleCollector.h)
-@@ -1758,6 +1782,25 @@ nsCycleCollector_shutdown()
+@@ -1758,6 +1877,25 @@ nsCycleCollector_shutdown()
      sCollector.Shutdown();
  }
  
