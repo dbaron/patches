@@ -1,9 +1,144 @@
 Add debugging code to cycle collector to give information about objects it has been told ought to be freed.
 
+diff -r 01cc967aebe9 dom/src/base/nsGlobalWindow.cpp
+--- a/dom/src/base/nsGlobalWindow.cpp	Thu Mar 01 14:02:41 2007 -0800
++++ b/dom/src/base/nsGlobalWindow.cpp	Thu Mar 01 14:10:31 2007 -0800
+@@ -74,6 +74,7 @@
+ #endif
+ #include "nsContentCID.h"
+ #include "nsLayoutStatics.h"
++#include "nsCycleCollector.h"
+ 
+ // Interfaces Needed
+ #include "nsIWidget.h"
+@@ -552,6 +553,10 @@ nsGlobalWindow::~nsGlobalWindow()
+ 
+   CleanUp();
+ 
++#ifdef DEBUG
++  nsCycleCollector_DEBUG_wasFreed(NS_STATIC_CAST(nsIScriptGlobalObject*, this));
++#endif
++
+   delete mPendingStorageEvents;
+ 
+   nsLayoutStatics::Release();
+@@ -604,6 +609,10 @@ nsGlobalWindow::CleanUp()
+   }
+   mArguments = nsnull;
+   mArgumentsLast = nsnull;
++
++#ifdef DEBUG
++  nsCycleCollector_DEBUG_shouldBeFreed(NS_STATIC_CAST(nsIScriptGlobalObject*, this));
++#endif
+ }
+ 
+ void
+@@ -661,6 +670,10 @@ nsGlobalWindow::FreeInnerObjects(PRBool 
+         scx->ClearScope(mScriptGlobals[NS_STID_INDEX(lang_id)], PR_TRUE);
+     }
+   }
++
++#ifdef DEBUG
++  nsCycleCollector_DEBUG_shouldBeFreed(NS_STATIC_CAST(nsIScriptGlobalObject*, this));
++#endif
+ }
+ 
+ //*****************************************************************************
 diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 14:02:41 2007 -0800
-+++ b/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 14:02:43 2007 -0800
-@@ -1758,6 +1758,17 @@ nsCycleCollector_shutdown()
++++ b/xpcom/base/nsCycleCollector.cpp	Thu Mar 01 14:57:51 2007 -0800
+@@ -289,7 +289,11 @@ struct PtrInfo
+ };
+ 
+ 
+-typedef nsBaseHashtable<nsClearingVoidPtrHashKey, PRUint32, PRUint32> PointerSet;
++// XXX Would be nice to have an nsHashSet<KeyType> API that has
++// Add/Remove/Has rather than PutEntry/RemoveEntry/GetEntry.
++typedef nsTHashtable<nsClearingVoidPtrHashKey> PointerSet;
++typedef nsBaseHashtable<nsClearingVoidPtrHashKey, PRUint32, PRUint32>
++    PointerSetWithGeneration;
+ typedef nsBaseHashtable<nsClearingVoidPtrHashKey, PtrInfo, PtrInfo> GCTable;
+ 
+ static void
+@@ -323,7 +327,7 @@ struct nsPurpleBuffer
+     nsCycleCollectorStats &mStats;
+     void* mCache[N_POINTERS];
+     PRUint32 mCurrGen;    
+-    PointerSet mBackingStore;
++    PointerSetWithGeneration mBackingStore;
+     nsDeque *mTransferBuffer;
+     
+     nsPurpleBuffer(nsCycleCollectorParams &params,
+@@ -480,7 +484,7 @@ struct nsCycleCollector
+                          nsCycleCollectionLanguageRuntime *rt);
+     void ForgetRuntime(PRUint32 langID);
+ 
+-    void CollectPurple();
++    void CollectPurple(); // XXXldb Should this be called SelectPurple?
+     void MarkRoots();
+     void ScanRoots();
+     void CollectWhite();
+@@ -495,6 +499,12 @@ struct nsCycleCollector
+     void Freed(void *n);
+     void Collect();
+     void Shutdown();
++
++#ifdef DEBUG
++    void ShouldBeFreed(nsISupports *n);
++    void WasFreed(nsISupports *n);
++    PointerSet mExpectedGarbage;
++#endif
+ };
+ 
+ 
+@@ -1125,14 +1135,12 @@ struct graphVizWalker : public GraphWalk
+ 
+     PRBool ShouldVisitNode(void *p, PtrInfo const & pi)  
+     { 
+-        PRUint32 dummy;
+-        return ! mVisited.Get(p, &dummy);
++        return ! mVisited.GetEntry(p);
+     }
+ 
+     void VisitNode(void *p, PtrInfo & pi, size_t refcount) 
+     {
+-        PRUint32 dummy = 0;
+-        mVisited.Put(p, dummy);
++        mVisited.PutEntry(p);
+         mParent = p;
+         fprintf(mStream, 
+                 "n%p [label=\"%s\\n%p\\n%u/%u refs found\", "
+@@ -1360,6 +1368,9 @@ nsCycleCollector::nsCycleCollector() :
+     mPtrLog(nsnull)
+ {
+     mGraph.Init();
++#ifdef DEBUG
++    mExpectedGarbage.Init();
++#endif
+ 
+     for (PRUint32 i = 0; i <= nsIProgrammingLanguage::MAX; ++i) {
+         mRuntimes[i] = nsnull;
+@@ -1693,6 +1704,19 @@ nsCycleCollector::Shutdown()
+     mParams.mDoNothing = PR_TRUE;
+ }
+ 
++#ifdef DEBUG
++void
++nsCycleCollector::ShouldBeFreed(nsISupports *n)
++{
++    mExpectedGarbage.PutEntry(n);
++}
++
++void
++nsCycleCollector::WasFreed(nsISupports *n)
++{
++    mExpectedGarbage.RemoveEntry(n);
++}
++#endif
+ 
+ ////////////////////////////////////////////////////////////////////////
+ // Module public API (exported in nsCycleCollector.h)
+@@ -1758,6 +1782,25 @@ nsCycleCollector_shutdown()
      sCollector.Shutdown();
  }
  
@@ -11,11 +146,19 @@ diff -r 01cc967aebe9 xpcom/base/nsCycleCollector.cpp
 +void
 +nsCycleCollector_DEBUG_shouldBeFreed(nsISupports *n)
 +{
++    if (sCollectorConstructed == 0)
++        return;
++    
++    sCollector.ShouldBeFreed(n);
 +}
 +
 +void
 +nsCycleCollector_DEBUG_wasFreed(nsISupports *n)
 +{
++    if (sCollectorConstructed == 0)
++        return;
++    
++    sCollector.WasFreed(n);
 +}
 +#endif
  
