@@ -1,0 +1,2759 @@
+Add a bunch of DOM objects to cycle collection.  b=368773
+
+diff -r c632a98e5834 content/base/src/nsContentList.cpp
+--- a/content/base/src/nsContentList.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsContentList.cpp	Thu Mar 01 17:15:59 2007 -0800
+@@ -78,17 +78,25 @@ nsBaseContentList::~nsBaseContentList()
+ {
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsBaseContentList)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mElements)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsBaseContentList)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mElements)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ // QueryInterface implementation for nsBaseContentList
+ NS_INTERFACE_MAP_BEGIN(nsBaseContentList)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNodeList)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIDOMNodeList)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(NodeList)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsBaseContentList)
+ NS_INTERFACE_MAP_END
+ 
+ 
+-NS_IMPL_ADDREF(nsBaseContentList)
+-NS_IMPL_RELEASE(nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsBaseContentList)
+ 
+ 
+ NS_IMETHODIMP
+diff -r c632a98e5834 content/base/src/nsContentList.h
+--- a/content/base/src/nsContentList.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsContentList.h	Thu Mar 01 17:15:59 2007 -0800
+@@ -52,6 +52,7 @@
+ #include "nsStubMutationObserver.h"
+ #include "nsIAtom.h"
+ #include "nsINameSpaceManager.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ // Magic namespace id that means "match all namespaces".  This is
+ // negative so it won't collide with actual namespace constants.
+@@ -78,10 +79,11 @@ public:
+   nsBaseContentList();
+   virtual ~nsBaseContentList();
+ 
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+   // nsIDOMNodeList
+   NS_DECL_NSIDOMNODELIST
++  NS_DECL_CYCLE_COLLECTION_CLASS(nsBaseContentList)
+ 
+   virtual void AppendElement(nsIContent *aContent);
+   virtual void RemoveElement(nsIContent *aContent);
+diff -r c632a98e5834 content/base/src/nsDocument.cpp
+--- a/content/base/src/nsDocument.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsDocument.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -940,6 +940,76 @@ NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUO
+                                                         LastRelease())
+ 
+ 
++PR_STATIC_CALLBACK(PLDHashOperator)
++SubDocTraverser(PLDHashTable *table, PLDHashEntryHdr *hdr, PRUint32 number,
++                void *arg)
++{
++  SubDocMapEntry *entry = NS_STATIC_CAST(SubDocMapEntry*, hdr);
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, arg);
++
++  cb->NoteXPCOMChild(entry->mKey);
++  nsISupports *doc = entry->mSubDocument;
++  if (doc) {
++    cb->NoteXPCOMChild(doc);
++  }
++
++  return PL_DHASH_NEXT;
++}
++
++PR_STATIC_CALLBACK(PRIntn)
++RadioGroupsTraverser(nsHashKey *aKey, void *aData, void* aClosure)
++{
++  nsRadioGroupStruct *entry = NS_STATIC_CAST(nsRadioGroupStruct*, aData);
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++
++  nsISupports *radioButton = entry->mSelectedRadioButton;
++  if (radioButton) {
++    cb->NoteXPCOMChild(radioButton);
++  }
++
++  nsSmallVoidArray &radioButtons = entry->mRadioButtons;
++  PRUint32 i, count = radioButtons.Count();
++  for (i = 0; i < count; ++i) {
++    cb->NoteXPCOMChild(NS_STATIC_CAST(nsIFormControl*, radioButtons[i]));
++  }
++  
++
++  return kHashEnumerateNext;
++}
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++BoxObjectTraverser(nsISupports* key, nsPIBoxObject* boxObject, void* userArg)
++{
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++ 
++  cb->NoteXPCOMChild(key);
++  cb->NoteXPCOMChild(boxObject);
++
++  return PL_DHASH_NEXT;
++}
++
++class LinkMapTraversalVisitor : public nsUint32ToContentHashEntry::Visitor
++{
++public:
++  nsCycleCollectionTraversalCallback *mCb;
++  virtual void Visit(nsIContent* aContent)
++  {
++    mCb->NoteXPCOMChild(aContent);
++  }
++};
++
++PLDHashOperator PR_CALLBACK
++LinkMapTraverser(nsUint32ToContentHashEntry* aEntry, void* userArg)
++{
++  LinkMapTraversalVisitor visitor;
++  visitor.mCb = NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++  aEntry->VisitContent(&visitor);
++  return PL_DHASH_NEXT;
++}
++
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsDocument)
+   // Traverse the mChildren nsAttrAndChildArray.
+   for (PRInt32 indx = PRInt32(tmp->mChildren.ChildCount()); indx > 0; --indx) {
+@@ -948,14 +1018,23 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+ 
+   // Traverse all nsIDocument pointer members.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mBindingManager)
++
++  // Traverse all nsDocument nsCOMPtrs.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mSecurityInfo)
+-
+-  // Traverse all nsDocument nsCOMPtrs.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mParser)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mScriptGlobalObject)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mListenerManager)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDOMStyleSheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mScriptLoader)
++
++  tmp->mRadioGroups.Enumerate(RadioGroupsTraverser, &cb);
++
++  // The boxobject for an element will only exist as long as it's in the
++  // document, so we'll traverse the table here instead of from the element.
++  if (tmp->mBoxObjectTable) {
++    tmp->mBoxObjectTable->EnumerateRead(BoxObjectTraverser, &cb);
++  }
++
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mChannel)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mStyleAttrStyleSheet)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mScriptEventManager)
+@@ -963,6 +1042,12 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mLayoutHistoryState)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mOnloadBlocker)
+ 
++  // An element will only be in the linkmap as long as it's in the
++  // document, so we'll traverse the table here instead of from the element.
++  if (tmp->mLinkMap.IsInitialized()) {
++    tmp->mLinkMap.EnumerateEntries(LinkMapTraverser, &cb);
++  }
++
+   // Traverse all our nsCOMArrays.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mStyleSheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mCatalogSheets)
+@@ -973,6 +1058,10 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+     nsISupports *preservedWrapper = tmp->GetReference(tmp);
+     if (preservedWrapper)
+       cb.NoteXPCOMChild(preservedWrapper);
++  }
++
++  if (tmp->mSubDocuments && tmp->mSubDocuments->ops) {
++    PL_DHashTableEnumerate(tmp->mSubDocuments, SubDocTraverser, &cb);
+   }
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+@@ -3580,8 +3669,8 @@ nsDocument::GetBoxObjectFor(nsIDOMElemen
+ 
+   if (!mBoxObjectTable) {
+     mBoxObjectTable = new nsInterfaceHashtable<nsISupportsHashKey, nsPIBoxObject>;
+-    if (mBoxObjectTable) {
+-      mBoxObjectTable->Init(12);
++    if (mBoxObjectTable && !mBoxObjectTable->Init(12)) {
++      mBoxObjectTable = nsnull;
+     }
+   } else {
+     // Want to use Get(content, aResult); but it's the wrong type
+diff -r c632a98e5834 content/base/src/nsFrameLoader.cpp
+--- a/content/base/src/nsFrameLoader.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsFrameLoader.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -90,7 +90,16 @@
+ // we'd need to re-institute a fixed version of bug 98158.
+ #define MAX_DEPTH_CONTENT_FRAMES 10
+ 
+-NS_IMPL_ISUPPORTS1(nsFrameLoader, nsIFrameLoader)
++NS_IMPL_CYCLE_COLLECTION_1(nsFrameLoader, mDocShell)
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsFrameLoader)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsFrameLoader)
++
++NS_INTERFACE_MAP_BEGIN(nsFrameLoader)
++  NS_INTERFACE_MAP_ENTRY(nsIFrameLoader)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsFrameLoader)
++NS_INTERFACE_MAP_END
+ 
+ NS_IMETHODIMP
+ nsFrameLoader::LoadFrame()
+diff -r c632a98e5834 content/base/src/nsFrameLoader.h
+--- a/content/base/src/nsFrameLoader.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsFrameLoader.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -60,7 +60,8 @@ public:
+     mIsTopLevelContent(PR_FALSE)
+   {}
+ 
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS(nsFrameLoader)
+   NS_DECL_NSIFRAMELOADER
+ 
+ private:
+diff -r c632a98e5834 content/base/src/nsGenericElement.cpp
+--- a/content/base/src/nsGenericElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsGenericElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -113,6 +113,7 @@
+ #include "nsEventDispatcher.h"
+ #include "nsContentCreatorFunctions.h"
+ #include "nsIFocusController.h"
++#include "nsIControllers.h"
+ 
+ 
+ #include "nsCycleCollectionParticipant.h"
+@@ -3005,8 +3006,27 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsGenericElement)
++  nsIDocument* ownerDoc = tmp->GetOwnerDoc();
++  if (ownerDoc) {
++    ownerDoc->BindingManager()->Traverse(tmp, cb);
++  }
++
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_LISTENERMANAGER
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_PRESERVED_WRAPPER
++
++  if (tmp->HasProperties() && tmp->IsNodeOfType(nsINode::eXUL)) {
++    nsISupports* property =
++      NS_STATIC_CAST(nsISupports*,
++                     tmp->GetProperty(nsGkAtoms::contextmenulistener));
++    if (property) {
++      cb.NoteXPCOMChild(property);
++    }
++    property = NS_STATIC_CAST(nsISupports*,
++                              tmp->GetProperty(nsGkAtoms::popuplistener));
++    if (property) {
++      cb.NoteXPCOMChild(property);
++    }
++  }
+ 
+   // Traverse child content.
+   {
+@@ -3022,9 +3042,11 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+     if (slots) {
+       if (slots->mAttributeMap.get())
+         cb.NoteXPCOMChild(slots->mAttributeMap.get());
+-    }
+-  }
+-NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END  
++      if (slots->mControllers)
++        cb.NoteXPCOMChild(slots->mControllers);
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ 
+ NS_INTERFACE_MAP_BEGIN(nsGenericElement)
+diff -r c632a98e5834 content/base/src/nsObjectLoadingContent.cpp
+--- a/content/base/src/nsObjectLoadingContent.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsObjectLoadingContent.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -1028,6 +1028,14 @@ nsObjectLoadingContent::RemovedFromDocum
+   }
+ }
+ 
++void
++nsObjectLoadingContent::Traverse(nsCycleCollectionTraversalCallback &cb)
++{
++  if (mFrameLoader) {
++    cb.NoteXPCOMChild(mFrameLoader);
++  }
++}
++
+ // <private>
+ /* static */ PRBool
+ nsObjectLoadingContent::IsSuccessfulRequest(nsIRequest* aRequest)
+diff -r c632a98e5834 content/base/src/nsObjectLoadingContent.h
+--- a/content/base/src/nsObjectLoadingContent.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/base/src/nsObjectLoadingContent.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -215,6 +215,8 @@ class nsObjectLoadingContent : public ns
+      */
+     void RemovedFromDocument();
+ 
++    void Traverse(nsCycleCollectionTraversalCallback &cb);
++
+   private:
+     /**
+      * Check whether the given request represents a successful load.
+diff -r c632a98e5834 content/html/content/src/Makefile.in
+--- a/content/html/content/src/Makefile.in	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/Makefile.in	Thu Mar 01 17:16:00 2007 -0800
+@@ -80,7 +80,6 @@ EXPORTS		= \
+ 
+ CPPSRCS		= \
+ 		nsGenericHTMLElement.cpp \
+-		nsGenericDOMHTMLCollection.cpp \
+ 		nsFormSubmission.cpp \
+ 		nsImageMapUtils.cpp \
+ 		nsHTMLAnchorElement.cpp \
+diff -r c632a98e5834 content/html/content/src/nsGenericDOMHTMLCollection.cpp
+--- a/content/html/content/src/nsGenericDOMHTMLCollection.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsGenericDOMHTMLCollection.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -1,57 +0,0 @@
+-/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* ***** BEGIN LICENSE BLOCK *****
+- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+- *
+- * The contents of this file are subject to the Mozilla Public License Version
+- * 1.1 (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- * http://www.mozilla.org/MPL/
+- *
+- * Software distributed under the License is distributed on an "AS IS" basis,
+- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+- * for the specific language governing rights and limitations under the
+- * License.
+- *
+- * The Original Code is Mozilla Communicator client code.
+- *
+- * The Initial Developer of the Original Code is
+- * Netscape Communications Corporation.
+- * Portions created by the Initial Developer are Copyright (C) 1998
+- * the Initial Developer. All Rights Reserved.
+- *
+- * Contributor(s):
+- *
+- * Alternatively, the contents of this file may be used under the terms of
+- * either of the GNU General Public License Version 2 or later (the "GPL"),
+- * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+- * in which case the provisions of the GPL or the LGPL are applicable instead
+- * of those above. If you wish to allow use of your version of this file only
+- * under the terms of either the GPL or the LGPL, and not to allow others to
+- * use your version of this file under the terms of the MPL, indicate your
+- * decision by deleting the provisions above and replace them with the notice
+- * and other provisions required by the GPL or the LGPL. If you do not delete
+- * the provisions above, a recipient may use your version of this file under
+- * the terms of any one of the MPL, the GPL or the LGPL.
+- *
+- * ***** END LICENSE BLOCK ***** */
+-#include "nsGenericDOMHTMLCollection.h"
+-#include "nsIDOMClassInfo.h"
+-#include "nsContentUtils.h"
+-
+-
+-nsGenericDOMHTMLCollection::nsGenericDOMHTMLCollection() 
+-{
+-}
+-
+-nsGenericDOMHTMLCollection::~nsGenericDOMHTMLCollection()
+-{
+-}
+-
+-NS_IMPL_ADDREF(nsGenericDOMHTMLCollection)
+-NS_IMPL_RELEASE(nsGenericDOMHTMLCollection)
+-
+-NS_INTERFACE_MAP_BEGIN(nsGenericDOMHTMLCollection)
+-  NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLCollection)
+-  NS_INTERFACE_MAP_ENTRY(nsISupports)
+-  NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLGenericCollection)
+-NS_INTERFACE_MAP_END
+diff -r c632a98e5834 content/html/content/src/nsGenericDOMHTMLCollection.h
+--- a/content/html/content/src/nsGenericDOMHTMLCollection.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsGenericDOMHTMLCollection.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -1,69 +0,0 @@
+-/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* ***** BEGIN LICENSE BLOCK *****
+- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+- *
+- * The contents of this file are subject to the Mozilla Public License Version
+- * 1.1 (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- * http://www.mozilla.org/MPL/
+- *
+- * Software distributed under the License is distributed on an "AS IS" basis,
+- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+- * for the specific language governing rights and limitations under the
+- * License.
+- *
+- * The Original Code is Mozilla Communicator client code.
+- *
+- * The Initial Developer of the Original Code is
+- * Netscape Communications Corporation.
+- * Portions created by the Initial Developer are Copyright (C) 1998
+- * the Initial Developer. All Rights Reserved.
+- *
+- * Contributor(s):
+- *
+- * Alternatively, the contents of this file may be used under the terms of
+- * either of the GNU General Public License Version 2 or later (the "GPL"),
+- * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+- * in which case the provisions of the GPL or the LGPL are applicable instead
+- * of those above. If you wish to allow use of your version of this file only
+- * under the terms of either the GPL or the LGPL, and not to allow others to
+- * use your version of this file under the terms of the MPL, indicate your
+- * decision by deleting the provisions above and replace them with the notice
+- * and other provisions required by the GPL or the LGPL. If you do not delete
+- * the provisions above, a recipient may use your version of this file under
+- * the terms of any one of the MPL, the GPL or the LGPL.
+- *
+- * ***** END LICENSE BLOCK ***** */
+-
+-#ifndef nsGenericDOMHTMLCollection_h__
+-#define nsGenericDOMHTMLCollection_h__
+-
+-#include "nsISupports.h"
+-#include "nsIDOMHTMLCollection.h"
+-
+-/**
+- * This is a base class for a generic HTML collection. The base class
+- * provides implementations for nsISupports, but it is up to the
+- * subclass to implement the core HTML collection
+- *
+- * methods:
+- *   GetLength
+- *   Item
+- *   NamedItem
+- * */
+-class nsGenericDOMHTMLCollection : public nsIDOMHTMLCollection
+-{
+-public:
+-  nsGenericDOMHTMLCollection();
+-  virtual ~nsGenericDOMHTMLCollection();
+-
+-  NS_DECL_ISUPPORTS
+-
+-  // The following need to be defined in the subclass
+-  // nsIDOMHTMLCollection interface
+-  NS_IMETHOD    GetLength(PRUint32* aLength)=0;
+-  NS_IMETHOD    Item(PRUint32 aIndex, nsIDOMNode** aReturn)=0;
+-  NS_IMETHOD    NamedItem(const nsAString& aName, nsIDOMNode** aReturn)=0;
+-};
+-
+-#endif // nsGenericDOMHTMLCollection_h__
+diff -r c632a98e5834 content/html/content/src/nsGenericHTMLElement.cpp
+--- a/content/html/content/src/nsGenericHTMLElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsGenericHTMLElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -3059,9 +3059,16 @@ nsGenericHTMLFrameElement::~nsGenericHTM
+   }
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsGenericHTMLFrameElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsGenericHTMLFrameElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mFrameLoader)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_INTERFACE_MAP_BEGIN(nsGenericHTMLFrameElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLFrameElement)
+   NS_INTERFACE_MAP_ENTRY(nsIFrameLoaderOwner)
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION(nsGenericHTMLFrameElement)
+ NS_INTERFACE_MAP_END_INHERITING(nsGenericHTMLElement)
+ 
+ nsresult
+diff -r c632a98e5834 content/html/content/src/nsGenericHTMLElement.h
+--- a/content/html/content/src/nsGenericHTMLElement.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsGenericHTMLElement.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -880,6 +880,9 @@ public:
+   NS_IMETHOD GetTabIndex(PRInt32 *aTabIndex);
+   NS_IMETHOD SetTabIndex(PRInt32 aTabIndex);
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsGenericHTMLFrameElement,
++                                                     nsGenericHTMLElement)
++
+ protected:
+   // This doesn't really ensure a frame loade in all cases, only when
+   // it makes sense.
+@@ -1043,6 +1046,37 @@ NS_NewHTML##_elementName##Element(nsINod
+   NS_HTML_CONTENT_INTERFACE_MAP_AMBIGOUS_BEGIN(_class, _base,                 \
+                                                nsIDOMHTMLElement)
+ 
++#define NS_HTML_CONTENT_CC_INTERFACE_MAP_AMBIGUOUS_BEGIN(_class, _base,       \
++                                                        _base_if)             \
++  NS_IMETHODIMP _class::QueryInterface(REFNSIID aIID, void** aInstancePtr)    \
++  {                                                                           \
++    NS_ENSURE_ARG_POINTER(aInstancePtr);                                      \
++                                                                              \
++    if ( aIID.Equals(NS_GET_IID(nsCycleCollectionParticipant)) ) {            \
++      *aInstancePtr = &NS_CYCLE_COLLECTION_NAME(_class);                      \
++      return NS_OK;                                                           \
++    }                                                                         \
++                                                                              \
++    *aInstancePtr = nsnull;                                                   \
++                                                                              \
++    nsresult rv;                                                              \
++                                                                              \
++    rv = _base::QueryInterface(aIID, aInstancePtr);                           \
++                                                                              \
++    if (NS_SUCCEEDED(rv))                                                     \
++      return rv;                                                              \
++                                                                              \
++    rv = DOMQueryInterface(NS_STATIC_CAST(_base_if *, this), aIID,            \
++                           aInstancePtr);                                     \
++                                                                              \
++    if (NS_SUCCEEDED(rv))                                                     \
++      return rv;                                                              \
++                                                                              \
++    nsISupports *foundInterface = nsnull;
++
++#define NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(_class, _base)                 \
++  NS_HTML_CONTENT_CC_INTERFACE_MAP_AMBIGUOUS_BEGIN(_class, _base,             \
++                                                   nsIDOMHTMLElement)
+ 
+ #define NS_HTML_CONTENT_INTERFACE_MAP_END                                     \
+     {                                                                         \
+diff -r c632a98e5834 content/html/content/src/nsHTMLFormElement.cpp
+--- a/content/html/content/src/nsHTMLFormElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLFormElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -236,6 +236,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLFormElement,
++                                                     nsGenericHTMLElement)
++
+ protected:
+   nsresult DoSubmitOrReset(nsEvent* aEvent,
+                            PRInt32 aMessage);
+@@ -389,7 +392,7 @@ public:
+ 
+   void DropFormReference();
+ 
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+   // nsIDOMHTMLCollection interface
+   NS_DECL_NSIDOMHTMLCOLLECTION
+@@ -428,6 +431,9 @@ public:
+   // (both weak and strong) between the form and its form controls.
+ 
+   nsTArray<nsIFormControl*> mNotInElements; // Holds WEAK references
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsFormControlList,
++                                           nsIDOMHTMLCollection)
+ 
+ protected:
+   // Drop all our references to the form elements
+@@ -553,12 +559,31 @@ nsHTMLFormElement::Init()
+ 
+ // nsISupports
+ 
++PR_STATIC_CALLBACK(PLDHashOperator)
++ElementTraverser(const nsAString& key, nsIDOMHTMLInputElement* element,
++                 void* userArg)
++{
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++ 
++  cb->NoteXPCOMChild(element);
++  return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLFormElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLFormElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mControls,
++                                                       nsIDOMHTMLCollection)
++  tmp->mSelectedRadioButtons.EnumerateRead(ElementTraverser, &cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLFormElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLFormElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLFormElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLFormElement, nsGenericHTMLElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLFormElement, nsGenericHTMLElement)
+   NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLFormElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLFormElement)
+@@ -1958,17 +1983,38 @@ nsFormControlList::FlushPendingNotificat
+   }
+ }
+ 
++PR_STATIC_CALLBACK(PLDHashOperator)
++ControlTraverser(const nsAString& key, nsISupports* control, void* userArg)
++{
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++ 
++  cb->NoteXPCOMChild(control);
++  return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsFormControlList)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsFormControlList)
++  tmp->Clear();
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsFormControlList)
++  tmp->mNameLookupTable.EnumerateRead(ControlTraverser, &cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ // XPConnect interface list for nsFormControlList
+ NS_INTERFACE_MAP_BEGIN(nsFormControlList)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLFormControlList)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLCollection)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIDOMHTMLCollection)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLFormControlCollection)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsFormControlList)
+ NS_INTERFACE_MAP_END
+ 
+ 
+-NS_IMPL_ADDREF(nsFormControlList)
+-NS_IMPL_RELEASE(nsFormControlList)
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsFormControlList,
++                                          nsIDOMHTMLCollection)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsFormControlList,
++                                           nsIDOMHTMLCollection)
+ 
+ 
+ // nsIDOMHTMLCollection interface
+diff -r c632a98e5834 content/html/content/src/nsHTMLInputElement.cpp
+--- a/content/html/content/src/nsHTMLInputElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLInputElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -238,6 +238,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLInputElement,
++                                                     nsGenericHTMLFormElement)
++
+ protected:
+   // Helper method
+   nsresult SetValueInternal(const nsAString& aValue,
+@@ -371,13 +374,19 @@ nsHTMLInputElement::~nsHTMLInputElement(
+ 
+ // nsISupports
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLInputElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLInputElement,
++                                                  nsGenericHTMLFormElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mControllers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLInputElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLInputElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLInputElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLInputElement,
+-                                    nsGenericHTMLFormElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLInputElement,
++                                       nsGenericHTMLFormElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLInputElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLInputElement)
+   NS_INTERFACE_MAP_ENTRY(nsITextControlElement)
+diff -r c632a98e5834 content/html/content/src/nsHTMLMapElement.cpp
+--- a/content/html/content/src/nsHTMLMapElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLMapElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -74,6 +74,9 @@ public:
+                               PRBool aNullParent = PR_TRUE);
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLMapElement,
++                                                     nsGenericHTMLElement)
++
+ protected:
+   nsRefPtr<nsContentList> mAreas;
+ };
+@@ -87,12 +90,19 @@ nsHTMLMapElement::nsHTMLMapElement(nsINo
+ {
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLMapElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLMapElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mAreas,
++                                                       nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLMapElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLMapElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLMapElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLMapElement, nsGenericHTMLElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLMapElement, nsGenericHTMLElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLMapElement)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLMapElement)
+ NS_HTML_CONTENT_INTERFACE_MAP_END
+diff -r c632a98e5834 content/html/content/src/nsHTMLObjectElement.cpp
+--- a/content/html/content/src/nsHTMLObjectElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLObjectElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -109,6 +109,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLObjectElement,
++                                                     nsGenericHTMLElement)
++
+ private:
+   /**
+    * Calls LoadObject with the correct arguments to start the plugin load.
+@@ -153,11 +156,17 @@ nsHTMLObjectElement::DoneAddingChildren(
+   return NS_OK;
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLObjectElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLObjectElement,
++                                                  nsGenericHTMLFormElement)
++  tmp->Traverse(cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLObjectElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLObjectElement, nsGenericElement) 
+ 
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLObjectElement,
+-                                    nsGenericHTMLFormElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLObjectElement,
++                                       nsGenericHTMLFormElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLObjectElement)
+   NS_INTERFACE_MAP_ENTRY(imgIDecoderObserver)
+   NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+diff -r c632a98e5834 content/html/content/src/nsHTMLSelectElement.cpp
+--- a/content/html/content/src/nsHTMLSelectElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLSelectElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -57,7 +57,6 @@
+ #include "nsIDOMHTMLOptGroupElement.h"
+ #include "nsIOptionElement.h"
+ #include "nsIEventStateManager.h"
+-#include "nsGenericDOMHTMLCollection.h"
+ #include "nsISelectElement.h"
+ #include "nsISelectControlFrame.h"
+ #include "nsIDOMHTMLOptionsCollection.h"
+@@ -95,13 +94,13 @@ class nsHTMLSelectElement;
+  */
+ class nsHTMLOptionCollection: public nsIDOMHTMLOptionsCollection,
+                               public nsIDOMNSHTMLOptionCollection,
+-                              public nsGenericDOMHTMLCollection
++                              public nsIDOMHTMLCollection
+ {
+ public:
+   nsHTMLOptionCollection(nsHTMLSelectElement* aSelect);
+   virtual ~nsHTMLOptionCollection();
+ 
+-  NS_DECL_ISUPPORTS_INHERITED
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+   // nsIDOMHTMLOptionsCollection interface
+   NS_DECL_NSIDOMHTMLOPTIONSCOLLECTION
+@@ -111,6 +110,9 @@ public:
+ 
+   // nsIDOMHTMLCollection interface, all its methods are defined in
+   // nsIDOMHTMLOptionsCollection
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsHTMLOptionCollection,
++                                           nsIDOMNSHTMLOptionCollection)
+ 
+   // Helpers for nsHTMLSelectElement
+   /**
+@@ -290,6 +292,9 @@ public:
+   NS_IMETHOD_(PRBool) IsAttributeMapped(const nsIAtom* aAttribute) const;
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLSelectElement,
++                                                     nsGenericHTMLFormElement)
+ 
+ protected:
+   // Helper Methods
+@@ -517,13 +522,20 @@ nsHTMLSelectElement::~nsHTMLSelectElemen
+ 
+ // ISupports
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLSelectElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLSelectElement,
++                                                  nsGenericHTMLFormElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mOptions,
++                                                       nsIDOMHTMLCollection)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLSelectElement, nsGenericElement)
+ NS_IMPL_RELEASE_INHERITED(nsHTMLSelectElement, nsGenericElement)
+ 
+ 
+ // QueryInterface implementation for nsHTMLSelectElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLSelectElement,
+-                                    nsGenericHTMLFormElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLSelectElement,
++                                       nsGenericHTMLFormElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLSelectElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLSelectElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSXBLFormControl)
+@@ -2233,6 +2245,14 @@ nsHTMLOptionCollection::GetOptionIndex(n
+ }
+ 
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLOptionCollection)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsHTMLOptionCollection)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mElements)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsHTMLOptionCollection)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mElements)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ // nsISupports
+ 
+ // QueryInterface implementation for nsHTMLOptionCollection
+@@ -2242,11 +2262,14 @@ NS_INTERFACE_MAP_BEGIN(nsHTMLOptionColle
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLCollection)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIDOMNSHTMLOptionCollection)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLOptionsCollection)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsHTMLOptionCollection)
+ NS_INTERFACE_MAP_END
+ 
+ 
+-NS_IMPL_ADDREF_INHERITED(nsHTMLOptionCollection, nsGenericDOMHTMLCollection)
+-NS_IMPL_RELEASE_INHERITED(nsHTMLOptionCollection, nsGenericDOMHTMLCollection)
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsHTMLOptionCollection,
++                                          nsIDOMNSHTMLOptionCollection)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsHTMLOptionCollection,
++                                           nsIDOMNSHTMLOptionCollection)
+ 
+ 
+ // nsIDOMNSHTMLOptionCollection interface
+diff -r c632a98e5834 content/html/content/src/nsHTMLSharedObjectElement.cpp
+--- a/content/html/content/src/nsHTMLSharedObjectElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLSharedObjectElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -128,6 +128,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLSharedObjectElement,
++                                                     nsGenericHTMLElement)
++
+ private:
+   /**
+    * Calls LoadObject with the correct arguments to start the plugin load.
+@@ -197,12 +200,18 @@ nsHTMLSharedObjectElement::DoneAddingChi
+   return NS_OK;
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLSharedObjectElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLSharedObjectElement,
++                                                  nsGenericHTMLElement)
++  tmp->Traverse(cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLSharedObjectElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLSharedObjectElement, nsGenericElement) 
+ 
+-NS_HTML_CONTENT_INTERFACE_MAP_AMBIGOUS_BEGIN(nsHTMLSharedObjectElement,
+-                                             nsGenericHTMLElement,
+-                                             nsIDOMHTMLAppletElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_AMBIGUOUS_BEGIN(nsHTMLSharedObjectElement,
++                                                 nsGenericHTMLElement,
++                                                 nsIDOMHTMLAppletElement)
+   NS_INTERFACE_MAP_ENTRY_IF_TAG(nsIDOMHTMLAppletElement, applet)
+   NS_INTERFACE_MAP_ENTRY_IF_TAG(nsIDOMHTMLEmbedElement, embed)
+ #ifdef MOZ_SVG
+diff -r c632a98e5834 content/html/content/src/nsHTMLTableElement.cpp
+--- a/content/html/content/src/nsHTMLTableElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLTableElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -41,7 +41,6 @@
+ #include "nsIDOMEventReceiver.h"
+ #include "nsDOMError.h"
+ #include "nsContentList.h"
+-#include "nsGenericDOMHTMLCollection.h"
+ #include "nsMappedAttributes.h"
+ #include "nsGenericHTMLElement.h"
+ #include "nsGkAtoms.h"
+@@ -95,6 +94,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLTableElement,
++                                                     nsGenericHTMLElement)
++
+ protected:
+   already_AddRefed<nsIDOMHTMLTableSectionElement> GetSection(nsIAtom *aTag);
+ 
+@@ -109,7 +111,7 @@ protected:
+  * This class provides a late-bound collection of rows in a table.
+  * mParent is NOT ref-counted to avoid circular references
+  */
+-class TableRowsCollection : public nsGenericDOMHTMLCollection 
++class TableRowsCollection : public nsIDOMHTMLCollection 
+ {
+ public:
+   TableRowsCollection(nsHTMLTableElement *aParent);
+@@ -117,12 +119,12 @@ public:
+ 
+   nsresult Init();
+ 
+-  NS_IMETHOD    GetLength(PRUint32* aLength);
+-  NS_IMETHOD    Item(PRUint32 aIndex, nsIDOMNode** aReturn);
+-  NS_IMETHOD    NamedItem(const nsAString& aName,
+-                          nsIDOMNode** aReturn);
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_NSIDOMHTMLCOLLECTION
+ 
+   NS_IMETHOD    ParentDestroyed();
++
++  NS_DECL_CYCLE_COLLECTION_CLASS(TableRowsCollection)
+ 
+ protected:
+   // Those rows that are not in table sections
+@@ -132,9 +134,8 @@ protected:
+ 
+ 
+ TableRowsCollection::TableRowsCollection(nsHTMLTableElement *aParent)
+-  : nsGenericDOMHTMLCollection()
+-{
+-  mParent = aParent;
++  : mParent(aParent)
++{
+ }
+ 
+ TableRowsCollection::~TableRowsCollection()
+@@ -144,6 +145,23 @@ TableRowsCollection::~TableRowsCollectio
+   // instantiator who provided mParent is responsible for managing our
+   // reference for us.
+ }
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(TableRowsCollection)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(TableRowsCollection)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(TableRowsCollection)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mOrphanRows,
++                                                       nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(TableRowsCollection)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(TableRowsCollection)
++
++NS_INTERFACE_MAP_BEGIN(TableRowsCollection)
++  NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLCollection)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLGenericCollection)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(TableRowsCollection)
++NS_INTERFACE_MAP_END
+ 
+ nsresult
+ TableRowsCollection::Init()
+@@ -339,12 +357,20 @@ nsHTMLTableElement::~nsHTMLTableElement(
+ }
+ 
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLTableElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLTableElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mTBodies,
++                                                       nsBaseContentList)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mRows)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLTableElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLTableElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLTableElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLTableElement, nsGenericHTMLElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLTableElement, nsGenericHTMLElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLTableElement)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLTableElement)
+ NS_HTML_CONTENT_INTERFACE_MAP_END
+diff -r c632a98e5834 content/html/content/src/nsHTMLTableRowElement.cpp
+--- a/content/html/content/src/nsHTMLTableRowElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLTableRowElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -83,6 +83,9 @@ public:
+   NS_IMETHOD_(PRBool) IsAttributeMapped(const nsIAtom* aAttribute) const;
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLTableRowElement,
++                                                     nsGenericHTMLElement)
+ 
+ protected:
+   nsresult GetSection(nsIDOMHTMLTableSectionElement** aSection);
+@@ -124,13 +127,20 @@ nsHTMLTableRowElement::nsHTMLTableRowEle
+ {
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLTableRowElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLTableRowElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mCells,
++                                                       nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLTableRowElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLTableRowElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLTableRowElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLTableRowElement,
+-                                    nsGenericHTMLElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLTableRowElement,
++                                       nsGenericHTMLElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLTableRowElement)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLTableRowElement)
+ NS_HTML_CONTENT_INTERFACE_MAP_END
+diff -r c632a98e5834 content/html/content/src/nsHTMLTableSectionElement.cpp
+--- a/content/html/content/src/nsHTMLTableSectionElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLTableSectionElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -79,6 +79,9 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLTableSectionElement,
++                                                     nsGenericHTMLElement)
++
+ protected:
+   nsRefPtr<nsContentList> mRows;
+ };
+@@ -92,13 +95,20 @@ nsHTMLTableSectionElement::nsHTMLTableSe
+ {
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLTableSectionElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLTableSectionElement,
++                                                  nsGenericHTMLElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mRows,
++                                                       nsBaseContentList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLTableSectionElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLTableSectionElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLTableSectionElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLTableSectionElement,
+-                                    nsGenericHTMLElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLTableSectionElement,
++                                       nsGenericHTMLElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLTableSectionElement)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLTableSectionElement)
+ NS_HTML_CONTENT_INTERFACE_MAP_END
+diff -r c632a98e5834 content/html/content/src/nsHTMLTextAreaElement.cpp
+--- a/content/html/content/src/nsHTMLTextAreaElement.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/content/src/nsHTMLTextAreaElement.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -165,6 +165,9 @@ public:
+                               nsIContent* aChild,
+                               PRInt32 aIndexInContainer);
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLTextAreaElement,
++                                                     nsGenericHTMLFormElement)
++
+ protected:
+   nsCOMPtr<nsIControllers> mControllers;
+   /** The current value.  This is null if the frame owns the value. */
+@@ -225,13 +228,19 @@ nsHTMLTextAreaElement::~nsHTMLTextAreaEl
+ }
+ 
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLTextAreaElement)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLTextAreaElement,
++                                                  nsGenericHTMLFormElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mControllers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLTextAreaElement, nsGenericElement) 
+ NS_IMPL_RELEASE_INHERITED(nsHTMLTextAreaElement, nsGenericElement) 
+ 
+ 
+ // QueryInterface implementation for nsHTMLTextAreaElement
+-NS_HTML_CONTENT_INTERFACE_MAP_BEGIN(nsHTMLTextAreaElement,
+-                                    nsGenericHTMLFormElement)
++NS_HTML_CONTENT_CC_INTERFACE_MAP_BEGIN(nsHTMLTextAreaElement,
++                                       nsGenericHTMLFormElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLTextAreaElement)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLTextAreaElement)
+   NS_INTERFACE_MAP_ENTRY(nsITextControlElement)
+diff -r c632a98e5834 content/html/document/src/nsHTMLDocument.cpp
+--- a/content/html/document/src/nsHTMLDocument.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/document/src/nsHTMLDocument.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -343,6 +343,40 @@ nsHTMLDocument::~nsHTMLDocument()
+   }
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsHTMLDocument)
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++IdAndNameMapEntryTraverse(PLDHashTable *table, PLDHashEntryHdr *hdr,
++                          PRUint32 number, void *arg)
++{
++  nsCycleCollectionTraversalCallback *cb =
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, arg);
++  IdAndNameMapEntry *entry = NS_STATIC_CAST(IdAndNameMapEntry*, hdr);
++
++  if (entry->mNameContentList && entry->mNameContentList != NAME_NOT_VALID)
++    cb->NoteXPCOMChild(entry->mNameContentList);
++
++  return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsHTMLDocument, nsDocument)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mBodyContent)
++  if (tmp->mIdAndNameHashTable.ops) {
++    PL_DHashTableEnumerate(&tmp->mIdAndNameHashTable,
++                           IdAndNameMapEntryTraverse,
++                           &cb);
++  }
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mImageMaps)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mImages)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mApplets)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mEmbeds)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mLinks)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mAnchors)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mForms, nsIDOMNodeList)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mFormControls,
++                                                       nsIDOMNodeList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsHTMLDocument, nsDocument)
+ NS_IMPL_RELEASE_INHERITED(nsHTMLDocument, nsDocument)
+ 
+@@ -353,6 +387,7 @@ NS_INTERFACE_MAP_BEGIN(nsHTMLDocument)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMHTMLDocument)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMNSHTMLDocument)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(HTMLDocument)
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION(nsHTMLDocument)
+ NS_INTERFACE_MAP_END_INHERITING(nsDocument)
+ 
+ 
+diff -r c632a98e5834 content/html/document/src/nsHTMLDocument.h
+--- a/content/html/document/src/nsHTMLDocument.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/html/document/src/nsHTMLDocument.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -206,6 +206,8 @@ public:
+                               PRBool aDocumentDefaultType,
+                               nsIContent** aResult);
+ #endif
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsHTMLDocument, nsDocument)
+ 
+ protected:
+   nsresult GetPixelDimensions(nsIPresShell* aShell,
+diff -r c632a98e5834 content/xbl/src/nsBindingManager.cpp
+--- a/content/xbl/src/nsBindingManager.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsBindingManager.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -333,30 +333,8 @@ LoadingDocHashtableTraverser(nsIURI* key
+   return PL_DHASH_NEXT;
+ }
+ 
+-static PLDHashOperator
+-XBLBindingHashtableTraverser(nsISupports* key,
+-                             nsXBLBinding* binding,
+-                             void* userArg)
+-{  
+-  nsCycleCollectionTraversalCallback *cb = 
+-    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
+- 
+-  // XBLBindings aren't nsISupports, so we don't tell the cycle collector
+-  // about them explicitly. Instead, we traverse their contents directly
+-  // here.
+- 
+-  while (binding) {
+-    nsISupports *c = binding->GetAnonymousContent();
+-    if (c)
+-      cb->NoteXPCOMChild(c);
+-    binding = binding->GetBaseBinding();
+-  }
+-  return PL_DHASH_NEXT;
+-}
+-
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsBindingManager)
+-  if (tmp->mBindingTable.IsInitialized())
+-      tmp->mBindingTable.EnumerateRead(&XBLBindingHashtableTraverser, &cb);
++  // The hashes keyed on nsIContent are traversed from the nsIContent itself.
+   if (tmp->mDocumentTable.IsInitialized())
+       tmp->mDocumentTable.EnumerateRead(&DocumentInfoHashtableTraverser, &cb);
+   if (tmp->mLoadingDocTable.IsInitialized())
+@@ -1356,3 +1334,36 @@ nsBindingManager::NodeWillBeDestroyed(co
+ {
+   NS_BINDINGMANAGER_NOTIFY_OBSERVERS(NodeWillBeDestroyed, (aNode));
+ }
++
++void
++nsBindingManager::Traverse(nsIContent *aContent,
++                           nsCycleCollectionTraversalCallback &cb)
++{
++  nsXBLBinding *binding = GetBinding(aContent);
++  if (binding) {
++    // XXX nsXBLBinding isn't nsISupports but it is refcounted, so we can't
++    //     traverse it.
++    cb.NoteXPCOMChild(aContent);
++  }
++  nsISupports *value;
++  if (mContentListTable.ops &&
++      (value = LookupObject(mContentListTable, aContent))) {
++    cb.NoteXPCOMChild(aContent);
++    cb.NoteXPCOMChild(value);
++  }
++  if (mAnonymousNodesTable.ops &&
++      (value = LookupObject(mAnonymousNodesTable, aContent))) {
++    cb.NoteXPCOMChild(aContent);
++    cb.NoteXPCOMChild(value);
++  }
++  if (mInsertionParentTable.ops &&
++      (value = LookupObject(mInsertionParentTable, aContent))) {
++    cb.NoteXPCOMChild(aContent);
++    cb.NoteXPCOMChild(value);
++  }
++  if (mWrapperTable.ops &&
++      (value = LookupObject(mWrapperTable, aContent))) {
++    cb.NoteXPCOMChild(aContent);
++    cb.NoteXPCOMChild(value);
++  }
++}
+diff -r c632a98e5834 content/xbl/src/nsBindingManager.h
+--- a/content/xbl/src/nsBindingManager.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsBindingManager.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -199,6 +199,9 @@ public:
+                      RuleProcessorData* aData,
+                      PRBool* aCutOffInheritance);
+ 
++  NS_HIDDEN_(void) Traverse(nsIContent *aContent,
++                            nsCycleCollectionTraversalCallback &cb);
++
+   NS_DECL_CYCLE_COLLECTION_CLASS(nsBindingManager)
+ 
+ protected:
+diff -r c632a98e5834 content/xbl/src/nsXBLDocumentInfo.cpp
+--- a/content/xbl/src/nsXBLDocumentInfo.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsXBLDocumentInfo.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -66,7 +66,7 @@ public:
+   nsXBLDocGlobalObject();
+ 
+   // nsISupports interface
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   
+   // nsIScriptGlobalObject methods
+   virtual nsresult EnsureScriptEnvironment(PRUint32 aLangID);
+@@ -85,6 +85,9 @@ public:
+ 
+   static JSBool doCheckAccess(JSContext *cx, JSObject *obj, jsval id,
+                               PRUint32 accessType);
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXBLDocGlobalObject,
++                                           nsIScriptGlobalObject)
+ 
+ protected:
+   virtual ~nsXBLDocGlobalObject();
+@@ -203,7 +206,22 @@ nsXBLDocGlobalObject::~nsXBLDocGlobalObj
+ {}
+ 
+ 
+-NS_IMPL_ISUPPORTS2(nsXBLDocGlobalObject, nsIScriptGlobalObject, nsIScriptObjectPrincipal)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXBLDocGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXBLDocGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXBLDocGlobalObject)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mScriptContext)
++  cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, tmp->mJSObject);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_INTERFACE_MAP_BEGIN(nsXBLDocGlobalObject)
++  NS_INTERFACE_MAP_ENTRY(nsIScriptGlobalObject)
++  NS_INTERFACE_MAP_ENTRY(nsIScriptObjectPrincipal)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptGlobalObject)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXBLDocGlobalObject)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXBLDocGlobalObject, nsIScriptGlobalObject)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXBLDocGlobalObject, nsIScriptGlobalObject)
+ 
+ void JS_DLL_CALLBACK
+ XBL_ProtoErrorReporter(JSContext *cx,
+@@ -426,7 +444,28 @@ static PRBool IsChromeURI(nsIURI* aURI)
+ 
+ /* Implementation file */
+ 
+-NS_IMPL_CYCLE_COLLECTION_2(nsXBLDocumentInfo, mDocument, mGlobalObject)
++static PRIntn PR_CALLBACK
++TraverseProtos(nsHashKey *aKey, void *aData, void* aClosure)
++{
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++  nsXBLPrototypeBinding *proto = NS_STATIC_CAST(nsXBLPrototypeBinding*, aData);
++  proto->Traverse(*cb);
++  return kHashEnumerateNext;
++}
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXBLDocumentInfo)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXBLDocumentInfo)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mDocument)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXBLDocumentInfo)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDocument)
++  if (tmp->mBindingTable) {
++    tmp->mBindingTable->Enumerate(TraverseProtos, &cb);
++  }
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_INTERFACE_MAP_BEGIN(nsXBLDocumentInfo)
+   NS_INTERFACE_MAP_ENTRY(nsIXBLDocumentInfo)
+diff -r c632a98e5834 content/xbl/src/nsXBLPrototypeBinding.cpp
+--- a/content/xbl/src/nsXBLPrototypeBinding.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsXBLPrototypeBinding.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -76,6 +76,7 @@
+ 
+ #include "nsICSSLoader.h"
+ #include "nsIStyleRuleProcessor.h"
++#include "nsXBLResourceLoader.h"
+ 
+ // Helper Classes =====================================================================
+ 
+@@ -276,6 +277,15 @@ nsXBLPrototypeBinding::Init(const nsACSt
+ 
+   SetBindingElement(aElement);
+   return NS_OK;
++}
++
++void
++nsXBLPrototypeBinding::Traverse(nsCycleCollectionTraversalCallback &cb) const
++{
++  cb.NoteXPCOMChild(mBinding);
++  // XXX mInsertionPointTable!
++  if (mResources && mResources->mLoader)
++    cb.NoteXPCOMChild(mResources->mLoader);
+ }
+ 
+ void
+diff -r c632a98e5834 content/xbl/src/nsXBLPrototypeBinding.h
+--- a/content/xbl/src/nsXBLPrototypeBinding.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsXBLPrototypeBinding.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -172,7 +172,9 @@ public:
+   nsresult Init(const nsACString& aRef,
+                 nsIXBLDocumentInfo* aInfo,
+                 nsIContent* aElement);
+-  
++
++  void Traverse(nsCycleCollectionTraversalCallback &cb) const;
++
+ // Static members
+   static PRUint32 gRefCnt;
+  
+diff -r c632a98e5834 content/xbl/src/nsXBLResourceLoader.cpp
+--- a/content/xbl/src/nsXBLResourceLoader.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsXBLResourceLoader.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -59,7 +59,26 @@
+ #include "nsCSSRuleProcessor.h"
+ #include "nsContentUtils.h"
+ 
+-NS_IMPL_ISUPPORTS1(nsXBLResourceLoader, nsICSSLoaderObserver)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXBLResourceLoader)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXBLResourceLoader)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXBLResourceLoader)
++  if (tmp->mBoundElements) {
++    PRUint32 i, count;
++    tmp->mBoundElements->Count(&count);
++    for (i = 0; i < count; ++i) {
++      cb.NoteXPCOMChild(tmp->mBoundElements->ElementAt(i));
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_INTERFACE_MAP_BEGIN(nsXBLResourceLoader)
++  NS_INTERFACE_MAP_ENTRY(nsICSSLoaderObserver)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXBLResourceLoader)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsXBLResourceLoader)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsXBLResourceLoader)
+ 
+ nsXBLResourceLoader::nsXBLResourceLoader(nsXBLPrototypeBinding* aBinding,
+                                          nsXBLPrototypeResources* aResources)
+diff -r c632a98e5834 content/xbl/src/nsXBLResourceLoader.h
+--- a/content/xbl/src/nsXBLResourceLoader.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xbl/src/nsXBLResourceLoader.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -39,6 +39,7 @@
+ #include "nsCOMPtr.h"
+ #include "nsICSSLoaderObserver.h"
+ #include "nsISupportsArray.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIContent;
+ class nsIAtom;
+@@ -72,7 +73,8 @@ class nsXBLResourceLoader : public nsICS
+ class nsXBLResourceLoader : public nsICSSLoaderObserver
+ {
+ public:
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS(nsXBLResourceLoader)
+ 
+   // nsICSSLoaderObserver
+   NS_IMETHOD StyleSheetLoaded(nsICSSStyleSheet* aSheet, PRBool aWasAlternate,
+diff -r c632a98e5834 content/xml/document/src/nsXMLDocument.cpp
+--- a/content/xml/document/src/nsXMLDocument.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xml/document/src/nsXMLDocument.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -191,6 +191,11 @@ nsXMLDocument::~nsXMLDocument()
+   mLoopingForSyncLoad = PR_FALSE;
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXMLDocument)
++
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsXMLDocument, nsDocument)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mScriptContext)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ // QueryInterface implementation for nsXMLDocument
+ NS_INTERFACE_MAP_BEGIN(nsXMLDocument)
+@@ -198,6 +203,7 @@ NS_INTERFACE_MAP_BEGIN(nsXMLDocument)
+   NS_INTERFACE_MAP_ENTRY(nsIChannelEventSink)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMXMLDocument)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(XMLDocument)
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION(nsXMLDocument)
+ NS_INTERFACE_MAP_END_INHERITING(nsDocument)
+ 
+ 
+diff -r c632a98e5834 content/xml/document/src/nsXMLDocument.h
+--- a/content/xml/document/src/nsXMLDocument.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xml/document/src/nsXMLDocument.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -97,6 +97,8 @@ public:
+ 
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsXMLDocument, nsDocument)
++
+ protected:
+   virtual nsresult GetLoadGroup(nsILoadGroup **aLoadGroup);
+ 
+diff -r c632a98e5834 content/xul/document/src/nsXULControllers.cpp
+--- a/content/xul/document/src/nsXULControllers.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULControllers.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -97,18 +97,33 @@ NS_NewXULControllers(nsISupports* aOuter
+   return rv;
+ }
+ 
+-// QueryInterface implementation for nsXULControllers
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULControllers)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXULControllers)
++  tmp->DeleteControllers();
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULControllers)
++  {
++    PRUint32 i, count = tmp->mControllers.Count();
++    for (i = 0; i < count; ++i) {
++      nsXULControllerData*  controllerData =
++        NS_STATIC_CAST(nsXULControllerData*, tmp->mControllers[i]);
++      if (controllerData) {
++        cb.NoteXPCOMChild(controllerData->mController);
++      }
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_INTERFACE_MAP_BEGIN(nsXULControllers)
+   NS_INTERFACE_MAP_ENTRY(nsIControllers)
+   NS_INTERFACE_MAP_ENTRY(nsISecurityCheckedComponent)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIControllers)
+   NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(XULControllers)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULControllers)
+ NS_INTERFACE_MAP_END
+ 
+-
+-NS_IMPL_ADDREF(nsXULControllers)
+-NS_IMPL_RELEASE(nsXULControllers)
+-
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXULControllers, nsIControllers)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXULControllers, nsIControllers)
+ 
+ NS_IMETHODIMP
+ nsXULControllers::GetControllerForCommand(const char *aCommand, nsIController** _retval)
+diff -r c632a98e5834 content/xul/document/src/nsXULControllers.h
+--- a/content/xul/document/src/nsXULControllers.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULControllers.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -51,6 +51,7 @@
+ #include "nsIControllers.h"
+ #include "nsISupportsArray.h"
+ #include "nsISecurityCheckedComponent.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ /* non-XPCOM class for holding controllers and their IDs */
+ class nsXULControllerData
+@@ -72,8 +73,6 @@ public:
+                               return NS_OK;
+                             }
+     
+-protected:
+-
+     PRUint32                mControllerID;
+     nsCOMPtr<nsIController> mController;
+ };
+@@ -88,7 +87,8 @@ public:
+     friend NS_IMETHODIMP
+     NS_NewXULControllers(nsISupports* aOuter, REFNSIID aIID, void** aResult);
+ 
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXULControllers, nsIControllers)
+     NS_DECL_NSICONTROLLERS
+     NS_DECL_NSISECURITYCHECKEDCOMPONENT
+   
+diff -r c632a98e5834 content/xul/document/src/nsXULDocument.cpp
+--- a/content/xul/document/src/nsXULDocument.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULDocument.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -296,6 +296,72 @@ NS_NewXULDocument(nsIXULDocument** resul
+ // nsISupports interface
+ //
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULDocument)
++
++static PRIntn
++TraverseElement(const PRUnichar* aID, nsIContent* aElement, void* aContext)
++{
++    nsCycleCollectionTraversalCallback *cb =
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aContext);
++
++    cb->NoteXPCOMChild(aElement);
++
++    return HT_ENUMERATE_NEXT;
++}
++
++static PLDHashOperator PR_CALLBACK
++TraverseTemplateBuilders(nsISupports* aKey, nsIXULTemplateBuilder* aData,
++                         void* aContext)
++{
++    nsCycleCollectionTraversalCallback *cb =
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aContext);
++
++    cb->NoteXPCOMChild(aKey);
++    cb->NoteXPCOMChild(aData);
++
++    return PL_DHASH_NEXT;
++}
++
++static PLDHashOperator PR_CALLBACK
++TraverseObservers(nsIURI* aKey, nsIObserver* aData, void* aContext)
++{
++    nsCycleCollectionTraversalCallback *cb =
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aContext);
++
++    cb->NoteXPCOMChild(aData);
++
++    return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsXULDocument, nsXMLDocument)
++    // XXX tmp->mForwardReferences?
++    // XXX tmp->mContextStack?
++
++    tmp->mElementMap.Enumerate(TraverseElement, &cb);
++
++    // An element will only have a template builder as long as it's in the
++    // document, so we'll traverse the table here instead of from the element.
++    if (tmp->mTemplateBuilderTable)
++        tmp->mTemplateBuilderTable->EnumerateRead(TraverseTemplateBuilders, &cb);
++        
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mCurrentPrototype,
++                                                     nsIScriptGlobalObjectOwner)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(mMasterPrototype,
++                                                     nsIScriptGlobalObjectOwner)
++    PRUint32 i, count = tmp->mPrototypes.Length();
++    for (i = 0; i < count; ++i) {
++        cb.NoteXPCOMChild(NS_STATIC_CAST(nsIScriptGlobalObjectOwner*, 
++                                         tmp->mPrototypes[i]));
++    }
++    
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mTooltipNode)
++
++    if (tmp->mOverlayLoadObservers.IsInitialized())
++        tmp->mOverlayLoadObservers.EnumerateRead(TraverseObservers, &cb);
++    if (tmp->mPendingOverlayLoadNotifications.IsInitialized())
++        tmp->mPendingOverlayLoadNotifications.EnumerateRead(TraverseObservers, &cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_IMPL_ADDREF_INHERITED(nsXULDocument, nsXMLDocument)
+ NS_IMPL_RELEASE_INHERITED(nsXULDocument, nsXMLDocument)
+ 
+@@ -307,6 +373,7 @@ NS_INTERFACE_MAP_BEGIN(nsXULDocument)
+     NS_INTERFACE_MAP_ENTRY(nsIStreamLoaderObserver)
+     NS_INTERFACE_MAP_ENTRY(nsICSSLoaderObserver)
+     NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(XULDocument)
++    NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION(nsXULDocument)
+ NS_INTERFACE_MAP_END_INHERITING(nsXMLDocument)
+ 
+ 
+@@ -1754,18 +1821,18 @@ nsXULDocument::SetTemplateBuilderFor(nsI
+                                      nsIXULTemplateBuilder* aBuilder)
+ {
+     if (! mTemplateBuilderTable) {
+-        mTemplateBuilderTable = new nsSupportsHashtable();
+-        if (! mTemplateBuilderTable)
++        mTemplateBuilderTable = new BuilderTable;
++        if (! mTemplateBuilderTable || !mTemplateBuilderTable->Init()) {
++            mTemplateBuilderTable = nsnull;
+             return NS_ERROR_OUT_OF_MEMORY;
+-    }
+-
+-    nsISupportsKey key(aContent);
++        }
++    }
+ 
+     if (aBuilder) {
+-        mTemplateBuilderTable->Put(&key, aBuilder);
++        mTemplateBuilderTable->Put(aContent, aBuilder);
+     }
+     else {
+-        mTemplateBuilderTable->Remove(&key);
++        mTemplateBuilderTable->Remove(aContent);
+     }
+ 
+     return NS_OK;
+@@ -1776,9 +1843,7 @@ nsXULDocument::GetTemplateBuilderFor(nsI
+                                      nsIXULTemplateBuilder** aResult)
+ {
+     if (mTemplateBuilderTable) {
+-        nsISupportsKey key(aContent);
+-        *aResult = NS_STATIC_CAST(nsIXULTemplateBuilder*,
+-                                  mTemplateBuilderTable->Get(&key));
++        mTemplateBuilderTable->Get(aContent, aResult);
+     }
+     else
+         *aResult = nsnull;
+diff -r c632a98e5834 content/xul/document/src/nsXULDocument.h
+--- a/content/xul/document/src/nsXULDocument.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULDocument.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -172,6 +172,9 @@ public:
+                    nsIAtom* aAttrName,
+                    void* aData);
+ 
++    NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsXULDocument,
++                                                       nsXMLDocument)
++
+ protected:
+     // Implementation methods
+     friend nsresult
+@@ -290,7 +293,9 @@ protected:
+ 
+     // Maintains the template builders that have been attached to
+     // content elements
+-    nsSupportsHashtable* mTemplateBuilderTable;
++    typedef nsInterfaceHashtable<nsISupportsHashKey, nsIXULTemplateBuilder>
++        BuilderTable;
++    BuilderTable* mTemplateBuilderTable;
+ 
+     nsVoidArray mForwardReferences;
+     nsForwardReference::Phase mResolutionPhase;
+diff -r c632a98e5834 content/xul/document/src/nsXULPrototypeDocument.cpp
+--- a/content/xul/document/src/nsXULPrototypeDocument.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULPrototypeDocument.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -76,7 +76,7 @@ public:
+     nsXULPDGlobalObject(nsXULPrototypeDocument* owner);
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+     // nsIScriptGlobalObject methods
+     virtual void SetGlobalObjectOwner(nsIScriptGlobalObjectOwner* aOwner);
+@@ -93,6 +93,9 @@ public:
+ 
+     // nsIScriptObjectPrincipal methods
+     virtual nsIPrincipal* GetPrincipal();
++
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXULPDGlobalObject,
++                                             nsIScriptGlobalObject)
+ 
+ protected:
+     virtual ~nsXULPDGlobalObject();
+@@ -190,9 +193,24 @@ nsXULPrototypeDocument::~nsXULPrototypeD
+     }
+ }
+ 
+-NS_IMPL_ISUPPORTS2(nsXULPrototypeDocument,
+-                   nsIScriptGlobalObjectOwner,
+-                   nsISerializable)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULPrototypeDocument)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULPrototypeDocument)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULPrototypeDocument)
++  // XXX Can't traverse tmp->mRoot, non-XPCOM refcounted object
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_INTERFACE_MAP_BEGIN(nsXULPrototypeDocument)
++  NS_INTERFACE_MAP_ENTRY(nsIScriptGlobalObjectOwner)
++  NS_INTERFACE_MAP_ENTRY(nsISerializable)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptGlobalObjectOwner)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULPrototypeDocument)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXULPrototypeDocument,
++                                          nsIScriptGlobalObjectOwner)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXULPrototypeDocument,
++                                           nsIScriptGlobalObjectOwner)
+ 
+ NS_IMETHODIMP
+ NS_NewXULPrototypeDocument(nsXULPrototypeDocument** aResult)
+@@ -602,14 +620,35 @@ nsXULPDGlobalObject::~nsXULPDGlobalObjec
+ {
+ }
+ 
+-NS_IMPL_ADDREF(nsXULPDGlobalObject)
+-NS_IMPL_RELEASE(nsXULPDGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULPDGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULPDGlobalObject)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULPDGlobalObject)
++  {
++    PRUint32 lang_id;
++    NS_STID_FOR_ID(lang_id) {
++      nsISupports *context = tmp->mScriptContexts[NS_STID_INDEX(lang_id)];
++      if (context) {
++        cb.NoteXPCOMChild(context);
++      }
++      void *global = tmp->mScriptGlobals[NS_STID_INDEX(lang_id)];
++      if (global) {
++        cb.NoteScriptChild(lang_id, global);
++      }
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_INTERFACE_MAP_BEGIN(nsXULPDGlobalObject)
+-    NS_INTERFACE_MAP_ENTRY(nsIScriptGlobalObject)
+-    NS_INTERFACE_MAP_ENTRY(nsIScriptObjectPrincipal)
+-    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptGlobalObject)
++  NS_INTERFACE_MAP_ENTRY(nsIScriptGlobalObject)
++  NS_INTERFACE_MAP_ENTRY(nsIScriptObjectPrincipal)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptGlobalObject)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULPDGlobalObject)
+ NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXULPDGlobalObject,
++                                          nsIScriptGlobalObject)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXULPDGlobalObject,
++                                           nsIScriptGlobalObject)
+ 
+ //----------------------------------------------------------------------
+ //
+diff -r c632a98e5834 content/xul/document/src/nsXULPrototypeDocument.h
+--- a/content/xul/document/src/nsXULPrototypeDocument.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/document/src/nsXULPrototypeDocument.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -48,6 +48,7 @@
+ #include "nsTArray.h"
+ #include "nsIScriptGlobalObjectOwner.h"
+ #include "nsISerializable.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIAtom;
+ class nsIPrincipal;
+@@ -73,7 +74,7 @@ public:
+     Create(nsIURI* aURI, nsXULPrototypeDocument** aResult);
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+     // nsISerializable interface
+     NS_DECL_NSISERIALIZABLE
+@@ -145,6 +146,9 @@ public:
+     // nsIScriptGlobalObjectOwner methods
+     virtual nsIScriptGlobalObject* GetScriptGlobalObject();
+ 
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXULPrototypeDocument,
++                                             nsIScriptGlobalObjectOwner)
++
+ protected:
+     nsCOMPtr<nsIURI> mURI;
+     nsXULPrototypeElement* mRoot;
+diff -r c632a98e5834 content/xul/templates/src/nsRDFQuery.cpp
+--- a/content/xul/templates/src/nsRDFQuery.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsRDFQuery.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -40,7 +40,22 @@
+ #include "nsXULTemplateQueryProcessorRDF.h"
+ #include "nsRDFQuery.h"
+ 
+-NS_IMPL_ISUPPORTS1(nsRDFQuery, nsITemplateRDFQuery)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsRDFQuery)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsRDFQuery)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mQueryNode)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsRDFQuery)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mQueryNode)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_INTERFACE_MAP_BEGIN(nsRDFQuery)
++  NS_INTERFACE_MAP_ENTRY(nsITemplateRDFQuery)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsRDFQuery)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsRDFQuery)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsRDFQuery)
+ 
+ void
+ nsRDFQuery::Finish()
+diff -r c632a98e5834 content/xul/templates/src/nsRDFQuery.h
+--- a/content/xul/templates/src/nsRDFQuery.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsRDFQuery.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -39,6 +39,7 @@
+ 
+ #include "nsAutoPtr.h"
+ #include "nsISimpleEnumerator.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ #define NS_ITEMPLATERDFQUERY_IID \
+   {0x8929ff60, 0x1c9c, 0x4d87, \
+@@ -79,7 +80,8 @@ public:
+ 
+     ~nsRDFQuery() { Finish(); }
+ 
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS(nsRDFQuery)
+ 
+     /**
+      * Retrieve the root node in the rule network
+diff -r c632a98e5834 content/xul/templates/src/nsTemplateRule.h
+--- a/content/xul/templates/src/nsTemplateRule.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsTemplateRule.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -48,6 +48,7 @@
+ #include "nsVoidArray.h"
+ #include "nsString.h"
+ #include "nsIXULTemplateRuleFilter.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIXULTemplateQueryProcessor;
+ class nsTemplateQuerySet;
+@@ -224,6 +225,16 @@ public:
+     nsresult
+     AddBindingsToQueryProcessor(nsIXULTemplateQueryProcessor* aProcessor);
+ 
++    void Traverse(nsCycleCollectionTraversalCallback &cb) const
++    {
++        if (mRuleNode) {
++            cb.NoteXPCOMChild(mRuleNode);
++        }
++        if (mAction) {
++            cb.NoteXPCOMChild(mAction);
++        }
++    }
++
+ protected:
+ 
+     struct Binding {
+diff -r c632a98e5834 content/xul/templates/src/nsXULContentBuilder.cpp
+--- a/content/xul/templates/src/nsXULContentBuilder.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULContentBuilder.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -152,6 +152,11 @@ protected:
+ 
+     nsXULContentBuilder();
+ 
++    void Traverse(nsCycleCollectionTraversalCallback &cb) const
++    {
++        mSortState.Traverse(cb);
++    }
++
+     virtual void Uninit(PRBool aIsFinal);
+ 
+     // Implementation methods
+diff -r c632a98e5834 content/xul/templates/src/nsXULSortService.h
+--- a/content/xul/templates/src/nsXULSortService.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULSortService.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -63,6 +63,7 @@
+ #include "nsIXULTemplateResult.h"
+ #include "nsIXULTemplateQueryProcessor.h"
+ #include "nsIXULSortService.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ enum nsSortState_direction {
+   nsSortState_descending,
+@@ -90,6 +91,15 @@ struct nsSortState
+   nsSortState()
+     : initialized(PR_FALSE)
+   {
++  }
++  void Traverse(nsCycleCollectionTraversalCallback &cb) const
++  {
++    if (processor) {
++      cb.NoteXPCOMChild(processor);
++    }
++    if (lastContainer) {
++      cb.NoteXPCOMChild(lastContainer);
++    }
+   }
+ };
+ 
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateBuilder.cpp
+--- a/content/xul/templates/src/nsXULTemplateBuilder.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateBuilder.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -230,9 +230,57 @@ nsXULTemplateBuilder::Uninit(PRBool aIsF
+     mQueriesCompiled = PR_FALSE;
+ }
+ 
+-
+-NS_IMPL_ADDREF(nsXULTemplateBuilder)
+-NS_IMPL_RELEASE(nsXULTemplateBuilder)
++static PLDHashOperator
++TraverseMatchList(nsISupports* aKey, nsTemplateMatch* aMatch, void* aContext)
++{
++    nsCycleCollectionTraversalCallback *cb =
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aContext);
++
++    cb->NoteXPCOMChild(aKey);
++    nsTemplateMatch* match = aMatch;
++    while (match) {
++        nsISupports *container = match->GetContainer();
++        if (container)
++            cb->NoteXPCOMChild(container);
++        nsISupports *result = match->mResult;
++        if (result)
++            cb->NoteXPCOMChild(result);
++        match = match->mNext;
++    }
++
++    return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULTemplateBuilder)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULTemplateBuilder)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULTemplateBuilder)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mRoot)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mRootResult)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mListeners)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mQueryProcessor)
++    if (tmp->mMatchMap.IsInitialized())
++        tmp->mMatchMap.EnumerateRead(TraverseMatchList, &cb);
++    {
++      PRUint32 i, count = tmp->mQuerySets.Length();
++      for (i = 0; i < count; ++i) {
++        nsTemplateQuerySet *set = tmp->mQuerySets[i];
++        cb.NoteXPCOMChild(set->mQueryNode);
++        if (set->mCompiledQuery) {
++          cb.NoteXPCOMChild(set->mCompiledQuery);
++        }
++        PRUint16 j, rulesCount = set->RuleCount();
++        for (j = 0; j < rulesCount; ++j) {
++          set->GetRuleAt(j)->Traverse(cb);
++        }
++      }
++    }
++    tmp->Traverse(cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXULTemplateBuilder,
++                                          nsIXULTemplateBuilder)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXULTemplateBuilder,
++                                           nsIXULTemplateBuilder)
+ 
+ NS_INTERFACE_MAP_BEGIN(nsXULTemplateBuilder)
+   NS_INTERFACE_MAP_ENTRY(nsIXULTemplateBuilder)
+@@ -240,6 +288,7 @@ NS_INTERFACE_MAP_BEGIN(nsXULTemplateBuil
+   NS_INTERFACE_MAP_ENTRY(nsIMutationObserver)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIXULTemplateBuilder)
+   NS_INTERFACE_MAP_ENTRY_DOM_CLASSINFO(XULTemplateBuilder)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULTemplateBuilder)
+ NS_INTERFACE_MAP_END
+ 
+ //----------------------------------------------------------------------
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateBuilder.h
+--- a/content/xul/templates/src/nsXULTemplateBuilder.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateBuilder.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -62,6 +62,7 @@
+ #include "nsTemplateRule.h"
+ #include "nsTemplateMatch.h"
+ #include "nsIXULTemplateQueryProcessor.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ #include "prlog.h"
+ #ifdef PR_LOGGING
+@@ -91,7 +92,9 @@ public:
+     virtual void Uninit(PRBool aIsFinal);
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXULTemplateBuilder,
++                                             nsIXULTemplateBuilder)
+ 
+     // nsIXULTemplateBuilder interface
+     NS_DECL_NSIXULTEMPLATEBUILDER
+@@ -463,6 +466,10 @@ protected:
+      */
+     virtual nsresult
+     SynchronizeResult(nsIXULTemplateResult* aResult) = 0;
++
++    virtual void Traverse(nsCycleCollectionTraversalCallback &cb) const
++    {
++    }
+ };
+ 
+ #endif // nsXULTemplateBuilder_h__
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp
+--- a/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -82,9 +82,78 @@ nsIRDFResource*           nsXULTemplateQ
+ nsIRDFResource*           nsXULTemplateQueryProcessorRDF::kNC_BookmarkSeparator;
+ nsIRDFResource*           nsXULTemplateQueryProcessorRDF::kRDF_type;
+ 
+-NS_IMPL_ISUPPORTS2(nsXULTemplateQueryProcessorRDF,
+-                   nsIXULTemplateQueryProcessor,
+-                   nsIRDFObserver)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULTemplateQueryProcessorRDF)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULTemplateQueryProcessorRDF)
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++BindingDependenciesTraverser(nsISupports* key,
++                             nsCOMArray<nsXULTemplateResultRDF>* array,
++                             void* userArg)
++{
++    nsCycleCollectionTraversalCallback *cb = 
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++
++    PRInt32 i, count = array->Count();
++    for (i = 0; i < count; ++i) {
++        cb->NoteXPCOMChild(array->ObjectAt(i));
++    }
++
++    return PL_DHASH_NEXT;
++}
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++MemoryElementTraverser(const PRUint32& key,
++                       nsCOMArray<nsXULTemplateResultRDF>* array,
++                       void* userArg)
++{
++    nsCycleCollectionTraversalCallback *cb = 
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++
++    PRInt32 i, count = array->Count();
++    for (i = 0; i < count; ++i) {
++        cb->NoteXPCOMChild(array->ObjectAt(i));
++    }
++
++    return PL_DHASH_NEXT;
++}
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++RuleToBindingTraverser(nsISupports* key, RDFBindingSet* binding, void* userArg)
++{
++    nsCycleCollectionTraversalCallback *cb = 
++        NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, userArg);
++
++    cb->NoteXPCOMChild(key);
++
++    return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULTemplateQueryProcessorRDF)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mLastRef)
++    if (tmp->mBindingDependencies.IsInitialized()) {
++        tmp->mBindingDependencies.EnumerateRead(BindingDependenciesTraverser,
++                                                &cb);
++    }
++    if (tmp->mMemoryElementToResultMap.IsInitialized()) {
++        tmp->mMemoryElementToResultMap.EnumerateRead(MemoryElementTraverser,
++                                                     &cb);
++    }
++    if (tmp->mRuleToBindingsMap.IsInitialized()) {
++        tmp->mRuleToBindingsMap.EnumerateRead(RuleToBindingTraverser, &cb);
++    }
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mQueries)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsXULTemplateQueryProcessorRDF,
++                                          nsIXULTemplateQueryProcessor)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsXULTemplateQueryProcessorRDF,
++                                           nsIXULTemplateQueryProcessor)
++NS_INTERFACE_MAP_BEGIN(nsXULTemplateQueryProcessorRDF)
++    NS_INTERFACE_MAP_ENTRY(nsIXULTemplateQueryProcessor)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFObserver)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIXULTemplateQueryProcessor)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULTemplateQueryProcessorRDF)
++NS_INTERFACE_MAP_END
+ 
+ nsXULTemplateQueryProcessorRDF::nsXULTemplateQueryProcessorRDF(void)
+     : mDB(nsnull),
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateQueryProcessorRDF.h
+--- a/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -67,6 +67,7 @@
+ #include "nsString.h"
+ #include "nsClassHashtable.h"
+ #include "nsRefPtrHashtable.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ #include "prlog.h"
+ #ifdef PR_LOGGING
+@@ -91,7 +92,9 @@ public:
+     nsresult InitGlobals();
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXULTemplateQueryProcessorRDF,
++                                             nsIXULTemplateQueryProcessor)
+ 
+     // nsIXULTemplateQueryProcessor interface
+     NS_DECL_NSIXULTEMPLATEQUERYPROCESSOR
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateResultRDF.cpp
+--- a/content/xul/templates/src/nsXULTemplateResultRDF.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateResultRDF.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -40,7 +40,22 @@
+ // XXXndeakin for some reason, making this class have classinfo breaks trees.
+ //#include "nsIDOMClassInfo.h"
+ 
+-NS_IMPL_ISUPPORTS1(nsXULTemplateResultRDF, nsIXULTemplateResult)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULTemplateResultRDF)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXULTemplateResultRDF)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mQuery)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULTemplateResultRDF)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mQuery)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_INTERFACE_MAP_BEGIN(nsXULTemplateResultRDF)
++  NS_INTERFACE_MAP_ENTRY(nsIXULTemplateResult)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsXULTemplateResultRDF)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsXULTemplateResultRDF)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsXULTemplateResultRDF)
+ 
+ nsXULTemplateResultRDF::nsXULTemplateResultRDF(nsIRDFResource* aNode)
+     : mQuery(nsnull),
+diff -r c632a98e5834 content/xul/templates/src/nsXULTemplateResultRDF.h
+--- a/content/xul/templates/src/nsXULTemplateResultRDF.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTemplateResultRDF.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -51,7 +51,8 @@ class nsXULTemplateResultRDF : public ns
+ class nsXULTemplateResultRDF : public nsIXULTemplateResult
+ {
+ public:
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS(nsXULTemplateResultRDF)
+ 
+     NS_DECL_NSIXULTEMPLATERESULT
+ 
+diff -r c632a98e5834 content/xul/templates/src/nsXULTreeBuilder.cpp
+--- a/content/xul/templates/src/nsXULTreeBuilder.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/content/xul/templates/src/nsXULTreeBuilder.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -295,13 +295,12 @@ NS_NewXULTreeBuilder(nsISupports* aOuter
+     return rv;
+ }
+ 
+-NS_IMPL_ADDREF(nsXULTreeBuilder)
+-NS_IMPL_RELEASE(nsXULTreeBuilder)
++NS_IMPL_ADDREF_INHERITED(nsXULTreeBuilder, nsXULTemplateBuilder)
++NS_IMPL_RELEASE_INHERITED(nsXULTreeBuilder, nsXULTemplateBuilder)
+ 
+ NS_INTERFACE_MAP_BEGIN(nsXULTreeBuilder)
+   NS_INTERFACE_MAP_ENTRY(nsIXULTreeBuilder)
+   NS_INTERFACE_MAP_ENTRY(nsITreeView)
+-  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIXULTreeBuilder)
+   NS_INTERFACE_MAP_ENTRY_DOM_CLASSINFO(XULTreeBuilder)
+ NS_INTERFACE_MAP_END_INHERITING(nsXULTemplateBuilder)
+ 
+diff -r c632a98e5834 dom/public/nsDOMScriptObjectHolder.h
+--- a/dom/public/nsDOMScriptObjectHolder.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/public/nsDOMScriptObjectHolder.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -41,6 +41,7 @@
+ 
+ #include "nsIScriptRuntime.h"
+ #include "nsIDOMScriptObjectFactory.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIScriptContext;
+ 
+@@ -213,6 +214,20 @@ public:
+     NS_ASSERTION(ctx, "How did I lose my pointer?");
+     return ctx->GetScriptTypeID();
+   }
++  void traverse(nsCycleCollectionTraversalCallback &cb)
++  {
++    if (mObject) {
++      if (mContextOrLangID & SOH_HAS_LANGID_BIT) {
++        cb.NoteScriptChild(getScriptTypeIDFromBits(), mObject);
++      } else {
++        nsIScriptContext *ctx = NS_REINTERPRET_CAST(nsIScriptContext *,
++                                                    mContextOrLangID);
++        cb.NoteXPCOMChild(ctx);
++        cb.NoteScriptChild(ctx->GetScriptTypeID(), mObject);
++      }
++    }
++  }
++
+ protected:
+   PRUint32 getScriptTypeIDFromBits() const {
+     NS_ASSERTION(mContextOrLangID & SOH_HAS_LANGID_BIT, "Not in the bits!");
+diff -r c632a98e5834 dom/src/base/nsFocusController.cpp
+--- a/dom/src/base/nsFocusController.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsFocusController.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -85,8 +85,30 @@ nsFocusController::~nsFocusController(vo
+ {
+ }
+ 
+-NS_IMPL_ISUPPORTS4(nsFocusController, nsIFocusController, nsIDOMFocusListener,
+-                   nsIDOMEventListener, nsSupportsWeakReference)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsFocusController)
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsFocusController, nsIFocusController)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsFocusController,
++                                           nsIFocusController)
++
++NS_INTERFACE_MAP_BEGIN(nsFocusController)
++  NS_INTERFACE_MAP_ENTRY(nsIFocusController)
++  NS_INTERFACE_MAP_ENTRY(nsIDOMFocusListener)
++  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
++  NS_INTERFACE_MAP_ENTRY(nsSupportsWeakReference)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIFocusController)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsFocusController)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsFocusController)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsFocusController)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mCurrentElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPreviousElement)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mCurrentWindow)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPreviousWindow)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPopupNode)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPopupEvent)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMETHODIMP
+ nsFocusController::Create(nsIFocusController** aResult)
+diff -r c632a98e5834 dom/src/base/nsFocusController.h
+--- a/dom/src/base/nsFocusController.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsFocusController.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -47,6 +47,7 @@
+ #include "nsIDOMElement.h"
+ #include "nsIDOMWindow.h"
+ #include "nsWeakReference.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIDOMElement;
+ class nsIDOMWindow;
+@@ -66,7 +67,7 @@ protected:
+   virtual ~nsFocusController(void);
+ 
+ public:
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+   NS_IMETHOD GetFocusedElement(nsIDOMElement** aResult);
+   NS_IMETHOD SetFocusedElement(nsIDOMElement* aElement);
+@@ -103,6 +104,9 @@ public:
+   // nsIDOMEventListener
+   NS_IMETHOD HandleEvent(nsIDOMEvent* anEvent) { return NS_OK; };
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsFocusController,
++                                           nsIFocusController)
++
+ protected:
+   void UpdateCommands();
+   void UpdateWWActiveWindow();
+diff -r c632a98e5834 dom/src/base/nsGlobalWindow.cpp
+--- a/dom/src/base/nsGlobalWindow.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsGlobalWindow.cpp	Thu Mar 01 17:16:30 2007 -0800
+@@ -716,12 +716,7 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsGlobalWindow)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mContext)
+ 
+-  // Strange bug: If you uncomment this line you will find that
+-  // the cycle collector crashes when working with multiple open
+-  // top-level windows. It is as though the windows somehow
+-  // race with one another. How can this be? Curious.
+-  //
+-  // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mOpener)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mOpener)
+ 
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mControllers)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mArguments)
+@@ -753,20 +748,9 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+     }
+   }
+ 
+-  // Traverse our possibly-inner window.
+-  if (tmp->IsOuterWindow()
+-      && tmp->GetCurrentInnerWindowInternal()) {    
+-    cb.NoteXPCOMChild(NS_STATIC_CAST(nsIScriptGlobalObject*, 
+-                                     tmp->GetCurrentInnerWindowInternal()));
+-  }
+-
+-  // FIXME: somewhere in these commented lines lies a bug that causes
+-  // a segfault. So we have disabled them, even though it seems wrong
+-  // to do so. Other matters are more pressing at the moment.
+-
+   // Traverse stuff from nsPIDOMWindow
+-  // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mChromeEventHandler)
+-  // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDocument)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mChromeEventHandler)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDocument)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsGlobalWindow)
+@@ -7578,10 +7562,17 @@ nsGlobalWindow::SetScriptTypeID(PRUint32
+     return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsGlobalChromeWindow)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(nsGlobalChromeWindow,
++                                                  nsGlobalWindow)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mBrowserDOMWindow)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ // QueryInterface implementation for nsGlobalChromeWindow
+ NS_INTERFACE_MAP_BEGIN(nsGlobalChromeWindow)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMChromeWindow)
+   NS_DOM_INTERFACE_MAP_ENTRY_CLASSINFO(ChromeWindow)
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION(nsGlobalChromeWindow)
+ NS_INTERFACE_MAP_END_INHERITING(nsGlobalWindow)
+ 
+ NS_IMPL_ADDREF_INHERITED(nsGlobalChromeWindow, nsGlobalWindow)
+diff -r c632a98e5834 dom/src/base/nsGlobalWindow.h
+--- a/dom/src/base/nsGlobalWindow.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsGlobalWindow.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -713,6 +713,9 @@ public:
+   {
+   }
+ 
++  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(nsGlobalChromeWindow,
++                                                     nsGlobalWindow)
++
+ protected:
+   nsCOMPtr<nsIBrowserDOMWindow> mBrowserDOMWindow;
+ };
+diff -r c632a98e5834 dom/src/base/nsJSEnvironment.cpp
+--- a/dom/src/base/nsJSEnvironment.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsJSEnvironment.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -1012,16 +1012,28 @@ nsJSContext::~nsJSContext()
+ }
+ 
+ // QueryInterface implementation for nsJSContext
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsJSContext)
++// XXX Should we call ClearScope here?
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsJSContext)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsJSContext)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mGlobalWrapperRef)
++  JSObject *globalObject = ::JS_GetGlobalObject(tmp->mContext);
++  if (globalObject) {
++    cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, globalObject);
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_INTERFACE_MAP_BEGIN(nsJSContext)
+   NS_INTERFACE_MAP_ENTRY(nsIScriptContext)
+   NS_INTERFACE_MAP_ENTRY(nsIXPCScriptNotify)
+   NS_INTERFACE_MAP_ENTRY(nsITimerCallback)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIScriptContext)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsJSContext)
+ NS_INTERFACE_MAP_END
+ 
+ 
+-NS_IMPL_ADDREF(nsJSContext)
+-NS_IMPL_RELEASE(nsJSContext)
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsJSContext, nsIScriptContext)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsJSContext, nsIScriptContext)
+ 
+ nsresult
+ nsJSContext::EvaluateStringWithValue(const nsAString& aScript,
+@@ -3631,13 +3643,17 @@ public:
+   nsJSArgArray(JSContext *aContext, PRUint32 argc, jsval *argv, nsresult *prv);
+   ~nsJSArgArray();
+   // nsISupports
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsJSArgArray, nsIJSArgArray)
+ 
+   // nsIArray
+   NS_DECL_NSIARRAY
+ 
+   // nsIJSArgArray
+   nsresult GetArgs(PRUint32 *argc, void **argv);
++
++  void ReleaseJSObjects();
++
+ protected:
+   JSContext *mContext;
+   jsval *mArgv;
+@@ -3670,6 +3686,12 @@ nsJSArgArray::nsJSArgArray(JSContext *aC
+ 
+ nsJSArgArray::~nsJSArgArray()
+ {
++  ReleaseJSObjects();
++}
++
++void
++nsJSArgArray::ReleaseJSObjects()
++{
+   if (mArgv) {
+     NS_ASSERTION(nsJSRuntime::sRuntime, "Where's the runtime gone?");
+     if (nsJSRuntime::sRuntime) {
+@@ -3679,17 +3701,37 @@ nsJSArgArray::~nsJSArgArray()
+     }
+     PR_DELETE(mArgv);
+   }
++  mArgc = 0;
+ }
+ 
+ // QueryInterface implementation for nsJSArgArray
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsJSArgArray)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsJSArgArray)
++  tmp->ReleaseJSObjects();
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsJSArgArray)
++  {
++    jsval *argv = tmp->mArgv;
++    if (argv) {
++      jsval *end;
++      for (end = argv + tmp->mArgc; argv < end; ++argv) {
++        if (JSVAL_IS_OBJECT(*argv))
++          cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT,
++                             JSVAL_TO_OBJECT(*argv));
++      }
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_INTERFACE_MAP_BEGIN(nsJSArgArray)
+   NS_INTERFACE_MAP_ENTRY(nsIArray)
+   NS_INTERFACE_MAP_ENTRY(nsIJSArgArray)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIJSArgArray)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsJSArgArray)
+ NS_INTERFACE_MAP_END
+ 
+-NS_IMPL_ADDREF(nsJSArgArray)
+-NS_IMPL_RELEASE(nsJSArgArray)
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsJSArgArray, nsIJSArgArray)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsJSArgArray, nsIJSArgArray)
+ 
+ nsresult
+ nsJSArgArray::GetArgs(PRUint32 *argc, void **argv)
+diff -r c632a98e5834 dom/src/base/nsJSEnvironment.h
+--- a/dom/src/base/nsJSEnvironment.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsJSEnvironment.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -45,6 +45,7 @@
+ #include "nsIXPCScriptNotify.h"
+ #include "nsITimer.h"
+ #include "prtime.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIXPConnectJSObjectHolder;
+ 
+@@ -56,7 +57,8 @@ public:
+   nsJSContext(JSRuntime *aRuntime);
+   virtual ~nsJSContext();
+ 
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsJSContext, nsIScriptContext)
+ 
+   virtual PRUint32 GetScriptTypeID()
+     { return nsIProgrammingLanguage::JAVASCRIPT; }
+diff -r c632a98e5834 dom/src/base/nsJSTimeoutHandler.cpp
+--- a/dom/src/base/nsJSTimeoutHandler.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/base/nsJSTimeoutHandler.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -58,7 +58,8 @@ class nsJSScriptTimeoutHandler: public n
+ {
+ public:
+   // nsISupports
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS(nsJSScriptTimeoutHandler)
+ 
+   nsJSScriptTimeoutHandler();
+   ~nsJSScriptTimeoutHandler();
+@@ -88,6 +89,9 @@ public:
+ 
+   nsresult Init(nsIScriptContext *aContext, PRBool aIsInterval,
+                 PRInt32 *aInterval);
++
++  void ReleaseJSObjects();
++
+ private:
+ 
+   nsCOMPtr<nsIScriptContext> mContext;
+@@ -107,13 +111,25 @@ private:
+ 
+ // nsJSScriptTimeoutHandler
+ // QueryInterface implementation for nsJSScriptTimeoutHandler
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsJSScriptTimeoutHandler)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsJSScriptTimeoutHandler)
++  tmp->ReleaseJSObjects();
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsJSScriptTimeoutHandler)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mContext)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mArgv)
++  if (tmp->mFunObj)
++    cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, tmp->mFunObj);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
+ NS_INTERFACE_MAP_BEGIN(nsJSScriptTimeoutHandler)
+   NS_INTERFACE_MAP_ENTRY(nsIScriptTimeoutHandler)
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsJSScriptTimeoutHandler)
+ NS_INTERFACE_MAP_END
+ 
+-NS_IMPL_ADDREF(nsJSScriptTimeoutHandler)
+-NS_IMPL_RELEASE(nsJSScriptTimeoutHandler)
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsJSScriptTimeoutHandler)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsJSScriptTimeoutHandler)
+ 
+ nsJSScriptTimeoutHandler::nsJSScriptTimeoutHandler() :
+   mLineNo(0),
+@@ -125,14 +141,21 @@ nsJSScriptTimeoutHandler::nsJSScriptTime
+ 
+ nsJSScriptTimeoutHandler::~nsJSScriptTimeoutHandler()
+ {
++  ReleaseJSObjects();
++}
++
++void
++nsJSScriptTimeoutHandler::ReleaseJSObjects()
++{
+   if (mExpr || mFunObj) {
+-    nsIScriptContext *scx = mContext;
++    nsCOMPtr<nsIScriptContext> scx = mContext;
+     JSRuntime *rt = nsnull;
+ 
+     if (scx) {
+       JSContext *cx;
+       cx = (JSContext *)scx->GetNativeContext();
+       rt = ::JS_GetRuntime(cx);
++      mContext = nsnull;
+     } else {
+       // XXX The timeout *must* be unrooted, even if !scx. This can be
+       // done without a JS context using the JSRuntime. This is safe
+@@ -152,7 +175,7 @@ nsJSScriptTimeoutHandler::~nsJSScriptTim
+ 
+       if (rtsvc) {
+         rtsvc->GetRuntime(&rt);
+-        }
++      }
+     }
+ 
+     if (!rt) {
+@@ -165,8 +188,10 @@ nsJSScriptTimeoutHandler::~nsJSScriptTim
+ 
+     if (mExpr) {
+       ::JS_RemoveRootRT(rt, &mExpr);
++      mExpr = nsnull;
+     } else if (mFunObj) {
+       ::JS_RemoveRootRT(rt, &mFunObj);
++      mFunObj = nsnull;
+     } else {
+       NS_WARNING("No func and no expr - roots may not have been removed");
+     }
+diff -r c632a98e5834 dom/src/events/nsJSEventListener.cpp
+--- a/dom/src/events/nsJSEventListener.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/dom/src/events/nsJSEventListener.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -87,7 +87,15 @@ nsJSEventListener::~nsJSEventListener()
+   mContext->DropScriptObject(mScopeObject);
+ }
+ 
+-NS_IMPL_CYCLE_COLLECTION_1(nsJSEventListener, mTarget)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsJSEventListener)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsJSEventListener)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mTarget)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsJSEventListener)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mTarget)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mContext)
++  cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, tmp->mScopeObject);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_INTERFACE_MAP_BEGIN(nsJSEventListener)
+   NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+diff -r c632a98e5834 embedding/components/commandhandler/src/nsCommandManager.cpp
+--- a/embedding/components/commandhandler/src/nsCommandManager.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/embedding/components/commandhandler/src/nsCommandManager.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -70,7 +70,42 @@ nsCommandManager::~nsCommandManager()
+ }
+ 
+ 
+-NS_IMPL_ISUPPORTS3(nsCommandManager, nsICommandManager, nsPICommandUpdater, nsISupportsWeakReference)
++PR_STATIC_CALLBACK(PRBool)
++TraverseCommandObservers(nsHashKey *aKey, void *aData, void* aClosure)
++{
++  nsISupportsArray *observers = NS_STATIC_CAST(nsISupportsArray*, aData);
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++
++  PRUint32 i, numItems;
++  nsresult rv = observers->Count(&numItems);
++  NS_ENSURE_SUCCESS(rv, kHashEnumerateStop);
++  
++  for (i = 0; i < numItems; ++i) {
++    cb->NoteXPCOMChild(observers->ElementAt(i));
++  }
++
++  return kHashEnumerateNext;
++}
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsCommandManager)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsCommandManager)
++  tmp->mCommandObserversTable.Reset();
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsCommandManager)
++  tmp->mCommandObserversTable.Enumerate(TraverseCommandObservers, &cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsCommandManager, nsICommandManager)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsCommandManager, nsICommandManager)
++
++NS_INTERFACE_MAP_BEGIN(nsCommandManager)
++   NS_INTERFACE_MAP_ENTRY(nsICommandManager)
++   NS_INTERFACE_MAP_ENTRY(nsPICommandUpdater)
++   NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
++   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsICommandManager)
++   NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsCommandManager)
++NS_INTERFACE_MAP_END
+ 
+ #if 0
+ #pragma mark -
+diff -r c632a98e5834 embedding/components/commandhandler/src/nsCommandManager.h
+--- a/embedding/components/commandhandler/src/nsCommandManager.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/embedding/components/commandhandler/src/nsCommandManager.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -46,6 +46,7 @@
+ 
+ #include "nsICommandManager.h"
+ #include "nsPICommandUpdater.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIController;
+ 
+@@ -62,7 +63,8 @@ public:
+   virtual               ~nsCommandManager();
+ 
+   // nsISupports
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsCommandManager, nsICommandManager)
+   
+   // nsICommandManager
+   NS_DECL_NSICOMMANDMANAGER
+diff -r c632a98e5834 xpcom/base/nsCycleCollectionParticipant.cpp
+--- a/xpcom/base/nsCycleCollectionParticipant.cpp	Thu Mar 01 17:13:38 2007 -0800
++++ b/xpcom/base/nsCycleCollectionParticipant.cpp	Thu Mar 01 17:16:00 2007 -0800
+@@ -54,18 +54,6 @@ NS_IMETHODIMP_(nsrefcnt) nsCycleCollecti
+   return 1;
+ }
+ 
+-NS_IMETHODIMP nsCycleCollectionParticipant::Unlink(nsISupports *n)
+-{
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP 
+-nsCycleCollectionParticipant::Traverse(nsISupports *n, 
+-                                       nsCycleCollectionTraversalCallback &cb)
+-{
+-  return NS_OK;
+-}
+-
+ #ifdef DEBUG
+ PRBool
+ nsCycleCollectionParticipant::CheckForRightISupports(nsISupports *s)
+diff -r c632a98e5834 xpcom/base/nsCycleCollectionParticipant.h
+--- a/xpcom/base/nsCycleCollectionParticipant.h	Thu Mar 01 17:13:38 2007 -0800
++++ b/xpcom/base/nsCycleCollectionParticipant.h	Thu Mar 01 17:16:00 2007 -0800
+@@ -97,9 +97,9 @@ public:
+     NS_DECLARE_STATIC_IID_ACCESSOR(NS_CYCLECOLLECTIONPARTICIPANT_IID)
+     NS_DECL_ISUPPORTS
+ 
+-    NS_IMETHOD Unlink(nsISupports *p);
++    NS_IMETHOD Unlink(nsISupports *p) = 0;
+     NS_IMETHOD Traverse(nsISupports *p, 
+-                        nsCycleCollectionTraversalCallback &cb);
++                        nsCycleCollectionTraversalCallback &cb) = 0;
+ 
+ #ifdef DEBUG
+     NS_EXTERNAL_VIS_(PRBool) CheckForRightISupports(nsISupports *s);
+@@ -159,6 +159,15 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+                  "not the nsISupports pointer we expect");                     \
+     _class *tmp = Downcast(s);
+ 
++#define NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(_class, _base_class)   \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(nsISupports *s)                \
++  {                                                                            \
++    NS_ASSERTION(CheckForRightISupports(s),                                    \
++                 "not the nsISupports pointer we expect");                     \
++    _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                        \
++    NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Unlink(s);
++
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(_field)                       \
+     tmp->_field = NULL;    
+ 
+@@ -197,11 +206,28 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+     _class *tmp = Downcast(s);                                                 \
+     NS_IMPL_CYCLE_COLLECTION_DESCRIBE(_class)
+ 
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(_class, _base_class) \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                              \
++                         (nsISupports *s,                                      \
++                          nsCycleCollectionTraversalCallback &cb)              \
++  {                                                                            \
++    NS_ASSERTION(CheckForRightISupports(s),                                    \
++                 "not the nsISupports pointer we expect");                     \
++    _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                        \
++    NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Traverse(s, cb);
++
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(_field)                       \
+     if (tmp->_field) { cb.NoteXPCOMChild(tmp->_field); }
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(_field)                     \
+     if (tmp->_field) { cb.NoteXPCOMChild(tmp->_field.get()); }
++
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(_field, _base)    \
++  {                                                                            \
++    nsISupports *f = NS_ISUPPORTS_CAST(_base*, tmp->_field);                   \
++    if (f) { cb.NoteXPCOMChild(f); }                                           \
++  }
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(_field)                   \
+     {                                                                          \
+@@ -240,14 +266,25 @@ public:                                 
+ #define NS_DECL_CYCLE_COLLECTION_CLASS(_class)                                 \
+   NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(_class, _class)
+ 
++#define NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED_NO_UNLINK(_class,             \
++                                                           _base_class)        \
++class NS_CYCLE_COLLECTION_INNERCLASS                                           \
++ : public NS_CYCLE_COLLECTION_CLASSNAME(_base_class)                           \
++{                                                                              \
++public:                                                                        \
++  NS_IMETHOD Traverse(nsISupports *n,                                          \
++                      nsCycleCollectionTraversalCallback &cb);                 \
++  static _class* Downcast(nsISupports* s)                                      \
++  {                                                                            \
++    return NS_STATIC_CAST(_class*, NS_STATIC_CAST(_base_class*,                \
++      NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Downcast(s)));               \
++  }                                                                            \
++};
++
+ #define NS_IMPL_CYCLE_COLLECTION_CLASS(_class)                                 \
+   static NS_CYCLE_COLLECTION_CLASSNAME(_class)                                 \
+     NS_CYCLE_COLLECTION_NAME(_class);
+ 
+-// The *_AMBIGUOUS macros are needed when a cast from _class* to
+-// nsISupports* is ambiguous.  The _base parameter must match the base
+-// class used to implement QueryInterface to nsISupports.
+-
+ #define NS_IMPL_CYCLE_COLLECTION_0(_class)                                     \
+  NS_IMPL_CYCLE_COLLECTION_CLASS(_class)                                        \
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)                                 \
