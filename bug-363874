@@ -1,0 +1,372 @@
+Redesign handling of specified widths on table cells to fix handling of specified widths on column-spanning cells:  accumulate specified widths as numbers rather than booleans, so we maintain three widths, min, spec, and pref.  b=363874
+
+diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTableLayoutStrategy.cpp
+--- a/layout/tables/BasicTableLayoutStrategy.cpp
++++ b/layout/tables/BasicTableLayoutStrategy.cpp
+@@ -84,17 +84,17 @@ BasicTableLayoutStrategy::GetPrefWidth(n
+ }
+ 
+ struct CellWidthInfo {
+-    CellWidthInfo(nscoord aMinCoord, nscoord aPrefCoord,
+-                  float aPrefPercent, PRBool aHasSpecifiedWidth)
+-        : hasSpecifiedWidth(aHasSpecifiedWidth)
++    CellWidthInfo(nscoord aMinCoord, nscoord aSpecCoord, nscoord aPrefCoord,
++                  float aPrefPercent)
+         , minCoord(aMinCoord)
++        , specCoord(aSpecCoord)
+         , prefCoord(aPrefCoord)
+         , prefPercent(aPrefPercent)
+     {
+     }
+ 
+-    PRBool hasSpecifiedWidth;
+     nscoord minCoord;
++    nscoord specCoord;
+     nscoord prefCoord;
+     float prefPercent;
+ };
+@@ -115,12 +115,11 @@ GetWidthInfo(nsIRenderingContext *aRende
+         prefCoord = 0;
+     }
+     float prefPercent = 0.0f;
+-    PRBool hasSpecifiedWidth = PR_FALSE;
++    nscoord specCoord = NO_SPECIFIED_COORD;
+ 
+     switch (aStylePos->mWidth.GetUnit()) {
+         case eStyleUnit_Coord: {
+-                hasSpecifiedWidth = PR_TRUE;
+-                nscoord w = aStylePos->mWidth.GetCoordValue();
++                specCoord = aStylePos->mWidth.GetCoordValue();
+                 // Quirk: A cell with "nowrap" set and a coord value for the
+                 // width which is bigger than the intrinsic minimum width uses
+                 // that coord value as the minimum width.
+@@ -129,9 +128,8 @@ GetWidthInfo(nsIRenderingContext *aRende
+                       eCompatibility_NavQuirks &&
+                     aCellFrame->GetContent()->HasAttr(kNameSpaceID_None,
+                                                       nsGkAtoms::nowrap)) {
+-                    minCoord = w;
+-                }
+-                prefCoord = PR_MAX(w, minCoord);
++                    minCoord = specCoord;
++                }
+             }
+             break;
+         case eStyleUnit_Percent: {
+@@ -146,10 +144,11 @@ GetWidthInfo(nsIRenderingContext *aRende
+         // XXX To really implement 'max-width' well, we'd need to store
+         // it separately on the columns.
+         case eStyleUnit_Coord: {
+-                hasSpecifiedWidth = PR_TRUE;
+                 nscoord w = aStylePos->mMaxWidth.GetCoordValue();
+                 if (w < minCoord)
+                     minCoord = w;
++                if (w < specCoord)
++                    specCoord = w;
+                 if (w < prefCoord)
+                     prefCoord = w;
+             }
+@@ -169,6 +168,8 @@ GetWidthInfo(nsIRenderingContext *aRende
+                 nscoord w = aStylePos->mMinWidth.GetCoordValue();
+                 if (w > minCoord)
+                     minCoord = w;
++                if (w > specCoord)
++                    specCoord = w;
+                 if (w > prefCoord)
+                     prefCoord = w;
+             }
+@@ -190,10 +191,11 @@ GetWidthInfo(nsIRenderingContext *aRende
+         // XXX Should we ignore percentage padding?
+         nscoord add = offsets.hPadding + offsets.hBorder;
+         minCoord += add;
++        specCoord += add;
+         prefCoord += add;
+     }
+ 
+-    return CellWidthInfo(minCoord, prefCoord, prefPercent, hasSpecifiedWidth);
++    return CellWidthInfo(minCoord, specCoord, prefCoord, prefPercent);
+ }
+ 
+ static inline CellWidthInfo
+@@ -245,8 +247,8 @@ BasicTableLayoutStrategy::ComputeColumnI
+ 
+         // Consider the widths on the column.
+         CellWidthInfo colInfo = GetColWidthInfo(aRenderingContext, colFrame);
+-        colFrame->AddMinCoord(colInfo.minCoord);
+-        colFrame->AddPrefCoord(colInfo.prefCoord, colInfo.hasSpecifiedWidth);
++        colFrame->AddCoords(colInfo.minCoord, colInfo.specCoord,
++                            colInfo.prefCoord);
+         colFrame->AddPrefPercent(colInfo.prefPercent);
+ 
+         // Consider the widths on the column-group.  Note that we follow
+@@ -257,8 +259,8 @@ BasicTableLayoutStrategy::ComputeColumnI
+                          nsGkAtoms::tableColGroupFrame,
+                      "expected a column-group");
+         colInfo = GetColWidthInfo(aRenderingContext, colFrame->GetParent());
+-        colFrame->AddMinCoord(colInfo.minCoord);
+-        colFrame->AddPrefCoord(colInfo.prefCoord, colInfo.hasSpecifiedWidth);
++        colFrame->AddCoords(colInfo.minCoord, colInfo.specCoord,
++                            colInfo.prefCoord);
+         colFrame->AddPrefPercent(colInfo.prefPercent);
+ 
+         // Consider the contents of and the widths on the cells without
+@@ -274,14 +276,14 @@ BasicTableLayoutStrategy::ComputeColumnI
+ 
+             CellWidthInfo info = GetCellWidthInfo(aRenderingContext, cellFrame);
+ 
+-            colFrame->AddMinCoord(info.minCoord);
+-            colFrame->AddPrefCoord(info.prefCoord, info.hasSpecifiedWidth);
++            colFrame->AddCoords(info.minCoord, info.specCoord,
++                                info.prefCoord);
+             colFrame->AddPrefPercent(info.prefPercent);
+         }
+ #ifdef DEBUG_dbaron_off
+-        printf("table %p col %d nonspan: min=%d pref=%d spec=%d pct=%f\n",
++        printf("table %p col %d nonspan: min=%d spec=%d pref=%d pct=%f\n",
+                mTableFrame, col, colFrame->GetMinCoord(),
+-               colFrame->GetPrefCoord(), colFrame->GetHasSpecifiedCoord(),
++               colFrame->GetSpecCoord(), colFrame->GetPrefCoord(),
+                colFrame->GetPrefPercent());
+ #endif
+     }
+@@ -494,32 +496,13 @@ BasicTableLayoutStrategy::ComputeColumnI
+                 continue;
+             }
+ 
+-            // Since PrefCoord is really a shorthand for two values (XXX
+-            // this isn't really a space savings since we have to store
+-            // mHasSpecifiedCoord; we should probably just store the values
+-            // since it's less confusing) and calling AddMinCoord can
+-            // influence the result of GetPrefCoord, save the value as it
+-            // was during the loop over spanning cells before messing with
+-            // anything.
+-            nscoord newPref =
+-                colFrame->GetPrefCoord() + colFrame->GetSpanPrefCoord();
+-            nscoord newMin =
+-                colFrame->GetMinCoord() + colFrame->GetSpanMinCoord();
+-            colFrame->AddMinCoord(newMin);
+-            colFrame->AddPrefCoord(PR_MAX(newPref, newMin),
+-                                   colFrame->GetHasSpecifiedCoord());
+-            NS_ASSERTION(colFrame->GetMinCoord() <= colFrame->GetPrefCoord(),
+-                         "min larger than pref");
+-            colFrame->AddPrefPercent(colFrame->GetSpanPrefPercent());
+-
+-            colFrame->ResetSpanMinCoord();
+-            colFrame->ResetSpanPrefCoord();
+-            colFrame->ResetSpanPrefPercent();
++            colFrame->AccumulateSpanIntrinsics();
++            colFrame->ResetSpanIntrinsics();
+ 
+ #ifdef DEBUG_dbaron_off
+-            printf("table %p col %d span %d: min=%d pref=%d spec=%d pct=%f\n",
++            printf("table %p col %d span %d: min=%d spec=%d pref=%d pct=%f\n",
+                    mTableFrame, col, colSpan, colFrame->GetMinCoord(),
+-                   colFrame->GetPrefCoord(), colFrame->GetHasSpecifiedCoord(),
++                   colFrame->GetSpecCoord(), colFrame->GetPrefCoord(),
+                    colFrame->GetPrefPercent());
+ #endif
+         }
+diff --git a/layout/tables/nsTableColFrame.cpp b/layout/tables/nsTableColFrame.cpp
+--- a/layout/tables/nsTableColFrame.cpp
++++ b/layout/tables/nsTableColFrame.cpp
+@@ -55,12 +55,8 @@ nsTableColFrame::nsTableColFrame(nsStyle
+ nsTableColFrame::nsTableColFrame(nsStyleContext* aContext) : nsFrame(aContext)
+ {
+   SetColType(eColContent);
+-  ResetMinCoord();
+-  ResetPrefCoord();
+-  ResetPrefPercent();
+-  ResetSpanMinCoord();
+-  ResetSpanPrefCoord();
+-  ResetSpanPrefPercent();
++  ResetIntrinsics();
++  ResetSpanIntrinsics();
+   ResetFinalWidth();
+ }
+ 
+diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
+--- a/layout/tables/nsTableColFrame.h
++++ b/layout/tables/nsTableColFrame.h
+@@ -41,6 +41,8 @@
+ #include "nsContainerFrame.h"
+ #include "nsTablePainter.h"
+ 
++#define NS_NO_SPECIFIED_WIDTH nscoord_MIN
++
+ class nsVoidArray;
+ class nsTableCellFrame;
+ 
+@@ -135,94 +137,94 @@ public:
+   void Dump(PRInt32 aIndent);
+ #endif
+ 
+-  // The largest min-width of the cells.
+-  void ResetMinCoord() {
++  /**
++   * Restore the default values of the intrinsic widths, so that we can
++   * re-accumulate intrinsic widths from the cells in the column.
++   */
++  void ResetIntrinsics() {
+     mMinCoord = 0;
+-  }
+-  void AddMinCoord(nscoord aMinCoord) {
++    mSpecCoord = NS_NO_SPECIFIED_WIDTH;
++    mPrefCoord = 0;
++    mPrefPercent = 0.0f;
++  }
++
++  /**
++   * Restore the default values of the temporary buffer for
++   * spanning-cell intrinsic widths (as we process spanning cells).
++   */
++  void ResetSpanIntrinsics() {
++    mSpanMinCoord = 0;
++    mSpanSpecCoord = NS_NO_SPECIFIED_WIDTH;
++    mSpanPrefCoord = 0;
++    mSpanPrefPercent = 0.0f;
++  }
++
++  void AddCoords(nscoord aMinCoord, nscoord aSpecCoord, nscoord aPrefCoord) {
++    NS_ASSERTION(aMinCoord <= aPrefCoord && aSpecCoord <= aPrefCoord,
++                 "intrinsic widths out of order");
++
++    // Accumulate
+     if (aMinCoord > mMinCoord)
+       mMinCoord = aMinCoord;
+-    // Needed in case mHasSpecifiedCoord is true.
+-    if (aMinCoord > mPrefCoord)
+-      mPrefCoord = aMinCoord;
+-  }
+-  nscoord GetMinCoord() {
+-    return mMinCoord;
+-  }
+-
+-  // The largest pref-width of the cells
+-  void ResetPrefCoord() {
+-    mPrefCoord = 0;
+-    mHasSpecifiedCoord = PR_FALSE;
+-  }
+-  void AddPrefCoord(nscoord aPrefCoord, PRBool aHasSpecifiedCoord) {
+-    if (aHasSpecifiedCoord) {
+-      if (!mHasSpecifiedCoord) {
+-        mPrefCoord = mMinCoord;
+-      }
+-      mHasSpecifiedCoord = PR_TRUE;
++    if (aSpecCoord > mSpecCoord)
++      mSpecCoord = aSpecCoord;
++    if (aPrefCoord > mPrefCoord)
++      mPrefCoord = aPrefCoord;
++
++    // Maintain invariants.
++    if (mSpecCoord != NS_NO_SPECIFIED_WIDTH &&
++        mSpecCoord < mMinCoord) {
++      mSpecCoord = mMinCoord;
+     }
+-    if (aPrefCoord > mPrefCoord &&
+-        (aHasSpecifiedCoord || !mHasSpecifiedCoord)) {
+-      mPrefCoord = aPrefCoord;
++    if (GetHasSpecifiedCoord()) {
++      mPrefCoord = PR_MAX(mMinCoord, mSpecCoord);
+     }
+-  }
+-  nscoord GetPrefCoord() {
+-    return mPrefCoord;
+-  }
+-
+-  // Whether to expand greater than pref width more conservatively
+-  // because the width was specified.
+-  PRBool GetHasSpecifiedCoord() {
+-    return mHasSpecifiedCoord;
++    NS_ASSERTION(mMinCoord <= mPrefCoord, "min larger than pref");
++    NS_ASSERTION(mSpecCoord <= mPrefCoord, "spec larger than pref");
++  }
++
++  nscoord GetMinCoord() const { return mMinCoord; }
++  nscoord GetSpecCoord() const { return mSpecCoord; }
++  nscoord GetPrefCoord() const { return mPrefCoord; }
++  PRBool GetHasSpecifiedCoord() const {
++    return mSpecCoord != NS_NO_SPECIFIED_WIDTH;
+   }
+ 
+   // The largest specified percentage width of the cells.
+-  void ResetPrefPercent() {
+-    mPrefPercent = 0.0f;
+-  }
+   void AddPrefPercent(float aPrefPercent) {
+     if (aPrefPercent > mPrefPercent)
+       mPrefPercent = aPrefPercent;
+   }
+-  float GetPrefPercent() {
++  float GetPrefPercent() const {
+     return mPrefPercent;
+   }
+ 
+-  // The largest min-width of the cells (for column-spanning cells).
+-  void ResetSpanMinCoord() {
+-    mSpanMinCoord = 0;
+-  }
+-  void AddSpanMinCoord(nscoord aSpanMinCoord) {
++  void AddSpanCoords(nscoord aMinCoord, nscoord aSpecCoord,
++                     nscoord aPrefCoord) {
++    NS_ASSERTION(aSpanMinCoord <= aSpanPrefCoord &&
++                 aSpanSpecCoord <= aSpanPrefCoord,
++                 "intrinsic widths out of order");
++
++    // Accumulate
+     if (aSpanMinCoord > mSpanMinCoord)
+       mSpanMinCoord = aSpanMinCoord;
+-  }
+-  nscoord GetSpanMinCoord() {
+-    return mSpanMinCoord;
+-  }
+-
+-  // The largest pref-width of the column-spanning cells.
+-  void ResetSpanPrefCoord() {
+-    mSpanPrefCoord = 0;
+-  }
+-  void AddSpanPrefCoord(nscoord aSpanPrefCoord) {
++    if (aSpanSpecCoord > mSpanSpecCoord)
++      mSpanSpecCoord = aSpanSpecCoord;
+     if (aSpanPrefCoord > mSpanPrefCoord)
+       mSpanPrefCoord = aSpanPrefCoord;
+   }
+-  nscoord GetSpanPrefCoord() {
+-    return mSpanPrefCoord;
+-  }
+ 
+   // The largest specified percentage width of the column-spanning cells.
+-  void ResetSpanPrefPercent() {
+-    mSpanPrefPercent = 0.0f;
+-  }
+   void AddSpanPrefPercent(float aSpanPrefPercent) {
+     if (aSpanPrefPercent > mSpanPrefPercent)
+       mSpanPrefPercent = aSpanPrefPercent;
+   }
+-  float GetSpanPrefPercent() {
+-    return mSpanPrefPercent;
++
++  void AcculumateSpanIntrinsics() {
++    AddCoords(mMinCoord  + mSpanMinCoord,
++              mSpecCoord + mSpanSpecCoord,
++              mPrefCoord + mSpanPrefCoord);
++    AddPrefPercent(mSpanPrefPercent);
+   }
+ 
+   // Used to adjust a column's pref percent so that the table's total
+@@ -263,14 +265,15 @@ protected:
+   BCPixelSize mRightContBorderWidth;
+   BCPixelSize mBottomContBorderWidth;
+ 
+-  PRPackedBool mHasSpecifiedCoord;
+   nscoord mMinCoord;
++  nscoord mSpecCoord;
+   nscoord mPrefCoord;
+   nscoord mSpanMinCoord; // XXX...
++  nscoord mSpanSpecCoord; // XXX...
+   nscoord mSpanPrefCoord; // XXX...
+   float mPrefPercent;
+   float mSpanPrefPercent; // XXX...
+-  // ...XXX the three members marked above could be allocated as part of
++  // ...XXX the four members marked above could be allocated as part of
+   // a separate array allocated only during
+   // BasicTableLayoutStrategy::ComputeColumnIntrinsicWidths (and only
+   // when colspans were present).
