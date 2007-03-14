@@ -10,9 +10,10 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
 -    CellWidthInfo(nscoord aMinCoord, nscoord aPrefCoord,
 -                  float aPrefPercent, PRBool aHasSpecifiedWidth)
 -        : hasSpecifiedWidth(aHasSpecifiedWidth)
+-        , minCoord(aMinCoord)
 +    CellWidthInfo(nscoord aMinCoord, nscoord aSpecCoord, nscoord aPrefCoord,
 +                  float aPrefPercent)
-         , minCoord(aMinCoord)
++        : minCoord(aMinCoord)
 +        , specCoord(aSpecCoord)
          , prefCoord(aPrefCoord)
          , prefPercent(aPrefPercent)
@@ -25,12 +26,12 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
      nscoord prefCoord;
      float prefPercent;
  };
-@@ -115,12 +115,11 @@ GetWidthInfo(nsIRenderingContext *aRende
+@@ -115,23 +115,21 @@ GetWidthInfo(nsIRenderingContext *aRende
          prefCoord = 0;
      }
      float prefPercent = 0.0f;
 -    PRBool hasSpecifiedWidth = PR_FALSE;
-+    nscoord specCoord = NO_SPECIFIED_COORD;
++    nscoord specCoord = NS_NO_SPECIFIED_WIDTH;
  
      switch (aStylePos->mWidth.GetUnit()) {
          case eStyleUnit_Coord: {
@@ -40,7 +41,9 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
                  // Quirk: A cell with "nowrap" set and a coord value for the
                  // width which is bigger than the intrinsic minimum width uses
                  // that coord value as the minimum width.
-@@ -129,9 +128,8 @@ GetWidthInfo(nsIRenderingContext *aRende
+-                if (aCellFrame && w > minCoord &&
++                if (aCellFrame && specCoord > minCoord &&
+                     aCellFrame->GetPresContext()->CompatibilityMode() ==
                        eCompatibility_NavQuirks &&
                      aCellFrame->GetContent()->HasAttr(kNameSpaceID_None,
                                                        nsGkAtoms::nowrap)) {
@@ -87,7 +90,18 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
  }
  
  static inline CellWidthInfo
-@@ -245,8 +247,8 @@ BasicTableLayoutStrategy::ComputeColumnI
+@@ -236,17 +238,13 @@ BasicTableLayoutStrategy::ComputeColumnI
+             NS_ERROR("column frames out of sync with cell map");
+             continue;
+         }
+-        colFrame->ResetMinCoord();
+-        colFrame->ResetPrefCoord();
+-        colFrame->ResetPrefPercent();
+-        colFrame->ResetSpanMinCoord();
+-        colFrame->ResetSpanPrefCoord();
+-        colFrame->ResetSpanPrefPercent();
++        colFrame->ResetIntrinsics();
++        colFrame->ResetSpanIntrinsics();
  
          // Consider the widths on the column.
          CellWidthInfo colInfo = GetColWidthInfo(aRenderingContext, colFrame);
@@ -98,7 +112,7 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
          colFrame->AddPrefPercent(colInfo.prefPercent);
  
          // Consider the widths on the column-group.  Note that we follow
-@@ -257,8 +259,8 @@ BasicTableLayoutStrategy::ComputeColumnI
+@@ -257,8 +255,8 @@ BasicTableLayoutStrategy::ComputeColumnI
                           nsGkAtoms::tableColGroupFrame,
                       "expected a column-group");
          colInfo = GetColWidthInfo(aRenderingContext, colFrame->GetParent());
@@ -109,7 +123,7 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
          colFrame->AddPrefPercent(colInfo.prefPercent);
  
          // Consider the contents of and the widths on the cells without
-@@ -274,14 +276,14 @@ BasicTableLayoutStrategy::ComputeColumnI
+@@ -274,14 +272,14 @@ BasicTableLayoutStrategy::ComputeColumnI
  
              CellWidthInfo info = GetCellWidthInfo(aRenderingContext, cellFrame);
  
@@ -128,7 +142,39 @@ diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTab
                 colFrame->GetPrefPercent());
  #endif
      }
-@@ -494,32 +496,13 @@ BasicTableLayoutStrategy::ComputeColumnI
+@@ -326,6 +324,12 @@ BasicTableLayoutStrategy::ComputeColumnI
+ 
+             CellWidthInfo info = GetCellWidthInfo(aRenderingContext, cellFrame);
+ 
++            // We don't really need separate specified and preferred
++            // widths here, so just use the specified width like a
++            // boolean and do the math in the preferred width.
++            if (info.specCoord != NS_NO_SPECIFIED_WIDTH)
++              info.prefCoord = PR_MAX(info.minCoord, info.specCoord);
++
+             // Before looping over the spanned columns to distribute
+             // this cell's width over the columns it spans, we first
+             // compute totals over the spanned columns so we know how to
+@@ -453,11 +457,15 @@ BasicTableLayoutStrategy::ComputeColumnI
+                     NSToCoordRound(float(minWithinPref) * minRatio);
+                 nscoord allocatedMinOutsidePref =
+                     NSToCoordRound(float(minOutsidePref) * coordRatio);
+-                scolFrame->AddSpanMinCoord(allocatedMinWithinPref +
+-                                           allocatedMinOutsidePref);
+                 nscoord allocatedPref =
+                     NSToCoordRound(float(info.prefCoord) * coordRatio);
+-                scolFrame->AddSpanPrefCoord(allocatedPref);
++                nscoord allocatedSpec = info.specCoord == NS_NO_SPECIFIED_WIDTH
++                                          ? NS_NO_SPECIFIED_WIDTH
++                                          : allocatedPref;
++                scolFrame->AddSpanCoords(allocatedMinWithinPref +
++                                           allocatedMinOutsidePref,
++                                         allocatedSpec,
++                                         allocatedPref);
+ 
+                 // To avoid accumulating rounding error from division,
+                 // subtract everything to do with the column we've
+@@ -494,32 +502,13 @@ BasicTableLayoutStrategy::ComputeColumnI
                  continue;
              }
  
@@ -183,6 +229,19 @@ diff --git a/layout/tables/nsTableColFrame.cpp b/layout/tables/nsTableColFrame.c
    ResetFinalWidth();
  }
  
+@@ -153,9 +149,9 @@ void nsTableColFrame::Dump(PRInt32 aInde
+     printf(" anonymous-cell ");
+     break;
+   }
+-  printf("\nm:%d c:%d p:%d sm:%d sc:%d sp:%d f:%d",
+-         GetMinCoord(), GetPrefCoord(), GetPrefPercent(),
+-         GetSpanMinCoord(), GetSpanPrefCoord(), GetSpanPrefPercent(),
++  printf("\nm:%d s:%d c:%d p:%f sm:%d ss:%d sc:%d sp:%f f:%d",
++         mMinCoord, mSpecCoord, mPrefCoord, mPrefPercent,
++         mSpanMinCoord, mSpanSpecCoord, mSpanPrefCoord, mSpanPrefPercent,
+          GetFinalWidth());
+   printf("\n%s**END COL DUMP** ", indent);
+   delete [] indent;
 diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
 --- a/layout/tables/nsTableColFrame.h
 +++ b/layout/tables/nsTableColFrame.h
@@ -195,7 +254,7 @@ diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
  class nsVoidArray;
  class nsTableCellFrame;
  
-@@ -135,94 +137,94 @@ public:
+@@ -135,94 +137,102 @@ public:
    void Dump(PRInt32 aIndent);
  #endif
  
@@ -211,6 +270,14 @@ diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
 -  void AddMinCoord(nscoord aMinCoord) {
 +    mSpecCoord = NS_NO_SPECIFIED_WIDTH;
 +    mPrefCoord = 0;
++    mPrefPercent = 0.0f;
++  }
++
++  /**
++   * Restore the default value of the preferred percentage width (the
++   * only intrinsic width used by FixedTableLayoutStrategy.
++   */
++  void ResetPrefPercent() {
 +    mPrefPercent = 0.0f;
 +  }
 +
@@ -305,8 +372,8 @@ diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
 -    mSpanMinCoord = 0;
 -  }
 -  void AddSpanMinCoord(nscoord aSpanMinCoord) {
-+  void AddSpanCoords(nscoord aMinCoord, nscoord aSpecCoord,
-+                     nscoord aPrefCoord) {
++  void AddSpanCoords(nscoord aSpanMinCoord, nscoord aSpanSpecCoord,
++                     nscoord aSpanPrefCoord) {
 +    NS_ASSERTION(aSpanMinCoord <= aSpanPrefCoord &&
 +                 aSpanSpecCoord <= aSpanPrefCoord,
 +                 "intrinsic widths out of order");
@@ -344,7 +411,7 @@ diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
 -  float GetSpanPrefPercent() {
 -    return mSpanPrefPercent;
 +
-+  void AcculumateSpanIntrinsics() {
++  void AccumulateSpanIntrinsics() {
 +    AddCoords(mMinCoord  + mSpanMinCoord,
 +              mSpecCoord + mSpanSpecCoord,
 +              mPrefCoord + mSpanPrefCoord);
@@ -352,7 +419,7 @@ diff --git a/layout/tables/nsTableColFrame.h b/layout/tables/nsTableColFrame.h
    }
  
    // Used to adjust a column's pref percent so that the table's total
-@@ -263,14 +265,15 @@ protected:
+@@ -263,14 +273,15 @@ protected:
    BCPixelSize mRightContBorderWidth;
    BCPixelSize mBottomContBorderWidth;
  
