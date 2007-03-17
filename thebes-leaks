@@ -1,0 +1,154 @@
+Fix memory leaks and shutdown leaks in thebes graphics code.
+
+diff --git a/gfx/src/thebes/nsThebesGfxFactory.cpp b/gfx/src/thebes/nsThebesGfxFactory.cpp
+--- a/gfx/src/thebes/nsThebesGfxFactory.cpp
++++ b/gfx/src/thebes/nsThebesGfxFactory.cpp
+@@ -51,6 +51,7 @@
+ #include "nsThebesBlender.h"
+ #include "nsThebesFontMetrics.h"
+ #include "nsThebesFontEnumerator.h"
++#include "gfxPlatform.h"
+ 
+ NS_GENERIC_FACTORY_CONSTRUCTOR(nsThebesFontMetrics)
+ NS_GENERIC_FACTORY_CONSTRUCTOR(nsThebesBlender)
+@@ -145,6 +146,7 @@ PR_STATIC_CALLBACK(void)
+ PR_STATIC_CALLBACK(void)
+ nsThebesGfxModuleDtor(nsIModule *self)
+ {
++    gfxPlatform::Shutdown();
+ }
+ 
+ NS_IMPL_NSGETMODULE_WITH_DTOR(nsGfxModule, components, nsThebesGfxModuleDtor)
+diff --git a/gfx/thebes/public/gfxPlatform.h b/gfx/thebes/public/gfxPlatform.h
+--- a/gfx/thebes/public/gfxPlatform.h
++++ b/gfx/thebes/public/gfxPlatform.h
+@@ -57,6 +57,11 @@ public:
+     static gfxPlatform *GetPlatform();
+ 
+     /**
++     * Clean up static objects to shut down thebes.
++     */
++    static void Shutdown();
++
++    /**
+      * Return PR_TRUE if we're to use Glitz for acceleration.
+      */
+     static PRBool UseGlitz();
+diff --git a/gfx/thebes/src/Makefile.in b/gfx/thebes/src/Makefile.in
+--- a/gfx/thebes/src/Makefile.in
++++ b/gfx/thebes/src/Makefile.in
+@@ -85,6 +85,7 @@ CPPSRCS +=	gfxPangoFonts.cpp
+ CPPSRCS +=	gfxPangoFonts.cpp 
+ CPPSRCS +=	gfxPDFSurface.cpp gfxPSSurface.cpp
+ CPPSRCS +=	gfxFontconfigUtils.cpp
++DEFINES +=	-DTHEBES_USES_FONTCONFIG
+ CPPSRCS +=	nsUnicodeRange.cpp
+ CSRCS = cairo-xlib-utils.c
+ EXTRA_DSO_LDOPTS += $(MOZ_PANGO_LIBS) $(ZLIB_LIBS) $(MOZ_XFT_LIBS) $(XLDFLAGS) $(XLIBS)
+@@ -95,6 +96,7 @@ CPPSRCS +=	gfxPangoFonts.cpp
+ CPPSRCS +=	gfxPangoFonts.cpp 
+ #CPPSRCS +=	gfxPDFSurface.cpp
+ CPPSRCS +=	gfxFontconfigUtils.cpp
++DEFINES +=	-DTHEBES_USES_FONTCONFIG
+ CPPSRCS +=	nsUnicodeRange.cpp
+ EXTRA_DSO_LDOPTS += $(MOZ_PANGO_LIBS) $(CAIRO_FT_LIBS) -lfontconfig -lpangocairo-1.0
+ endif
+diff --git a/gfx/thebes/src/gfxFontconfigUtils.cpp b/gfx/thebes/src/gfxFontconfigUtils.cpp
+--- a/gfx/thebes/src/gfxFontconfigUtils.cpp
++++ b/gfx/thebes/src/gfxFontconfigUtils.cpp
+@@ -46,6 +46,8 @@
+ 
+ #include "nsIAtom.h"
+ #include "nsCRT.h"
++
++/* static */ gfxFontconfigUtils* gfxFontconfigUtils::sUtils = nsnull;
+ 
+ gfxFontconfigUtils::gfxFontconfigUtils()
+ {
+diff --git a/gfx/thebes/src/gfxFontconfigUtils.h b/gfx/thebes/src/gfxFontconfigUtils.h
+--- a/gfx/thebes/src/gfxFontconfigUtils.h
++++ b/gfx/thebes/src/gfxFontconfigUtils.h
+@@ -55,10 +55,14 @@ public:
+     gfxFontconfigUtils();
+ 
+     static gfxFontconfigUtils* GetFontconfigUtils() {
+-        static gfxFontconfigUtils* sUtils = nsnull;
+         if (!sUtils)
+             sUtils = new gfxFontconfigUtils();
+         return sUtils;
++    }
++
++    static void Shutdown() {
++        delete sUtils;
++        sUtils = nsnull;
+     }
+ 
+     nsresult GetFontList(const nsACString& aLangGroup,
+@@ -72,6 +76,8 @@ public:
+                              void *aClosure, PRBool& aAborted);
+ 
+ protected:
++    static gfxFontconfigUtils* sUtils;
++
+     PRInt32 IsExistingFont(const nsACString& aFontName);
+     nsresult GetResolvedFonts(const nsACString& aName,
+                               gfxFontNameList* aResult);
+diff --git a/gfx/thebes/src/gfxPangoFonts.cpp b/gfx/thebes/src/gfxPangoFonts.cpp
+--- a/gfx/thebes/src/gfxPangoFonts.cpp
++++ b/gfx/thebes/src/gfxPangoFonts.cpp
+@@ -862,6 +862,7 @@ CreateScaledFont(cairo_t *aCR, cairo_mat
+     cairo_scaled_font_t *scaledFont =
+         cairo_scaled_font_create(face, &fontMatrix, aCTM, fontOptions);
+     cairo_font_options_destroy(fontOptions);
++    cairo_font_face_destroy(face);
+     return scaledFont;
+ }
+ 
+diff --git a/gfx/thebes/src/gfxPlatform.cpp b/gfx/thebes/src/gfxPlatform.cpp
+--- a/gfx/thebes/src/gfxPlatform.cpp
++++ b/gfx/thebes/src/gfxPlatform.cpp
+@@ -59,6 +59,12 @@
+ #include <stdlib.h>
+ #endif
+ 
++#include "cairo.h"
++#ifdef THEBES_USES_FONTCONFIG
++#include <fontconfig/fontconfig.h>
++#include "gfxFontconfigUtils.h"
++#endif
++
+ gfxPlatform *gPlatform = nsnull;
+ int gGlitzState = -1;
+ 
+@@ -82,6 +88,31 @@ gfxPlatform::GetPlatform()
+     return gPlatform;
+ }
+ 
++void
++gfxPlatform::Shutdown()
++{
++#ifdef THEBES_USES_FONTCONFIG
++    gfxFontconfigUtils::Shutdown();
++#endif
++
++    // The cairo folks think we should only clean up in debug builds,
++    // but we're generally in the habit of trying to shut down as
++    // cleanly as possible even in production code, so call this
++    // cairo_debug_* function unconditionally.
++    cairo_debug_reset_static_data();
++
++#ifdef THEBES_USES_FONTCONFIG
++    // Should we call this before the cairo call above, after it, or
++    // should cairo really be doing it for us?  Since it appears to be
++    // idempotent (although it's not documented as such), I'll call it
++    // afterwards since that's safe.
++    FcFini();
++#endif
++
++    delete gPlatform;
++    gPlatform = nsnull;
++}
++
+ PRBool
+ gfxPlatform::UseGlitz()
+ {
