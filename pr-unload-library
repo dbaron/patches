@@ -1,0 +1,542 @@
+Add missing calls to PR_UnloadLibrary (excluding XPCOM component loader and nsPluginsDir*).
+
+diff --git a/accessible/src/atk/nsAppRootAccessible.cpp b/accessible/src/atk/nsAppRootAccessible.cpp
+--- a/accessible/src/atk/nsAppRootAccessible.cpp
++++ b/accessible/src/atk/nsAppRootAccessible.cpp
+@@ -51,6 +51,7 @@ typedef GType (* AtkGetTypeType) (void);
+ typedef GType (* AtkGetTypeType) (void);
+ GType g_atk_hyperlink_impl_type = G_TYPE_INVALID;
+ static PRBool sATKChecked = PR_FALSE;
++static PRLibrary *sATKLib = nsnull;
+ static PRBool sInitialized = PR_FALSE;
+ static const char sATKLibName[] = "libatk-1.0.so";
+ static const char sATKHyperlinkImplGetTypeSymbol[] = "atk_hyperlink_impl_get_type";
+@@ -567,6 +568,7 @@ NS_IMETHODIMP nsAppRootAccessible::Init(
+         // an exit function registered will take care of it
+         // if (sAtkBridge.shutdown)
+         //     (*sAtkBridge.shutdown)();
++        PR_UnloadLibrary(sAtkBridge.lib);
+         sAtkBridge.lib = NULL;
+         sAtkBridge.init = NULL;
+         sAtkBridge.shutdown = NULL;
+@@ -577,9 +579,14 @@ NS_IMETHODIMP nsAppRootAccessible::Init(
+         // 2) We need it to avoid assert in spi_atk_tidy_windows
+         // if (sGail.shutdown)
+         //   (*sGail.shutdown)();
++        PR_UnloadLibrary(sGail.lib);
+         sGail.lib = NULL;
+         sGail.init = NULL;
+         sGail.shutdown = NULL;
++    }
++    if (sATKLib) {
++        PR_UnloadLibrary(sATKLib);
++        sATKLib = nsnull;
+     }
+ }
+ 
+@@ -810,7 +817,7 @@ nsAppRootAccessible::Create()
+ nsAppRootAccessible::Create()
+ {
+     if (!sATKChecked) {
+-        PRLibrary *atkLib = PR_LoadLibrary(sATKLibName);
++        sATKLib = PR_LoadLibrary(sATKLibName);
+         AtkGetTypeType pfn_atk_hyperlink_impl_get_type = (AtkGetTypeType) PR_FindFunctionSymbol(atkLib, sATKHyperlinkImplGetTypeSymbol);
+         if (pfn_atk_hyperlink_impl_get_type) {
+             g_atk_hyperlink_impl_type = pfn_atk_hyperlink_impl_get_type();
+diff --git a/extensions/auth/nsAuthFactory.cpp b/extensions/auth/nsAuthFactory.cpp
+--- a/extensions/auth/nsAuthFactory.cpp
++++ b/extensions/auth/nsAuthFactory.cpp
+@@ -270,4 +270,11 @@ InitNegotiateAuth(nsIModule *self)
+ #define InitNegotiateAuth nsnull
+ #endif
+ 
+-NS_IMPL_NSGETMODULE_WITH_CTOR(nsAuthModule, components, InitNegotiateAuth)
++PR_STATIC_CALLBACK(void)
++DestroyNegotiateAuth(nsIModule *self)
++{
++  nsAuthGSSAPI::Shutdown();
++}
++
++NS_IMPL_NSGETMODULE_WITH_CTOR_DTOR(nsAuthModule, components,
++                                   InitNegotiateAuth, DestroyNegotiateAuth)
+diff --git a/extensions/auth/nsAuthGSSAPI.cpp b/extensions/auth/nsAuthGSSAPI.cpp
+--- a/extensions/auth/nsAuthGSSAPI.cpp
++++ b/extensions/auth/nsAuthGSSAPI.cpp
+@@ -103,7 +103,7 @@ static const char *gssFuncStr[] = {
+ 
+ static PRFuncPtr gssFunPtr[gssFuncItems]; 
+ static PRBool    gssNativeImp = PR_TRUE;
+-static PRBool    gssFunInit = PR_FALSE;
++static PRLibrary* gssLibrary = nsnull;
+ 
+ #define gss_display_status_ptr      ((gss_display_status_type)*gssFunPtr[0])
+ #define gss_init_sec_context_ptr    ((gss_init_sec_context_type)*gssFunPtr[1])
+@@ -223,7 +223,7 @@ gssInit()
+     }
+ #endif
+ 
+-    gssFunInit = PR_TRUE;
++    gssLibrary = lib;
+     return NS_OK;
+ }
+ 
+@@ -242,7 +242,7 @@ LogGssError(OM_uint32 maj_stat, OM_uint3
+     nsCAutoString errorStr;
+     errorStr.Assign(prefix);
+ 
+-    if (!gssFunInit)
++    if (!gssLibrary)
+         return;
+ 
+     errorStr += ": ";
+@@ -296,7 +296,7 @@ nsAuthGSSAPI::nsAuthGSSAPI(pType package
+ 
+     mComplete = PR_FALSE;
+ 
+-    if (!gssFunInit && NS_FAILED(gssInit()))
++    if (!gssLibrary && NS_FAILED(gssInit()))
+         return;
+ 
+     mCtx = GSS_C_NO_CONTEXT;
+@@ -340,12 +340,21 @@ void
+ void
+ nsAuthGSSAPI::Reset()
+ {
+-    if (gssFunInit && mCtx != GSS_C_NO_CONTEXT) {
++    if (gssLibrary && mCtx != GSS_C_NO_CONTEXT) {
+         OM_uint32 minor_status;
+         gss_delete_sec_context_ptr(&minor_status, &mCtx, GSS_C_NO_BUFFER);
+     }
+     mCtx = GSS_C_NO_CONTEXT;
+     mComplete = PR_FALSE;
++}
++
++/* static */ void
++nsAuthGSSAPI::Shutdown()
++{
++    if (gssLibrary) {
++        PR_UnloadLibrary(gssLibrary);
++        gssLibrary = nsnull;
++    }
+ }
+ 
+ NS_IMPL_ISUPPORTS1(nsAuthGSSAPI, nsIAuthModule)
+@@ -365,7 +374,7 @@ nsAuthGSSAPI::Init(const char *serviceNa
+ 
+     LOG(("entering nsAuthGSSAPI::Init()\n"));
+ 
+-    if (!gssFunInit)
++    if (!gssLibrary)
+        return NS_ERROR_NOT_INITIALIZED;
+ 
+     mServiceName = serviceName;
+@@ -390,7 +399,7 @@ nsAuthGSSAPI::GetNextToken(const void *i
+ 
+     LOG(("entering nsAuthGSSAPI::GetNextToken()\n"));
+ 
+-    if (!gssFunInit)
++    if (!gssLibrary)
+        return NS_ERROR_NOT_INITIALIZED;
+ 
+     // If they've called us again after we're complete, reset to start afresh.
+diff --git a/extensions/auth/nsAuthGSSAPI.h b/extensions/auth/nsAuthGSSAPI.h
+--- a/extensions/auth/nsAuthGSSAPI.h
++++ b/extensions/auth/nsAuthGSSAPI.h
+@@ -60,6 +60,8 @@ public:
+ 
+     nsAuthGSSAPI(pType package);
+ 
++    static void Shutdown();
++
+ private:
+     ~nsAuthGSSAPI() { Reset(); }
+ 
+diff --git a/extensions/pref/system-pref/src/gconf/nsSystemPrefService.cpp b/extensions/pref/system-pref/src/gconf/nsSystemPrefService.cpp
+--- a/extensions/pref/system-pref/src/gconf/nsSystemPrefService.cpp
++++ b/extensions/pref/system-pref/src/gconf/nsSystemPrefService.cpp
+@@ -615,6 +615,8 @@ GConfProxy::~GConfProxy()
+         (void)mObservers->EnumerateForwards(gconfDeleteObserver, nsnull);
+         delete mObservers;
+     }
++
++    PR_UnloadLibrary(mGConfLib);
+ }
+ 
+ PRBool
+diff --git a/gfx/src/thebes/nsSystemFontsGTK2.cpp b/gfx/src/thebes/nsSystemFontsGTK2.cpp
+--- a/gfx/src/thebes/nsSystemFontsGTK2.cpp
++++ b/gfx/src/thebes/nsSystemFontsGTK2.cpp
+@@ -56,10 +56,11 @@
+ #include "gfxPlatformGtk.h"
+ 
+ // Glue to avoid build/runtime dependencies on Pango > 1.6
+-
++#ifndef THEBES_USE_PANGO_CAIRO
+ static gboolean
+ (* PTR_pango_font_description_get_size_is_absolute)(PangoFontDescription*)
+     = nsnull;
++static PRLibrary *gPangoLib = nsnull;
+ 
+ static void InitPangoLib()
+ {
+@@ -68,15 +69,23 @@ static void InitPangoLib()
+         return;
+     initialized = PR_TRUE;
+ 
+-    PRLibrary* lib = PR_LoadLibrary("libpango-1.0.so");
+-    if (!lib)
++    gPangoLib = PR_LoadLibrary("libpango-1.0.so");
++    if (!gPangoLib)
+         return;
+ 
+     PTR_pango_font_description_get_size_is_absolute =
+         (gboolean (*)(PangoFontDescription*))
+-        PR_FindFunctionSymbol(lib, "pango_font_description_get_size_is_absolute");
+-
+-    // leak lib deliberately
++        PR_FindFunctionSymbol(gPangoLib,
++                              "pango_font_description_get_size_is_absolute");
++}
++
++static void
++ShutdownPangoLib()
++{
++    if (gPangoLib) {
++        PR_UnloadLibrary(gPangoLib);
++        gPangoLib = nsnull;
++    }
+ }
+ 
+ static gboolean
+@@ -89,6 +98,21 @@ MOZ_pango_font_description_get_size_is_a
+     // In old versions of pango, this was always false.
+     return PR_FALSE;
+ }
++#else
++static inline void InitPangoLib()
++{
++}
++
++static inline void ShutdownPangoLib()
++{
++}
++
++static inline gboolean
++MOZ_pango_font_description_get_size_is_absolute(PangoFontDescription *desc)
++{
++    pango_font_description_get_size_is_absolute(desc);
++}
++#endif
+ 
+ #define DEFAULT_PIXEL_FONT_SIZE 16.0f
+ 
+@@ -181,6 +205,11 @@ nsSystemFontsGTK2::nsSystemFontsGTK2()
+     gtk_widget_destroy(window);  // no unref, windows are different
+ }
+ 
++nsSystemFontsGTK2::~nsSystemFontsGTK2()
++{
++    ShutdownPangoLib();
++}
++
+ nsresult
+ nsSystemFontsGTK2::GetSystemFontInfo(GtkWidget *aWidget, nsString *aFontName,
+                                      gfxFontStyle *aFontStyle) const
+diff --git a/gfx/src/thebes/nsSystemFontsGTK2.h b/gfx/src/thebes/nsSystemFontsGTK2.h
+--- a/gfx/src/thebes/nsSystemFontsGTK2.h
++++ b/gfx/src/thebes/nsSystemFontsGTK2.h
+@@ -45,6 +45,7 @@ class nsSystemFontsGTK2
+ {
+ public:
+     nsSystemFontsGTK2();
++    ~nsSystemFontsGTK2();
+ 
+     nsresult GetSystemFont(nsSystemFontID anID, nsString *aFontName,
+                            gfxFontStyle *aFontStyle) const;
+diff --git a/gfx/thebes/public/gfxPangoFonts.h b/gfx/thebes/public/gfxPangoFonts.h
+--- a/gfx/thebes/public/gfxPangoFonts.h
++++ b/gfx/thebes/public/gfxPangoFonts.h
+@@ -64,6 +64,8 @@ public:
+     gfxPangoFont (const nsAString& aName,
+                   const gfxFontStyle *aFontStyle);
+     virtual ~gfxPangoFont ();
++
++    static void Shutdown();
+ 
+     virtual const gfxFont::Metrics& GetMetrics();
+ 
+diff --git a/gfx/thebes/src/gfxBeOSPlatform.cpp b/gfx/thebes/src/gfxBeOSPlatform.cpp
+--- a/gfx/thebes/src/gfxBeOSPlatform.cpp
++++ b/gfx/thebes/src/gfxBeOSPlatform.cpp
+@@ -37,6 +37,7 @@
+ 
+ #include "gfxBeOSPlatform.h"
+ #include "gfxFontconfigUtils.h"
++#include "gfxPangoFonts.h"
+ 
+ #include "gfxImageSurface.h"
+ #include "gfxBeOSSurface.h"
+@@ -53,6 +54,8 @@ gfxBeOSPlatform::~gfxBeOSPlatform()
+ {
+     gfxFontconfigUtils::Shutdown();
+     sFontconfigUtils = nsnull;
++
++    gfxPangoFont::Shutdown();
+ 
+ #if 0
+     // It would be nice to do this (although it might need to be after
+diff --git a/gfx/thebes/src/gfxPangoFonts.cpp b/gfx/thebes/src/gfxPangoFonts.cpp
+--- a/gfx/thebes/src/gfxPangoFonts.cpp
++++ b/gfx/thebes/src/gfxPangoFonts.cpp
+@@ -178,6 +178,7 @@ static void
+ static void
+ (* PTR_pango_font_description_set_absolute_size)(PangoFontDescription*, double)
+     = nsnull;
++static PRLibrary *gPangoLib = nsnull;
+ 
+ static void InitPangoLib()
+ {
+@@ -188,17 +189,16 @@ static void InitPangoLib()
+ 
+     g_type_init();
+ 
+-    PRLibrary *lib = PR_LoadLibrary("libpango-1.0.so");
+-    if (!lib)
++    gPangoLib = PR_LoadLibrary("libpango-1.0.so");
++    if (!gPangoLib)
+         return;
+ 
+     PTR_pango_font_description_set_absolute_size =
+         (void (*)(PangoFontDescription*, double))
+-        PR_FindFunctionSymbol(lib, "pango_font_description_set_absolute_size");
+-
+-    // leak lib deliberately
+-
+-    lib = nsnull;
++        PR_FindFunctionSymbol(gPangoLib,
++                              "pango_font_description_set_absolute_size");
++
++    PRLibrary *lib = nsnull;
+     int *xft_max_freetype_files_ptr = nsnull;
+     xft_max_freetype_files_ptr = (int*) PR_FindSymbolAndLibrary("XftMaxFreeTypeFiles", &lib);
+     if (xft_max_freetype_files_ptr && *xft_max_freetype_files_ptr < 50)
+@@ -208,6 +208,15 @@ static void InitPangoLib()
+ }
+ 
+ static void
++ShutdownPangoLib()
++{
++    if (gPangoLib) {
++        PR_UnloadLibrary(gPangoLib);
++        gPangoLib = nsnull;
++    }
++}
++
++static void
+ MOZ_pango_font_description_set_absolute_size(PangoFontDescription *desc,
+                                              double size)
+ {
+@@ -220,11 +229,15 @@ MOZ_pango_font_description_set_absolute_
+     }
+ }
+ #else
+-static void InitPangoLib()
+-{
+-}
+-
+-static void
++static inline void InitPangoLib()
++{
++}
++
++static inline void ShutdownPangoLib()
++{
++}
++
++static inline void
+ MOZ_pango_font_description_set_absolute_size(PangoFontDescription *desc, double size)
+ {
+     pango_font_description_set_absolute_size(desc, size);
+@@ -251,6 +264,12 @@ gfxPangoFont::~gfxPangoFont()
+ 
+     if (mCairoFont)
+         cairo_scaled_font_destroy(mCairoFont);
++}
++
++/* static */ void
++gfxPangoFont::Shutdown()
++{
++    ShutdownPangoLib();
+ }
+ 
+ static PangoStyle
+diff --git a/gfx/thebes/src/gfxPlatformGtk.cpp b/gfx/thebes/src/gfxPlatformGtk.cpp
+--- a/gfx/thebes/src/gfxPlatformGtk.cpp
++++ b/gfx/thebes/src/gfxPlatformGtk.cpp
+@@ -42,6 +42,7 @@
+ #include "gfxPlatformGtk.h"
+ 
+ #include "gfxFontconfigUtils.h"
++#include "gfxPangoFonts.h"
+ 
+ #include "cairo.h"
+ #include <gtk/gtk.h>
+@@ -90,6 +91,9 @@ gfxPlatformGtk::~gfxPlatformGtk()
+ {
+     gfxFontconfigUtils::Shutdown();
+     sFontconfigUtils = nsnull;
++
++    gfxPangoFont::Shutdown();
++
+ #ifndef THEBES_USE_PANGO_CAIRO
+     pango_xft_shutdown_display(GDK_DISPLAY(), 0);
+ #endif
+diff --git a/uriloader/exthandler/unix/nsGNOMERegistry.cpp b/uriloader/exthandler/unix/nsGNOMERegistry.cpp
+--- a/uriloader/exthandler/unix/nsGNOMERegistry.cpp
++++ b/uriloader/exthandler/unix/nsGNOMERegistry.cpp
+@@ -102,14 +102,18 @@ CleanUp()
+ CleanUp()
+ {
+   // Unload all libraries
+-  if (gnomeLib)
++  if (gnomeLib) {
+     PR_UnloadLibrary(gnomeLib);
+-  if (gconfLib)
++    gnomeLib = nsnull;
++  }
++  if (gconfLib) {
+     PR_UnloadLibrary(gconfLib);
+-  if (vfsLib)
++    gconfLib = nsnull;
++  }
++  if (vfsLib) {
+     PR_UnloadLibrary(vfsLib);
+-
+-  gnomeLib = gconfLib = vfsLib = nsnull;
++    vfsLib = nsnull;
++  }
+ }
+ 
+ static PRLibrary *
+diff --git a/widget/src/gtk/nsSound.cpp b/widget/src/gtk/nsSound.cpp
+--- a/widget/src/gtk/nsSound.cpp
++++ b/widget/src/gtk/nsSound.cpp
+@@ -122,6 +122,15 @@ nsSound::Init()
+   mInited = PR_TRUE;
+ 
+   return NS_OK;
++}
++
++/* static */ void
++nsSound::Shutdown()
++{
++  if (elib) {
++    PR_UnloadLibrary(elib)
++    elib = nsnull;
++  }
+ }
+ 
+ #define GET_WORD(s, i) (s[i+1] << 8) | s[i]
+diff --git a/widget/src/gtk/nsSound.h b/widget/src/gtk/nsSound.h
+--- a/widget/src/gtk/nsSound.h
++++ b/widget/src/gtk/nsSound.h
+@@ -53,6 +53,8 @@ class nsSound : public nsISound,
+   nsSound();
+   virtual ~nsSound();
+ 
++  static void Shutdown();
++
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSISOUND
+   NS_DECL_NSISTREAMLOADEROBSERVER
+diff --git a/widget/src/gtk2/nsIdleServiceGTK.cpp b/widget/src/gtk2/nsIdleServiceGTK.cpp
+--- a/widget/src/gtk2/nsIdleServiceGTK.cpp
++++ b/widget/src/gtk2/nsIdleServiceGTK.cpp
+@@ -68,6 +68,7 @@ nsIdleServiceGTK::nsIdleServiceGTK()
+ nsIdleServiceGTK::nsIdleServiceGTK()
+     : mXssInfo(nsnull)
+ {
++    NS_ASSERTION(!xsslib, "created two instances of the idle service");
+ #ifdef PR_LOGGING
+     if (!sIdleLog)
+         sIdleLog = PR_NewLogModule("nsIIdleService");
+@@ -103,8 +104,10 @@ nsIdleServiceGTK::~nsIdleServiceGTK()
+ {
+     if (mXssInfo)
+         XFree(mXssInfo);
+-    if (xsslib)
++    if (xsslib) {
+         PR_UnloadLibrary(xsslib);
++        xsslib = nsnull;
++    }
+ }
+ 
+ NS_IMETHODIMP
+diff --git a/widget/src/gtk2/nsSound.cpp b/widget/src/gtk2/nsSound.cpp
+--- a/widget/src/gtk2/nsSound.cpp
++++ b/widget/src/gtk2/nsSound.cpp
+@@ -130,6 +130,15 @@ nsSound::Init()
+     mInited = PR_TRUE;
+ 
+     return NS_OK;
++}
++
++/* static */ void
++nsSound::Shutdown()
++{
++    if (elib) {
++        PR_UnloadLibrary(elib)
++        elib = nsnull;
++    }
+ }
+ 
+ #define GET_WORD(s, i) (s[i+1] << 8) | s[i]
+diff --git a/widget/src/gtk2/nsSound.h b/widget/src/gtk2/nsSound.h
+--- a/widget/src/gtk2/nsSound.h
++++ b/widget/src/gtk2/nsSound.h
+@@ -53,6 +53,8 @@ public:
+     nsSound(); 
+     virtual ~nsSound();
+ 
++    static void Shutdown();
++
+     NS_DECL_ISUPPORTS
+     NS_DECL_NSISOUND
+     NS_DECL_NSISTREAMLOADEROBSERVER
+diff --git a/widget/src/gtk2/nsWidgetFactory.cpp b/widget/src/gtk2/nsWidgetFactory.cpp
+--- a/widget/src/gtk2/nsWidgetFactory.cpp
++++ b/widget/src/gtk2/nsWidgetFactory.cpp
+@@ -280,6 +280,7 @@ nsWidgetGtk2ModuleDtor(nsIModule *aSelf)
+ nsWidgetGtk2ModuleDtor(nsIModule *aSelf)
+ {
+   nsFilePicker::Shutdown();
++  nsSound::Shutdown();
+   nsWindow::ReleaseGlobals();
+   nsAppShellShutdown(aSelf);
+ }
+diff --git a/xpcom/io/nsILocalFile.idl b/xpcom/io/nsILocalFile.idl
+--- a/xpcom/io/nsILocalFile.idl
++++ b/xpcom/io/nsILocalFile.idl
+@@ -101,9 +101,22 @@ interface nsILocalFile : nsIFile
+      */
+     attribute PRBool followLinks;  
+ 
++    /**
++     * Return the result of PR_Open on the file.  The caller is
++     * responsible for calling PR_Close on the result.
++     */
+     [noscript] PRFileDescStar openNSPRFileDesc(in long flags, in long mode);
++
++    /**
++     * Return the result of fopen on the file.  The caller is
++     * responsible for calling fclose on the result.
++     */
+     [noscript] FILE           openANSIFileDesc(in string mode);
+ 
++    /**
++     * Return the result of PR_LoadLibrary on the file.  The caller is
++     * responsible for calling PR_UnloadLibrary on the result.
++     */
+     [noscript] PRLibraryStar  load();
+     
+     readonly attribute PRInt64 diskSpaceAvailable;
