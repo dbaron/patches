@@ -1,0 +1,1464 @@
+Convert trace-malloc to using XPCOM stack walking API.  b=374829
+
+diff --git a/tools/trace-malloc/lib/Makefile.in b/tools/trace-malloc/lib/Makefile.in
+--- a/tools/trace-malloc/lib/Makefile.in
++++ b/tools/trace-malloc/lib/Makefile.in
+@@ -55,17 +55,15 @@ CSRCS		= \
+ 		$(NULL)
+ 
+ CPPSRCS		= \
+-		nsDemangle.cpp \
+ 		nsTypeInfo.cpp \
+ 		$(NULL)
+ 
+ EXPORTS         = nsTraceMalloc.h
+ 
+-EXTRA_DSO_LDOPTS = $(NSPR_LIBS)
++EXTRA_DSO_LDOPTS = $(NSPR_LIBS) $(XPCOM_LIBS)
+ 
+ ifeq ($(OS_ARCH),WINNT)
+-CPPSRCS		+= nsDebugHelpWin32.cpp nsWinTraceMalloc.cpp nsStackFrameWin.cpp
+-EXTRA_DSO_LDOPTS += $(XPCOM_LIBS)
++CPPSRCS		+= nsDebugHelpWin32.cpp nsWinTraceMalloc.cpp
+ OS_LIBS		+= shell32.lib ole32.lib uuid.lib imagehlp.lib
+ endif
+ 
+diff --git a/tools/trace-malloc/lib/nsDebugHelpWin32.cpp b/tools/trace-malloc/lib/nsDebugHelpWin32.cpp
+--- a/tools/trace-malloc/lib/nsDebugHelpWin32.cpp
++++ b/tools/trace-malloc/lib/nsDebugHelpWin32.cpp
+@@ -48,7 +48,6 @@
+ #include "prlock.h"
+ #include "nscore.h"
+ #include "nsDebugHelpWin32.h"
+-#include "nsStackFrameWin.h"
+ #else
+ #error "nsDebugHelpWin32.cpp should only be built in Win32 x86 builds"
+ #endif
+diff --git a/tools/trace-malloc/lib/nsDemangle.cpp b/tools/trace-malloc/lib/nsDemangle.cpp
+deleted file mode 100644
+--- a/tools/trace-malloc/lib/nsDemangle.cpp
++++ /dev/null
+@@ -1,49 +0,0 @@
+-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+- *
+- * ***** BEGIN LICENSE BLOCK *****
+- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+- *
+- * The contents of this file are subject to the Mozilla Public License Version
+- * 1.1 (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- * http://www.mozilla.org/MPL/
+- *
+- * Software distributed under the License is distributed on an "AS IS" basis,
+- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+- * for the specific language governing rights and limitations under the
+- * License.
+- *
+- * The Original Code is trace-malloc/nsDemangle.cpp.
+- *
+- * The Initial Developer of the Original Code is
+- * The Mozilla Foundation.
+- * Portions created by the Initial Developer are Copyright (C) 2004
+- * the Initial Developer. All Rights Reserved.
+- *
+- * Contributor(s):
+- *
+- * Alternatively, the contents of this file may be used under the terms of
+- * either the GNU General Public License Version 2 or later (the "GPL"), or
+- * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+- * in which case the provisions of the GPL or the LGPL are applicable instead
+- * of those above. If you wish to allow use of your version of this file only
+- * under the terms of either the GPL or the LGPL, and not to allow others to
+- * use your version of this file under the terms of the MPL, indicate your
+- * decision by deleting the provisions above and replace them with the notice
+- * and other provisions required by the GPL or the LGPL. If you do not delete
+- * the provisions above, a recipient may use your version of this file under
+- * the terms of any one of the MPL, the GPL or the LGPL.
+- *
+- * ***** END LICENSE BLOCK ***** */
+-#ifdef MOZ_DEMANGLE_SYMBOLS
+-
+-#include <cxxabi.h>
+-#include <stdlib.h>
+-
+-extern "C" char *nsDemangle(const char *symbol);
+-
+-char *nsDemangle(const char *symbol) {
+-    return  abi::__cxa_demangle(symbol, 0, 0, 0);
+-}
+-
+-#endif
+diff --git a/tools/trace-malloc/lib/nsStackFrameWin.cpp b/tools/trace-malloc/lib/nsStackFrameWin.cpp
+deleted file mode 100644
+--- a/tools/trace-malloc/lib/nsStackFrameWin.cpp
++++ /dev/null
+@@ -1,351 +0,0 @@
+-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+- *
+- * ***** BEGIN LICENSE BLOCK *****
+- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+- *
+- * The contents of this file are subject to the Mozilla Public License Version
+- * 1.1 (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- * http://www.mozilla.org/MPL/
+- *
+- * Software distributed under the License is distributed on an "AS IS" basis,
+- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+- * for the specific language governing rights and limitations under the
+- * License.
+- *
+- * The Original Code is nsStackFrameWin.h code, released
+- * December 20, 2000.
+- *
+- * The Initial Developer of the Original Code is
+- * Netscape Communications Corporation.
+- * Portions created by the Initial Developer are Copyright (C) 2000
+- * the Initial Developer. All Rights Reserved.
+- *
+- * Contributor(s):
+- *   Michael Judge, 20-December-2000
+- *
+- * Alternatively, the contents of this file may be used under the terms of
+- * either the GNU General Public License Version 2 or later (the "GPL"), or
+- * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+- * in which case the provisions of the GPL or the LGPL are applicable instead
+- * of those above. If you wish to allow use of your version of this file only
+- * under the terms of either the GPL or the LGPL, and not to allow others to
+- * use your version of this file under the terms of the MPL, indicate your
+- * decision by deleting the provisions above and replace them with the notice
+- * and other provisions required by the GPL or the LGPL. If you do not delete
+- * the provisions above, a recipient may use your version of this file under
+- * the terms of any one of the MPL, the GPL or the LGPL.
+- *
+- * ***** END LICENSE BLOCK ***** */
+-
+-#include "nscore.h"
+-#include "windows.h"
+-#include "imagehlp.h"
+-#include "stdio.h"
+-#include "nsStackFrameWin.h"
+-
+-// Define these as static pointers so that we can load the DLL on the
+-// fly (and not introduce a link-time dependency on it). Tip o' the
+-// hat to Matt Pietrick for this idea. See:
+-//
+-//   http://msdn.microsoft.com/library/periodic/period97/F1/D3/S245C6.htm
+-//
+-
+-
+-PR_BEGIN_EXTERN_C
+-
+-SYMSETOPTIONSPROC _SymSetOptions;
+-
+-SYMINITIALIZEPROC _SymInitialize;
+-
+-SYMCLEANUPPROC _SymCleanup;
+-
+-STACKWALKPROC _StackWalk;
+-
+-SYMFUNCTIONTABLEACCESSPROC _SymFunctionTableAccess;
+-
+-SYMGETMODULEBASEPROC _SymGetModuleBase;
+-
+-SYMGETSYMFROMADDRPROC _SymGetSymFromAddr;
+-
+-SYMLOADMODULE _SymLoadModule;
+-
+-SYMUNDNAME _SymUnDName;
+-
+-SYMGETMODULEINFO _SymGetModuleInfo;
+-
+-ENUMLOADEDMODULES _EnumerateLoadedModules;
+-
+-SYMGETLINEFROMADDRPROC _SymGetLineFromAddr;
+-
+-PR_END_EXTERN_C
+-
+-
+-
+-
+-PRBool
+-EnsureImageHlpInitialized()
+-{
+-  static PRBool gInitialized = PR_FALSE;
+-
+-  if (! gInitialized) {
+-    HMODULE module = ::LoadLibrary("IMAGEHLP.DLL");
+-    if (!module) return PR_FALSE;
+-
+-    _SymSetOptions = (SYMSETOPTIONSPROC) ::GetProcAddress(module, "SymSetOptions");
+-    if (!_SymSetOptions) return PR_FALSE;
+-
+-    _SymInitialize = (SYMINITIALIZEPROC) ::GetProcAddress(module, "SymInitialize");
+-    if (!_SymInitialize) return PR_FALSE;
+-
+-    _SymCleanup = (SYMCLEANUPPROC)GetProcAddress(module, "SymCleanup");
+-    if (!_SymCleanup) return PR_FALSE;
+-
+-    _StackWalk = (STACKWALKPROC)GetProcAddress(module, "StackWalk");
+-    if (!_StackWalk) return PR_FALSE;
+-
+-    _SymFunctionTableAccess = (SYMFUNCTIONTABLEACCESSPROC) GetProcAddress(module, "SymFunctionTableAccess");
+-    if (!_SymFunctionTableAccess) return PR_FALSE;
+-
+-    _SymGetModuleBase = (SYMGETMODULEBASEPROC)GetProcAddress(module, "SymGetModuleBase");
+-    if (!_SymGetModuleBase) return PR_FALSE;
+-
+-    _SymGetSymFromAddr = (SYMGETSYMFROMADDRPROC)GetProcAddress(module, "SymGetSymFromAddr");
+-    if (!_SymGetSymFromAddr) return PR_FALSE;
+-
+-    _SymLoadModule = (SYMLOADMODULE)GetProcAddress(module, "SymLoadModule");
+-    if (!_SymLoadModule) return PR_FALSE;
+-
+-    _SymUnDName = (SYMUNDNAME)GetProcAddress(module, "SymUnDName");
+-    if (!_SymUnDName) return PR_FALSE;
+-
+-    _SymGetModuleInfo = (SYMGETMODULEINFO)GetProcAddress(module, "SymGetModuleInfo");
+-    if (!_SymGetModuleInfo) return PR_FALSE;
+-
+-    _EnumerateLoadedModules = (ENUMLOADEDMODULES)GetProcAddress(module, "EnumerateLoadedModules");
+-    if (!_EnumerateLoadedModules) return PR_FALSE;
+-
+-    _SymGetLineFromAddr = (SYMGETLINEFROMADDRPROC)GetProcAddress(module, "SymGetLineFromAddr");
+-    if (!_SymGetLineFromAddr) return PR_FALSE;
+-
+-    gInitialized = PR_TRUE;
+-  }
+-
+-  return gInitialized;
+-} 
+-
+-/*
+- * Callback used by SymGetModuleInfoEspecial
+- */
+-static BOOL CALLBACK callbackEspecial(LPSTR aModuleName, ULONG aModuleBase, ULONG aModuleSize, PVOID aUserContext)
+-{
+-    BOOL retval = TRUE;
+-    DWORD addr = (DWORD)aUserContext;
+-
+-    /*
+-     * You'll want to control this if we are running on an
+-     *  architecture where the addresses go the other direction.
+-     * Not sure this is even a realistic consideration.
+-     */
+-    const BOOL addressIncreases = TRUE;
+-    
+-    /*
+-     * If it falls in side the known range, load the symbols.
+-     */
+-    if(addressIncreases
+-       ? (addr >= aModuleBase && addr <= (aModuleBase + aModuleSize))
+-       : (addr <= aModuleBase && addr >= (aModuleBase - aModuleSize))
+-        )
+-    {
+-        BOOL loadRes = FALSE;
+-        HANDLE process = GetCurrentProcess();
+-                
+-        loadRes = _SymLoadModule(process, NULL, aModuleName, NULL, aModuleBase, aModuleSize);
+-        PR_ASSERT(FALSE != loadRes);
+-    }
+-
+-    return retval;
+-}
+-
+-/*
+- * SymGetModuleInfoEspecial
+- *
+- * Attempt to determine the module information.
+- * Bug 112196 says this DLL may not have been loaded at the time
+- *  SymInitialize was called, and thus the module information
+- *  and symbol information is not available.
+- * This code rectifies that problem.
+- */
+-BOOL SymGetModuleInfoEspecial(HANDLE aProcess, DWORD aAddr, PIMAGEHLP_MODULE aModuleInfo, PIMAGEHLP_LINE aLineInfo)
+-{
+-    BOOL retval = FALSE;
+-
+-    /*
+-     * Init the vars if we have em.
+-     */
+-    aModuleInfo->SizeOfStruct = sizeof(IMAGEHLP_MODULE);
+-    if (nsnull != aLineInfo) {
+-      aLineInfo->SizeOfStruct = sizeof(IMAGEHLP_LINE);
+-    }
+-
+-    /*
+-     * Give it a go.
+-     * It may already be loaded.
+-     */
+-    retval = _SymGetModuleInfo(aProcess, aAddr, aModuleInfo);
+-
+-    if (FALSE == retval) {
+-        BOOL enumRes = FALSE;
+-
+-        /*
+-         * Not loaded, here's the magic.
+-         * Go through all the modules.
+-         */
+-        enumRes = _EnumerateLoadedModules(aProcess, callbackEspecial, (PVOID)aAddr);
+-        if(FALSE != enumRes)
+-        {
+-            /*
+-             * One final go.
+-             * If it fails, then well, we have other problems.
+-             */
+-            retval = _SymGetModuleInfo(aProcess, aAddr, aModuleInfo);
+-        }
+-    }
+-
+-    /*
+-     * If we got module info, we may attempt line info as well.
+-     * We will not report failure if this does not work.
+-     */
+-    if (FALSE != retval && nsnull != aLineInfo && nsnull != _SymGetLineFromAddr) {
+-      DWORD displacement = 0;
+-      BOOL lineRes = FALSE;
+-
+-      lineRes = _SymGetLineFromAddr(aProcess, aAddr, &displacement, aLineInfo);
+-    }
+-
+-    return retval;
+-}
+-
+-PRBool
+-EnsureSymInitialized()
+-{  
+-  static PRBool gInitialized = PR_FALSE;
+-
+-  if (! gInitialized) {
+-    if (! EnsureImageHlpInitialized())
+-      return PR_FALSE;
+-    _SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+-    gInitialized = _SymInitialize(GetCurrentProcess(), 0, TRUE);
+-  }
+-  return gInitialized;
+-}
+-
+-
+-/**
+- * Walk the stack, translating PC's found into strings and recording the
+- * chain in aBuffer. For this to work properly, the dll's must be rebased
+- * so that the address in the file agrees with the address in memory.
+- * Otherwise StackWalk will return FALSE when it hits a frame in a dll's
+- * whose in memory address doesn't match it's in-file address.
+- *
+- * Fortunately, there is a handy dandy routine in IMAGEHLP.DLL that does
+- * the rebasing and accordingly I've made a tool to use it to rebase the
+- * DLL's in one fell swoop (see xpcom/tools/windows/rebasedlls.cpp).
+- */
+-
+-
+-void
+-DumpStackToFile(FILE* aStream) 
+-{
+-  HANDLE myProcess = ::GetCurrentProcess();
+-  HANDLE myThread = ::GetCurrentThread();
+-  BOOL ok;
+-
+-  ok = EnsureSymInitialized();
+-  if (! ok)
+-    return;
+-
+-  // Get the context information for this thread. That way we will
+-  // know where our sp, fp, pc, etc. are and can fill in the
+-  // STACKFRAME with the initial values.
+-  CONTEXT context;
+-  context.ContextFlags = CONTEXT_FULL;
+-  ok = GetThreadContext(myThread, &context);
+-  if (! ok)
+-    return;
+-
+-  // Setup initial stack frame to walk from
+-  STACKFRAME frame;
+-  memset(&frame, 0, sizeof(frame));
+-  frame.AddrPC.Offset    = context.Eip;
+-  frame.AddrPC.Mode      = AddrModeFlat;
+-  frame.AddrStack.Offset = context.Esp;
+-  frame.AddrStack.Mode   = AddrModeFlat;
+-  frame.AddrFrame.Offset = context.Ebp;
+-  frame.AddrFrame.Mode   = AddrModeFlat;
+-
+-  // Now walk the stack and map the pc's to symbol names
+-  int skip = 2;
+-  while (1) {
+-    ok = _StackWalk(IMAGE_FILE_MACHINE_I386,
+-                   myProcess,
+-                   myThread,
+-                   &frame,
+-                   &context,
+-                   0,                        // read process memory routine
+-                   _SymFunctionTableAccess,  // function table access routine
+-                   _SymGetModuleBase,        // module base routine
+-                   0);                       // translate address routine
+-
+-    if (!ok) {
+-      LPVOID lpMsgBuf;
+-      FormatMessage( 
+-        FORMAT_MESSAGE_ALLOCATE_BUFFER | 
+-        FORMAT_MESSAGE_FROM_SYSTEM | 
+-        FORMAT_MESSAGE_IGNORE_INSERTS,
+-        NULL,
+-        GetLastError(),
+-        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
+-        (LPTSTR) &lpMsgBuf,
+-        0,
+-        NULL 
+-        );
+-      fprintf(aStream, "### ERROR: WalkStack: %s", lpMsgBuf);
+-      fflush(aStream);
+-      LocalFree( lpMsgBuf );
+-    }
+-    if (!ok || frame.AddrPC.Offset == 0)
+-      break;
+-
+-    if (skip-- > 0)
+-      continue;
+-
+-    //
+-    // Attempt to load module info before we attempt to reolve the symbol.
+-    // This just makes sure we get good info if available.
+-    //
+-    IMAGEHLP_MODULE modInfo;
+-    modInfo.SizeOfStruct = sizeof(modInfo);
+-    BOOL modInfoRes = TRUE;
+-    modInfoRes = SymGetModuleInfoEspecial(myProcess, frame.AddrPC.Offset, &modInfo, nsnull);
+-
+-    char buf[sizeof(IMAGEHLP_SYMBOL) + 512];
+-    PIMAGEHLP_SYMBOL symbol = (PIMAGEHLP_SYMBOL) buf;
+-    symbol->SizeOfStruct = sizeof(buf);
+-    symbol->MaxNameLength = 512;
+-
+-    DWORD displacement;
+-    ok = _SymGetSymFromAddr(myProcess,
+-                            frame.AddrPC.Offset,
+-                            &displacement,
+-                            symbol);
+-
+-    if (ok) {
+-      fprintf(aStream, "%s+0x%08X\n", symbol->Name, displacement);
+-    }
+-    else {
+-      fprintf(aStream, "0x%08X\n", frame.AddrPC.Offset);
+-    }
+-  }
+-}
+-
+diff --git a/tools/trace-malloc/lib/nsStackFrameWin.h b/tools/trace-malloc/lib/nsStackFrameWin.h
+deleted file mode 100644
+--- a/tools/trace-malloc/lib/nsStackFrameWin.h
++++ /dev/null
+@@ -1,126 +0,0 @@
+-/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+- *
+- * ***** BEGIN LICENSE BLOCK *****
+- * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+- *
+- * The contents of this file are subject to the Mozilla Public License Version
+- * 1.1 (the "License"); you may not use this file except in compliance with
+- * the License. You may obtain a copy of the License at
+- * http://www.mozilla.org/MPL/
+- *
+- * Software distributed under the License is distributed on an "AS IS" basis,
+- * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+- * for the specific language governing rights and limitations under the
+- * License.
+- *
+- * The Original Code is nsStackFrameWin.h code, released
+- * December 20, 2000.
+- *
+- * The Initial Developer of the Original Code is
+- * Netscape Communications Corporation.
+- * Portions created by the Initial Developer are Copyright (C) 2000
+- * the Initial Developer. All Rights Reserved.
+- *
+- * Contributor(s):
+- *   Michael Judge, 20-December-2000
+- *
+- * Alternatively, the contents of this file may be used under the terms of
+- * either the GNU General Public License Version 2 or later (the "GPL"), or
+- * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+- * in which case the provisions of the GPL or the LGPL are applicable instead
+- * of those above. If you wish to allow use of your version of this file only
+- * under the terms of either the GPL or the LGPL, and not to allow others to
+- * use your version of this file under the terms of the MPL, indicate your
+- * decision by deleting the provisions above and replace them with the notice
+- * and other provisions required by the GPL or the LGPL. If you do not delete
+- * the provisions above, a recipient may use your version of this file under
+- * the terms of any one of the MPL, the GPL or the LGPL.
+- *
+- * ***** END LICENSE BLOCK ***** */
+-#ifndef nsStackFrameWin_h___
+-#define nsStackFrameWin_h___
+-
+-
+-#if defined(_WIN32) && defined(_M_IX86) // WIN32 x86 stack walking code
+-#include "nspr.h"
+-#include <windows.h>
+-#include <imagehlp.h>
+-
+-// Define these as static pointers so that we can load the DLL on the
+-// fly (and not introduce a link-time dependency on it). Tip o' the
+-// hat to Matt Pietrick for this idea. See:
+-//
+-//   http://msdn.microsoft.com/library/periodic/period97/F1/D3/S245C6.htm
+-//
+-PR_BEGIN_EXTERN_C
+-
+-typedef DWORD (__stdcall *SYMSETOPTIONSPROC)(DWORD);
+-extern SYMSETOPTIONSPROC _SymSetOptions;
+-
+-typedef BOOL (__stdcall *SYMINITIALIZEPROC)(HANDLE, LPSTR, BOOL);
+-extern SYMINITIALIZEPROC _SymInitialize;
+-
+-typedef BOOL (__stdcall *SYMCLEANUPPROC)(HANDLE);
+-extern SYMCLEANUPPROC _SymCleanup;
+-
+-typedef BOOL (__stdcall *STACKWALKPROC)(DWORD,
+-                                        HANDLE,
+-                                        HANDLE,
+-                                        LPSTACKFRAME,
+-                                        LPVOID,
+-                                        PREAD_PROCESS_MEMORY_ROUTINE,
+-                                        PFUNCTION_TABLE_ACCESS_ROUTINE,
+-                                        PGET_MODULE_BASE_ROUTINE,
+-                                        PTRANSLATE_ADDRESS_ROUTINE);
+-extern  STACKWALKPROC _StackWalk;
+-
+-typedef LPVOID (__stdcall *SYMFUNCTIONTABLEACCESSPROC)(HANDLE, DWORD);
+-extern  SYMFUNCTIONTABLEACCESSPROC _SymFunctionTableAccess;
+-
+-typedef DWORD (__stdcall *SYMGETMODULEBASEPROC)(HANDLE, DWORD);
+-extern  SYMGETMODULEBASEPROC _SymGetModuleBase;
+-
+-typedef BOOL (__stdcall *SYMGETSYMFROMADDRPROC)(HANDLE, DWORD, PDWORD, PIMAGEHLP_SYMBOL);
+-extern  SYMGETSYMFROMADDRPROC _SymGetSymFromAddr;
+-
+-typedef DWORD ( __stdcall *SYMLOADMODULE)(HANDLE, HANDLE, PSTR, PSTR, DWORD, DWORD);
+-extern  SYMLOADMODULE _SymLoadModule;
+-
+-typedef DWORD ( __stdcall *SYMUNDNAME)(PIMAGEHLP_SYMBOL, PSTR, DWORD);
+-extern  SYMUNDNAME _SymUnDName;
+-
+-typedef DWORD ( __stdcall *SYMGETMODULEINFO)( HANDLE, DWORD, PIMAGEHLP_MODULE);
+-extern  SYMGETMODULEINFO _SymGetModuleInfo;
+-
+-typedef BOOL ( __stdcall *ENUMLOADEDMODULES)( HANDLE, PENUMLOADED_MODULES_CALLBACK, PVOID);
+-extern  ENUMLOADEDMODULES _EnumerateLoadedModules;
+-
+-typedef BOOL (__stdcall *SYMGETLINEFROMADDRPROC)(HANDLE, DWORD, PDWORD, PIMAGEHLP_LINE);
+-extern  SYMGETLINEFROMADDRPROC _SymGetLineFromAddr;
+-
+-PRBool EnsureSymInitialized();
+-
+-PRBool EnsureImageHlpInitialized();
+-
+-/*
+- * SymGetModuleInfoEspecial
+- *
+- * Attempt to determine the module information.
+- * Bug 112196 says this DLL may not have been loaded at the time
+- *  SymInitialize was called, and thus the module information
+- *  and symbol information is not available.
+- * This code rectifies that problem.
+- * Line information is optional.
+- */
+-BOOL SymGetModuleInfoEspecial(HANDLE aProcess, DWORD aAddr, PIMAGEHLP_MODULE aModuleInfo, PIMAGEHLP_LINE aLineInfo);
+-
+-
+-void DumpStackToFile(FILE* out);
+-
+-PR_END_EXTERN_C
+-
+-#endif //WIN32
+-
+-#endif //nsStackFrameWin_h___
+-
+-
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
+--- a/tools/trace-malloc/lib/nsTraceMalloc.c
++++ b/tools/trace-malloc/lib/nsTraceMalloc.c
+@@ -67,9 +67,9 @@
+ #include "nsTraceMalloc.h"
+ #include "nscore.h"
+ #include "prinit.h"
++#include "nsStackWalk.h"
+ 
+ #ifdef XP_WIN32
+-#include "nsStackFrameWin.h"
+ #include <sys/timeb.h>/*for timeb*/
+ #include <sys/stat.h>/*for fstat*/
+ 
+@@ -82,10 +82,6 @@
+ 
+ #ifdef XP_UNIX
+ #define WRITE_FLAGS "w"
+-
+-#ifdef MOZ_DEMANGLE_SYMBOLS
+-char *nsDemangle(const char *);
+-#endif
+ 
+ #ifdef WRAP_SYSTEM_INCLUDES
+ #pragma GCC visibility push(default)
+@@ -570,7 +566,7 @@ static void log_tmstats(logfile *fp)
+ {
+     log_event1(fp, TM_EVENT_STATS, ++tmstats_serial_generator);
+     log_uint32(fp, tmstats.calltree_maxstack);
+-    log_uint32(fp, tmstats.calltree_maxdepth);
++    log_uint32(fp, tmstats.calltree_maxstack);
+     log_uint32(fp, tmstats.calltree_parents);
+     log_uint32(fp, tmstats.calltree_maxkids);
+     log_uint32(fp, tmstats.calltree_kidhits);
+@@ -641,401 +637,10 @@ static PLHashTable *filenames = NULL;
+ /* Table mapping method names to logged 'N' record serial numbers. */
+ static PLHashTable *methods = NULL;
+ 
+-#ifdef XP_WIN32
+-
+-/*
+- * Realease builds seem to take more stackframes.
+- */
+-#define  MAX_STACKFRAMES 512
+-#define  MAX_UNMANGLED_NAME_LEN 256
+-
+-static callsite *calltree(int skip)
++static callsite *calltree(void **stack, size_t stack_entries)
+ {
+     logfile *fp = logfp;
+-    HANDLE myProcess;
+-    HANDLE myThread;
+-    CONTEXT context;
+-    int ok, maxstack, offset;
+-    int getSymRes = 0;
+-    STACKFRAME frame[MAX_STACKFRAMES];
+-    uint32 library_serial, method_serial;
+-    int framenum;
+     void *pc;
+-    uint32 depth, nkids;
+-    callsite *parent, **csp, *tmp;
+-    callsite *site = NULL;
+-    char *demangledname;
+-    const char *library;
+-    IMAGEHLP_MODULE imagehelp;
+-    char buf[sizeof(IMAGEHLP_SYMBOL) + 512];
+-    PIMAGEHLP_SYMBOL symbol;
+-    char *method, *slash;
+-    PLHashNumber hash;
+-    PLHashEntry **hep, *he;
+-    lfdset_entry *le;
+-    char* noname = "noname";
+-    IMAGEHLP_LINE imagehelpLine;
+-    const char* filename = NULL;
+-    uint32 linenumber = 0;
+-    uint32 filename_serial = 0;
+-
+-    imagehelp.SizeOfStruct = sizeof(imagehelp);
+-    framenum = 0;
+-    myProcess = GetCurrentProcess();
+-    myThread = GetCurrentThread();
+-
+-    ok = EnsureSymInitialized();
+-    if (! ok)
+-        return 0;
+-
+-    /*
+-     * Get the context information for this thread.  That way we will know
+-     * where our sp, fp, pc, etc. are, and we can fill in the STACKFRAME with
+-     * the initial values.
+-     */
+-    context.ContextFlags = CONTEXT_FULL;
+-    ok = GetThreadContext(myThread, &context);
+-    if (! ok)
+-        return 0;
+-
+-    /* Setup initial stack frame from which to walk. */
+-    memset(&(frame[0]), 0, sizeof(frame[0]));
+-    frame[0].AddrPC.Offset    = context.Eip;
+-    frame[0].AddrPC.Mode      = AddrModeFlat;
+-    frame[0].AddrStack.Offset = context.Esp;
+-    frame[0].AddrStack.Mode   = AddrModeFlat;
+-    frame[0].AddrFrame.Offset = context.Ebp;
+-    frame[0].AddrFrame.Mode   = AddrModeFlat;
+-    for (;framenum < MAX_STACKFRAMES;) {
+-        PIMAGEHLP_SYMBOL symbol = (PIMAGEHLP_SYMBOL) buf;
+-        if (framenum)
+-            memcpy(&(frame[framenum]),&(frame[framenum-1]),sizeof(STACKFRAME));
+-
+-        ok = _StackWalk(IMAGE_FILE_MACHINE_I386,
+-                        myProcess,
+-                        myThread,
+-                        &(frame[framenum]),
+-                        &context,
+-                        0,                      /* read process memory hook */
+-                        _SymFunctionTableAccess,/* function table access hook */
+-                        _SymGetModuleBase,      /* module base hook */
+-                        0);                     /* translate address hook */
+-
+-        if (!ok)
+-            break;
+-        if (skip) {
+-            /* skip tells us to skip the first skip amount of stackframes */
+-            skip--;
+-            continue;
+-        }
+-        if (frame[framenum].AddrPC.Offset == 0)
+-            break;
+-
+-        framenum++;
+-
+-        /*
+-         * Time to increase the number of stack frames?
+-         */
+-        if (framenum >= MAX_STACKFRAMES)
+-            break;
+-    }
+-
+-    depth = framenum;
+-    maxstack = (depth > tmstats.calltree_maxstack);
+-    if (maxstack)
+-        tmstats.calltree_maxstack = depth;
+-
+-    /* Reverse the stack again, finding and building a path in the tree. */
+-    parent = &calltree_root;
+-    while (0 < framenum) {
+-        DWORD displacement;/*used for getsymfromaddr*/
+-
+-        pc = frame[--framenum].AddrPC.Offset;
+-
+-        csp = &parent->kids;
+-        while ((site = *csp) != NULL) {
+-            if (site->pc == pc) {
+-                tmstats.calltree_kidhits++;
+-
+-                /* Put the most recently used site at the front of siblings. */
+-                *csp = site->siblings;
+-                site->siblings = parent->kids;
+-                parent->kids = site;
+-
+-                /* Check whether we've logged for this site and logfile yet. */
+-                if (!LFD_TEST(fp->lfd, &site->lfdset)) {
+-                    /*
+-                     * Some other logfile put this site in the calltree.  We
+-                     * must log an event for site, and possibly first for its
+-                     * method and/or library.  Note the code after the while
+-                     * loop that tests if (!site).
+-                     */
+-                    break;
+-                }
+-
+-                /* Site already built and logged to fp -- go up the stack. */
+-                goto upward;
+-            }
+-            tmstats.calltree_kidsteps++;
+-            csp = &site->siblings;
+-        }
+-
+-        if (!site) {
+-            tmstats.calltree_kidmisses++;
+-
+-            /* Check for recursion: see if pc is on our ancestor line. */
+-            for (site = parent; site; site = site->parent) {
+-                if (site->pc == pc) {
+-                    tmstats.callsite_recurrences++;
+-                    last_callsite_recurrence = site;
+-                    goto upward;
+-                }
+-            }
+-        }
+-
+-        /*
+-         * Not in tree at all, or not logged to fp: let's find our symbolic
+-         * callsite info.  XXX static syms are masked by nearest lower global
+-         * Load up the info for the dll.
+-         */
+-        memset(&imagehelpLine, 0, sizeof(imagehelpLine));
+-        if (!SymGetModuleInfoEspecial(myProcess,
+-                               frame[framenum].AddrPC.Offset,
+-                               &imagehelp, &imagehelpLine)) {
+-            library = noname;
+-            filename = noname;
+-            linenumber = 0;
+-        } else {
+-            library = imagehelp.ModuleName;
+-            filename = imagehelpLine.FileName;
+-            linenumber = imagehelpLine.LineNumber;
+-
+-            if ('\0' == filename) {
+-                filename = noname;
+-                linenumber = 0;
+-            }
+-        }
+-
+-        /* Check whether we need to emit a library trace record. */
+-        library_serial = 0;
+-        if (library) {
+-           if (!libraries) {
+-                libraries = PL_NewHashTable(100, PL_HashString,
+-                                            PL_CompareStrings, PL_CompareValues,
+-                                            &lfdset_hashallocops, NULL);
+-                if (!libraries) {
+-                    tmstats.btmalloc_failures++;
+-                    return NULL;
+-                }
+-            }
+-            hash = PL_HashString(library);
+-            hep = PL_HashTableRawLookup(libraries, hash, library);
+-            he = *hep;
+-            library = strdup(library); /* strdup it always? */
+-            if (he) {
+-                library_serial = (uint32) NS_PTR_TO_INT32(he->value);
+-                le = (lfdset_entry *) he;
+-                if (LFD_TEST(fp->lfd, &le->lfdset)) {
+-                    /* We already logged an event on fp for this library. */
+-                    le = NULL;
+-                }
+-            } else {
+-/*                library = strdup(library); */
+-                if (library) {
+-                    library_serial = ++library_serial_generator;
+-                    he = PL_HashTableRawAdd(libraries, hep, hash, library,
+-                                            (void*) library_serial);
+-                }
+-                if (!he) {
+-                    tmstats.btmalloc_failures++;
+-                    return NULL;
+-                }
+-                le = (lfdset_entry *) he;
+-            }
+-            if (le) {
+-                /* Need to log an event to fp for this lib. */
+-                slash = strrchr(library, '/');
+-                if (slash)
+-                    library = slash + 1;
+-                log_event1(fp, TM_EVENT_LIBRARY, library_serial);
+-                log_string(fp, library);
+-                LFD_SET(fp->lfd, &le->lfdset);
+-            }
+-        }
+-
+-        /* Check whether we need to emit a filename trace record. */
+-        filename_serial = 0;
+-        if (filename) {
+-            if (!filenames) {
+-                filenames = PL_NewHashTable(100, PL_HashString,
+-                                            PL_CompareStrings, PL_CompareValues,
+-                                            &lfdset_hashallocops, NULL);
+-                if (!filenames) {
+-                    tmstats.btmalloc_failures++;
+-                    return NULL;
+-                }
+-            }
+-            hash = PL_HashString(filename);
+-            hep = PL_HashTableRawLookup(filenames, hash, filename);
+-            he = *hep;
+-            if (he) {
+-                filename_serial = (uint32) NS_PTR_TO_INT32(he->value);
+-                le = (lfdset_entry *) he;
+-                if (LFD_TEST(fp->lfd, &le->lfdset)) {
+-                    /* We already logged an event on fp for this filename. */
+-                    le = NULL;
+-                }
+-            } else {
+-                filename = strdup(filename);
+-                if (filename) {
+-                    filename_serial = ++filename_serial_generator;
+-                    he = PL_HashTableRawAdd(filenames, hep, hash, filename,
+-                                            (void*) filename_serial);
+-                }
+-                if (!he) {
+-                    tmstats.btmalloc_failures++;
+-                    return NULL;
+-                }
+-                le = (lfdset_entry *) he;
+-            }
+-            if (le) {
+-                /* Need to log an event to fp for this filename. */
+-                log_event1(fp, TM_EVENT_FILENAME, filename_serial);
+-                log_filename(fp, filename);
+-                LFD_SET(fp->lfd, &le->lfdset);
+-            }
+-        }
+-
+-        symbol = (PIMAGEHLP_SYMBOL) buf;
+-        symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL);
+-        symbol->MaxNameLength = sizeof(buf) - sizeof(IMAGEHLP_SYMBOL);
+-        symbol->Name[symbol->MaxNameLength] = '\0';
+-
+-        getSymRes = _SymGetSymFromAddr(myProcess,
+-                                frame[framenum].AddrPC.Offset,
+-                                &displacement,
+-                                symbol);
+-
+-        /* Now find the demangled method name and pc offset in it. */
+-        if (0 != getSymRes) {
+-            demangledname = (char *)malloc(MAX_UNMANGLED_NAME_LEN);
+-            if (!_SymUnDName(symbol,demangledname,MAX_UNMANGLED_NAME_LEN)) {
+-                free(demangledname);
+-                return 0;
+-            }
+-            method = demangledname;
+-            offset = (char*)pc - (char*)(symbol->Address);
+-        }
+-        else {
+-            method = noname;
+-            offset = pc;
+-        }
+-
+-        /* Emit an 'N' (for New method, 'M' is for malloc!) event if needed. */
+-        method_serial = 0;
+-        if (!methods) {
+-            methods = PL_NewHashTable(10000, PL_HashString,
+-                                      PL_CompareStrings, PL_CompareValues,
+-                                      &lfdset_hashallocops, NULL);
+-            if (!methods) {
+-                tmstats.btmalloc_failures++;
+-                if (method != noname) {
+-                    free((void*) method);
+-                }
+-                return NULL;
+-            }
+-        }
+-        hash = PL_HashString(method);
+-        hep = PL_HashTableRawLookup(methods, hash, method);
+-        he = *hep;
+-        if (he) {
+-            method_serial = (uint32) NS_PTR_TO_INT32(he->value);
+-            if (method != noname) {
+-                free((void*) method);
+-            }
+-            method = (char *) he->key;
+-            le = (lfdset_entry *) he;
+-            if (LFD_TEST(fp->lfd, &le->lfdset)) {
+-                /* We already logged an event on fp for this method. */
+-                le = NULL;
+-            }
+-        } else {
+-            method_serial = ++method_serial_generator;
+-            he = PL_HashTableRawAdd(methods, hep, hash, method,
+-                                    (void*) method_serial);
+-            if (!he) {
+-                tmstats.btmalloc_failures++;
+-                if (method != noname) {
+-                    free((void*) method);
+-                }
+-                return NULL;
+-            }
+-            le = (lfdset_entry *) he;
+-        }
+-        if (le) {
+-            log_event4(fp, TM_EVENT_METHOD, method_serial, library_serial,
+-                       filename_serial, linenumber);
+-            log_string(fp, method);
+-            LFD_SET(fp->lfd, &le->lfdset);
+-        }
+-
+-        /* Create a new callsite record. */
+-        if (!site) {
+-            site = malloc(sizeof(callsite));
+-            if (!site) {
+-                tmstats.btmalloc_failures++;
+-                return NULL;
+-            }
+-
+-            /* Update parent and max-kids-per-parent stats. */
+-            if (!parent->kids)
+-                tmstats.calltree_parents++;
+-            nkids = 1;
+-            for (tmp = parent->kids; tmp; tmp = tmp->siblings)
+-                nkids++;
+-            if (nkids > tmstats.calltree_maxkids) {
+-                tmstats.calltree_maxkids = nkids;
+-                calltree_maxkids_parent = parent;
+-            }
+-
+-            /* Insert the new site into the tree. */
+-            site->pc = pc;
+-            site->serial = ++callsite_serial_generator;
+-            LFD_ZERO(&site->lfdset);
+-            site->name = method;
+-            site->offset = offset;
+-            site->parent = parent;
+-            site->siblings = parent->kids;
+-            site->library = library;
+-            parent->kids = site;
+-            site->kids = NULL;
+-        }
+-
+-        /* Log the site with its parent, method, and offset. */
+-        log_event4(fp, TM_EVENT_CALLSITE, site->serial, parent->serial,
+-                   method_serial, offset);
+-        LFD_SET(fp->lfd, &site->lfdset);
+-
+-      upward:
+-        parent = site;
+-    }
+-
+-    if (maxstack)
+-        calltree_maxstack_top = site;
+-    depth = 0;
+-    for (tmp = site; tmp; tmp = tmp->parent)
+-        depth++;
+-    if (depth > tmstats.calltree_maxdepth)
+-        tmstats.calltree_maxdepth = depth;
+-    return site;
+-}
+-
+-#else /*XP_UNIX*/
+-
+-static callsite *calltree(void **bp)
+-{
+-    logfile *fp = logfp;
+-    void **bpup, **bpdown, *pc;
+     uint32 depth, nkids;
+     callsite *parent, *site, **csp, *tmp;
+     Dl_info info;
+@@ -1049,27 +654,18 @@ static callsite *calltree(void **bp)
+     uint32 filename_serial;
+     uint32 linenumber;
+     const char* filename;
+-
+-    /* Reverse the stack frame list to avoid recursion. */
+-    bpup = NULL;
+-    for (depth = 0; ; depth++) {
+-        bpdown = (void**) bp[0];
+-        bp[0] = (void*) bpup;
+-        if ((void**) bpdown[0] < bpdown)
+-            break;
+-        bpup = bp;
+-        bp = bpdown;
+-    }
+-    maxstack = (depth > tmstats.calltree_maxstack);
++    size_t stack_entry;
++
++    maxstack = (stack_entries > tmstats.calltree_maxstack);
+     if (maxstack)
+-        tmstats.calltree_maxstack = depth;
++        tmstats.calltree_maxstack = stack_entries;
+ 
+     /* Reverse the stack again, finding and building a path in the tree. */
+     parent = &calltree_root;
++    stack_entry = stack_entries;
+     do {
+-        bpup = (void**) bp[0];
+-        bp[0] = (void*) bpdown;
+-        pc = bp[1];
++        --stack_entry;
++        pc = stack[stack_entry];
+ 
+         csp = &parent->kids;
+         while ((site = *csp) != NULL) {
+@@ -1223,11 +819,6 @@ static callsite *calltree(void **bp)
+         symbol = info.dli_sname;
+         offset = (char*)pc - (char*)info.dli_saddr;
+         method = NULL;
+-#ifdef MOZ_DEMANGLE_SYMBOLS
+-        if (symbol && (len = strlen(symbol)) != 0) {
+-            method = nsDemangle(symbol);
+-        }
+-#endif
+         if (!method) {
+             method = symbol
+                      ? strdup(symbol)
+@@ -1321,23 +912,41 @@ static callsite *calltree(void **bp)
+ 
+       upward:
+         parent = site;
+-        bpdown = bp;
+-        bp = bpup;
+-    } while (bp);
++    } while (stack_entry > 0);
+ 
+     if (maxstack)
+         calltree_maxstack_top = site;
+-    depth = 0;
+-    for (tmp = site; tmp; tmp = tmp->parent)
+-        depth++;
+-    if (depth > tmstats.calltree_maxdepth)
+-        tmstats.calltree_maxdepth = depth;
+     return site;
+ }
+ 
+-#endif
+-
+-#ifdef XP_WIN32
++/* buffer the stack so that we can reverse it */
++static void **stack_buffer = NULL;
++static size_t stack_buffer_size = 0;
++static size_t stack_buffer_entries = 0;
++
++PR_STATIC_CALLBACK(void)
++stack_callback(void *pc, void *closure)
++{
++    size_t increment;
++    void ** new_stack_buffer;
++    size_t new_stack_buffer_size;
++
++    if (stack_buffer_entries == stack_buffer_size) {
++        if (stack_buffer_size == 0)
++            new_stack_buffer_size = 500;
++        else
++            new_stack_buffer_size = 2 * stack_buffer_size;
++        new_stack_buffer = realloc(stack_buffer,
++                                   new_stack_buffer_size * sizeof(void*));
++        if (!new_stack_buffer)
++            return;
++        stack_buffer = new_stack_buffer;
++        stack_buffer_size = new_stack_buffer_size;
++    }
++
++    stack_buffer[stack_buffer_entries] = pc;
++    ++stack_buffer_entries;
++}
+ 
+ callsite *
+ backtrace(int skip)
+@@ -1347,50 +956,10 @@ backtrace(int skip)
+     tmstats.backtrace_calls++;
+     suppress_tracing++;
+ 
+-    site = calltree(skip);
+-    if (!site) {
+-        tmstats.backtrace_failures++;
+-        /* PR_ASSERT(tmstats.backtrace_failures < 100); */
+-    }
+-    suppress_tracing--;
+-    return site;
+-}
+-
+-#else /*XP_UNIX*/
+-
+-callsite *
+-backtrace(int skip)
+-{
+-    void **bp, **bpdown;
+-    callsite *site, **key;
+-    PLHashNumber hash;
+-    PLHashEntry **hep, *he;
+-    int i, n;
+-
+-    tmstats.backtrace_calls++;
+-    suppress_tracing++;
+-
+-    /* Stack walking code adapted from Kipp's "leaky". */
+-#if defined(__i386) 
+-    __asm__( "movl %%ebp, %0" : "=g"(bp));
+-#elif defined(__x86_64__)
+-    __asm__( "movq %%rbp, %0" : "=g"(bp));
+-#else
+-    /*
+-     * It would be nice if this worked uniformly, but at least on i386 and
+-     * x86_64, it stopped working with gcc 4.1, because it points to the
+-     * end of the saved registers instead of the start.
+-     */
+-    bp = (void**) __builtin_frame_address(0);
+-#endif
+-    while (--skip >= 0) {
+-        bpdown = (void**) bp[0];
+-        if (bpdown < bp)
+-            break;
+-        bp = bpdown;
+-    }
+-
+-    site = calltree(bp);
++    stack_buffer_entries = 0;
++    NS_StackWalk(stack_callback, skip + 1, NULL);
++
++    site = calltree(stack_buffer, stack_buffer_entries);
+     if (!site) {
+         tmstats.backtrace_failures++;
+         PR_ASSERT(tmstats.backtrace_failures < 100);
+@@ -1398,10 +967,6 @@ backtrace(int skip)
+     suppress_tracing--;
+     return site;
+ }
+-
+-
+-#endif /* XP_UNIX */
+-
+ 
+ typedef struct allocation {
+     PLHashEntry entry;
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.h b/tools/trace-malloc/lib/nsTraceMalloc.h
+--- a/tools/trace-malloc/lib/nsTraceMalloc.h
++++ b/tools/trace-malloc/lib/nsTraceMalloc.h
+@@ -63,7 +63,7 @@ PR_BEGIN_EXTERN_C
+  */
+ typedef struct nsTMStats {
+     uint32 calltree_maxstack;
+-    uint32 calltree_maxdepth;
++    /* maxdepth used to be here, but it was the same as maxstack */
+     uint32 calltree_parents;
+     uint32 calltree_maxkids;
+     uint32 calltree_kidhits;
+@@ -84,7 +84,7 @@ typedef struct nsTMStats {
+     uint32 null_free_calls;
+ } nsTMStats;
+ 
+-#define NS_TMSTATS_STATIC_INITIALIZER {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
++#define NS_TMSTATS_STATIC_INITIALIZER {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+ 
+ /**
+  * Call NS_TraceMallocStartup with a valid file descriptor to enable logging
+diff --git a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
+--- a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
++++ b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
+@@ -7,121 +7,8 @@
+ #include "nscore.h"
+ #include "nsAutoLock.h"
+ 
+-#include "nsStackFrameWin.h"
+ #include "nsDebugHelpWin32.h"
+ #include "nsTraceMallocCallbacks.h"
+-
+-// XXX These are *very* quick hacks and need improvement!
+-
+-static PRBool GetSymbolFromAddress(uint32 addr, char* outBuf)
+-{
+-    PRBool ok;
+-    ok = EnsureSymInitialized();
+-    if(!ok)
+-        return ok;
+-
+-    char buf[sizeof(IMAGEHLP_SYMBOL) + 512];
+-    PIMAGEHLP_SYMBOL symbol = (PIMAGEHLP_SYMBOL) buf;
+-    symbol->SizeOfStruct = sizeof(buf);
+-    symbol->MaxNameLength = 512;
+-
+-    DWORD displacement;
+-
+-    ok = SymGetSymFromAddr(::GetCurrentProcess(),
+-                           addr,
+-                           &displacement,
+-                           symbol);
+-
+-    if(ok)
+-    {
+-        char buf2[512];
+-        sprintf(buf2, "%s+0x%08X", symbol->Name, displacement);
+-        strcat(outBuf, buf2);
+-    }
+-    else
+-        strcat(outBuf, "dunno");
+-    return ok;
+-}
+-
+-static PRBool GetModuleFromAddress(uint32 addr, char* outBuf)
+-{
+-    PRBool ok;
+-    ok = EnsureSymInitialized();
+-    if(!ok)
+-        return ok;
+-
+-
+-    IMAGEHLP_MODULE module;
+-    module.SizeOfStruct = sizeof(IMAGEHLP_MODULE);
+-
+-    ok = SymGetModuleInfo(::GetCurrentProcess(),
+-                          addr,
+-                          &module);
+-
+-    if(ok)
+-        strcat(outBuf, module.ModuleName);
+-    else
+-        strcat(outBuf, "dunno");
+-    return ok;
+-}
+-
+-/***************************************************************************/
+-#ifdef VERBOSE
+-#define SHOW(x_, buf_) \
+-    printf(#x_" = %#x... %s\n", x_,             \
+-    (buf_[0] = 0,                               \
+-     GetModuleFromAddress((uint32)x_, buf_),    \
+-     strcat(buf," :: "),                        \
+-     GetSymbolFromAddress((uint32)x_, buf_),    \
+-     buf_));
+-#else
+-#define SHOW(x_, buf_)
+-#endif  //VERBOSE
+-
+-
+-/***************************************************************************/
+-
+-#ifdef VERBOSE
+-// XXX This is a quick hack to show that x86 Win32 stack walking can be done
+-// with this sort of loop following the bp. 
+-
+-void dumpStack()
+-{
+-    uint32* bp_;
+-    uint32* bpdown;
+-    uint32  pc;
+-
+-    char buf[512];
+-
+-    _asm { mov bp_ , ebp }
+-
+-    /* Stack walking code adapted from Kipp's "leaky". */
+-    while (1) {
+-        bpdown = (uint32*) *bp_++;
+-        pc = *bp_;
+-        // These addresses are iffy...
+-        if (pc < 0x00400000 || pc > 0x7fffffff || bpdown < bp_)
+-            break;
+-        SHOW(pc, buf);
+-        bp_ = bpdown;
+-    }
+-    printf("\n");
+-}
+-#endif
+-
+-char* _stdcall call2(void* v)
+-{
+-//    dumpStack();
+-//    return 0; 
+-
+-    return (char *)malloc(123);   
+-}
+-
+-int call1(char c, int i, double d, ... )
+-{
+-    free(call2(0));
+-    return 0;    
+-}
+ 
+ /***************************************************************************/
+ // shows how to use the dhw stuff to hook imported functions
+@@ -298,86 +185,6 @@ void __cdecl dhw_delete(void* p)
+     g_lockOut = FALSE;
+ }
+ 
+-
+-
+-
+-/***************************************************************************/
+-// A demonstration of using the _CrtSetAllocHook based hooking.
+-// This system sucks because you don't get to see the allocated pointer.
+-#if 0
+-class myAllocationSizePrinter : public DHWAllocationSizeDebugHook
+-{
+-public:
+-    PRBool AllocHook(size_t size)
+-    {
+-        alloc_calls++ ;
+-        total_mem += size;
+-        if(verbosity)
+-        {
+-            printf("alloc called to get %d bytes.\n", size);
+-            dumpStack();
+-        }
+-        return PR_TRUE;
+-    }
+-
+-    PRBool ReallocHook(size_t size, size_t sizeOld)
+-    {
+-        realloc_calls++ ;
+-        total_mem += size;
+-        total_mem -= sizeOld;
+-        if(verbosity)
+-        {
+-            printf("realloc called to size to %d bytes. Old size: %d.\n",
+-                   size, sizeOld);
+-            dumpStack();
+-        }
+-        return PR_TRUE;
+-    }
+-
+-    PRBool FreeHook(size_t size)
+-    {
+-        free_calls++ ;
+-        total_mem -= size;
+-        if(verbosity)
+-        {
+-            printf("free called to release %d bytes.\n", size);
+-            dumpStack();
+-        }
+-        return PR_TRUE;
+-    }
+-
+-    myAllocationSizePrinter(int v)
+-        : verbosity(v),
+-          alloc_calls(0),
+-          realloc_calls(0),
+-          free_calls(0),
+-          total_mem(0) {}
+-    virtual ~myAllocationSizePrinter(){}
+-
+-    void report()
+-    {
+-        printf("%d allocs, %d reallocs, %d frees, %d bytes leaked\n",
+-               alloc_calls, realloc_calls, free_calls, total_mem);
+-    }
+-
+-private:
+-    void dumpStack()
+-    {
+-        if(verbosity == 2)
+-            ::dumpStack();
+-    }
+- 
+-    int verbosity;
+-    int alloc_calls;
+-    int realloc_calls;
+-    int free_calls;
+-    size_t total_mem;
+-};
+-#endif
+-
+-
+-
+-
+ /*C Callbacks*/
+ PR_IMPLEMENT(void)
+ StartupHooker()
+@@ -403,50 +210,3 @@ ShutdownHooker()
+ ShutdownHooker()
+ {
+ }
+-
+-
+-
+-#if 0
+-
+-int main()
+-{
+-    // A demonstration of using the (sucky) _CrtSetAllocHook based hooking.
+-    myAllocationSizePrinter ap(0);
+-    dhwSetAllocationSizeDebugHook(&ap);
+-
+-    // show that the ImportHooker is hooking calls from loaded dll
+-    DHW_DECLARE_FUN_TYPE(void, __stdcall, SOMECALL_, (void));
+-    HMODULE module = ::LoadLibrary("Other.dll");
+-    if(module) {
+-        SOMECALL_ _SomeCall = (SOMECALL_) GetProcAddress(module, "SomeCall");
+-        if(_SomeCall)
+-            _SomeCall(); 
+-    }
+-
+-    // show that the ImportHooker is hooking sneaky calls made from this dll.
+-    HMODULE module2 = ::LoadLibrary(NS_DEBUG_CRT);
+-    if(module2) {
+-        MALLOC_ _sneakyMalloc = (MALLOC_) GetProcAddress(module2, "malloc");
+-        if(_sneakyMalloc)
+-        {
+-            void* p = _sneakyMalloc(987); 
+-            free(p);
+-        }
+-    }
+-
+-    call1('x', 1, 1.0, "hi there", 2);
+-
+-    char* p = new char[10];
+-    delete p;
+-
+-    void* v = malloc(10);
+-    v = realloc(v, 15);
+-    v = realloc(v, 5);
+-    free(v);`
+-
+-    ap.report();
+-    dhwClearAllocationSizeDebugHook();
+-    return 0;
+-}
+-#endif //0
+-
