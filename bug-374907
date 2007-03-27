@@ -1,0 +1,311 @@
+Make rule nodes know their level in the cascade.  b=374907
+
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -111,20 +111,24 @@ public:
+  */
+ 
+ struct ChildrenHashEntry : public PLDHashEntryHdr {
+-  // key (the rule) is |mRuleNode->GetRule()|
++  // key is |mRuleNode->GetKey()|
+   nsRuleNode *mRuleNode;
+ };
+ 
+-PR_STATIC_CALLBACK(PRBool)
+-ChildrenHashMatchEntry(PLDHashTable *table, const PLDHashEntryHdr *hdr,
+-                         const void *key)
++/* static */ PR_CALLBACK PRBool
++nsRuleNode::ChildrenHashMatchEntry(PLDHashTable *table,
++                                   const PLDHashEntryHdr *hdr,
++                                   const void *k)
+ {
+   const ChildrenHashEntry *entry =
+     NS_STATIC_CAST(const ChildrenHashEntry*, hdr);
+-  return entry->mRuleNode->GetRule() == key;
+-}
+-
+-static PLDHashTableOps ChildrenHashOps = {
++  const nsRuleNode::Key *key =
++    NS_STATIC_CAST(const nsRuleNode::Key*, k);
++  return entry->mRuleNode->GetKey() == *key;
++}
++
++/* static */ PLDHashTableOps
++nsRuleNode::ChildrenHashOps = {
+   // It's probably better to allocate the table itself using malloc and
+   // free rather than the pres shell's arena because the table doesn't
+   // grow very often and the pres shell's arena doesn't recycle very
+@@ -433,15 +437,17 @@ nsRuleNode::~nsRuleNode()
+   NS_IF_RELEASE(mRule);
+ }
+ 
+-nsresult 
+-nsRuleNode::Transition(nsIStyleRule* aRule, nsRuleNode** aResult)
++nsRuleNode*
++nsRuleNode::Transition(nsIStyleRule* aRule, PRUint8 aLevel,
++                       PRPackedBool aIsImportantRule)
+ {
+   nsRuleNode* next = nsnull;
++  nsRuleNode::Key key(aRule, aLevel, aIsImportantRule);
+ 
+   if (HaveChildren() && !ChildrenAreHashed()) {
+     PRInt32 numKids = 0;
+     nsRuleList* curr = ChildrenList();
+-    while (curr && curr->mRuleNode->mRule != aRule) {
++    while (curr && curr->mRuleNode->GetKey() == key) {
+       curr = curr->mNext;
+       ++numKids;
+     }
+@@ -453,10 +459,9 @@ nsRuleNode::Transition(nsIStyleRule* aRu
+ 
+   if (ChildrenAreHashed()) {
+     ChildrenHashEntry *entry = NS_STATIC_CAST(ChildrenHashEntry*,
+-        PL_DHashTableOperate(ChildrenHash(), aRule, PL_DHASH_ADD));
++        PL_DHashTableOperate(ChildrenHash(), &key, PL_DHASH_ADD));
+     if (!entry) {
+-      *aResult = nsnull;
+-      return NS_ERROR_OUT_OF_MEMORY;
++      return nsnull;
+     }
+     if (entry->mRuleNode)
+       next = entry->mRuleNode;
+@@ -465,28 +470,24 @@ nsRuleNode::Transition(nsIStyleRule* aRu
+           new (mPresContext) nsRuleNode(mPresContext, aRule, this);
+       if (!next) {
+         PL_DHashTableRawRemove(ChildrenHash(), entry);
+-        *aResult = nsnull;
+-        return NS_ERROR_OUT_OF_MEMORY;
++        return nsnull;
+       }
+     }
+   } else if (!next) {
+     // Create the new entry in our list.
+     next = new (mPresContext) nsRuleNode(mPresContext, aRule, this);
+     if (!next) {
+-      *aResult = nsnull;
+-      return NS_ERROR_OUT_OF_MEMORY;
++      return nsnull;
+     }
+     nsRuleList* newChildrenList = new (mPresContext) nsRuleList(next, ChildrenList());
+     if (NS_UNLIKELY(!newChildrenList)) {
+       next->Destroy();
+-      *aResult = nsnull;
+-      return NS_ERROR_OUT_OF_MEMORY;
++      return nsnull;
+     }
+     SetChildrenList(newChildrenList);
+   }
+   
+-  *aResult = next;
+-  return NS_OK;
++  return next;
+ }
+ 
+ void
+diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
+--- a/layout/style/nsRuleNode.h
++++ b/layout/style/nsRuleNode.h
+@@ -334,6 +334,36 @@ private:
+                        // use for lookups of style properties.
+   nsIStyleRule* mRule; // [STRONG] A pointer to our specific rule.
+ 
++  struct Key {
++    nsIStyleRule* mRule;
++    PRUint8 mLevel;
++    PRPackedBool mIsImportantRule;
++
++    Key(nsIStyleRule* aRule, PRUint8 aLevel, PRPackedBool aIsImportantRule)
++      : mRule(aRule), mLevel(aLevel), mIsImportantRule(aIsImportantRule)
++    {}
++
++    PRBool operator==(const Key& aOther) const
++    {
++      return mRule == aOther.mRule &&
++             mLevel == aOther.mLevel &&
++             mIsImportantRule == aOther.mIsImportantRule;
++    }
++  };
++
++  static PR_CALLBACK PRBool
++  ChildrenHashMatchEntry(PLDHashTable *table,
++                         const PLDHashEntryHdr *hdr,
++                         const void *k);
++  static PLDHashTableOps ChildrenHashOps;
++
++  // It's probably better to allocate the table itself using malloc and
++  // free rather than the pres shell's arena because the table doesn't
++
++  Key GetKey() const {
++    return Key(mRule, GetLevel(), IsImportantRule());
++  }
++
+   // The children of this node are stored in either a hashtable or list
+   // that maps from rules to our nsRuleNode children.  When matching
+   // rules, we use this mapping to transition from node to node
+@@ -638,9 +668,31 @@ public:
+ public:
+   static NS_HIDDEN_(nsRuleNode*) CreateRootNode(nsPresContext* aPresContext);
+ 
+-  NS_HIDDEN_(nsresult) Transition(nsIStyleRule* aRule, nsRuleNode** aResult);
++  NS_HIDDEN_(nsRuleNode*) Transition(nsIStyleRule* aRule, PRUint8 aLevel,
++                                     PRPackedBool aIsImportantRule);
+   nsRuleNode* GetParent() const { return mParent; }
+   PRBool IsRoot() const { return mParent == nsnull; }
++
++  // These PRUint8s are really nsStyleSet::sheetType values.
++private:
++  void SetLevel(PRUint8 aLevel, PRBool aIsImportant) {
++    mDependentBits = (mDependentBits &
++                      ~(NS_RULE_NODE_LEVEL_MASK|NS_RULE_NODE_IS_IMPORTANT)) |
++                     (aLevel << NS_RULE_NODE_LEVEL_SHIFT) |
++                     (aIsImportant ? NS_RULE_NODE_IS_IMPORTANT : 0);
++    NS_ASSERTION(GetLevel() == aLevel, "not enough bits");
++    NS_ASSERTION(IsImportantRule() == aIsImportant, "yikes");
++  }
++public:
++  PRUint8 GetLevel() const { 
++    NS_ASSERTION(!IsRoot(), "can't call on root");
++    return (mDependentBits & NS_RULE_NODE_LEVEL_MASK) >>
++             NS_RULE_NODE_LEVEL_SHIFT;
++  }
++  PRBool IsImportantRule() const {
++    NS_ASSERTION(!IsRoot(), "can't call on root");
++    return (mDependentBits & NS_RULE_NODE_IS_IMPORTANT) != 0;
++  }
+ 
+   // NOTE:  Does not |AddRef|.
+   nsIStyleRule* GetRule() const { return mRule; }
+diff --git a/layout/style/nsRuleWalker.h b/layout/style/nsRuleWalker.h
+--- a/layout/style/nsRuleWalker.h
++++ b/layout/style/nsRuleWalker.h
+@@ -49,23 +49,27 @@ public:
+   void SetCurrentNode(nsRuleNode* aNode) { mCurrent = aNode; }
+ 
+   void Forward(nsIStyleRule* aRule) { 
+-    nsRuleNode* next;
+-    mCurrent->Transition(aRule, &next);
+-    mCurrent = next;
+-  }
+-
+-  void Back() {
+-    if (mCurrent != mRoot)
+-      mCurrent = mCurrent->GetParent();
++    if (mCurrent) {
++      mCurrent = mCurrent->Transition(aRule, mLevel, mImportance);
++    }
+   }
+ 
+   void Reset() { mCurrent = mRoot; }
+ 
+   PRBool AtRoot() { return mCurrent == mRoot; }
+ 
++  void SetLevel(PRUint8 aLevel, PRBool aImportance) {
++    mLevel = aLevel;
++    mImportance = aImportance;
++  }
++  PRUint8 GetLevel() const { return mLevel; }
++  PRBool GetImportance() const { return mImportance; }
++
+ private:
+   nsRuleNode* mCurrent; // Our current position.
+   nsRuleNode* mRoot; // The root of the tree we're walking.
++  PRUint8 mLevel; // an nsStyleSet::sheetType
++  PRPackedBool mImportance;
+ 
+ public:
+   nsRuleWalker(nsRuleNode* aRoot) :mCurrent(aRoot), mRoot(aRoot) { MOZ_COUNT_CTOR(nsRuleWalker); };
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -454,22 +454,27 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+                   SheetCount(eHTMLPresHintSheet) == 0,
+                   "Can't have both types of preshint sheets at once!");
+   
++  mRuleWalker->SetLevel(eAgentSheet, PR_FALSE);
+   if (mRuleProcessors[eAgentSheet])
+     (*aCollectorFunc)(mRuleProcessors[eAgentSheet], aData);
+   nsRuleNode* lastAgentRN = mRuleWalker->GetCurrentNode();
+ 
++  mRuleWalker->SetLevel(ePresHintSheet, PR_FALSE);
+   if (mRuleProcessors[ePresHintSheet])
+     (*aCollectorFunc)(mRuleProcessors[ePresHintSheet], aData);
+   nsRuleNode* lastPresHintRN = mRuleWalker->GetCurrentNode();
+   
++  mRuleWalker->SetLevel(eUserSheet, PR_FALSE);
+   if (mRuleProcessors[eUserSheet])
+     (*aCollectorFunc)(mRuleProcessors[eUserSheet], aData);
+   nsRuleNode* lastUserRN = mRuleWalker->GetCurrentNode();
+ 
++  mRuleWalker->SetLevel(eHTMLPresHintSheet, PR_FALSE);
+   if (mRuleProcessors[eHTMLPresHintSheet])
+     (*aCollectorFunc)(mRuleProcessors[eHTMLPresHintSheet], aData);
+   nsRuleNode* lastHTMLPresHintRN = mRuleWalker->GetCurrentNode();
+   
++  mRuleWalker->SetLevel(eDocSheet, PR_FALSE);
+   PRBool cutOffInheritance = PR_FALSE;
+   if (mBindingManager) {
+     // We can supply additional document-level sheets that should be walked.
+@@ -478,24 +483,31 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   }
+   if (!cutOffInheritance && mRuleProcessors[eDocSheet]) // NOTE: different
+     (*aCollectorFunc)(mRuleProcessors[eDocSheet], aData);
++  mRuleWalker->SetLevel(eStyleAttrSheet, PR_FALSE);
+   if (mRuleProcessors[eStyleAttrSheet])
+     (*aCollectorFunc)(mRuleProcessors[eStyleAttrSheet], aData);
+-
++  nsRuleNode* lastDocRN = mRuleWalker->GetCurrentNode();
++
++  mRuleWalker->SetLevel(eOverrideSheet, PR_FALSE);
+   if (mRuleProcessors[eOverrideSheet])
+     (*aCollectorFunc)(mRuleProcessors[eOverrideSheet], aData);
+   nsRuleNode* lastOvrRN = mRuleWalker->GetCurrentNode();
+ 
+-  // There should be no important rules in the preshint or HTMLpreshint level
+-  AddImportantRules(lastOvrRN, lastHTMLPresHintRN);  // doc and override
++  mRuleWalker->SetLevel(eDocSheet, PR_TRUE);
++  AddImportantRules(lastDocRN, lastHTMLPresHintRN);  // doc
++  mRuleWalker->SetLevel(eOverrideSheet, PR_TRUE);
++  AddImportantRules(lastOvrRN, lastDocRN);  // override
+ #ifdef DEBUG
+   AssertNoCSSRules(lastHTMLPresHintRN, lastUserRN);
+   AssertNoImportantRules(lastHTMLPresHintRN, lastUserRN); // HTML preshints
+ #endif
++  mRuleWalker->SetLevel(eUserSheet, PR_TRUE);
+   AddImportantRules(lastUserRN, lastPresHintRN); //user
+ #ifdef DEBUG
+   AssertNoCSSRules(lastPresHintRN, lastAgentRN);
+   AssertNoImportantRules(lastPresHintRN, lastAgentRN); // preshints
+ #endif
++  mRuleWalker->SetLevel(eAgentSheet, PR_TRUE);
+   AddImportantRules(lastAgentRN, nsnull);     //agent
+ 
+ }
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -161,8 +161,9 @@ class nsStyleSet
+     eStyleAttrSheet,
+     eOverrideSheet, // CSS
+     eSheetTypeCount
+-    // be sure to keep the number of bits in |mDirty| below updated when
+-    // changing the number of sheet types
++    // be sure to keep the number of bits in |mDirty| below and in
++    // NS_RULE_NODE_LEVEL_MASK updated when changing the number of sheet
++    // types
+   };
+ 
+   // APIs to manipulate the style sheet lists.  The sheets in each
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -92,6 +92,9 @@ nsStyleStructID_Length /* one past the e
+ 
+ // Additional bits for nsRuleNode's mDependentBits:
+ #define NS_RULE_NODE_GC_MARK              0x02000000
++#define NS_RULE_NODE_IS_IMPORTANT         0x08000000
++#define NS_RULE_NODE_LEVEL_MASK           0xf0000000
++#define NS_RULE_NODE_LEVEL_SHIFT          28
+ 
+ // The actual structs start here
+ struct nsStyleStruct {
