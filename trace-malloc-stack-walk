@@ -586,7 +586,15 @@ deleted file mode 100644
 diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
 --- a/tools/trace-malloc/lib/nsTraceMalloc.c
 +++ b/tools/trace-malloc/lib/nsTraceMalloc.c
-@@ -67,9 +67,9 @@
+@@ -41,7 +41,6 @@
+ #ifdef NS_TRACE_MALLOC
+  /*
+  * TODO:
+- * - fix my_dladdr so it builds its own symbol tables from bfd
+  * - extend logfile so 'F' record tells free stack
+  * - diagnose rusty's SMP realloc oldsize corruption bug
+  * - #ifdef __linux__/x86 and port to other platforms
+@@ -67,9 +66,9 @@
  #include "nsTraceMalloc.h"
  #include "nscore.h"
  #include "prinit.h"
@@ -597,7 +605,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  #include <sys/timeb.h>/*for timeb*/
  #include <sys/stat.h>/*for fstat*/
  
-@@ -82,10 +82,6 @@
+@@ -82,10 +81,6 @@
  
  #ifdef XP_UNIX
  #define WRITE_FLAGS "w"
@@ -608,7 +616,144 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  #ifdef WRAP_SYSTEM_INCLUDES
  #pragma GCC visibility push(default)
-@@ -641,401 +637,10 @@ static PLHashTable *filenames = NULL;
+@@ -99,136 +94,6 @@ extern __ptr_t __libc_valloc(size_t);
+ #ifdef WRAP_SYSTEM_INCLUDES
+ #pragma GCC visibility pop
+ #endif
+-
+-/* XXX I wish dladdr could find local text symbols (static functions). */
+-#define __USE_GNU 1
+-#include <dlfcn.h>
+-
+-#if 1
+-#define my_dladdr dladdr
+-#else
+-/* XXX this version, which uses libbfd, runs mozilla clean out of memory! */
+-#include <bfd.h>
+-#include <elf.h>        /* damn dladdr ignores local symbols! */
+-#include <link.h>
+-
+-extern struct link_map *_dl_loaded;
+-
+-static int my_dladdr(const void *address, Dl_info *info)
+-{
+-    const ElfW(Addr) addr = (ElfW(Addr)) address;
+-    struct link_map *lib, *matchlib;
+-    unsigned int n, size;
+-    bfd *abfd;
+-    PTR minisyms;
+-    long nsyms;
+-    bfd_byte *mini, *endmini;
+-    asymbol *sym, *storage;
+-    bfd_vma target, symaddr;
+-    static const char *sname;
+-
+-    /* Find the highest-addressed object not greater than address. */
+-    matchlib = NULL;
+-    for (lib = _dl_loaded; lib; lib = lib->l_next) {
+-        if (lib->l_addr != 0 &&         /* 0 means map not set up yet? */
+-            lib->l_addr <= addr &&
+-            (!matchlib || matchlib->l_addr < lib->l_addr)) {
+-            matchlib = lib;
+-        }
+-    }
+-    if (!matchlib)
+-        return 0;
+-
+-    /*
+-     * We know the address lies within matchlib, if it's in any shared object.
+-     * Make sure it isn't past the end of matchlib's segments.
+-     */
+-    n = (size_t) matchlib->l_phnum;
+-    if (n > 0) {
+-        do {
+-            --n;
+-        } while (matchlib->l_phdr[n].p_type != PT_LOAD);
+-        if (addr >= (matchlib->l_addr +
+-                     matchlib->l_phdr[n].p_vaddr +
+-                     matchlib->l_phdr[n].p_memsz)) {
+-            /* Off the end of the highest-addressed shared object. */
+-            return 0;
+-        }
+-    }
+-
+-    /*
+-     * Now we know what object the address lies in.  Set up info for a file
+-     * match, then find the greatest info->dli_saddr <= addr.
+-     */
+-    info->dli_fname = matchlib->l_name;
+-    info->dli_fbase = (void*) matchlib->l_addr;
+-    info->dli_sname = NULL;
+-    info->dli_saddr = NULL;
+-
+-    /* Ah, the joys of libbfd.... */
+-    const char target[] = 
+-#if defined(__i386)
+-        "elf32-i386"
+-#elif defined(__x86_64__)
+-        "elf64-x86-64"
+-#else 
+-#error Unknown architecture
+-#endif
+-        ;
+-    abfd = bfd_openr(matchlib->l_name, target);
+-    if (!abfd)
+-        return 0;
+-    if (!bfd_check_format(abfd, bfd_object)) {
+-        printf("%s is not an object file, according to libbfd.\n",
+-               matchlib->l_name);
+-        return 0;
+-    }
+-    nsyms = bfd_read_minisymbols(abfd, 0, &minisyms, &size);
+-    if (nsyms < 0) {
+-        bfd_close(abfd);
+-        return 0;
+-    }
+-
+-    if (nsyms > 0) {
+-        storage = bfd_make_empty_symbol(abfd);
+-        if (!storage) {
+-            bfd_close(abfd);
+-            return 0;
+-        }
+-        target = (bfd_vma) addr - (bfd_vma) matchlib->l_addr;
+-        endmini = (bfd_byte*) minisyms + nsyms * size;
+-
+-        for (mini = (bfd_byte*) minisyms; mini < endmini; mini += size) {
+-            sym = bfd_minisymbol_to_symbol(abfd, 0, (const PTR)mini, storage);
+-            if (!sym) {
+-                bfd_close(abfd);
+-                return 0;
+-            }
+-            if (sym->flags & (BSF_GLOBAL | BSF_LOCAL | BSF_WEAK)) {
+-                symaddr = sym->value + sym->section->vma;
+-                if (symaddr == 0 || symaddr > target)
+-                    continue;
+-                if (!info->dli_sname || info->dli_saddr < (void*) symaddr) {
+-                    info->dli_sname = sym->name;
+-                    info->dli_saddr = (void*) symaddr;
+-                }
+-            }
+-        }
+-
+-        /* Emulate dladdr by allocating and owning info->dli_sname's storage. */
+-        if (info->dli_sname) {
+-            if (sname)
+-                __libc_free((void*) sname);
+-            sname = strdup(info->dli_sname);
+-            if (!sname)
+-                return 0;
+-            info->dli_sname = sname;
+-        }
+-    }
+-    bfd_close(abfd);
+-    return 1;
+-}
+-#endif /* 0 */
+ 
+ #else  /* !XP_UNIX */
+ 
+@@ -641,401 +506,10 @@ static PLHashTable *filenames = NULL;
  /* Table mapping method names to logged 'N' record serial numbers. */
  static PLHashTable *methods = NULL;
  
@@ -1011,7 +1156,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      uint32 depth, nkids;
      callsite *parent, *site, **csp, *tmp;
      Dl_info info;
-@@ -1049,27 +654,21 @@ static callsite *calltree(void **bp)
+@@ -1049,27 +523,21 @@ static callsite *calltree(void **bp)
      uint32 filename_serial;
      uint32 linenumber;
      const char* filename;
@@ -1050,7 +1195,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
          csp = &parent->kids;
          while ((site = *csp) != NULL) {
-@@ -1223,11 +822,6 @@ static callsite *calltree(void **bp)
+@@ -1223,11 +691,6 @@ static callsite *calltree(void **bp)
          symbol = info.dli_sname;
          offset = (char*)pc - (char*)info.dli_saddr;
          method = NULL;
@@ -1062,7 +1207,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          if (!method) {
              method = symbol
                       ? strdup(symbol)
-@@ -1321,23 +915,41 @@ static callsite *calltree(void **bp)
+@@ -1321,23 +784,41 @@ static callsite *calltree(void **bp)
  
        upward:
          parent = site;
@@ -1115,7 +1260,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  callsite *
  backtrace(int skip)
-@@ -1347,50 +959,10 @@ backtrace(int skip)
+@@ -1347,50 +828,10 @@ backtrace(int skip)
      tmstats.backtrace_calls++;
      suppress_tracing++;
  
@@ -1170,7 +1315,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      if (!site) {
          tmstats.backtrace_failures++;
          PR_ASSERT(tmstats.backtrace_failures < 100);
-@@ -1398,10 +970,6 @@ backtrace(int skip)
+@@ -1398,10 +839,6 @@ backtrace(int skip)
      suppress_tracing--;
      return site;
  }
