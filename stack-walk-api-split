@@ -11,7 +11,7 @@ diff --git a/xpcom/base/nsStackFrameUnix.cpp b/xpcom/base/nsStackFrameUnix.cpp
  
    // Get the frame pointer
    void **bp;
-@@ -113,40 +112,44 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+@@ -113,39 +112,64 @@ NS_StackWalk(NS_WalkStackCallback aCallb
    for ( ; (void**)*bp > bp; bp = (void**)*bp) {
      void *pc = *(bp+1);
      if (--skip <= 0) {
@@ -29,29 +29,7 @@ diff --git a/xpcom/base/nsStackFrameUnix.cpp b/xpcom/base/nsStackFrameUnix.cpp
 -      int len;
 -      if (!symbol || !(len = strlen(symbol))) {
 -        snprintf(buf, sizeof(buf), "UNKNOWN [%s +0x%08X]\n",
-+      (*aCallback)(pc, aClosure);
-+    }
-+  }
-+  return NS_OK;
-+}
-+
-+nsresult
-+NS_DescribeCodeAddress(void *aPC, char *aBuffer, PRUint32 aBufferSize)
-+{
-+  Dl_info info;
-+  int ok = dladdr(aPC, &info);
-+  if (!ok) {
-+    snprintf(aBuffer, aBufferSize, "UNKNOWN %p\n", aPC);
-+    return NS_OK;
-+  }
-+
-+  PRUint32 foff = (char*)aPC - (char*)info.dli_fbase;
-+
-+  const char * symbol = info.dli_sname;
-+  int len;
-+  if (!symbol || !(len = strlen(symbol))) {
-+    snprintf(aBuffer, aBufferSize, "UNKNOWN [%s +0x%08X]\n",
-                                    info.dli_fname, foff);
+-                                   info.dli_fname, foff);
 -        (*aCallback)(buf, aClosure);
 -        continue;
 -      }
@@ -67,6 +45,37 @@ diff --git a/xpcom/base/nsStackFrameUnix.cpp b/xpcom/base/nsStackFrameUnix.cpp
 -
 -      PRUint32 off = (char*)pc - (char*)info.dli_saddr;
 -      snprintf(buf, sizeof(buf), "%s+0x%08X [%s +0x%08X]\n",
+-                                 symbol, off, info.dli_fname, foff);
+-      (*aCallback)(buf, aClosure);
+-    }
++      (*aCallback)(pc, aClosure);
++    }
++  }
++  return NS_OK;
++}
++
++nsresult
++NS_DescribeCodeAddress(void *aPC, nsCodeAddressDetails *aDetails)
++{
++  aDetails->library[0] = '\0';
++  aDetails->loffset = 0;
++  aDetails->filename[0] = '\0';
++  aDetails->lineno = 0;
++  aDetails->function[0] = '\0';
++  aDetails->foffset = 0;
++
++  Dl_info info;
++  int ok = dladdr(aPC, &info);
++  if (!ok) {
++    return NS_OK;
++  }
++
++  PL_strncpyz(aDetails->library, info.dli_fname, sizeof(aDetails->library));
++  aDetails->loffset = (char*)aPC - (char*)info.dli_fbase;
++
++  const char * symbol = info.dli_sname;
++  int len;
++  if (!symbol || !(len = strlen(symbol))) {
 +    return NS_OK;
 +  }
 +
@@ -79,16 +88,28 @@ diff --git a/xpcom/base/nsStackFrameUnix.cpp b/xpcom/base/nsStackFrameUnix.cpp
 +    len = strlen(symbol);
 +  }
 +
-+  PRUint32 off = (char*)aPC - (char*)info.dli_saddr;
-+  snprintf(aBuffer, aBufferSize, "%s+0x%08X [%s +0x%08X]\n",
-                                  symbol, off, info.dli_fname, foff);
--      (*aCallback)(buf, aClosure);
--    }
--  }
++  PL_strncpyz(aDetails->function, symbol, sizeof(aDetails->function));
++  aDetails->foffset = (char*)aPC - (char*)info.dli_saddr;
++  return NS_OK;
++}
++
++nsresult
++NS_FormatCodeAddressDetails(void *aPC, const nsCodeAddressDetails *aDetails,
++                            char *aBuffer, PRUint32 aBufferSize)
++{
++  if (!aDetails->library) {
++    snprintf(aBuffer, aBufferSize, "UNKNOWN %p\n", aPC);
++  } else if (!aDetails->function) {
++    snprintf(aBuffer, aBufferSize, "UNKNOWN [%s +0x%08X]\n",
++                                   aDetails->library, aDetails->loffset);
++  } else {
++    snprintf(aBuffer, aBufferSize, "%s+0x%08X [%s +0x%08X]\n",
++                                   aDetails->function, aDetails->foffset,
++                                   aDetails->library, aDetails->loffset);
+   }
    return NS_OK;
  }
- 
-@@ -256,33 +259,10 @@ load_address(void * pc, void * arg )
+@@ -256,33 +280,10 @@ load_address(void * pc, void * arg )
      if (ptr->next) {
          mutex_unlock(&lock);
      } else {
@@ -123,38 +144,57 @@ diff --git a/xpcom/base/nsStackFrameUnix.cpp b/xpcom/base/nsStackFrameUnix.cpp
      }
      return 0;
  }
-@@ -360,4 +340,34 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+@@ -360,4 +361,53 @@ NS_StackWalk(NS_WalkStackCallback aCallb
      cs_operate(load_address, &args);
      return NS_OK;
  }
 -#endif
 +
 +nsresult
-+NS_DescribeCodeAddress(void *aPC, char *aBuffer, PRUint32 aBufferSize)
++NS_DescribeCodeAddress(void *aPC, nsCodeAddressDetails *aDetails)
 +{
++    aDetails->library[0] = '\0';
++    aDetails->loffset = 0;
++    aDetails->filename[0] = '\0';
++    aDetails->lineno = 0;
++    aDetails->function[0] = '\0';
++    aDetails->foffset = 0;
++
 +    char dembuff[4096];
 +    Dl_info info;
-+    const char *func = "??", *lib = "??";
 +
 +    if (dladdr(aPC, & info)) {
-+        if (info.dli_fname)
-+            lib =  info.dli_fname;
-+        if (info.dli_sname)
-+            func = info.dli_sname;
++        if (info.dli_fname) {
++            PL_strncpyz(aDetails->library, info.dli_fname,
++                        sizeof(aDetails->library));
++            aDetails->loffset = (char*)aPC - (char*)info.dli_fbase;
++        }
++        if (info.dli_sname) {
++            aDetails->foffset = (char*)aPC - (char*)info.dli_saddr;
++#ifdef __GNUC__
++            DemangleSymbol(func, dembuff, sizeof(dembuff));
++#else
++            if (!demf || demf(func, dembuff, sizeof (dembuff)))
++                dembuff[0] = 0;
++#endif /*__GNUC__*/
++            PL_strncpyz(aDetails->function,
++                        (dembuff[0] != '\0') ? dembuff : info.dli_sname,
++                        sizeof(aDetails->function));
++        }
 +    }
 +
-+#ifdef __GNUC__
-+    DemangleSymbol(func, dembuff, sizeof(dembuff));
-+#else
-+    if (!demf || demf(func, dembuff, sizeof (dembuff)))
-+        dembuff[0] = 0;
-+#endif /*__GNUC__*/
-+    if (dembuff[0] != '\0') {
-+        func = dembuff;
-+    }
-+    snprintf(aBuffer, aBufferSize, "%u %s:%s+0x%x\n",
-+             ptr->next->index, lib, func,
-+             (char *)aPC - (char*)info.dli_saddr);
++    return NS_OK;
++}
++
++nsresult
++NS_FormatCodeAddressDetails(void *aPC, const nsCodeAddressDetails *aDetails,
++                            char *aBuffer, PRUint32 aBufferSize)
++{
++    snprintf(aBuffer, aBufferSize, "%p %s:%s+0x%lx\n",
++             aPC,
++             aDetails->library[0] ? aDetails->library : "??",
++             aDetails->function[0] ? aDetails->function : "??",
++             aDetails->foffset);
 +    return NS_OK;
 +}
 +
@@ -439,14 +479,21 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
          }
          
      }
-@@ -775,3 +717,89 @@ WalkStackMain(struct WalkStackData* data
+@@ -775,3 +717,138 @@ WalkStackMain(struct WalkStackData* data
      return;
  
  }
 +
 +nsresult
-+NS_DescribeCodeAddress(void *aPC, char *aBuffer, PRUint32 aBufferSize)
++NS_DescribeCodeAddress(void *aPC, nsCodeAddressDetails *aDetails);
 +{
++    aDetails->library[0] = '\0';
++    aDetails->loffset = 0;
++    aDetails->filename[0] = '\0';
++    aDetails->lineno = 0;
++    aDetails->function[0] = '\0';
++    aDetails->foffset = 0;
++
 +    HANDLE myProcess = ::GetCurrentProcess();
 +    BOOL ok;
 +
@@ -459,7 +506,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +#ifdef USING_WXP_VERSION
 +    if (_StackWalk64) {
 +        //
-+        // Attempt to load module info before we attempt to reolve the symbol.
++        // Attempt to load module info before we attempt to resolve the symbol.
 +        // This just makes sure we get good info if available.
 +        //
 +
@@ -468,6 +515,14 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +        modInfo.SizeOfStruct = sizeof(modInfo);
 +        BOOL modInfoRes;
 +        modInfoRes = SymGetModuleInfoEspecial64(myProcess, addr, &modInfo, nsnull);
++
++        if (modInfoRes) {
++            PL_strncpyz(aDetails->library, modInfo.ModuleName,
++                        sizeof(aDetails->library));
++            aDetails->loffset = (char*) aPC - (char*) modInfo.BaseOfImage;
++            // XXX We could get filename/lineno information from
++            // SymGetModuleInfoEspecial64
++        }
 +
 +        ULONG64 buffer[(sizeof(SYMBOL_INFO) +
 +          MAX_SYM_NAME*sizeof(TCHAR) + sizeof(ULONG64) - 1) / sizeof(ULONG64)];
@@ -478,10 +533,11 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +        DWORD64 displacement;
 +        ok = _SymFromAddr && _SymFromAddr(myProcess, addr, &displacement, pSymbol);
 +
-+        if (ok)
-+            _snprintf(aBuffer, aBufferSize, "%s!%s+0x%016X\n", modInfo.ModuleName, pSymbol->Name, displacement);
-+        else
-+            _snprintf(aBuffer, aBufferSize, "0x%016X\n", addr);
++        if (ok) {
++            PL_strncpyz(aDetails->function, pSymbol->Name,
++                        sizeof(aDetails->function));
++            aDetails->foffset = displacement;
++        }
 +    } else
 +#endif
 +    {
@@ -495,6 +551,14 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +        modInfo.SizeOfStruct = sizeof(modInfo);
 +        BOOL modInfoRes;
 +        modInfoRes = SymGetModuleInfoEspecial(myProcess, addr, &modInfo, nsnull);
++
++        if (modInfoRes) {
++            PL_strncpyz(aDetails->library, modInfo.ModuleName,
++                        sizeof(aDetails->library));
++            aDetails->loffset = (char*) aPC - (char*) modInfo.BaseOfImage;
++            // XXX We could get filename/lineno information from
++            // SymGetModuleInfoEspecial
++        }
 +
 +#ifdef USING_WXP_VERSION
 +        ULONG64 buffer[(sizeof(SYMBOL_INFO) +
@@ -520,25 +584,64 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +                    pSymbol);
 +#endif
 +
-+        if (ok)
-+            _snprintf(aBuffer, aBufferSize, "%s!%s+0x%08X\n", modInfo.ImageName, pSymbol->Name, displacement);
-+        else
-+            _snprintf(aBuffer, aBufferSize, "0x%08X\n", (DWORD) addr);
++        if (ok) {
++            PL_strncpyz(aDetails->function, pSymbol->Name,
++                        sizeof(aDetails->function));
++            aDetails->foffset = displacement;
++        }
 +    }
 +
 +    ReleaseMutex(hStackWalkMutex);  // release our lock
 +    return NS_OK;
 +}
++
++nsresult
++NS_FormatCodeAddressDetails(void *aPC, const nsCodeAddressDetails *aDetails,
++                            char *aBuffer, PRUint32 aBufferSize)
++{
++#ifdef USING_WXP_VERSION
++    if (_StackWalk64) {
++        if (aDetails->function[0])
++            _snprintf(aBuffer, aBufferSize, "%s!%s+0x%016X\n",
++                      aDetails->library, aDetails->function, aDetails->foffset);
++        else
++            _snprintf(aBuffer, aBufferSize, "0x%016X\n", aPC);
++    } else {
++#endif
++        if (aDetails->function[0])
++            _snprintf(aBuffer, aBufferSize, "%s!%s+0x%08X\n",
++                      aDetails->library, aDetails->function, aDetails->foffset);
++        else
++            _snprintf(aBuffer, aBufferSize, "0x%08X\n", aPC);
++#ifdef USING_WXP_VERSION
++    }
++#endif
++    return NS_OK;
++}
 diff --git a/xpcom/base/nsStackWalk.cpp b/xpcom/base/nsStackWalk.cpp
 --- a/xpcom/base/nsStackWalk.cpp
 +++ b/xpcom/base/nsStackWalk.cpp
-@@ -56,4 +56,10 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+@@ -56,4 +56,24 @@ NS_StackWalk(NS_WalkStackCallback aCallb
      return NS_ERROR_NOT_IMPLEMENTED;
  }
  
 +nsresult
-+NS_DescribeCodeAddress(void *aPC, void *aBuffer, PRUint32 aBufferSize)
++NS_DescribeCodeAddress(void *aPC, nsCodeAddressDetails *aDetails)
 +{
++    aDetails->library[0] = '\0';
++    aDetails->loffset = 0;
++    aDetails->filename[0] = '\0';
++    aDetails->lineno = 0;
++    aDetails->function[0] = '\0';
++    aDetails->foffset = 0;
++    return NS_ERROR_NOT_IMPLEMENTED;
++}
++
++NS_COM nsresult
++NS_FormatCodeAddressDetails(void *aPC, const nsCodeAddressDetails *aDetails,
++                            char *aBuffer, PRUint32 aBufferSize)
++{
++    aBuffer[0] = '\0';
 +    return NS_ERROR_NOT_IMPLEMENTED;
 +}
 +
@@ -555,18 +658,52 @@ diff --git a/xpcom/base/nsStackWalk.h b/xpcom/base/nsStackWalk.h
  
  /**
   * Call aCallback for the C/C++ stack frames on the current thread, from
-@@ -69,6 +69,25 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+@@ -69,6 +69,60 @@ NS_StackWalk(NS_WalkStackCallback aCallb
  NS_StackWalk(NS_WalkStackCallback aCallback, PRUint32 aSkipFrames,
               void *aClosure);
  
++typedef struct {
++    /*
++     * The name of the shared library or executable containing an
++     * address and the address's offset within that library, or empty
++     * string and zero if unknown.
++     */
++    char library[256];
++    unsigned long loffset;
++    /*
++     * The name of the file name and line number of the code
++     * corresponding to the address, or empty string and zero if
++     * unknown.
++     */
++    char filename[256];
++    unsigned long lineno;
++    /*
++     * The name of the function containing an address and the address's
++     * offset within that function, or empty string and zero if unknown.
++     */
++    char function[256];
++    unsigned long foffset;
++} nsCodeAddressDetails;
++
 +/**
-+ * For a given pointer to code, fill in a string that is suitable for
-+ * printing in a stack trace.  When available, this string should
-+ * contain the function name, source file, and line number.  When these
-+ * are not available, library and offset should be reported, if
-+ * possible.  Further fallback may be needed in many cases.
++ * For a given pointer to code, fill in the pieces of information used
++ * when printing a stack trace.
 + *
 + * @param aPC         The code address.
++ * @param aDetails    A structure to be filled in with the result.
++ */
++NS_COM nsresult
++NS_DescribeCodeAddress(void *aPC, nsCodeAddressDetails *aDetails);
++
++/**
++ * Format the information about a code address in a format suitable for
++ * stack traces on the current platform.  When available, this string
++ * should contain the function name, source file, and line number.  When
++ * these are not available, library and offset should be reported, if
++ * possible.
++ *
++ * @param aPC         The code address.
++ * @param aDetails    The value filled in by NS_DescribeCodeAddress(aPC).
 + * @param aBuffer     A string to be filled in with the description.
 + *                    The string will always be null-terminated.
 + * @param aBufferSize The size, in bytes, of aBuffer, including
@@ -576,7 +713,8 @@ diff --git a/xpcom/base/nsStackWalk.h b/xpcom/base/nsStackWalk.h
 + *                    is the terminating null.
 + */
 +NS_COM nsresult
-+NS_DescribeCodeAddress(void *aPC, char *aBuffer, PRUint32 aBufferSize);
++NS_FormatCodeAddressDetails(void *aPC, const nsCodeAddressDetails *aDetails,
++                            char *aBuffer, PRUint32 aBufferSize);
 +
  PR_END_EXTERN_C
  
