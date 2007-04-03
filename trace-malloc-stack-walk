@@ -901,11 +901,13 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
          csp = &parent->kids;
          while ((site = *csp) != NULL) {
-@@ -796,30 +581,18 @@ static callsite *calltree(int skip)
+@@ -795,31 +580,34 @@ static callsite *calltree(int skip)
+ 
          /*
           * Not in tree at all, or not logged to fp: let's find our symbolic
-          * callsite info.  XXX static syms are masked by nearest lower global
+-         * callsite info.  XXX static syms are masked by nearest lower global
 -         * Load up the info for the dll.
++         * callsite info.
           */
 -        memset(&imagehelpLine, 0, sizeof(imagehelpLine));
 -        if (!SymGetModuleInfoEspecial(myProcess,
@@ -923,7 +925,22 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -                filename = noname;
 -                linenumber = 0;
 -            }
++
++        /*
++         * NS_DescribeCodeAddress can (on Linux) acquire a lock inside
++         * the shared library loader.  Another thread might call malloc
++         * while holding that lock (when loading a shared library).  So
++         * we have to exit tmmon around this call.  For details, see
++         * https://bugzilla.mozilla.org/show_bug.cgi?id=363334#c3
++         *
++         * We could be more efficient by building the nodes in the
++         * calltree, exiting the monitor once to describe all of them,
++         * and then filling in the descriptions for any that hadn't been
++         * described already.  But this is easier for now.
++         */
++        TM_EXIT_MONITOR();
 +        rv = NS_DescribeCodeAddress(pc, &details);
++        TM_ENTER_MONITOR();
 +        if (NS_FAILED(rv)) {
 +            tmstats.dladdr_failures++;
 +            return NULL;
@@ -939,7 +956,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  libraries = PL_NewHashTable(100, PL_HashString,
                                              PL_CompareStrings, PL_CompareValues,
                                              &lfdset_hashallocops, NULL);
-@@ -828,11 +601,11 @@ static callsite *calltree(int skip)
+@@ -828,11 +616,11 @@ static callsite *calltree(int skip)
                      return NULL;
                  }
              }
@@ -954,7 +971,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  library_serial = (uint32) NS_PTR_TO_INT32(he->value);
                  le = (lfdset_entry *) he;
                  if (LFD_TEST(fp->lfd, &le->lfdset)) {
-@@ -840,7 +613,7 @@ static callsite *calltree(int skip)
+@@ -840,7 +628,7 @@ static callsite *calltree(int skip)
                      le = NULL;
                  }
              } else {
@@ -963,7 +980,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  if (library) {
                      library_serial = ++library_serial_generator;
                      he = PL_HashTableRawAdd(libraries, hep, hash, library,
-@@ -854,7 +627,7 @@ static callsite *calltree(int skip)
+@@ -854,7 +642,7 @@ static callsite *calltree(int skip)
              }
              if (le) {
                  /* Need to log an event to fp for this lib. */
@@ -972,7 +989,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  if (slash)
                      library = slash + 1;
                  log_event1(fp, TM_EVENT_LIBRARY, library_serial);
-@@ -865,7 +638,8 @@ static callsite *calltree(int skip)
+@@ -865,7 +653,8 @@ static callsite *calltree(int skip)
  
          /* Check whether we need to emit a filename trace record. */
          filename_serial = 0;
@@ -982,7 +999,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (!filenames) {
                  filenames = PL_NewHashTable(100, PL_HashString,
                                              PL_CompareStrings, PL_CompareValues,
-@@ -875,10 +649,11 @@ static callsite *calltree(int skip)
+@@ -875,10 +664,11 @@ static callsite *calltree(int skip)
                      return NULL;
                  }
              }
@@ -996,7 +1013,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  filename_serial = (uint32) NS_PTR_TO_INT32(he->value);
                  le = (lfdset_entry *) he;
                  if (LFD_TEST(fp->lfd, &le->lfdset)) {
-@@ -886,7 +661,7 @@ static callsite *calltree(int skip)
+@@ -886,7 +676,7 @@ static callsite *calltree(int skip)
                      le = NULL;
                  }
              } else {
@@ -1005,7 +1022,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
                  if (filename) {
                      filename_serial = ++filename_serial_generator;
                      he = PL_HashTableRawAdd(filenames, hep, hash, filename,
-@@ -906,31 +681,6 @@ static callsite *calltree(int skip)
+@@ -906,29 +696,9 @@ static callsite *calltree(int skip)
              }
          }
  
@@ -1032,12 +1049,13 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -        else {
 -            method = noname;
 -            offset = pc;
--        }
--
++        if (!details.function[0]) {
++            PR_snprintf(details.function, sizeof(details.function),
++                        "%s+%X", library ? library : "main", details.loffset);
+         }
+ 
          /* Emit an 'N' (for New method, 'M' is for malloc!) event if needed. */
-         method_serial = 0;
-         if (!methods) {
-@@ -939,49 +689,43 @@ static callsite *calltree(int skip)
+@@ -939,49 +709,43 @@ static callsite *calltree(int skip)
                                        &lfdset_hashallocops, NULL);
              if (!methods) {
                  tmstats.btmalloc_failures++;
@@ -1098,7 +1116,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (!site) {
                  tmstats.btmalloc_failures++;
                  return NULL;
-@@ -1003,311 +747,8 @@ static callsite *calltree(int skip)
+@@ -1003,311 +767,8 @@ static callsite *calltree(int skip)
              site->serial = ++callsite_serial_generator;
              LFD_ZERO(&site->lfdset);
              site->name = method;
@@ -1411,7 +1429,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              site->parent = parent;
              site->siblings = parent->kids;
              parent->kids = site;
-@@ -1316,28 +757,46 @@ static callsite *calltree(void **bp)
+@@ -1316,28 +777,46 @@ static callsite *calltree(void **bp)
  
          /* Log the site with its parent, method, and offset. */
          log_event4(fp, TM_EVENT_CALLSITE, site->serial, parent->serial,
@@ -1470,7 +1488,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  callsite *
  backtrace(int skip)
-@@ -1347,50 +806,10 @@ backtrace(int skip)
+@@ -1347,50 +826,10 @@ backtrace(int skip)
      tmstats.backtrace_calls++;
      suppress_tracing++;
  
@@ -1525,7 +1543,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      if (!site) {
          tmstats.backtrace_failures++;
          PR_ASSERT(tmstats.backtrace_failures < 100);
-@@ -1398,10 +817,6 @@ backtrace(int skip)
+@@ -1398,10 +837,6 @@ backtrace(int skip)
      suppress_tracing--;
      return site;
  }
