@@ -753,7 +753,18 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  #else  /* !XP_UNIX */
  
-@@ -641,401 +506,10 @@ static PLHashTable *filenames = NULL;
+@@ -535,8 +400,8 @@ struct callsite {
+     void*       pc;
+     uint32      serial;
+     lfd_set     lfdset;
+-    char        *name;
+-    const char  *library;
++    const char  *name; /* pointer to string owned by methods table */
++    const char  *library; /* pointer to string owned by libraries table */
+     int         offset;
+     callsite    *parent;
+     callsite    *siblings;
+@@ -641,116 +506,37 @@ static PLHashTable *filenames = NULL;
  /* Table mapping method names to logged 'N' record serial numbers. */
  static PLHashTable *methods = NULL;
  
@@ -778,7 +789,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -    uint32 library_serial, method_serial;
 -    int framenum;
      void *pc;
--    uint32 depth, nkids;
+     uint32 depth, nkids;
 -    callsite *parent, **csp, *tmp;
 -    callsite *site = NULL;
 -    char *demangledname;
@@ -787,9 +798,14 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -    char buf[sizeof(IMAGEHLP_SYMBOL) + 512];
 -    PIMAGEHLP_SYMBOL symbol;
 -    char *method, *slash;
--    PLHashNumber hash;
--    PLHashEntry **hep, *he;
--    lfdset_entry *le;
++    callsite *parent, *site, **csp, *tmp;
++    int ok, len, maxstack;
++    uint32 library_serial, method_serial;
++    const char *library, *method;
++    char *slash;
+     PLHashNumber hash;
+     PLHashEntry **hep, *he;
+     lfdset_entry *le;
 -    char* noname = "noname";
 -    IMAGEHLP_LINE imagehelpLine;
 -    const char* filename = NULL;
@@ -861,13 +877,305 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -    maxstack = (depth > tmstats.calltree_maxstack);
 -    if (maxstack)
 -        tmstats.calltree_maxstack = depth;
--
--    /* Reverse the stack again, finding and building a path in the tree. */
--    parent = &calltree_root;
++    uint32 filename_serial;
++    size_t stack_entry;
++    nsCodeAddressDetails details;
++    nsresult rv;
++
++    maxstack = (stack_entries > tmstats.calltree_maxstack);
++    if (maxstack) {
++        /* these two are the same, although that used to be less clear */
++        tmstats.calltree_maxstack = stack_entries;
++        tmstats.calltree_maxdepth = stack_entries;
++    }
+ 
+     /* Reverse the stack again, finding and building a path in the tree. */
+     parent = &calltree_root;
 -    while (0 < framenum) {
 -        DWORD displacement;/*used for getsymfromaddr*/
 -
 -        pc = frame[--framenum].AddrPC.Offset;
++    stack_entry = stack_entries;
++    do {
++        --stack_entry;
++        pc = stack[stack_entry];
+ 
+         csp = &parent->kids;
+         while ((site = *csp) != NULL) {
+@@ -796,30 +582,18 @@ static callsite *calltree(int skip)
+         /*
+          * Not in tree at all, or not logged to fp: let's find our symbolic
+          * callsite info.  XXX static syms are masked by nearest lower global
+-         * Load up the info for the dll.
+          */
+-        memset(&imagehelpLine, 0, sizeof(imagehelpLine));
+-        if (!SymGetModuleInfoEspecial(myProcess,
+-                               frame[framenum].AddrPC.Offset,
+-                               &imagehelp, &imagehelpLine)) {
+-            library = noname;
+-            filename = noname;
+-            linenumber = 0;
+-        } else {
+-            library = imagehelp.ModuleName;
+-            filename = imagehelpLine.FileName;
+-            linenumber = imagehelpLine.LineNumber;
+-
+-            if ('\0' == filename) {
+-                filename = noname;
+-                linenumber = 0;
+-            }
++        rv = NS_DescribeCodeAddress(pc, &details);
++        if (NS_FAILED(rv)) {
++            tmstats.dladdr_failures++;
++            return NULL;
+         }
+ 
+         /* Check whether we need to emit a library trace record. */
+         library_serial = 0;
+-        if (library) {
+-           if (!libraries) {
++        library = NULL;
++        if (details.library[0]) {
++            if (!libraries) {
+                 libraries = PL_NewHashTable(100, PL_HashString,
+                                             PL_CompareStrings, PL_CompareValues,
+                                             &lfdset_hashallocops, NULL);
+@@ -828,11 +602,11 @@ static callsite *calltree(int skip)
+                     return NULL;
+                 }
+             }
+-            hash = PL_HashString(library);
+-            hep = PL_HashTableRawLookup(libraries, hash, library);
++            hash = PL_HashString(details.library);
++            hep = PL_HashTableRawLookup(libraries, hash, details.library);
+             he = *hep;
+-            library = strdup(library); /* strdup it always? */
+             if (he) {
++                library = (char*) he->key;
+                 library_serial = (uint32) NS_PTR_TO_INT32(he->value);
+                 le = (lfdset_entry *) he;
+                 if (LFD_TEST(fp->lfd, &le->lfdset)) {
+@@ -840,7 +614,7 @@ static callsite *calltree(int skip)
+                     le = NULL;
+                 }
+             } else {
+-/*                library = strdup(library); */
++                library = strdup(details.library);
+                 if (library) {
+                     library_serial = ++library_serial_generator;
+                     he = PL_HashTableRawAdd(libraries, hep, hash, library,
+@@ -854,7 +628,7 @@ static callsite *calltree(int skip)
+             }
+             if (le) {
+                 /* Need to log an event to fp for this lib. */
+-                slash = strrchr(library, '/');
++                slash = strrchr(details.library, '/');
+                 if (slash)
+                     library = slash + 1;
+                 log_event1(fp, TM_EVENT_LIBRARY, library_serial);
+@@ -865,7 +639,7 @@ static callsite *calltree(int skip)
+ 
+         /* Check whether we need to emit a filename trace record. */
+         filename_serial = 0;
+-        if (filename) {
++        if (details.filename[0]) {
+             if (!filenames) {
+                 filenames = PL_NewHashTable(100, PL_HashString,
+                                             PL_CompareStrings, PL_CompareValues,
+@@ -875,8 +649,8 @@ static callsite *calltree(int skip)
+                     return NULL;
+                 }
+             }
+-            hash = PL_HashString(filename);
+-            hep = PL_HashTableRawLookup(filenames, hash, filename);
++            hash = PL_HashString(details.filename);
++            hep = PL_HashTableRawLookup(filenames, hash, details.filename);
+             he = *hep;
+             if (he) {
+                 filename_serial = (uint32) NS_PTR_TO_INT32(he->value);
+@@ -886,10 +660,10 @@ static callsite *calltree(int skip)
+                     le = NULL;
+                 }
+             } else {
+-                filename = strdup(filename);
+-                if (filename) {
++                if (details.filename) {
+                     filename_serial = ++filename_serial_generator;
+-                    he = PL_HashTableRawAdd(filenames, hep, hash, filename,
++                    he = PL_HashTableRawAdd(filenames, hep, hash,
++                                            details.filename,
+                                             (void*) filename_serial);
+                 }
+                 if (!he) {
+@@ -901,34 +675,9 @@ static callsite *calltree(int skip)
+             if (le) {
+                 /* Need to log an event to fp for this filename. */
+                 log_event1(fp, TM_EVENT_FILENAME, filename_serial);
+-                log_filename(fp, filename);
++                log_filename(fp, details.filename);
+                 LFD_SET(fp->lfd, &le->lfdset);
+             }
+-        }
+-
+-        symbol = (PIMAGEHLP_SYMBOL) buf;
+-        symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL);
+-        symbol->MaxNameLength = sizeof(buf) - sizeof(IMAGEHLP_SYMBOL);
+-        symbol->Name[symbol->MaxNameLength] = '\0';
+-
+-        getSymRes = _SymGetSymFromAddr(myProcess,
+-                                frame[framenum].AddrPC.Offset,
+-                                &displacement,
+-                                symbol);
+-
+-        /* Now find the demangled method name and pc offset in it. */
+-        if (0 != getSymRes) {
+-            demangledname = (char *)malloc(MAX_UNMANGLED_NAME_LEN);
+-            if (!_SymUnDName(symbol,demangledname,MAX_UNMANGLED_NAME_LEN)) {
+-                free(demangledname);
+-                return 0;
+-            }
+-            method = demangledname;
+-            offset = (char*)pc - (char*)(symbol->Address);
+-        }
+-        else {
+-            method = noname;
+-            offset = pc;
+         }
+ 
+         /* Emit an 'N' (for New method, 'M' is for malloc!) event if needed. */
+@@ -939,49 +688,43 @@ static callsite *calltree(int skip)
+                                       &lfdset_hashallocops, NULL);
+             if (!methods) {
+                 tmstats.btmalloc_failures++;
+-                if (method != noname) {
+-                    free((void*) method);
+-                }
+                 return NULL;
+             }
+         }
+-        hash = PL_HashString(method);
+-        hep = PL_HashTableRawLookup(methods, hash, method);
++        hash = PL_HashString(details.function);
++        hep = PL_HashTableRawLookup(methods, hash, details.function);
+         he = *hep;
+         if (he) {
++            method = (char*) he->key;
+             method_serial = (uint32) NS_PTR_TO_INT32(he->value);
+-            if (method != noname) {
+-                free((void*) method);
+-            }
+-            method = (char *) he->key;
+             le = (lfdset_entry *) he;
+             if (LFD_TEST(fp->lfd, &le->lfdset)) {
+                 /* We already logged an event on fp for this method. */
+                 le = NULL;
+             }
+         } else {
+-            method_serial = ++method_serial_generator;
+-            he = PL_HashTableRawAdd(methods, hep, hash, method,
+-                                    (void*) method_serial);
++            method = strdup(details.function);
++            if (method) {
++                method_serial = ++method_serial_generator;
++                he = PL_HashTableRawAdd(methods, hep, hash, method,
++                                        (void*) method_serial);
++            }
+             if (!he) {
+                 tmstats.btmalloc_failures++;
+-                if (method != noname) {
+-                    free((void*) method);
+-                }
+                 return NULL;
+             }
+             le = (lfdset_entry *) he;
+         }
+         if (le) {
+             log_event4(fp, TM_EVENT_METHOD, method_serial, library_serial,
+-                       filename_serial, linenumber);
+-            log_string(fp, method);
++                       filename_serial, details.lineno);
++            log_string(fp, details.function);
+             LFD_SET(fp->lfd, &le->lfdset);
+         }
+ 
+         /* Create a new callsite record. */
+         if (!site) {
+-            site = malloc(sizeof(callsite));
++            site = __libc_malloc(sizeof(callsite));
+             if (!site) {
+                 tmstats.btmalloc_failures++;
+                 return NULL;
+@@ -1003,311 +746,8 @@ static callsite *calltree(int skip)
+             site->serial = ++callsite_serial_generator;
+             LFD_ZERO(&site->lfdset);
+             site->name = method;
+-            site->offset = offset;
+-            site->parent = parent;
+-            site->siblings = parent->kids;
+             site->library = library;
+-            parent->kids = site;
+-            site->kids = NULL;
+-        }
+-
+-        /* Log the site with its parent, method, and offset. */
+-        log_event4(fp, TM_EVENT_CALLSITE, site->serial, parent->serial,
+-                   method_serial, offset);
+-        LFD_SET(fp->lfd, &site->lfdset);
+-
+-      upward:
+-        parent = site;
+-    }
+-
+-    if (maxstack)
+-        calltree_maxstack_top = site;
+-    depth = 0;
+-    for (tmp = site; tmp; tmp = tmp->parent)
+-        depth++;
+-    if (depth > tmstats.calltree_maxdepth)
+-        tmstats.calltree_maxdepth = depth;
+-    return site;
+-}
+-
+-#else /*XP_UNIX*/
+-
+-static callsite *calltree(void **bp)
+-{
+-    logfile *fp = logfp;
+-    void **bpup, **bpdown, *pc;
+-    uint32 depth, nkids;
+-    callsite *parent, *site, **csp, *tmp;
+-    Dl_info info;
+-    int ok, len, maxstack, offset;
+-    uint32 library_serial, method_serial;
+-    const char *library, *symbol;
+-    char *method, *slash;
+-    PLHashNumber hash;
+-    PLHashEntry **hep, *he;
+-    lfdset_entry *le;
+-    uint32 filename_serial;
+-    uint32 linenumber;
+-    const char* filename;
+-
+-    /* Reverse the stack frame list to avoid recursion. */
+-    bpup = NULL;
+-    for (depth = 0; ; depth++) {
+-        bpdown = (void**) bp[0];
+-        bp[0] = (void*) bpup;
+-        if ((void**) bpdown[0] < bpdown)
+-            break;
+-        bpup = bp;
+-        bp = bpdown;
+-    }
+-    maxstack = (depth > tmstats.calltree_maxstack);
+-    if (maxstack)
+-        tmstats.calltree_maxstack = depth;
+-
+-    /* Reverse the stack again, finding and building a path in the tree. */
+-    parent = &calltree_root;
+-    do {
+-        bpup = (void**) bp[0];
+-        bp[0] = (void*) bpdown;
+-        pc = bp[1];
 -
 -        csp = &parent->kids;
 -        while ((site = *csp) != NULL) {
@@ -913,30 +1221,26 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -        /*
 -         * Not in tree at all, or not logged to fp: let's find our symbolic
 -         * callsite info.  XXX static syms are masked by nearest lower global
--         * Load up the info for the dll.
 -         */
--        memset(&imagehelpLine, 0, sizeof(imagehelpLine));
--        if (!SymGetModuleInfoEspecial(myProcess,
--                               frame[framenum].AddrPC.Offset,
--                               &imagehelp, &imagehelpLine)) {
--            library = noname;
--            filename = noname;
--            linenumber = 0;
--        } else {
--            library = imagehelp.ModuleName;
--            filename = imagehelpLine.FileName;
--            linenumber = imagehelpLine.LineNumber;
--
--            if ('\0' == filename) {
--                filename = noname;
--                linenumber = 0;
--            }
+-        info.dli_fname = info.dli_sname = NULL;
+-        ok = my_dladdr((void*) pc, &info);
+-        if (ok < 0) {
+-            tmstats.dladdr_failures++;
+-            return NULL;
 -        }
+-
+-        /*
+-         * One day, if someone figures out how to get filename and line
+-         *   number info, this is the place to fill it all in.
+-         */
+-        filename = "noname";
+-        linenumber = 0;
 -
 -        /* Check whether we need to emit a library trace record. */
 -        library_serial = 0;
+-        library = info.dli_fname;
 -        if (library) {
--           if (!libraries) {
+-            if (!libraries) {
 -                libraries = PL_NewHashTable(100, PL_HashString,
 -                                            PL_CompareStrings, PL_CompareValues,
 -                                            &lfdset_hashallocops, NULL);
@@ -948,7 +1252,6 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -            hash = PL_HashString(library);
 -            hep = PL_HashTableRawLookup(libraries, hash, library);
 -            he = *hep;
--            library = strdup(library); /* strdup it always? */
 -            if (he) {
 -                library_serial = (uint32) NS_PTR_TO_INT32(he->value);
 -                le = (lfdset_entry *) he;
@@ -957,7 +1260,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -                    le = NULL;
 -                }
 -            } else {
--/*                library = strdup(library); */
+-                library = strdup(library);
 -                if (library) {
 -                    library_serial = ++library_serial_generator;
 -                    he = PL_HashTableRawAdd(libraries, hep, hash, library,
@@ -1003,7 +1306,6 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -                    le = NULL;
 -                }
 -            } else {
--                filename = strdup(filename);
 -                if (filename) {
 -                    filename_serial = ++filename_serial_generator;
 -                    he = PL_HashTableRawAdd(filenames, hep, hash, filename,
@@ -1023,29 +1325,25 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -            }
 -        }
 -
--        symbol = (PIMAGEHLP_SYMBOL) buf;
--        symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL);
--        symbol->MaxNameLength = sizeof(buf) - sizeof(IMAGEHLP_SYMBOL);
--        symbol->Name[symbol->MaxNameLength] = '\0';
--
--        getSymRes = _SymGetSymFromAddr(myProcess,
--                                frame[framenum].AddrPC.Offset,
--                                &displacement,
--                                symbol);
--
 -        /* Now find the demangled method name and pc offset in it. */
--        if (0 != getSymRes) {
--            demangledname = (char *)malloc(MAX_UNMANGLED_NAME_LEN);
--            if (!_SymUnDName(symbol,demangledname,MAX_UNMANGLED_NAME_LEN)) {
--                free(demangledname);
--                return 0;
--            }
--            method = demangledname;
--            offset = (char*)pc - (char*)(symbol->Address);
+-        symbol = info.dli_sname;
+-        offset = (char*)pc - (char*)info.dli_saddr;
+-        method = NULL;
+-#ifdef MOZ_DEMANGLE_SYMBOLS
+-        if (symbol && (len = strlen(symbol)) != 0) {
+-            method = nsDemangle(symbol);
 -        }
--        else {
--            method = noname;
--            offset = pc;
+-#endif
+-        if (!method) {
+-            method = symbol
+-                     ? strdup(symbol)
+-                     : PR_smprintf("%s+%X",
+-                                   info.dli_fname ? info.dli_fname : "main",
+-                                   (char*)pc - (char*)info.dli_fbase);
+-        }
+-        if (!method) {
+-            tmstats.btmalloc_failures++;
+-            return NULL;
 -        }
 -
 -        /* Emit an 'N' (for New method, 'M' is for malloc!) event if needed. */
@@ -1056,9 +1354,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -                                      &lfdset_hashallocops, NULL);
 -            if (!methods) {
 -                tmstats.btmalloc_failures++;
--                if (method != noname) {
--                    free((void*) method);
--                }
+-                free((void*) method);
 -                return NULL;
 -            }
 -        }
@@ -1067,9 +1363,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -        he = *hep;
 -        if (he) {
 -            method_serial = (uint32) NS_PTR_TO_INT32(he->value);
--            if (method != noname) {
--                free((void*) method);
--            }
+-            free((void*) method);
 -            method = (char *) he->key;
 -            le = (lfdset_entry *) he;
 -            if (LFD_TEST(fp->lfd, &le->lfdset)) {
@@ -1082,9 +1376,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -                                    (void*) method_serial);
 -            if (!he) {
 -                tmstats.btmalloc_failures++;
--                if (method != noname) {
--                    free((void*) method);
--                }
+-                free((void*) method);
 -                return NULL;
 -            }
 -            le = (lfdset_entry *) he;
@@ -1098,7 +1390,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -
 -        /* Create a new callsite record. */
 -        if (!site) {
--            site = malloc(sizeof(callsite));
+-            site = __libc_malloc(sizeof(callsite));
 -            if (!site) {
 -                tmstats.btmalloc_failures++;
 -                return NULL;
@@ -1120,94 +1412,19 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -            site->serial = ++callsite_serial_generator;
 -            LFD_ZERO(&site->lfdset);
 -            site->name = method;
--            site->offset = offset;
--            site->parent = parent;
--            site->siblings = parent->kids;
--            site->library = library;
--            parent->kids = site;
--            site->kids = NULL;
--        }
--
--        /* Log the site with its parent, method, and offset. */
--        log_event4(fp, TM_EVENT_CALLSITE, site->serial, parent->serial,
+-            site->library = info.dli_fname;
+-            site->offset = (char*)pc - (char*)info.dli_fbase;
++            site->offset = details.loffset;
+             site->parent = parent;
+             site->siblings = parent->kids;
+             parent->kids = site;
+@@ -1316,28 +756,46 @@ static callsite *calltree(void **bp)
+ 
+         /* Log the site with its parent, method, and offset. */
+         log_event4(fp, TM_EVENT_CALLSITE, site->serial, parent->serial,
 -                   method_serial, offset);
--        LFD_SET(fp->lfd, &site->lfdset);
--
--      upward:
--        parent = site;
--    }
--
--    if (maxstack)
--        calltree_maxstack_top = site;
--    depth = 0;
--    for (tmp = site; tmp; tmp = tmp->parent)
--        depth++;
--    if (depth > tmstats.calltree_maxdepth)
--        tmstats.calltree_maxdepth = depth;
--    return site;
--}
--
--#else /*XP_UNIX*/
--
--static callsite *calltree(void **bp)
--{
--    logfile *fp = logfp;
--    void **bpup, **bpdown, *pc;
-     uint32 depth, nkids;
-     callsite *parent, *site, **csp, *tmp;
-     Dl_info info;
-@@ -1049,27 +523,21 @@ static callsite *calltree(void **bp)
-     uint32 filename_serial;
-     uint32 linenumber;
-     const char* filename;
--
--    /* Reverse the stack frame list to avoid recursion. */
--    bpup = NULL;
--    for (depth = 0; ; depth++) {
--        bpdown = (void**) bp[0];
--        bp[0] = (void*) bpup;
--        if ((void**) bpdown[0] < bpdown)
--            break;
--        bpup = bp;
--        bp = bpdown;
--    }
--    maxstack = (depth > tmstats.calltree_maxstack);
--    if (maxstack)
--        tmstats.calltree_maxstack = depth;
-+    size_t stack_entry;
-+
-+    maxstack = (stack_entries > tmstats.calltree_maxstack);
-+    if (maxstack) {
-+        /* these two are the same, although that used to be less clear */
-+        tmstats.calltree_maxstack = stack_entries;
-+        tmstats.calltree_maxdepth = stack_entries;
-+    }
- 
-     /* Reverse the stack again, finding and building a path in the tree. */
-     parent = &calltree_root;
-+    stack_entry = stack_entries;
-     do {
--        bpup = (void**) bp[0];
--        bp[0] = (void*) bpdown;
--        pc = bp[1];
-+        --stack_entry;
-+        pc = stack[stack_entry];
- 
-         csp = &parent->kids;
-         while ((site = *csp) != NULL) {
-@@ -1223,11 +691,6 @@ static callsite *calltree(void **bp)
-         symbol = info.dli_sname;
-         offset = (char*)pc - (char*)info.dli_saddr;
-         method = NULL;
--#ifdef MOZ_DEMANGLE_SYMBOLS
--        if (symbol && (len = strlen(symbol)) != 0) {
--            method = nsDemangle(symbol);
--        }
--#endif
-         if (!method) {
-             method = symbol
-                      ? strdup(symbol)
-@@ -1321,23 +784,41 @@ static callsite *calltree(void **bp)
++                   method_serial, details.foffset);
+         LFD_SET(fp->lfd, &site->lfdset);
  
        upward:
          parent = site;
@@ -1260,7 +1477,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  callsite *
  backtrace(int skip)
-@@ -1347,50 +828,10 @@ backtrace(int skip)
+@@ -1347,50 +805,10 @@ backtrace(int skip)
      tmstats.backtrace_calls++;
      suppress_tracing++;
  
@@ -1315,7 +1532,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      if (!site) {
          tmstats.backtrace_failures++;
          PR_ASSERT(tmstats.backtrace_failures < 100);
-@@ -1398,10 +839,6 @@ backtrace(int skip)
+@@ -1398,10 +816,6 @@ backtrace(int skip)
      suppress_tracing--;
      return site;
  }
@@ -1326,18 +1543,6 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  typedef struct allocation {
      PLHashEntry entry;
-diff --git a/tools/trace-malloc/lib/nsTraceMalloc.h b/tools/trace-malloc/lib/nsTraceMalloc.h
---- a/tools/trace-malloc/lib/nsTraceMalloc.h
-+++ b/tools/trace-malloc/lib/nsTraceMalloc.h
-@@ -84,7 +84,7 @@ typedef struct nsTMStats {
-     uint32 null_free_calls;
- } nsTMStats;
- 
--#define NS_TMSTATS_STATIC_INITIALIZER {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
-+#define NS_TMSTATS_STATIC_INITIALIZER {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
- 
- /**
-  * Call NS_TraceMallocStartup with a valid file descriptor to enable logging
 diff --git a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
 --- a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
 +++ b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
