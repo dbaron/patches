@@ -1,0 +1,1452 @@
+Add cycle collection to RDF datasources.  b=372713  Patch from peterv.
+
+diff --git a/browser/components/bookmarks/src/nsBookmarksService.cpp b/browser/components/bookmarks/src/nsBookmarksService.cpp
+--- a/browser/components/bookmarks/src/nsBookmarksService.cpp
++++ b/browser/components/bookmarks/src/nsBookmarksService.cpp
+@@ -1662,7 +1662,6 @@ BookmarkParser::AssertTime(nsIRDFResourc
+ // nsBookmarksService implementation
+ 
+ nsBookmarksService::nsBookmarksService() :
+-    mInner(nsnull),
+     mUpdateBatchNest(0),
+     mBookmarksAvailable(PR_FALSE),
+     mDirty(PR_FALSE),
+@@ -1687,7 +1686,6 @@ nsBookmarksService::~nsBookmarksService(
+     // has probably already been destroyed
+     // Flush();
+     bm_ReleaseGlobals();
+-    NS_IF_RELEASE(mInner);
+ }
+ 
+ nsresult
+@@ -2519,42 +2517,33 @@ NS_IMETHODIMP nsBookmarksService::Observ
+ ////////////////////////////////////////////////////////////////////////
+ // nsISupports methods
+ 
+-NS_IMPL_ADDREF(nsBookmarksService)
+-
+-NS_IMETHODIMP_(nsrefcnt)
+-nsBookmarksService::Release()
+-{
+-    // We need a special implementation of Release() because our mInner
+-    // holds a Circular References back to us.
+-    NS_PRECONDITION(PRInt32(mRefCnt) > 0, "duplicate release");
+-    --mRefCnt;
+-    NS_LOG_RELEASE(this, mRefCnt, "nsBookmarksService");
+-
+-    if (mInner && mRefCnt == 1) {
+-        nsIRDFDataSource* tmp = mInner;
+-        mInner = nsnull;
+-        NS_IF_RELEASE(tmp);
+-        return 0;
+-    }
+-    else if (mRefCnt == 0) {
+-        delete this;
+-        return 0;
+-    }
+-    else {
+-        return mRefCnt;
+-    }
+-}
+-
+-NS_IMPL_QUERY_INTERFACE9(nsBookmarksService,
+-             nsIBookmarksService,
+-             nsIRDFDataSource,
+-             nsIRDFRemoteDataSource,
+-             nsIRDFObserver,
+-             nsIStreamListener,
+-             nsIRequestObserver,
+-             nsICharsetResolver,
+-             nsIObserver,
+-             nsISupportsWeakReference)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsBookmarksService)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsBookmarksService)
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsBookmarksService)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInner)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsBookmarksService,
++                                          nsIBookmarksService)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsBookmarksService,
++                                           nsIBookmarksService)
++
++NS_INTERFACE_MAP_BEGIN(nsBookmarksService)
++    NS_INTERFACE_MAP_ENTRY(nsIBookmarksService)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFRemoteDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFObserver)
++    NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
++    NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
++    NS_INTERFACE_MAP_ENTRY(nsICharsetResolver)
++    NS_INTERFACE_MAP_ENTRY(nsIObserver)
++    NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIBookmarksService)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsBookmarksService)
++NS_INTERFACE_MAP_END
+ 
+ 
+ ////////////////////////////////////////////////////////////////////////
+@@ -4595,10 +4584,9 @@ nsBookmarksService::InitDataSource()
+ {
+     // the profile manager might call Readbookmarks() in certain circumstances
+     // so we need to forget about any previous bookmarks
+-    NS_IF_RELEASE(mInner);
+-
+     // don't change this to an xml-ds, it will cause serious perf problems
+-    nsresult rv = CallCreateInstance(kRDFInMemoryDataSourceCID, &mInner);
++    nsresult rv;
++    mInner = do_CreateInstance(kRDFInMemoryDataSourceCID, &rv);
+     if (NS_FAILED(rv)) return rv;
+ 
+     rv = mInner->AddObserver(this);
+diff --git a/browser/components/bookmarks/src/nsBookmarksService.h b/browser/components/bookmarks/src/nsBookmarksService.h
+--- a/browser/components/bookmarks/src/nsBookmarksService.h
++++ b/browser/components/bookmarks/src/nsBookmarksService.h
+@@ -58,6 +58,7 @@
+ #include "nsICacheSession.h"
+ #include "nsIPrefBranch.h"
+ #include "nsICharsetResolver.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsIOutputStream;
+ 
+@@ -77,7 +78,7 @@ class nsBookmarksService : public nsIBoo
+                            public nsSupportsWeakReference
+ {
+ protected:
+-    nsIRDFDataSource*               mInner;
++    nsCOMPtr<nsIRDFDataSource>      mInner;
+     nsCOMPtr<nsIRDFResource>        busyResource;
+     nsCOMArray<nsIRDFObserver>      mObservers;
+     nsCOMPtr<nsIStringBundle>       mBundle;
+@@ -197,7 +198,9 @@ public:
+     nsresult ClearBookmarksContainer(nsIRDFResource* aContainer);
+ 
+     // nsISupports
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsBookmarksService,
++                                             nsIBookmarksService)
+ 
+     // nsIBookmarksService
+     NS_DECL_NSIBOOKMARKSSERVICE
+diff --git a/browser/components/bookmarks/src/nsForwardProxyDataSource.cpp b/browser/components/bookmarks/src/nsForwardProxyDataSource.cpp
+--- a/browser/components/bookmarks/src/nsForwardProxyDataSource.cpp
++++ b/browser/components/bookmarks/src/nsForwardProxyDataSource.cpp
+@@ -137,55 +137,26 @@ nsForwardProxyDataSource::GetRealSource(
+ // nsISupports interface
+ //
+ 
+-NS_IMPL_ADDREF(nsForwardProxyDataSource)
+-
+-//
+-// Use a custom Release() for the same reasons one is used in the
+-// Composite DS; we have circular relationships with our child DS.
+-
+-NS_IMETHODIMP_(nsrefcnt)
+-nsForwardProxyDataSource::Release()
+-{
+-    NS_PRECONDITION(PRInt32(mRefCnt) > 0, "duplicate release");
+-    nsrefcnt count = --mRefCnt;
+-
+-    if (count == 0) {
+-        NS_LOG_RELEASE(this, count, "nsForwardProxyDataSource");
+-        mRefCnt = 1;
+-        NS_DELETEXPCOM(this);
+-        return 0;
+-    }
+-    else if (mDS && (PRInt32(count) == 1)) {
+-        // if the count is 1, the only ref is from our nested data
+-        // source, which holds on to us as an observer.
+-
+-        // We must add 1 here because otherwise the nested releases
+-        // on this object will enter this same code path.
+-        ++mRefCnt;
+-
+-        mDS->RemoveObserver(this);
+-        mDS = nsnull;
+-
+-        // In CompositeDataSource, there's a comment here that we call
+-        // ourselves again instead of just doing a delete in case
+-        // something might have added a ref count in the meantime.
+-        // However, if that happens, this object will be in an
+-        // inconsistent state, because we'll have removed the Observer
+-        // from mDS.  Hence the assertion.
+-        NS_ASSERTION(mRefCnt >= 1, "bad mRefCnt");
+-        return Release();
+-    }
+-    else {
+-        NS_LOG_RELEASE(this, count, "nsForwardProxyDataSource");
+-        return count;
+-    }
+-}
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsForwardProxyDataSource)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsForwardProxyDataSource)
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsForwardProxyDataSource)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDS)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsForwardProxyDataSource,
++                                          nsIRDFInferDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsForwardProxyDataSource,
++                                           nsIRDFInferDataSource)
+ 
+ NS_INTERFACE_MAP_BEGIN(nsForwardProxyDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFInferDataSource)
+     NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsIRDFDataSource, nsIRDFInferDataSource)
+     NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFInferDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFObserver)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsForwardProxyDataSource)
+ NS_INTERFACE_MAP_END
+ 
+ //----------------------------------------------------------------------
+diff --git a/browser/components/bookmarks/src/nsForwardProxyDataSource.h b/browser/components/bookmarks/src/nsForwardProxyDataSource.h
+--- a/browser/components/bookmarks/src/nsForwardProxyDataSource.h
++++ b/browser/components/bookmarks/src/nsForwardProxyDataSource.h
+@@ -42,6 +42,7 @@
+ #include "nsIRDFService.h"
+ #include "nsIRDFInferDataSource.h"
+ #include "nsIRDFDataSource.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsForwardProxyDataSource : public nsIRDFInferDataSource,
+                                  public nsIRDFObserver
+@@ -52,7 +53,9 @@ public:
+     nsresult Init(void);
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsForwardProxyDataSource,
++                                             nsIRDFInferDataSource)
+ 
+     // nsIRDFDataSource interface
+     NS_DECL_NSIRDFDATASOURCE
+diff --git a/content/xul/templates/src/nsXULTemplateBuilder.cpp b/content/xul/templates/src/nsXULTemplateBuilder.cpp
+--- a/content/xul/templates/src/nsXULTemplateBuilder.cpp
++++ b/content/xul/templates/src/nsXULTemplateBuilder.cpp
+@@ -248,8 +248,13 @@ TraverseMatchList(nsISupports* aKey, nsT
+ }
+ 
+ NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULTemplateBuilder)
+-NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULTemplateBuilder)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXULTemplateBuilder)
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mDB)
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mCompDB)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULTemplateBuilder)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDB)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mCompDB)
+     NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mRoot)
+     NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mRootResult)
+     NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mListeners)
+diff --git a/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp b/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp
+--- a/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp
++++ b/content/xul/templates/src/nsXULTemplateQueryProcessorRDF.cpp
+@@ -129,6 +129,7 @@ RuleToBindingTraverser(nsISupports* key,
+ }
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULTemplateQueryProcessorRDF)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDB)
+     NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mLastRef)
+     if (tmp->mBindingDependencies.IsInitialized()) {
+         tmp->mBindingDependencies.EnumerateRead(BindingDependenciesTraverser,
+diff --git a/rdf/base/src/nsCompositeDataSource.cpp b/rdf/base/src/nsCompositeDataSource.cpp
+--- a/rdf/base/src/nsCompositeDataSource.cpp
++++ b/rdf/base/src/nsCompositeDataSource.cpp
+@@ -76,6 +76,7 @@
+ #include "nsArrayEnumerator.h"
+ #include "nsXPIDLString.h"
+ #include "rdf.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ #include "nsEnumeratorUtils.h"
+ 
+@@ -105,7 +106,9 @@ public:
+     CompositeDataSourceImpl(char** dataSources);
+ 
+     // nsISupports interface
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(CompositeDataSourceImpl,
++                                             nsIRDFCompositeDataSource)
+ 
+     // nsIRDFDataSource interface
+     NS_DECL_NSIRDFDATASOURCE
+@@ -646,77 +649,34 @@ CompositeDataSourceImpl::CompositeDataSo
+ // nsISupports interface
+ //
+ 
+-NS_IMPL_THREADSAFE_ADDREF(CompositeDataSourceImpl)
+-
+-NS_IMETHODIMP_(nsrefcnt)
+-CompositeDataSourceImpl::Release()
+-{
+-    // We need a special implementation of Release() because the
+-    // composite datasource holds a reference to each datasource that
+-    // it "composes", and each database that the composite datasource
+-    // observes holds a reference _back_ to the composite datasource.
+-    NS_PRECONDITION(PRInt32(mRefCnt) > 0, "duplicate release");
+-    nsrefcnt count =
+-      PR_AtomicDecrement(NS_REINTERPRET_CAST(PRInt32 *, &mRefCnt));
+-
+-    // When the number of references == the number of datasources,
+-    // then we know that all that remains are the circular
+-    // references from those datasources back to us. Release them.
+-    if (count == 0) {
+-        NS_LOG_RELEASE(this, count, "CompositeDataSourceImpl");
+-        mRefCnt = 1;
+-        NS_DELETEXPCOM(this);
+-        return 0;
+-    }
+-    else if (PRInt32(count) == mDataSources.Count()) {
+-        // We must add 1 here because otherwise the nested releases
+-        // on this object will enter this same code path.
+-        PR_AtomicIncrement(NS_REINTERPRET_CAST(PRInt32 *, &mRefCnt));
+-        
+-        PRInt32 dsCount;
+-        while (0 != (dsCount = mDataSources.Count())) {
+-            // Take ref so it won't die before its time.
+-            nsCOMPtr<nsIRDFDataSource> ds = mDataSources[dsCount-1];
+-            mDataSources.RemoveObjectAt(dsCount-1);
+-            ds->RemoveObserver(this);
+-        }
+-        // Nest into Release to deal with the one last reference we added above.
+-        // We don't want to assume that we can 'delete this' because an
+-        // extra reference might have been added by other code while we were 
+-        // calling out.
+-        NS_ASSERTION(mRefCnt >= 1, "bad mRefCnt");
+-        return Release();
+-    }
+-    else {
+-        NS_LOG_RELEASE(this, count, "CompositeDataSourceImpl");
+-        return count;
+-    }
+-}
+-
+-NS_IMETHODIMP
+-CompositeDataSourceImpl::QueryInterface(REFNSIID iid, void** result)
+-{
+-    if (! result)
+-        return NS_ERROR_NULL_POINTER;
+-
+-    if (iid.Equals(NS_GET_IID(nsIRDFCompositeDataSource)) ||
+-        iid.Equals(NS_GET_IID(nsIRDFDataSource)) ||
+-        iid.Equals(kISupportsIID)) {
+-        *result = NS_STATIC_CAST(nsIRDFCompositeDataSource*, this);
+-		NS_ADDREF(this);
+-        return NS_OK;
+-    }
+-    else if (iid.Equals(NS_GET_IID(nsIRDFObserver))) {
+-        *result = NS_STATIC_CAST(nsIRDFObserver*, this);
+-        NS_ADDREF(this);
+-        return NS_OK;
+-    }
+-    else {
+-        *result = nsnull;
+-        return NS_NOINTERFACE;
+-    }
+-}
+-
++NS_IMPL_CYCLE_COLLECTION_CLASS(CompositeDataSourceImpl)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(CompositeDataSourceImpl)
++    PRUint32 i, count = tmp->mDataSources.Count();
++    for (i = count; i > 0; --i) {
++        tmp->mDataSources[i - 1]->RemoveObserver(tmp);
++        tmp->mDataSources.RemoveObjectAt(i - 1);
++    }
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers);
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(CompositeDataSourceImpl)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mDataSources)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(CompositeDataSourceImpl,
++                                          nsIRDFCompositeDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(CompositeDataSourceImpl,
++                                           nsIRDFCompositeDataSource)
++
++NS_INTERFACE_MAP_BEGIN(CompositeDataSourceImpl)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFCompositeDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFObserver)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFCompositeDataSource)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFCompositeDataSource)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(CompositeDataSourceImpl)
++NS_INTERFACE_MAP_END
+ 
+ 
+ //----------------------------------------------------------------------
+diff --git a/rdf/base/src/nsInMemoryDataSource.cpp b/rdf/base/src/nsInMemoryDataSource.cpp
+--- a/rdf/base/src/nsInMemoryDataSource.cpp
++++ b/rdf/base/src/nsInMemoryDataSource.cpp
+@@ -348,7 +348,8 @@ protected:
+     NS_NewRDFInMemoryDataSource(nsISupports* aOuter, const nsIID& aIID, void** aResult);
+ 
+ public:
+-    NS_DECL_AGGREGATED
++    NS_DECL_CYCLE_COLLECTING_AGGREGATED
++    NS_DECL_AGGREGATED_CYCLE_COLLECTION_CLASS(InMemoryDataSource)
+ 
+     // nsIRDFDataSource methods
+     NS_DECL_NSIRDFDATASOURCE
+@@ -974,13 +975,22 @@ InMemoryDataSource::DeleteForwardArcsEnt
+ 
+ ////////////////////////////////////////////////////////////////////////
+ 
+-NS_IMPL_AGGREGATED(InMemoryDataSource)
++NS_IMPL_CYCLE_COLLECTION_CLASS(InMemoryDataSource)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(InMemoryDataSource)
++    NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_AGGREGATED(InMemoryDataSource)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_AGGREGATED(InMemoryDataSource)
+ NS_INTERFACE_MAP_BEGIN_AGGREGATED(InMemoryDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFInMemoryDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFPropagatableDataSource)
+     NS_INTERFACE_MAP_ENTRY(nsIRDFPurgeableDataSource)
+     NS_INTERFACE_MAP_ENTRY(rdfIDataSource)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION_AGGREGATED(InMemoryDataSource)
+ NS_INTERFACE_MAP_END
+ 
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/rdf/base/src/nsRDFXMLDataSource.cpp b/rdf/base/src/nsRDFXMLDataSource.cpp
+--- a/rdf/base/src/nsRDFXMLDataSource.cpp
++++ b/rdf/base/src/nsRDFXMLDataSource.cpp
+@@ -122,6 +122,7 @@
+ #include "prlog.h"
+ #include "nsNameSpaceMap.h"
+ #include "nsCRT.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ #include "rdfIDataSource.h"
+ 
+@@ -154,7 +155,7 @@ protected:
+         eLoadState_Loaded
+     };
+ 
+-    nsIRDFDataSource*   mInner;         // OWNER
++    nsCOMPtr<nsIRDFDataSource> mInner;
+     PRPackedBool        mIsWritable;    // true if the document can be written back
+     PRPackedBool        mIsDirty;       // true if the document should be written back
+     LoadState           mLoadState;     // what we're doing now
+@@ -182,7 +183,9 @@ protected:
+ 
+ public:
+     // nsISupports
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(RDFXMLDataSourceImpl,
++                                             nsIRDFDataSource)
+ 
+     // nsIRDFDataSource
+     NS_IMETHOD GetURI(char* *uri);
+@@ -413,8 +416,7 @@ NS_NewRDFXMLDataSource(nsIRDFDataSource*
+ 
+ 
+ RDFXMLDataSourceImpl::RDFXMLDataSourceImpl(void)
+-    : mInner(nsnull),
+-      mIsWritable(PR_TRUE),
++    : mIsWritable(PR_TRUE),
+       mIsDirty(PR_FALSE),
+       mLoadState(eLoadState_Unloaded)
+ {
+@@ -429,7 +431,7 @@ RDFXMLDataSourceImpl::Init()
+ RDFXMLDataSourceImpl::Init()
+ {
+     nsresult rv;
+-    rv = CallCreateInstance(kRDFInMemoryDataSourceCID, &mInner);
++    mInner = do_CreateInstance(kRDFInMemoryDataSourceCID, &rv);
+     if (NS_FAILED(rv)) return rv;
+ 
+     if (gRefCnt++ == 0) {
+@@ -456,21 +458,32 @@ RDFXMLDataSourceImpl::~RDFXMLDataSourceI
+     // Release RDF/XML sink observers
+     mObservers.Clear();
+ 
+-    NS_RELEASE(mInner);
+-
+     if (--gRefCnt == 0)
+         NS_IF_RELEASE(gRDFService);
+ }
+ 
+-
+-NS_IMPL_ISUPPORTS7(RDFXMLDataSourceImpl,
+-                   nsIRDFDataSource,
+-                   nsIRDFRemoteDataSource,
+-                   nsIRDFXMLSink,
+-                   nsIRDFXMLSource,
+-                   nsIRequestObserver,
+-                   nsIStreamListener,
+-                   rdfIDataSource)
++NS_IMPL_CYCLE_COLLECTION_CLASS(RDFXMLDataSourceImpl)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(RDFXMLDataSourceImpl)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(RDFXMLDataSourceImpl)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInner)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(RDFXMLDataSourceImpl,
++                                          nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(RDFXMLDataSourceImpl,
++                                           nsIRDFDataSource)
++
++NS_INTERFACE_MAP_BEGIN(RDFXMLDataSourceImpl)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFRemoteDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFXMLSink)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFXMLSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
++    NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
++    NS_INTERFACE_MAP_ENTRY(rdfIDataSource)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(RDFXMLDataSourceImpl)
++NS_INTERFACE_MAP_END
+ 
+ 
+ nsresult
+diff --git a/rdf/chrome/src/nsChromeUIDataSource.cpp b/rdf/chrome/src/nsChromeUIDataSource.cpp
+--- a/rdf/chrome/src/nsChromeUIDataSource.cpp
++++ b/rdf/chrome/src/nsChromeUIDataSource.cpp
+@@ -80,30 +80,30 @@ nsChromeUIDataSource::~nsChromeUIDataSou
+   NS_IF_RELEASE(mRDFService);
+ }
+ 
+-// we require a special implementation of Release, which knows about
+-// a circular strong reference
+-NS_IMPL_ADDREF(nsChromeUIDataSource)
+-NS_IMPL_QUERY_INTERFACE2(nsChromeUIDataSource, nsIRDFDataSource, nsIRDFObserver)
+-
+-NS_IMETHODIMP_(nsrefcnt)
+-nsChromeUIDataSource::Release()
+-{
+-  NS_PRECONDITION(PRInt32(mRefCnt) > 0, "duplicate release");
+-  --mRefCnt;
+-  NS_LOG_RELEASE(this, mRefCnt, "nsChromeUIDataSource");
+-
+-  // delete if the last reference is our strong circular reference
+-  if (mComposite && PRInt32(mRefCnt) == 1) {
+-    mComposite->RemoveObserver(this);
+-    return 0;
+-  }
+-  else if (mRefCnt == 0) {
+-    delete this;
+-    return 0;
+-  }
+-  return mRefCnt;
+-}
+-
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsChromeUIDataSource)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsChromeUIDataSource)
++  if (tmp->mComposite) {
++    tmp->mComposite->RemoveObserver(tmp);
++    tmp->mComposite = nsnull;
++  }
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers);
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsChromeUIDataSource)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mComposite)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsChromeUIDataSource,
++                                          nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsChromeUIDataSource,
++                                           nsIRDFDataSource)
++
++NS_INTERFACE_MAP_BEGIN(nsChromeUIDataSource)
++  NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++  NS_INTERFACE_MAP_ENTRY(nsIRDFObserver)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFDataSource)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsChromeUIDataSource)
++NS_INTERFACE_MAP_END
+ 
+ //----------------------------------------------------------------------
+ //
+diff --git a/rdf/chrome/src/nsChromeUIDataSource.h b/rdf/chrome/src/nsChromeUIDataSource.h
+--- a/rdf/chrome/src/nsChromeUIDataSource.h
++++ b/rdf/chrome/src/nsChromeUIDataSource.h
+@@ -48,11 +48,14 @@ class nsIDocument;
+ #include "nsIRDFDataSource.h"
+ #include "nsIRDFObserver.h"
+ #include "nsCOMArray.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsChromeUIDataSource : public nsIRDFDataSource, public nsIRDFObserver
+ {
+ public:
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsChromeUIDataSource,
++                                           nsIRDFDataSource)
+ 
+   // nsIRDFDataSource methods
+   NS_DECL_NSIRDFDATASOURCE
+diff --git a/rdf/datasource/src/nsFileSystemDataSource.cpp b/rdf/datasource/src/nsFileSystemDataSource.cpp
+--- a/rdf/datasource/src/nsFileSystemDataSource.cpp
++++ b/rdf/datasource/src/nsFileSystemDataSource.cpp
+@@ -823,18 +823,7 @@ NS_IMETHODIMP
+ NS_IMETHODIMP
+ FileSystemDataSource::AddObserver(nsIRDFObserver *n)
+ {
+-    NS_PRECONDITION(n != nsnull, "null ptr");
+-    if (! n)
+-        return NS_ERROR_NULL_POINTER;
+-
+-    if (! mObservers)
+-    {
+-        nsresult rv;
+-        rv = NS_NewISupportsArray(getter_AddRefs(mObservers));
+-        if (NS_FAILED(rv)) return rv;
+-    }
+-    mObservers->AppendElement(n);
+-    return NS_OK;
++    return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ 
+@@ -842,15 +831,7 @@ NS_IMETHODIMP
+ NS_IMETHODIMP
+ FileSystemDataSource::RemoveObserver(nsIRDFObserver *n)
+ {
+-    NS_PRECONDITION(n != nsnull, "null ptr");
+-    if (! n)
+-        return NS_ERROR_NULL_POINTER;
+-
+-    if (! mObservers)
+-        return NS_OK;
+-
+-    mObservers->RemoveElement(n);
+-    return NS_OK;
++    return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ 
+diff --git a/rdf/datasource/src/nsFileSystemDataSource.h b/rdf/datasource/src/nsFileSystemDataSource.h
+--- a/rdf/datasource/src/nsFileSystemDataSource.h
++++ b/rdf/datasource/src/nsFileSystemDataSource.h
+@@ -76,7 +76,6 @@ private:
+     nsresult GetFileSize(nsIRDFResource *source, nsIRDFInt** aResult);
+     nsresult GetLastMod(nsIRDFResource *source, nsIRDFDate** aResult);
+ 
+-    nsCOMPtr<nsISupportsArray> mObservers;
+     nsCOMPtr<nsIRDFService>    mRDFService;
+ 
+     // pseudo-constants
+diff --git a/rdf/datasource/src/nsLocalStore.cpp b/rdf/datasource/src/nsLocalStore.cpp
+--- a/rdf/datasource/src/nsLocalStore.cpp
++++ b/rdf/datasource/src/nsLocalStore.cpp
+@@ -85,7 +85,6 @@ protected:
+     friend NS_IMETHODIMP
+     NS_NewLocalStore(nsISupports* aOuter, REFNSIID aIID, void** aResult);
+ 
+-    nsCOMPtr<nsISupportsArray> mObservers;
+     nsCOMPtr<nsIRDFService>    mRDFService;
+ 
+ public:
+@@ -162,23 +161,11 @@ public:
+     }
+ 
+     NS_IMETHOD AddObserver(nsIRDFObserver* aObserver) {
+-        // Observers are _never_ notified, but we still have to play
+-        // nice.
+-        if (! mObservers) {
+-            nsresult rv;
+-            rv = NS_NewISupportsArray(getter_AddRefs(mObservers));
+-            if (NS_FAILED(rv)) return rv;
+-        }
+-
+-        mObservers->AppendElement(aObserver);
+-        return NS_OK;
++        return NS_ERROR_NOT_IMPLEMENTED;
+     }
+ 
+     NS_IMETHOD RemoveObserver(nsIRDFObserver* aObserver) {
+-        if (mObservers) {
+-            mObservers->RemoveElement(aObserver);
+-        }
+-        return NS_OK;
++        return NS_ERROR_NOT_IMPLEMENTED;
+     }
+ 
+     NS_IMETHOD HasArcIn(nsIRDFNode *aNode, nsIRDFResource *aArc, PRBool *_retval) {
+diff --git a/toolkit/components/downloads/src/nsDownloadManager.cpp b/toolkit/components/downloads/src/nsDownloadManager.cpp
+--- a/toolkit/components/downloads/src/nsDownloadManager.cpp
++++ b/toolkit/components/downloads/src/nsDownloadManager.cpp
+@@ -1586,7 +1586,24 @@ nsXPIProgressListener::AssertProgressInf
+ //          this datasource into functions on this object, to simplify the 
+ //          code in the download manager service and front end.
+ 
+-NS_IMPL_ISUPPORTS2(nsDownloadsDataSource, nsIRDFDataSource, nsIRDFRemoteDataSource)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsDownloadsDataSource)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsDownloadsDataSource)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsDownloadsDataSource)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInner)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsDownloadsDataSource,
++                                          nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsDownloadsDataSource,
++                                           nsIRDFDataSource)
++
++NS_INTERFACE_MAP_BEGIN(nsDownloadsDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFRemoteDataSource)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsDownloadsDataSource)
++NS_INTERFACE_MAP_END
+ 
+ nsresult
+ nsDownloadsDataSource::LoadDataSource()
+diff --git a/toolkit/components/downloads/src/nsDownloadManager.h b/toolkit/components/downloads/src/nsDownloadManager.h
+--- a/toolkit/components/downloads/src/nsDownloadManager.h
++++ b/toolkit/components/downloads/src/nsDownloadManager.h
+@@ -65,6 +65,7 @@
+ #include "nsIMIMEInfo.h"
+ #include "nsITimer.h"
+ #include "nsIAlertsService.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ typedef PRInt16 DownloadState;
+ typedef PRInt16 DownloadType;
+@@ -182,7 +183,9 @@ public:
+ public:
+   NS_DECL_NSIRDFDATASOURCE
+   NS_DECL_NSIRDFREMOTEDATASOURCE
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsDownloadsDataSource,
++                                           nsIRDFDataSource)
+ 
+   nsDownloadsDataSource() { };
+   virtual ~nsDownloadsDataSource() { };
+diff --git a/toolkit/components/history/src/nsGlobalHistory.cpp b/toolkit/components/history/src/nsGlobalHistory.cpp
+--- a/toolkit/components/history/src/nsGlobalHistory.cpp
++++ b/toolkit/components/history/src/nsGlobalHistory.cpp
+@@ -547,8 +547,17 @@ nsGlobalHistory::~nsGlobalHistory()
+ //
+ //   nsISupports methods
+ 
+-NS_IMPL_ADDREF(nsGlobalHistory)
+-NS_IMPL_RELEASE(nsGlobalHistory)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsGlobalHistory)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsGlobalHistory)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsGlobalHistory)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mObservers)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsGlobalHistory, nsIBrowserHistory)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsGlobalHistory, nsIBrowserHistory)
+ 
+ NS_INTERFACE_MAP_BEGIN(nsGlobalHistory)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsIGlobalHistory2, nsIGlobalHistory3)
+@@ -560,6 +569,7 @@ NS_INTERFACE_MAP_BEGIN(nsGlobalHistory)
+   NS_INTERFACE_MAP_ENTRY(nsIRDFRemoteDataSource)
+   NS_INTERFACE_MAP_ENTRY(nsIAutoCompleteSearch)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIBrowserHistory)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsGlobalHistory)
+ NS_INTERFACE_MAP_END
+ 
+ //----------------------------------------------------------------------
+@@ -2296,12 +2306,7 @@ nsGlobalHistory::AddObserver(nsIRDFObser
+   if (! aObserver)
+     return NS_ERROR_NULL_POINTER;
+ 
+-  if (! mObservers) {
+-    nsresult rv;
+-    rv = NS_NewISupportsArray(getter_AddRefs(mObservers));
+-    if (NS_FAILED(rv)) return rv;
+-  }
+-  mObservers->AppendElement(aObserver);
++  mObservers.AppendObject(aObserver);
+   return NS_OK;
+ }
+ 
+@@ -2312,10 +2317,7 @@ nsGlobalHistory::RemoveObserver(nsIRDFOb
+   if (! aObserver)
+     return NS_ERROR_NULL_POINTER;
+ 
+-  if (! mObservers)
+-    return NS_OK;
+-
+-  mObservers->RemoveElement(aObserver);
++  mObservers.RemoveObject(aObserver);
+ 
+   return NS_OK;
+ }
+@@ -2487,25 +2489,9 @@ nsGlobalHistory::BeginUpdateBatch()
+ 
+   ++mBatchesInProgress;
+   
+-  // we could call mObservers->EnumerateForwards() here
+-  // to save the addref/release on each observer, but
+-  // it's unlikely that anyone but the tree builder
+-  // is observing us
+-  if (mObservers) {
+-    PRUint32 count;
+-    rv = mObservers->Count(&count);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    for (PRInt32 i = 0; i < PRInt32(count); ++i) {
+-      nsIRDFObserver* observer = NS_STATIC_CAST(nsIRDFObserver*, mObservers->ElementAt(i));
+-
+-      NS_ASSERTION(observer != nsnull, "null ptr");
+-      if (! observer)
+-        continue;
+-
+-      rv = observer->OnBeginUpdateBatch(this);
+-      NS_RELEASE(observer);
+-    }
++  PRUint32 i = mObservers.Length();
++  while (i > 0) {
++    rv = mObservers[i--]->OnBeginUpdateBatch(this);
+   }
+   return rv;
+ }
+@@ -2517,25 +2503,9 @@ nsGlobalHistory::EndUpdateBatch()
+ 
+   --mBatchesInProgress;
+ 
+-  // we could call mObservers->EnumerateForwards() here
+-  // to save the addref/release on each observer, but
+-  // it's unlikely that anyone but the tree builder
+-  // is observing us
+-  if (mObservers) {
+-    PRUint32 count;
+-    rv = mObservers->Count(&count);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    for (PRInt32 i = 0; i < PRInt32(count); ++i) {
+-      nsIRDFObserver* observer = NS_STATIC_CAST(nsIRDFObserver*, mObservers->ElementAt(i));
+-
+-      NS_ASSERTION(observer != nsnull, "null ptr");
+-      if (! observer)
+-        continue;
+-
+-      rv = observer->OnEndUpdateBatch(this);
+-      NS_RELEASE(observer);
+-    }
++  PRUint32 i = mObservers.Length();
++  while (i > 0) {
++    rv = mObservers[i--]->OnEndUpdateBatch(this);
+   }
+   return rv;
+ }
+@@ -3209,23 +3179,9 @@ nsGlobalHistory::NotifyAssert(nsIRDFReso
+                               nsIRDFResource* aProperty,
+                               nsIRDFNode* aValue)
+ {
+-  nsresult rv;
+-
+-  if (mObservers) {
+-    PRUint32 count;
+-    rv = mObservers->Count(&count);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    for (PRInt32 i = 0; i < PRInt32(count); ++i) {
+-      nsIRDFObserver* observer = NS_STATIC_CAST(nsIRDFObserver*, mObservers->ElementAt(i));
+-
+-      NS_ASSERTION(observer != nsnull, "null ptr");
+-      if (! observer)
+-        continue;
+-
+-      rv = observer->OnAssert(this, aSource, aProperty, aValue);
+-      NS_RELEASE(observer);
+-    }
++  PRUint32 i = mObservers.Length();
++  while (i > 0) {
++    mObservers[i--]->OnAssert(this, aSource, aProperty, aValue);
+   }
+ 
+   return NS_OK;
+@@ -3237,23 +3193,9 @@ nsGlobalHistory::NotifyUnassert(nsIRDFRe
+                                 nsIRDFResource* aProperty,
+                                 nsIRDFNode* aValue)
+ {
+-  nsresult rv;
+-
+-  if (mObservers) {
+-    PRUint32 count;
+-    rv = mObservers->Count(&count);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    for (PRInt32 i = 0; i < PRInt32(count); ++i) {
+-      nsIRDFObserver* observer = NS_STATIC_CAST(nsIRDFObserver*, mObservers->ElementAt(i));
+-
+-      NS_ASSERTION(observer != nsnull, "null ptr");
+-      if (! observer)
+-        continue;
+-
+-      rv = observer->OnUnassert(this, aSource, aProperty, aValue);
+-      NS_RELEASE(observer);
+-    }
++  PRUint32 i = mObservers.Length();
++  while (i > 0) {
++    mObservers[i--]->OnUnassert(this, aSource, aProperty, aValue);
+   }
+ 
+   return NS_OK;
+@@ -3267,23 +3209,9 @@ nsGlobalHistory::NotifyChange(nsIRDFReso
+                               nsIRDFNode* aOldValue,
+                               nsIRDFNode* aNewValue)
+ {
+-  nsresult rv;
+-
+-  if (mObservers) {
+-    PRUint32 count;
+-    rv = mObservers->Count(&count);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    for (PRInt32 i = 0; i < PRInt32(count); ++i) {
+-      nsIRDFObserver* observer = NS_STATIC_CAST(nsIRDFObserver*, mObservers->ElementAt(i));
+-
+-      NS_ASSERTION(observer != nsnull, "null ptr");
+-      if (! observer)
+-        continue;
+-
+-      rv = observer->OnChange(this, aSource, aProperty, aOldValue, aNewValue);
+-      NS_RELEASE(observer);
+-    }
++  PRUint32 i = mObservers.Length();
++  while (i > 0) {
++    mObservers[i--]->OnChange(this, aSource, aProperty, aOldValue, aNewValue);
+   }
+ 
+   return NS_OK;
+diff --git a/toolkit/components/history/src/nsGlobalHistory.h b/toolkit/components/history/src/nsGlobalHistory.h
+--- a/toolkit/components/history/src/nsGlobalHistory.h
++++ b/toolkit/components/history/src/nsGlobalHistory.h
+@@ -61,6 +61,8 @@
+ #include "nsIAutoCompleteResult.h"
+ #include "nsIAutoCompleteResultTypes.h"
+ #include "nsHashSets.h"
++#include "nsCOMArray.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ //----------------------------------------------------------------------
+ //
+@@ -137,7 +139,9 @@ class nsGlobalHistory : nsSupportsWeakRe
+ {
+ public:
+   // nsISupports methods 
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsGlobalHistory,
++                                           nsIBrowserHistory)
+ 
+   NS_DECL_NSIGLOBALHISTORY2
+   NS_DECL_NSIGLOBALHISTORY3
+@@ -266,7 +270,7 @@ protected:
+   //
+   // RDF stuff
+   //
+-  nsCOMPtr<nsISupportsArray> mObservers;
++  nsCOMArray<nsIRDFObserver> mObservers;
+   
+   PRBool IsURLInHistory(nsIRDFResource* aResource);
+   
+diff --git a/xpcom/base/nsAgg.h b/xpcom/base/nsAgg.h
+--- a/xpcom/base/nsAgg.h
++++ b/xpcom/base/nsAgg.h
+@@ -39,14 +39,22 @@
+ #define nsAgg_h___
+ 
+ #include "nsISupports.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+-// Put this in your class's declaration:
++// Put NS_DECL_AGGREGATED or NS_DECL_CYCLE_COLLECTING_AGGREGATED in your class's
++// declaration.
+ #define NS_DECL_AGGREGATED                                                  \
+     NS_DECL_ISUPPORTS                                                       \
+-                                                                            \
++    NS_DECL_AGGREGATED_HELPER
++
++#define NS_DECL_CYCLE_COLLECTING_AGGREGATED                                 \
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS                                      \
++    NS_DECL_AGGREGATED_HELPER
++
++#define NS_DECL_AGGREGATED_HELPER                                           \
+ public:                                                                     \
+                                                                             \
+     /**                                                                     \
+@@ -60,6 +68,11 @@ public:                                 
+      */                                                                     \
+     nsISupports* InnerObject(void) { return &fAggregated; }                 \
+                                                                             \
++    /**                                                                     \
++     * Returns PR_TRUE if this object is part of an aggregated object.      \
++     */                                                                     \
++    PRBool IsPartOfAggregated(void) { return fOuter != InnerObject(); }     \
++                                                                            \
+ private:                                                                    \
+                                                                             \
+     /* You must implement this operation instead of the nsISupports */      \
+@@ -85,6 +98,27 @@ private:                                
+                                                                             \
+ public:                                                                     \
+ 
++#define NS_DECL_AGGREGATED_CYCLE_COLLECTION_CLASS(_class)                   \
++class NS_CYCLE_COLLECTION_INNERCLASS                                        \
++ : public nsCycleCollectionParticipant                                      \
++{                                                                           \
++public:                                                                     \
++  NS_IMETHOD Unlink(nsISupports *p);                                        \
++  NS_IMETHOD Traverse(nsISupports *p,                                       \
++                      nsCycleCollectionTraversalCallback &cb);              \
++  NS_IMETHOD_(void) UnmarkPurple(nsISupports *p)                            \
++  {                                                                         \
++    Downcast(p)->UnmarkPurple();                                            \
++  }                                                                         \
++  static _class* Downcast(nsISupports* s)                                   \
++  {                                                                         \
++    return (_class*)((char*)(s) - offsetof(_class, fAggregated));           \
++  }                                                                         \
++  static nsISupports* Upcast(_class *p)                                     \
++  {                                                                         \
++    return p->InnerObject();                                                \
++  }                                                                         \
++};                                                           
+ 
+ // Put this in your class's constructor:
+ #define NS_INIT_AGGREGATED(outer)                                           \
+@@ -95,30 +129,8 @@ public:                                 
+ 
+ // Put this in your class's implementation file:
+ #define NS_IMPL_AGGREGATED(_class)                                          \
+-NS_IMETHODIMP                                                               \
+-_class::QueryInterface(const nsIID& aIID, void** aInstancePtr)              \
+-{                                                                           \
+-    return fOuter->QueryInterface(aIID, aInstancePtr);                      \
+-}                                                                           \
+-                                                                            \
+-NS_IMETHODIMP_(nsrefcnt)                                                    \
+-_class::AddRef(void)                                                        \
+-{                                                                           \
+-    return fOuter->AddRef();                                                \
+-}                                                                           \
+-                                                                            \
+-NS_IMETHODIMP_(nsrefcnt)                                                    \
+-_class::Release(void)                                                       \
+-{                                                                           \
+-    return fOuter->Release();                                               \
+-}                                                                           \
+-                                                                            \
+-NS_IMETHODIMP                                                               \
+-_class::Internal::QueryInterface(const nsIID& aIID, void** aInstancePtr)    \
+-{                                                                           \
+-    _class* agg = (_class*)((char*)(this) - offsetof(_class, fAggregated)); \
+-    return agg->AggregatedQueryInterface(aIID, aInstancePtr);               \
+-}                                                                           \
++                                                                            \
++NS_IMPL_AGGREGATED_HELPER(_class)                                           \
+                                                                             \
+ NS_IMETHODIMP_(nsrefcnt)                                                    \
+ _class::Internal::AddRef(void)                                              \
+@@ -145,10 +157,122 @@ _class::Internal::Release(void)         
+     return agg->mRefCnt;                                                    \
+ }                                                                           \
+ 
++#define NS_IMPL_CYCLE_COLLECTING_AGGREGATED(_class)                         \
++                                                                            \
++NS_IMPL_AGGREGATED_HELPER(_class)                                           \
++                                                                            \
++NS_IMETHODIMP_(nsrefcnt)                                                    \
++_class::Internal::AddRef(void)                                              \
++{                                                                           \
++    _class* agg = NS_CYCLE_COLLECTION_CLASSNAME(_class)::Downcast(this);    \
++    NS_PRECONDITION(PRInt32(agg->mRefCnt) >= 0, "illegal refcnt");          \
++    NS_CheckThreadSafe(agg->_mOwningThread.GetThread(),                     \
++                       #_class " not thread-safe");                         \
++    nsrefcnt count = agg->mRefCnt.incr(this);                               \
++    NS_LOG_ADDREF(this, count, #_class, sizeof(*agg));                      \
++    return count;                                                           \
++}                                                                           \
++                                                                            \
++NS_IMETHODIMP_(nsrefcnt)                                                    \
++_class::Internal::Release(void)                                             \
++{                                                                           \
++    _class* agg = NS_CYCLE_COLLECTION_CLASSNAME(_class)::Downcast(this);    \
++    NS_PRECONDITION(0 != agg->mRefCnt, "dup release");                      \
++    NS_CheckThreadSafe(agg->_mOwningThread.GetThread(),                     \
++                       #_class " not thread-safe");                         \
++    nsrefcnt count = agg->mRefCnt.decr(this);                               \
++    NS_LOG_RELEASE(this, count, #_class);                                   \
++    if (count == 0) {                                                       \
++        agg->mRefCnt.stabilizeForDeletion(this);                            \
++        NS_DELETEXPCOM(agg);                                                \
++        return 0;                                                           \
++    }                                                                       \
++    return count;                                                           \
++}
++
++#define NS_IMPL_AGGREGATED_HELPER(_class)                                   \
++NS_IMETHODIMP                                                               \
++_class::QueryInterface(const nsIID& aIID, void** aInstancePtr)              \
++{                                                                           \
++    return fOuter->QueryInterface(aIID, aInstancePtr);                      \
++}                                                                           \
++                                                                            \
++NS_IMETHODIMP_(nsrefcnt)                                                    \
++_class::AddRef(void)                                                        \
++{                                                                           \
++    return fOuter->AddRef();                                                \
++}                                                                           \
++                                                                            \
++NS_IMETHODIMP_(nsrefcnt)                                                    \
++_class::Release(void)                                                       \
++{                                                                           \
++    return fOuter->Release();                                               \
++}                                                                           \
++                                                                            \
++NS_IMETHODIMP                                                               \
++_class::Internal::QueryInterface(const nsIID& aIID, void** aInstancePtr)    \
++{                                                                           \
++    _class* agg = (_class*)((char*)(this) - offsetof(_class, fAggregated)); \
++    return agg->AggregatedQueryInterface(aIID, aInstancePtr);               \
++}                                                                           \
++
++/**
++ * To make aggregated objects participate in cycle collection we need to enable
++ * the outer object (aggregator) to traverse/unlink the objects held by the
++ * inner object (the aggregatee). We can't just make the inner object QI'able to
++ * NS_CYCLECOLLECTIONPARTICIPANT_IID, we don't want to return the inner object's
++ * nsCycleCollectionParticipant for the outer object (which will happen if the
++ * outer object doesn't participate in cycle collection itself).
++ * NS_AGGREGATED_CYCLECOLLECTIONPARTICIPANT_IID enables the outer object to get
++ * the inner objects nsCycleCollectionParticipant.
++ *
++ * There are three cases:
++ *   - No aggregation
++ *     QI'ing to NS_CYCLECOLLECTIONPARTICIPANT_IID will return the inner
++ *     object's nsCycleCollectionParticipant.
++ *
++ *   - Aggregation and outer object does not participate in cycle collection
++ *     QI'ing to NS_CYCLECOLLECTIONPARTICIPANT_IID will not return anything.
++ *
++ *   - Aggregation and outer object does participate in cycle collection
++ *     QI'ing to NS_CYCLECOLLECTIONPARTICIPANT_IID will return the outer
++ *     object's nsCycleCollectionParticipant. The outer object's
++ *     nsCycleCollectionParticipant can then QI the inner object to
++ *     NS_AGGREGATED_CYCLECOLLECTIONPARTICIPANT_IID to get the inner object's
++ *     nsCycleCollectionParticipant, which it can use to traverse/unlink the
++ *     objects reachable from the inner object.
++ */
++#define NS_AGGREGATED_CYCLECOLLECTIONPARTICIPANT_IID                        \
++{                                                                           \
++    0x32889b7e,                                                             \
++    0xe4fe,                                                                 \
++    0x43f4,                                                                 \
++    { 0x85, 0x31, 0xb5, 0x28, 0x23, 0xa2, 0xe9, 0xfc }                      \
++}
++
++/**
++ * Just holds the IID so NS_GET_IID works.
++ */
++class nsAggregatedCycleCollectionParticipant
++{
++public:
++    NS_DECLARE_STATIC_IID_ACCESSOR(NS_AGGREGATED_CYCLECOLLECTIONPARTICIPANT_IID)
++};
++
++NS_DEFINE_STATIC_IID_ACCESSOR(nsAggregatedCycleCollectionParticipant, 
++                              NS_AGGREGATED_CYCLECOLLECTIONPARTICIPANT_IID)
++
+ // for use with QI macros in nsISupportsUtils.h:
+ 
+ #define NS_INTERFACE_MAP_BEGIN_AGGREGATED(_class)                           \
+   NS_IMPL_AGGREGATED_QUERY_HEAD(_class)
++
++#define NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION_AGGREGATED(_class)          \
++  NS_IMPL_QUERY_CYCLE_COLLECTION(_class)
++
++#define NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION_AGGREGATED(_class)        \
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION_AGGREGATED(_class)                \
++  NS_INTERFACE_MAP_ENTRY_CYCLE_COLLECTION_ISUPPORTS(_class)
+ 
+ #define NS_IMPL_AGGREGATED_QUERY_HEAD(_class)                               \
+ nsresult                                                                    \
+@@ -163,6 +287,25 @@ _class::AggregatedQueryInterface(REFNSII
+     foundInterface = InnerObject();                                         \
+   else
+ 
++#define NS_IMPL_AGGREGATED_QUERY_CYCLE_COLLECTION(_class)                   \
++  if (aIID.Equals(IsPartOfAggregated() ?                                    \
++                  NS_GET_IID(nsCycleCollectionParticipant) :                \
++                  NS_GET_IID(nsAggregatedCycleCollectionParticipant)))      \
++    foundInterface = & NS_CYCLE_COLLECTION_NAME(_class);                    \
++  else
++
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_AGGREGATED(_class)          \
++  NS_IMETHODIMP                                                             \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                           \
++                         (nsISupports *p,                                   \
++                          nsCycleCollectionTraversalCallback &cb)           \
++  {                                                                         \
++    NS_ASSERTION(CheckForRightISupports(p),                                 \
++                 "not the nsISupports pointer we expect");                  \
++    _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                     \
++    if (!tmp->IsPartOfAggregated())                                         \
++        NS_IMPL_CYCLE_COLLECTION_DESCRIBE(_class)
++
+ #define NS_GENERIC_AGGREGATED_CONSTRUCTOR(_InstanceClass)                   \
+ static NS_METHOD                                                            \
+ _InstanceClass##Constructor(nsISupports *aOuter, REFNSIID aIID,             \
+diff --git a/xpfe/components/intl/nsCharsetMenu.cpp b/xpfe/components/intl/nsCharsetMenu.cpp
+--- a/xpfe/components/intl/nsCharsetMenu.cpp
++++ b/xpfe/components/intl/nsCharsetMenu.cpp
+@@ -65,6 +65,7 @@
+ #include "nsITimelineService.h"
+ #include "nsCRT.h"
+ #include "prmem.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ //----------------------------------------------------------------------------
+ // Global functions and data [declaration]
+@@ -153,7 +154,8 @@ public:
+  */
+ class nsCharsetMenu : public nsIRDFDataSource, public nsICurrentCharsetListener
+ {
+-  NS_DECL_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsCharsetMenu, nsIRDFDataSource)
+ 
+ private:
+   static nsIRDFResource * kNC_BrowserAutodetMenuRoot;
+@@ -465,7 +467,20 @@ NS_IMETHODIMP nsCharsetMenuObserver::Obs
+ //----------------------------------------------------------------------------
+ // Class nsCharsetMenu [implementation]
+ 
+-NS_IMPL_ISUPPORTS2(nsCharsetMenu, nsIRDFDataSource, nsICurrentCharsetListener)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsCharsetMenu)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsCharsetMenu)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsCharsetMenu)
++  cb.NoteXPCOMChild(nsCharsetMenu::mInner);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsCharsetMenu, nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsCharsetMenu, nsIRDFDataSource)
++NS_INTERFACE_MAP_BEGIN(nsCharsetMenu)
++  NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++  NS_INTERFACE_MAP_ENTRY(nsICurrentCharsetListener)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRDFDataSource)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsCharsetMenu)
++NS_INTERFACE_MAP_END
+ 
+ nsIRDFDataSource * nsCharsetMenu::mInner = NULL;
+ nsIRDFResource * nsCharsetMenu::kNC_BrowserAutodetMenuRoot = NULL;
+diff --git a/xpfe/components/related/src/nsRelatedLinksHandler.cpp b/xpfe/components/related/src/nsRelatedLinksHandler.cpp
+--- a/xpfe/components/related/src/nsRelatedLinksHandler.cpp
++++ b/xpfe/components/related/src/nsRelatedLinksHandler.cpp
+@@ -658,7 +658,23 @@ RelatedLinksHandlerImpl::Init()
+ 
+ // nsISupports interface
+ 
+-NS_IMPL_ISUPPORTS2(RelatedLinksHandlerImpl, nsIRelatedLinksHandler, nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTION_CLASS(RelatedLinksHandlerImpl)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(RelatedLinksHandlerImpl)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(RelatedLinksHandlerImpl)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInner)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(RelatedLinksHandlerImpl,
++                                          nsIRelatedLinksHandler)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(RelatedLinksHandlerImpl,
++                                           nsIRelatedLinksHandler)
++
++NS_INTERFACE_MAP_BEGIN(RelatedLinksHandlerImpl)
++    NS_INTERFACE_MAP_ENTRY(nsIRelatedLinksHandler)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRelatedLinksHandler)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(RelatedLinksHandlerImpl)
++NS_INTERFACE_MAP_END
+ 
+ // nsIRelatedLinksHandler interface
+ 
+diff --git a/xpfe/components/related/src/nsRelatedLinksHandlerImpl.h b/xpfe/components/related/src/nsRelatedLinksHandlerImpl.h
+--- a/xpfe/components/related/src/nsRelatedLinksHandlerImpl.h
++++ b/xpfe/components/related/src/nsRelatedLinksHandlerImpl.h
+@@ -44,6 +44,7 @@
+ #include "nsIRDFResource.h"
+ #include "nsCOMPtr.h"
+ #include "nsIRDFDataSource.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ ////////////////////////////////////////////////////////////////////////
+ // RelatedLinksHandlerImpl
+@@ -71,7 +72,9 @@ public:
+ 	nsresult	Init();
+ 
+ 
+-	NS_DECL_ISUPPORTS
++        NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++        NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(RelatedLinksHandlerImpl,
++                                                 nsIRelatedLinksHandler)
+ 	NS_DECL_NSIRELATEDLINKSHANDLER
+ 	NS_DECL_NSIRDFDATASOURCE
+ };
+diff --git a/xpfe/components/search/src/nsLocalSearchService.cpp b/xpfe/components/search/src/nsLocalSearchService.cpp
+--- a/xpfe/components/search/src/nsLocalSearchService.cpp
++++ b/xpfe/components/search/src/nsLocalSearchService.cpp
+@@ -885,17 +885,7 @@ NS_IMETHODIMP
+ NS_IMETHODIMP
+ LocalSearchDataSource::AddObserver(nsIRDFObserver *n)
+ {
+-	NS_PRECONDITION(n != nsnull, "null ptr");
+-	if (! n)
+-		return NS_ERROR_NULL_POINTER;
+-
+-	if (! mObservers)
+-	{
+-		nsresult	rv;
+-		rv = NS_NewISupportsArray(getter_AddRefs(mObservers));
+-		if (NS_FAILED(rv)) return rv;
+-	}
+-	return mObservers->AppendElement(n) ? NS_OK : NS_ERROR_FAILURE;
++	return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ 
+@@ -903,21 +893,7 @@ NS_IMETHODIMP
+ NS_IMETHODIMP
+ LocalSearchDataSource::RemoveObserver(nsIRDFObserver *n)
+ {
+-	NS_PRECONDITION(n != nsnull, "null ptr");
+-	if (! n)
+-		return NS_ERROR_NULL_POINTER;
+-
+-	if (! mObservers)
+-		return(NS_OK);
+-
+-#ifdef DEBUG
+-	PRBool ok =
+-#endif
+-	mObservers->RemoveElement(n);
+-
+-	NS_ASSERTION(ok, "observer not present");
+-
+-	return(NS_OK);
++	return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ 
+diff --git a/xpfe/components/search/src/nsLocalSearchService.h b/xpfe/components/search/src/nsLocalSearchService.h
+--- a/xpfe/components/search/src/nsLocalSearchService.h
++++ b/xpfe/components/search/src/nsLocalSearchService.h
+@@ -56,8 +56,6 @@ class LocalSearchDataSource : public nsI
+ class LocalSearchDataSource : public nsIRDFDataSource
+ {
+ private:
+-	nsCOMPtr<nsISupportsArray> mObservers;
+-
+ 	static PRInt32		gRefCnt;
+ 
+     // pseudo-constants
+diff --git a/xpfe/components/windowds/nsWindowDataSource.cpp b/xpfe/components/windowds/nsWindowDataSource.cpp
+--- a/xpfe/components/windowds/nsWindowDataSource.cpp
++++ b/xpfe/components/windowds/nsWindowDataSource.cpp
+@@ -129,44 +129,26 @@ nsWindowDataSource::Observe(nsISupports 
+     return NS_OK;
+ }
+ 
+-#if 0
+-NS_IMETHODIMP_(nsrefcnt)
+-nsWindowMediator::Release()
+-{
+-	// We need a special implementation of Release() due to having
+-	// two circular references:  mInner and mContainer
+-
+-	NS_PRECONDITION(PRInt32(mRefCnt) > 0, "duplicate release");
+-	--mRefCnt;
+-	NS_LOG_RELEASE(this, mRefCnt, "nsWindowMediator");
+-
+-	if (mInner && mRefCnt == 2)
+-	{
+-		NS_IF_RELEASE(mContainer);
+-		mContainer = nsnull;
+-
+-		nsIRDFDataSource* tmp = mInner;
+-		mInner = nsnull;
+-		NS_IF_RELEASE(tmp);
+-		return(0);
+-	}
+-	else if (mRefCnt == 0)
+-	{
+-		mRefCnt = 1;
+-		delete this;
+-		return(0);
+-	}
+-	return(mRefCnt);
+-}
+-
+-#endif
+-
+-
+-NS_IMPL_ISUPPORTS4(nsWindowDataSource,
+-                   nsIObserver,
+-                   nsIWindowMediatorListener,
+-                   nsIWindowDataSource,
+-                   nsIRDFDataSource)
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsWindowDataSource)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsWindowDataSource)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsWindowDataSource)
++    // XXX mContainer?
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInner)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF_AMBIGUOUS(nsWindowDataSource,
++                                          nsIObserver)
++NS_IMPL_CYCLE_COLLECTING_RELEASE_AMBIGUOUS(nsWindowDataSource,
++                                           nsIObserver)
++
++NS_INTERFACE_MAP_BEGIN(nsWindowDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIObserver)
++    NS_INTERFACE_MAP_ENTRY(nsIWindowMediatorListener)
++    NS_INTERFACE_MAP_ENTRY(nsIWindowDataSource)
++    NS_INTERFACE_MAP_ENTRY(nsIRDFDataSource)
++    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIObserver)
++    NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsWindowDataSource)
++NS_INTERFACE_MAP_END
+ 
+ // nsIWindowMediatorListener implementation
+ // handle notifications from the window mediator and reflect them into
+diff --git a/xpfe/components/windowds/nsWindowDataSource.h b/xpfe/components/windowds/nsWindowDataSource.h
+--- a/xpfe/components/windowds/nsWindowDataSource.h
++++ b/xpfe/components/windowds/nsWindowDataSource.h
+@@ -46,6 +46,7 @@
+ #include "nsIRDFService.h"
+ #include "nsIRDFContainer.h"
+ #include "nsHashtable.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ // {C744CA3D-840B-460a-8D70-7CE63C51C958}
+ #define NS_WINDOWDATASOURCE_CID \
+@@ -64,7 +65,9 @@ class nsWindowDataSource : public nsIRDF
+ 
+     nsresult Init();
+     
+-    NS_DECL_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++    NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsWindowDataSource,
++                                             nsIRDFDataSource)
+     NS_DECL_NSIOBSERVER
+     NS_DECL_NSIWINDOWMEDIATORLISTENER
+     NS_DECL_NSIWINDOWDATASOURCE
