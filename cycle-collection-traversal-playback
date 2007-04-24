@@ -1,1 +1,229 @@
 Record results of cycle collection traversal so we only have to call the traversal APIs once per collection.  b=378514
+
+diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
+--- a/xpcom/base/nsCycleCollector.cpp
++++ b/xpcom/base/nsCycleCollector.cpp
+@@ -294,102 +294,132 @@ enum NodeColor { black, white, grey };
+ // each cycle collection.
+ 
+ struct PtrInfo
+-    : public PLDHashEntryStub
+-{
++{
++    void *mPointer;
+     PRUint32 mColor : 2;
+     PRUint32 mInternalRefs : 30;
+     // FIXME: mLang expands back to a full word when bug 368774 lands.
+     PRUint32 mLang : 2;
+     PRUint32 mRefCount : 30;
++    PRUint32 mChildCount;
+ 
+ #ifdef DEBUG_CC
+     size_t mBytes;
+     const char *mName;
+ #endif
++
++    PtrInfo(void *aPointer)
++      : mPointer(aPointer)
++      , mColor(grey)
++      , mInternalRefs(0)
++      , mLang(nsIProgrammingLanguage::CPLUSPLUS)
++      , mRefCount(0)
++      , mChildCount(0)
++#ifdef DEBUG_CC
++      , mBytes(0)
++      , mName(nsnull)
++#endif
++    {
++    }
+ };
+ 
+-PR_STATIC_CALLBACK(PRBool)
+-InitPtrInfo(PLDHashTable *table, PLDHashEntryHdr *entry, const void *key)
+-{
+-    PtrInfo* pi = (PtrInfo*)entry;
+-    pi->key = key;
+-    pi->mColor = black;
+-    pi->mInternalRefs = 0;
+-    pi->mLang = nsIProgrammingLanguage::CPLUSPLUS;
+-    pi->mRefCount = 0;
+-#ifdef DEBUG_CC
+-    pi->mBytes = 0;
+-    pi->mName = nsnull;
+-#endif
+-    return PR_TRUE;
+-}
+-
+-static PLDHashTableOps GCTableOps = {
+-    PL_DHashAllocTable,
+-    PL_DHashFreeTable,
+-    PL_DHashVoidPtrKeyStub,
+-    PL_DHashMatchEntryStub,
+-    PL_DHashMoveEntryStub,
+-    PL_DHashClearEntryStub,
+-    PL_DHashFinalizeStub,
+-    InitPtrInfo
+- };
+-
+-struct GCTable
+-{
+-    PLDHashTable mTab;
+-
+-    GCTable()
+-    {
+-        Init();
+-    }
+-    ~GCTable()
+-    {
+-        if (mTab.ops)
+-            PL_DHashTableFinish(&mTab);
+-    }
+-
+-    void Init()
+-    {
+-        if (!PL_DHashTableInit(&mTab, &GCTableOps, nsnull, sizeof(PtrInfo),
+-                               32768))
+-            mTab.ops = nsnull;
+-    }
+-    void Clear()
+-    {
+-        if (!mTab.ops || mTab.entryCount > 0) {
+-            if (mTab.ops)
+-                PL_DHashTableFinish(&mTab);
+-            Init();
+-        }
+-    }
+-
+-    PtrInfo *Lookup(void *key)
+-    {
+-        if (!mTab.ops)
+-            return nsnull;
+-
+-        PLDHashEntryHdr *entry =
+-            PL_DHashTableOperate(&mTab, key, PL_DHASH_LOOKUP);
+-
+-        return PL_DHASH_ENTRY_IS_BUSY(entry) ? (PtrInfo*)entry : nsnull;
+-    }
+-
+-    PtrInfo *Add(void *key)
+-    {
+-        if (!mTab.ops)
+-            return nsnull;
+-
+-        return (PtrInfo*)PL_DHashTableOperate(&mTab, key, PL_DHASH_ADD);
+-    }
+-    
+-    void Enumerate(PLDHashEnumerator etor, void *arg)
+-    {
+-        if (mTab.ops)
+-            PL_DHashTableEnumerate(&mTab, etor, arg);
+-    }
++// A structure designed to be used like a linked list, but allocated
++// many items at a time.
++template<class EntryType, int BlockSize>
++class ListPool
++{
++private:
++    struct Block {
++        Block* mNext;
++        EntryType mEntries[BlockSize];
++    };
++
++public:
++    ListPool()
++      : mBlocks(nsnull)
++      , mLast(nsnull)
++    {
++    }
++
++    class Builder;
++    friend class Builder;
++    class Builder {
++    public:
++        Builder(ListPool<EntryType, BlockSize>& aPool)
++          : mNextBlock(&aPool.mBlocks)
++          , mNext(aPool.mLast)
++          , mBlockEnd(nsnull)
++        {
++            NS_ASSERTION(aPool.mBlocks == nsnull && aPool.mLast == nsnull,
++                         "pool not empty");
++        }
++        EntryType *Add()
++        {
++            if (mNext == mBlockEnd) {
++                Block *block;
++                if (!(*mNextBlock = block = new Block))
++                    return nsnull;
++                mCurrent = block->mEntries;
++                mBlockEnd = block->mEntries + BlockSize;
++                mNextBlock = &block->mNext;
++            }
++            return mNext++;
++        }
++    private:
++        Block **mNextBlock;
++        EntryType *&mNext;
++        EntryType *mBlockEnd;
++    };
++
++    class Enumerator;
++    friend class Enumerator;
++    class Enumerator {
++    public:
++        Enumerator(ListPool<EntryType, BlockSize>& aPool)
++          : mNextBlock(aPool.mBlocks)
++          , mNext(nsnull)
++          , mBlockEnd(nsnull)
++          , mLast(aPool.mLast)
++        {
++        }
++
++        PRBool IsDone() const
++        {
++            return mNext == mLast;
++        }
++
++        void Advance(PRUint32 aCount)
++        {
++            while (mNext + aCount >= mBlockEnd) {
++                aCount -= (mBlockEnd - mNext);
++                mNext = mNextBlock->mEntries;
++                mBlockEnd = mNext + BlockSize;
++                mNextBlock = mNextBlock->mNext;
++            }
++            mNext += aCount;
++        }
++
++        EntryType& GetNext()
++        {
++            NS_ASSERTION(!IsDone(), "calling GetNext when done");
++            if (mNext == mBlockEnd) {
++                mNext = mNextBlock->mEntries;
++                mBlockEnd = mNext + BlockSize;
++                mNextBlock = mNextBlock->mNext;
++            }
++            return *(mNext++);
++        }
++    private:
++        Block *mNextBlock;
++        // mNext is the next value we want to return, unless mNext == mBlockEnd
++        EntryType *mNext, *mBlockEnd, *mLast;
++    };
++
++private:
++    Block *mBlocks;
++    EntryType *mLast;
++
+ };
+-
+ 
+ // XXX Would be nice to have an nsHashSet<KeyType> API that has
+ // Add/Remove/Has rather than PutEntry/RemoveEntry/GetEntry.
+@@ -954,6 +984,7 @@ GraphWalker::Walk(void *s0)
+ ////////////////////////////////////////////////////////////////////////
+ 
+ 
++// SHOULD GO AWAY
+ struct MarkGreyWalker : public GraphWalker
+ {
+     MarkGreyWalker(GCTable &tab,
