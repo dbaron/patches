@@ -931,53 +931,94 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
          if (mRuntimes[i] &&
-@@ -1217,17 +1385,16 @@ nsCycleCollector::CollectWhite()
- // Extra book-keeping functions.
+@@ -1214,86 +1382,6 @@ nsCycleCollector::CollectWhite()
+ 
+ #ifdef DEBUG_CC
  ////////////////////////////////////////////////////////////////////////
- 
-+// XXX Convert to NodePool::Enumerator
- struct graphVizWalker : public GraphWalker
- {
-     // We can't just use _popen here because graphviz-for-windows
-     // doesn't set up its stdin stream properly, sigh.
+-// Extra book-keeping functions.
+-////////////////////////////////////////////////////////////////////////
+-
+-struct graphVizWalker : public GraphWalker
+-{
+-    // We can't just use _popen here because graphviz-for-windows
+-    // doesn't set up its stdin stream properly, sigh.
 -    PointerSet mVisited;
-     const void *mParent;
-     FILE *mStream;
- 
+-    const void *mParent;
+-    FILE *mStream;
+-
 -    graphVizWalker(GCTable &tab,
 -                   nsCycleCollectionLanguageRuntime **runtimes)
 -        : GraphWalker(tab, runtimes), 
-+    graphVizWalker(GCGraph &graph)
-+        : GraphWalker(graph), 
-           mParent(nsnull), 
-           mStream(nsnull)        
-     {
-@@ -1270,7 +1437,7 @@ struct graphVizWalker : public GraphWalk
-         return ! mVisited.GetEntry(pi->key);
-     }
- 
+-          mParent(nsnull), 
+-          mStream(nsnull)        
+-    {
+-#ifdef WIN32
+-        mStream = fopen("c:\\cycle-graph.dot", "w+");
+-#else
+-        mStream = popen("dotty -", "w");
+-#endif
+-        mVisited.Init();
+-        fprintf(mStream, 
+-                "digraph collection {\n"
+-                "rankdir=LR\n"
+-                "node [fontname=fixed, fontsize=10, style=filled, shape=box]\n"
+-                );
+-    }
+-
+-    ~graphVizWalker()
+-    {
+-        fprintf(mStream, "\n}\n");
+-#ifdef WIN32
+-        fclose(mStream);
+-        // Even dotty doesn't work terribly well on windows, since
+-        // they execute lefty asynchronously. So we'll just run 
+-        // lefty ourselves.
+-        _spawnlp(_P_WAIT, 
+-                 "lefty", 
+-                 "lefty",
+-                 "-e",
+-                 "\"load('dotty.lefty');"
+-                 "dotty.simple('c:\\cycle-graph.dot');\"",
+-                 NULL);
+-        unlink("c:\\cycle-graph.dot");
+-#else
+-        pclose(mStream);
+-#endif
+-    }
+-
+-    PRBool ShouldVisitNode(PtrInfo const *pi)
+-    { 
+-        return ! mVisited.GetEntry(pi->key);
+-    }
+-
 -    void VisitNode(PtrInfo *pi, size_t refcount)
-+    void VisitNode(PtrInfo *pi)
-     {
-         const void *p = pi->key;
-         mVisited.PutEntry(p);
-@@ -1284,11 +1451,10 @@ struct graphVizWalker : public GraphWalk
-                 pi->mInternalRefs, pi->mRefCount,
-                 (pi->mColor == black ? "black" : "white"),
-                 (pi->mColor == black ? "white" : "black"));
+-    {
+-        const void *p = pi->key;
+-        mVisited.PutEntry(p);
+-        mParent = p;
+-        fprintf(mStream, 
+-                "n%p [label=\"%s\\n%p\\n%u/%u refs found\", "
+-                "fillcolor=%s, fontcolor=%s]\n", 
+-                p,
+-                pi->mName,
+-                p,
+-                pi->mInternalRefs, pi->mRefCount,
+-                (pi->mColor == black ? "black" : "white"),
+-                (pi->mColor == black ? "white" : "black"));
 -    }
 -
 -    void NoteChild(PtrInfo *childpi)
 -    { 
 -        fprintf(mStream, "n%p -> n%p\n", mParent, childpi->key);
-+        for (EdgeIterator child = pi->mFirstChild, child_end = pi->mLastChild;
-+             child != child_end; ++child) {
-+            fprintf(mStream, "n%p -> n%p\n", mParent, (*child)->mPointer);
-+        }
-     }
- };
- 
-@@ -1511,8 +1677,6 @@ nsCycleCollector::nsCycleCollector() :
+-    }
+-};
+-
+-
+-////////////////////////////////////////////////////////////////////////
+ // Memory-hooking stuff
+ // When debugging wild pointers, it sometimes helps to hook malloc and
+ // free. This stuff is disabled unless you set an environment variable.
+@@ -1511,8 +1599,6 @@ nsCycleCollector::nsCycleCollector() :
  
  nsCycleCollector::~nsCycleCollector()
  {
@@ -986,7 +1027,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      for (PRUint32 i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
          mRuntimes[i] = NULL;
      }
-@@ -1567,15 +1731,15 @@ FindAnyWhiteCallback(PLDHashTable *table
+@@ -1567,20 +1653,63 @@ FindAnyWhiteCallback(PLDHashTable *table
  
  
  void 
@@ -1001,11 +1042,63 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
          if (anyWhites) {
 -            graphVizWalker gw(mGraph, mRuntimes);
-+            graphVizWalker gw(graph);
-             while (mBufs[0].GetSize() > 0) {
-                 nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].Pop());
-                 s = canonicalize(s);
-@@ -1804,14 +1968,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
+-            while (mBufs[0].GetSize() > 0) {
+-                nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].Pop());
+-                s = canonicalize(s);
+-                gw.Walk(s);
++            // We can't just use _popen here because graphviz-for-windows
++            // doesn't set up its stdin stream properly, sigh.
++            FILE *stream;
++#ifdef WIN32
++            stream = fopen("c:\\cycle-graph.dot", "w+");
++#else
++            stream = popen("dotty -", "w");
++#endif
++            fprintf(stream, 
++                    "digraph collection {\n"
++                    "rankdir=LR\n"
++                    "node [fontname=fixed, fontsize=10, style=filled, shape=box]\n"
++                    );
++
++            NodePool::Enumerator queue(graph.mNodePool);
++            while (!queue.IsDone()) {
++                const void *p = pi->mPointer;
++                fprintf(stream, 
++                        "n%p [label=\"%s\\n%p\\n%u/%u refs found\", "
++                        "fillcolor=%s, fontcolor=%s]\n", 
++                        p,
++                        pi->mName,
++                        p,
++                        pi->mInternalRefs, pi->mRefCount,
++                        (pi->mColor == black ? "black" : "white"),
++                        (pi->mColor == black ? "white" : "black"));
++                for (EdgeIterator child = pi->mFirstChild, child_end = pi->mLastChild;
++                     child != child_end; ++child) {
++                    fprintf(stream, "n%p -> n%p\n", p, (*child)->mPointer);
++                }
+             }
++
++            fprintf(stream, "\n}\n");
++#ifdef WIN32
++            fclose(stream);
++            // Even dotty doesn't work terribly well on windows, since
++            // they execute lefty asynchronously. So we'll just run 
++            // lefty ourselves.
++            _spawnlp(_P_WAIT, 
++                     "lefty", 
++                     "lefty",
++                     "-e",
++                     "\"load('dotty.lefty');"
++                     "dotty.simple('c:\\cycle-graph.dot');\"",
++                     NULL);
++            unlink("c:\\cycle-graph.dot");
++#else
++            pclose(stream);
++#endif
+         }
+     }
+ }
+@@ -1804,14 +1933,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
  
                  mScanInProgress = PR_TRUE;
  
@@ -1022,7 +1115,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  {
-@@ -1822,7 +1986,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1822,7 +1951,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
                  }
  #endif
  
@@ -1031,7 +1124,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: ScanRoots() took %lldms\n",
-@@ -1830,7 +1994,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1830,7 +1959,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
  #ifdef DEBUG_CC
@@ -1040,7 +1133,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
                  mScanInProgress = PR_FALSE;
-@@ -1839,7 +2003,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1839,7 +1968,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef COLLECT_TIME_DEBUG
                  now = PR_Now();
  #endif
@@ -1049,7 +1142,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: CollectWhite() took %lldms\n",
-@@ -1847,8 +2011,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1847,8 +1976,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
                  // Some additional book-keeping.
@@ -1058,7 +1151,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
                  --aTryCollections;
              }
-@@ -1909,45 +2071,6 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
+@@ -1909,45 +2036,6 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
      return PL_DHASH_NEXT;
  }
  
@@ -1104,7 +1197,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  void
  nsCycleCollector::ExplainLiveExpectedGarbage()
  {
-@@ -1968,25 +2091,39 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -1968,25 +2056,39 @@ nsCycleCollector::ExplainLiveExpectedGar
      mCollectionInProgress = PR_TRUE;
      mScanInProgress = PR_TRUE;
  
