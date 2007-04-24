@@ -3,7 +3,126 @@ Record results of cycle collection traversal so we only have to call the travers
 diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp
 +++ b/xpcom/base/nsCycleCollector.cpp
-@@ -294,102 +294,150 @@ enum NodeColor { black, white, grey };
+@@ -1,4 +1,5 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/* vim: set cindent tabstop=4 expandtab shiftwidth=4: */
+ /* ***** BEGIN LICENSE BLOCK *****
+  * Version: MPL 1.1/GPL 2.0/LGPL 2.1
+  *
+@@ -287,6 +288,112 @@ nsCycleCollector_shouldSuppress(nsISuppo
+ // Base types
+ ////////////////////////////////////////////////////////////////////////
+ 
++struct PtrInfo;
++
++class EdgeIterator
++{
++public:
++    EdgeIterator() : mPointer(nsnull) {}
++    EdgeIterator(void **aPointer) : mPointer(aPointer) {}
++    EdgeIterator(const EdgeIterator& aOther) : mPointer(aOther.mPointer) {}
++
++    EdgeIterator& operator++(int)
++    {
++        if (*mPointer == nsnull) {
++            // Null pointer is a sentinel for link to the next block.
++            mPointer = *(++mPointer);
++        }
++        return *this;
++    }
++
++    PtrInfo* operator*() const
++        { return NS_STATIC_CAST(PtrInfo*, *mPointer); }
++    PRBool operator==(const EdgeIterator& aOther) const
++        { return mPointer == aOther.mPointer; }
++    PRBool operator!=(const EdgeIterator& aOther) const
++        { return mPointer != aOther.mPointer; }
++
++private:
++    void **mPointer;
++};
++
++class EdgePool
++{
++    // EdgePool allocates arrays of void*, primarily to hold PtrInfo*.
++    // However, at the end of a block, the last two pointers are a null
++    // and then a void** pointing to the next block.  This allows
++    // EdgeIterators to be a single word but still capable of crossing
++    // block boundaries.
++
++    EdgePool()
++      : mBlocks(nsnull)
++    {
++    }
++
++    ~EdgePool()
++    {
++        Block *b = mBlocks;
++        while (b) {
++            Block *next = b->Next();
++            delete b;
++            b = next;
++        }
++    }
++
++    class Builder;
++    friend class Builder;
++    class Builder {
++    public:
++        Builder(EdgePool &aPool)
++          : mCurrent(nsnull)
++          , mBlockEnd(nsnull)
++          , mNextBlock(&aPool.mBlocks)
++        {
++        }
++
++        EdgeIterator Mark() { return EdgeIterator(mCurrent); }
++
++        void Add(PtrInfo* aEdge) {
++            if (mCurrent == mBlockEnd) {
++                Block *b = new Block();
++                if (!b) {
++                    // This means we just won't free things.
++                    NS_NOTREACHED("out of memory, ignoring edges");
++                    return;
++                }
++                *mNextBlockPtr = b;
++                mCurrent = b->Start();
++                mBlockEnd = b->End();
++                mNextBlockPtr = &b->Next();
++            }
++            *(mCurrent++) = aEdge;
++        }
++    private:
++        PtrInfo **mCurrent;
++        PtrInfo **mBlockEnd; // mBlockEnd points to space for null sentinel
++        Block **mNextBlockPtr;
++    };
++
++private:
++    Block *mBlocks;
++    enum { BlockSize = 65536 };
++
++    struct Block {
++        void* mPointers[BlockSize];
++        Block() {
++            mPointers[mBlockSize - 2] = nsnull; // sentinel
++            mPointers[mBlockSize - 1] = nsnull; // next block pointer
++        }
++        Block*& Next()
++            { return NS_STATIC_CAST(Block*&, mPointers[mBlockSize - 1]); }
++        PtrInfo** Start()
++            { return NS_STATIC_CAST(PtrInfo**, mPointers); }
++        PtrInfo** End()
++            { return NS_STATIC_CAST(PtrInfo**, mPointers + mBlockSize - 2); }
++    };
++};
++
++
+ enum NodeColor { black, white, grey };
+ 
+ // This structure should be kept as small as possible; we may expect
+@@ -294,102 +401,148 @@ enum NodeColor { black, white, grey };
  // each cycle collection.
  
  struct PtrInfo
@@ -16,8 +135,8 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      // FIXME: mLang expands back to a full word when bug 368774 lands.
      PRUint32 mLang : 2;
      PRUint32 mRefCount : 30;
-+    PtrInfo **mFirstChild;
-+    PtrInfo **mLastChild;
++    EdgeIterator mFirstChild; // first
++    EdgeIterator mLastChild; // one after last
  
  #ifdef DEBUG_CC
      size_t mBytes;
@@ -122,27 +241,26 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -    }
 +// A structure designed to be used like a linked list, but allocated
 +// many items at a time.
-+enum { BlockSize = 32768 }; // could be int template parameter
 +
-+template<class EntryType>
-+class ListPool
++class NodePool
 +{
 +private:
++    enum { BlockSize = 32768 }; // could be int template parameter
++    typedef PtrInfo EntryType;
++
 +    struct Block {
-+        // XXX This is wrong.  We need to have the end be marked within
-+        // the entries so that we can traverse from first to last.
 +        Block* mNext;
 +        EntryType mEntries[BlockSize];
 +    };
 +
 +public:
-+    ListPool()
++    NodePool()
 +      : mBlocks(nsnull)
 +      , mLast(nsnull)
 +    {
 +    }
 +
-+    ~ListPool()
++    ~NodePool()
 +    {
 +        Block *b = mBlocks;
 +        while (b) {
@@ -156,7 +274,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    friend class Builder;
 +    class Builder {
 +    public:
-+        Builder(ListPool<EntryType>& aPool)
++        Builder(NodePool& aPool)
 +          : mNextBlock(&aPool.mBlocks)
 +          , mNext(aPool.mLast)
 +          , mBlockEnd(nsnull)
@@ -186,7 +304,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    friend class Enumerator;
 +    class Enumerator {
 +    public:
-+        Enumerator(ListPool<EntryType>& aPool)
++        Enumerator(NodePool& aPool)
 +          : mNextBlock(&aPool.mBlocks)
 +          , mNext(nsnull)
 +          , mBlockEnd(nsnull)
@@ -231,13 +349,12 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +private:
 +    Block *mBlocks;
 +    EntryType *mLast;
-+
  };
 -
  
  // XXX Would be nice to have an nsHashSet<KeyType> API that has
  // Add/Remove/Has rather than PutEntry/RemoveEntry/GetEntry.
-@@ -661,13 +709,17 @@ struct nsCycleCollectionXPCOMRuntime :
+@@ -661,13 +814,17 @@ struct nsCycleCollectionXPCOMRuntime :
      }
  };
  
@@ -256,7 +373,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      nsCycleCollectionLanguageRuntime *mRuntimes[nsIProgrammingLanguage::MAX+1];
      nsCycleCollectionXPCOMRuntime mXPCOMRuntime;
  
-@@ -689,9 +741,9 @@ struct nsCycleCollector
+@@ -689,9 +846,9 @@ struct nsCycleCollector
      void ForgetRuntime(PRUint32 langID);
  
      void CollectPurple(); // XXXldb Should this be called SelectPurple?
@@ -269,7 +386,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      nsCycleCollector();
      ~nsCycleCollector();
-@@ -708,7 +760,7 @@ struct nsCycleCollector
+@@ -708,7 +865,7 @@ struct nsCycleCollector
  
      FILE *mPtrLog;
  
@@ -278,7 +395,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      void ExplainLiveExpectedGarbage();
      void ShouldBeFreed(nsISupports *n);
      void WasFreed(nsISupports *n);
-@@ -725,15 +777,15 @@ private:
+@@ -725,15 +882,15 @@ private:
      PtrInfo *mCurrPi;
  
  protected:
@@ -297,7 +414,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          mRuntimes(runtimes)
      {}
  
-@@ -916,6 +968,7 @@ GraphWalker::Walk(void *s0)
+@@ -916,6 +1073,7 @@ GraphWalker::Walk(void *s0)
      while (mQueue.GetSize() > 0) {
  
          void *ptr = mQueue.Pop();
@@ -305,7 +422,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          mCurrPi = mGraph.Lookup(ptr);
  
          if (!mCurrPi) {
-@@ -953,12 +1006,16 @@ GraphWalker::Walk(void *s0)
+@@ -953,12 +1111,16 @@ GraphWalker::Walk(void *s0)
  // Bacon & Rajan's |MarkRoots| routine.
  ////////////////////////////////////////////////////////////////////////
  
@@ -325,7 +442,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      {}
  
      PRBool ShouldVisitNode(PtrInfo const *pi)
-@@ -988,14 +1045,14 @@ nsCycleCollector::CollectPurple()
+@@ -988,14 +1150,14 @@ nsCycleCollector::CollectPurple()
  }
  
  void
@@ -343,7 +460,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  }
  
-@@ -1007,9 +1064,9 @@ nsCycleCollector::MarkRoots()
+@@ -1007,9 +1169,9 @@ nsCycleCollector::MarkRoots()
  
  struct ScanBlackWalker : public GraphWalker
  {
@@ -356,7 +473,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      {}
  
      PRBool ShouldVisitNode(PtrInfo const *pi)
-@@ -1031,9 +1088,9 @@ struct ScanBlackWalker : public GraphWal
+@@ -1031,9 +1193,9 @@ struct ScanBlackWalker : public GraphWal
  
  struct scanWalker : public GraphWalker
  {
@@ -368,7 +485,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      {}
  
      PRBool ShouldVisitNode(PtrInfo const *pi)
-@@ -1079,20 +1136,20 @@ NoGreyCallback(PLDHashTable *table, PLDH
+@@ -1079,20 +1241,20 @@ NoGreyCallback(PLDHashTable *table, PLDH
  
  
  void
@@ -392,7 +509,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  }
  
-@@ -1137,7 +1194,7 @@ FindWhiteCallback(PLDHashTable *table, P
+@@ -1137,7 +1299,7 @@ FindWhiteCallback(PLDHashTable *table, P
  
  
  void
@@ -401,7 +518,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  {
      // Explanation of "somewhat modified": we have no way to collect the
      // set of whites "all at once", we have to ask each of them to drop
-@@ -1164,7 +1221,7 @@ nsCycleCollector::CollectWhite()
+@@ -1164,7 +1326,7 @@ nsCycleCollector::CollectWhite()
      _CrtMemCheckpoint(&ms1);
  #endif
  
@@ -410,7 +527,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
          if (mRuntimes[i] &&
-@@ -1225,9 +1282,9 @@ struct graphVizWalker : public GraphWalk
+@@ -1225,9 +1387,9 @@ struct graphVizWalker : public GraphWalk
      const void *mParent;
      FILE *mStream;
  
@@ -422,7 +539,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
            mParent(nsnull), 
            mStream(nsnull)        
      {
-@@ -1511,8 +1568,6 @@ nsCycleCollector::nsCycleCollector() :
+@@ -1511,8 +1673,6 @@ nsCycleCollector::nsCycleCollector() :
  
  nsCycleCollector::~nsCycleCollector()
  {
@@ -431,7 +548,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      for (PRUint32 i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
          mRuntimes[i] = NULL;
      }
-@@ -1567,15 +1622,15 @@ FindAnyWhiteCallback(PLDHashTable *table
+@@ -1567,15 +1727,15 @@ FindAnyWhiteCallback(PLDHashTable *table
  
  
  void 
@@ -450,7 +567,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
              while (mBufs[0].GetSize() > 0) {
                  nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].Pop());
                  s = canonicalize(s);
-@@ -1804,14 +1859,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1804,14 +1964,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
  
                  mScanInProgress = PR_TRUE;
  
@@ -467,7 +584,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  {
-@@ -1822,7 +1877,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1822,7 +1982,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
                  }
  #endif
  
@@ -476,7 +593,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: ScanRoots() took %lldms\n",
-@@ -1830,7 +1885,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1830,7 +1990,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
  #ifdef DEBUG_CC
@@ -485,7 +602,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
                  mScanInProgress = PR_FALSE;
-@@ -1839,7 +1894,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1839,7 +1999,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef COLLECT_TIME_DEBUG
                  now = PR_Now();
  #endif
@@ -494,7 +611,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: CollectWhite() took %lldms\n",
-@@ -1847,8 +1902,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1847,8 +2007,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
                  // Some additional book-keeping.
@@ -503,7 +620,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
                  --aTryCollections;
              }
-@@ -1911,9 +1964,9 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
+@@ -1911,9 +2069,9 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
  
  struct explainWalker : public GraphWalker
  {
@@ -515,7 +632,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      {}
  
      PRBool ShouldVisitNode(PtrInfo const *pi)
-@@ -1968,25 +2021,26 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -1968,25 +2126,26 @@ nsCycleCollector::ExplainLiveExpectedGar
      mCollectionInProgress = PR_TRUE;
      mScanInProgress = PR_TRUE;
  
