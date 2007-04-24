@@ -3,7 +3,7 @@ Record results of cycle collection traversal so we only have to call the travers
 diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp
 +++ b/xpcom/base/nsCycleCollector.cpp
-@@ -294,102 +294,134 @@ enum NodeColor { black, white, grey };
+@@ -294,102 +294,144 @@ enum NodeColor { black, white, grey };
  // each cycle collection.
  
  struct PtrInfo
@@ -138,6 +138,16 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    {
 +    }
 +
++    ~ListPool()
++    {
++        Block *b = mBlocks;
++        while (b) {
++            Block *n = mBlocks->mNext;
++            delete b;
++            b = n;
++        }
++    }
++
 +    class Builder;
 +    friend class Builder;
 +    class Builder {
@@ -221,11 +231,287 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  // XXX Would be nice to have an nsHashSet<KeyType> API that has
  // Add/Remove/Has rather than PutEntry/RemoveEntry/GetEntry.
-@@ -954,6 +986,7 @@ GraphWalker::Walk(void *s0)
+@@ -661,13 +703,17 @@ struct nsCycleCollectionXPCOMRuntime :
+     }
+ };
+ 
++struct GCGraph
++{
++    ListPool<PtrInfo> mNodes;
++    ListPool<PtrInfo*> mEdges;
++};
+ 
+ struct nsCycleCollector
+ {
+     PRBool mCollectionInProgress;
+     PRBool mScanInProgress;
+ 
+-    GCTable mGraph;
+     nsCycleCollectionLanguageRuntime *mRuntimes[nsIProgrammingLanguage::MAX+1];
+     nsCycleCollectionXPCOMRuntime mXPCOMRuntime;
+ 
+@@ -689,9 +735,9 @@ struct nsCycleCollector
+     void ForgetRuntime(PRUint32 langID);
+ 
+     void CollectPurple(); // XXXldb Should this be called SelectPurple?
+-    void MarkRoots();
+-    void ScanRoots();
+-    void CollectWhite();
++    void MarkRoots(GCGraph &graph);
++    void ScanRoots(GCGraph &graph);
++    void CollectWhite(GCGraph &graph);
+ 
+     nsCycleCollector();
+     ~nsCycleCollector();
+@@ -708,7 +754,7 @@ struct nsCycleCollector
+ 
+     FILE *mPtrLog;
+ 
+-    void MaybeDrawGraphs();
++    void MaybeDrawGraphs(GCGraph &graph);
+     void ExplainLiveExpectedGarbage();
+     void ShouldBeFreed(nsISupports *n);
+     void WasFreed(nsISupports *n);
+@@ -725,15 +771,15 @@ private:
+     PtrInfo *mCurrPi;
+ 
+ protected:
+-    GCTable &mGraph;
++    GCGraph &mGraph;
+     nsCycleCollectionLanguageRuntime **mRuntimes;
+ 
+ public:
+-    GraphWalker(GCTable & tab,
++    GraphWalker(GCGraph &graph,
+                 nsCycleCollectionLanguageRuntime **runtimes) : 
+         mQueue(nsnull),
+         mCurrPi(nsnull),
+-        mGraph(tab),
++        mGraph(graph),
+         mRuntimes(runtimes)
+     {}
+ 
+@@ -954,11 +1000,12 @@ GraphWalker::Walk(void *s0)
  ////////////////////////////////////////////////////////////////////////
  
  
 +// SHOULD GO AWAY
  struct MarkGreyWalker : public GraphWalker
  {
-     MarkGreyWalker(GCTable &tab,
+-    MarkGreyWalker(GCTable &tab,
++    MarkGreyWalker(GCGraph &graph,
+                    nsCycleCollectionLanguageRuntime **runtimes)
+-        : GraphWalker(tab, runtimes) 
++        : GraphWalker(graph, runtimes) 
+     {}
+ 
+     PRBool ShouldVisitNode(PtrInfo const *pi)
+@@ -988,14 +1035,14 @@ nsCycleCollector::CollectPurple()
+ }
+ 
+ void
+-nsCycleCollector::MarkRoots()
++nsCycleCollector::MarkRoots(GCGraph &graph)
+ {
+     int i;
+     for (i = 0; i < mBufs[0].GetSize(); ++i) {
+         nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].ObjectAt(i));
+         s = canonicalize(s);
+         mGraph.Add(s);
+-        MarkGreyWalker(mGraph, mRuntimes).Walk(s);
++        MarkGreyWalker(graph, mRuntimes).Walk(s);
+     }
+ }
+ 
+@@ -1007,9 +1054,9 @@ nsCycleCollector::MarkRoots()
+ 
+ struct ScanBlackWalker : public GraphWalker
+ {
+-    ScanBlackWalker(GCTable &tab,
+-                   nsCycleCollectionLanguageRuntime **runtimes)
+-        : GraphWalker(tab, runtimes) 
++    ScanBlackWalker(GCGraph &graph,
++                    nsCycleCollectionLanguageRuntime **runtimes)
++        : GraphWalker(graph, runtimes) 
+     {}
+ 
+     PRBool ShouldVisitNode(PtrInfo const *pi)
+@@ -1031,9 +1078,9 @@ struct ScanBlackWalker : public GraphWal
+ 
+ struct scanWalker : public GraphWalker
+ {
+-    scanWalker(GCTable &tab,
++    scanWalker(GCGraph &graph,
+                nsCycleCollectionLanguageRuntime **runtimes)
+-        : GraphWalker(tab, runtimes) 
++        : GraphWalker(graph, runtimes) 
+     {}
+ 
+     PRBool ShouldVisitNode(PtrInfo const *pi)
+@@ -1079,14 +1126,14 @@ NoGreyCallback(PLDHashTable *table, PLDH
+ 
+ 
+ void
+-nsCycleCollector::ScanRoots()
++nsCycleCollector::ScanRoots(GCGraph &graph)
+ {
+     int i;
+ 
+     for (i = 0; i < mBufs[0].GetSize(); ++i) {
+         nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].ObjectAt(i));
+         s = canonicalize(s);
+-        scanWalker(mGraph, mRuntimes).Walk(s); 
++        scanWalker(graph, mRuntimes).Walk(s); 
+     }
+ 
+ #ifdef DEBUG_CC
+@@ -1137,7 +1184,7 @@ FindWhiteCallback(PLDHashTable *table, P
+ 
+ 
+ void
+-nsCycleCollector::CollectWhite()
++nsCycleCollector::CollectWhite(GCGraph &graph)
+ {
+     // Explanation of "somewhat modified": we have no way to collect the
+     // set of whites "all at once", we have to ask each of them to drop
+@@ -1225,9 +1272,9 @@ struct graphVizWalker : public GraphWalk
+     const void *mParent;
+     FILE *mStream;
+ 
+-    graphVizWalker(GCTable &tab,
++    graphVizWalker(GCGraph &graph,
+                    nsCycleCollectionLanguageRuntime **runtimes)
+-        : GraphWalker(tab, runtimes), 
++        : GraphWalker(graph, runtimes), 
+           mParent(nsnull), 
+           mStream(nsnull)        
+     {
+@@ -1567,7 +1614,7 @@ FindAnyWhiteCallback(PLDHashTable *table
+ 
+ 
+ void 
+-nsCycleCollector::MaybeDrawGraphs()
++nsCycleCollector::MaybeDrawGraphs(GCGraph &graph)
+ {
+     if (mParams.mDrawGraphs) {
+         // We draw graphs only if there were any white nodes.
+@@ -1575,7 +1622,7 @@ nsCycleCollector::MaybeDrawGraphs()
+         mGraph.Enumerate(FindAnyWhiteCallback, &anyWhites);
+ 
+         if (anyWhites) {
+-            graphVizWalker gw(mGraph, mRuntimes);
++            graphVizWalker gw(graph, mRuntimes);
+             while (mBufs[0].GetSize() > 0) {
+                 nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].Pop());
+                 s = canonicalize(s);
+@@ -1804,14 +1851,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
+ 
+                 mScanInProgress = PR_TRUE;
+ 
+-                mGraph.Clear();
++                GCGraph graph;
+ 
+                 // The main Bacon & Rajan collection algorithm.
+ 
+ #ifdef COLLECT_TIME_DEBUG
+                 now = PR_Now();
+ #endif
+-                MarkRoots();
++                MarkRoots(graph);
+ 
+ #ifdef COLLECT_TIME_DEBUG
+                 {
+@@ -1822,7 +1869,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+                 }
+ #endif
+ 
+-                ScanRoots();
++                ScanRoots(graph);
+ 
+ #ifdef COLLECT_TIME_DEBUG
+                 printf("cc: ScanRoots() took %lldms\n",
+@@ -1830,7 +1877,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+ #endif
+ 
+ #ifdef DEBUG_CC
+-                MaybeDrawGraphs();
++                MaybeDrawGraphs(graph);
+ #endif
+ 
+                 mScanInProgress = PR_FALSE;
+@@ -1839,7 +1886,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+ #ifdef COLLECT_TIME_DEBUG
+                 now = PR_Now();
+ #endif
+-                CollectWhite();
++                CollectWhite(graph);
+ 
+ #ifdef COLLECT_TIME_DEBUG
+                 printf("cc: CollectWhite() took %lldms\n",
+@@ -1847,8 +1894,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
+ #endif
+ 
+                 // Some additional book-keeping.
+-
+-                mGraph.Clear();
+ 
+                 --aTryCollections;
+             }
+@@ -1911,9 +1956,9 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
+ 
+ struct explainWalker : public GraphWalker
+ {
+-    explainWalker(GCTable &tab,
++    explainWalker(GCGraph &graph,
+                   nsCycleCollectionLanguageRuntime **runtimes)
+-        : GraphWalker(tab, runtimes) 
++        : GraphWalker(graph, runtimes) 
+     {}
+ 
+     PRBool ShouldVisitNode(PtrInfo const *pi)
+@@ -1968,25 +2013,26 @@ nsCycleCollector::ExplainLiveExpectedGar
+     mCollectionInProgress = PR_TRUE;
+     mScanInProgress = PR_TRUE;
+ 
+-    mGraph.Clear();
+-    mBufs[0].Empty();
+-
+-    // Instead of filling mBufs[0] from the purple buffer, we fill it
+-    // from the list of nodes we were expected to collect.
+-    mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, this);
+-
+-    MarkRoots();
+-    ScanRoots();
+-
+-    mScanInProgress = PR_FALSE;
+-
+-    for (int i = 0; i < mBufs[0].GetSize(); ++i) {
+-        nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].ObjectAt(i));
+-        s = canonicalize(s);
+-        explainWalker(mGraph, mRuntimes).Walk(s); 
+-    }
+-
+-    mGraph.Clear();
++    {
++        GCGraph graph;
++        mBufs[0].Empty();
++
++        // Instead of filling mBufs[0] from the purple buffer, we fill it
++        // from the list of nodes we were expected to collect.
++        mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, this);
++
++        MarkRoots(graph);
++        ScanRoots(graph);
++
++        mScanInProgress = PR_FALSE;
++
++        for (int i = 0; i < mBufs[0].GetSize(); ++i) {
++            nsISupports *s =
++                NS_STATIC_CAST(nsISupports *, mBufs[0].ObjectAt(i));
++            s = canonicalize(s);
++            explainWalker(graph, mRuntimes).Walk(s); 
++        }
++    }
+ 
+     mCollectionInProgress = PR_FALSE;
+ 
