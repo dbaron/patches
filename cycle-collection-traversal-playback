@@ -15,40 +15,13 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
 +struct PtrInfo;
 +
-+class EdgeIterator
-+{
-+public:
-+    EdgeIterator() : mPointer(nsnull) {}
-+    EdgeIterator(PtrInfo **aPointer) : mPointer(aPointer) {}
-+    EdgeIterator(const EdgeIterator& aOther) : mPointer(aOther.mPointer) {}
-+
-+    EdgeIterator& operator++()
-+    {
-+        if (*mPointer == nsnull) {
-+            // Null pointer is a sentinel for link to the next block.
-+            mPointer = NS_REINTERPRET_CAST(PtrInfo**, *(++mPointer));
-+        }
-+        return *this;
-+    }
-+
-+    PtrInfo* operator*() const
-+        { return *mPointer; }
-+    PRBool operator==(const EdgeIterator& aOther) const
-+        { return mPointer == aOther.mPointer; }
-+    PRBool operator!=(const EdgeIterator& aOther) const
-+        { return mPointer != aOther.mPointer; }
-+
-+private:
-+    PtrInfo **mPointer;
-+};
-+
 +class EdgePool
 +{
 +public:
 +    // EdgePool allocates arrays of void*, primarily to hold PtrInfo*.
 +    // However, at the end of a block, the last two pointers are a null
 +    // and then a void** pointing to the next block.  This allows
-+    // EdgeIterators to be a single word but still capable of crossing
++    // EdgePool::Iterators to be a single word but still capable of crossing
 +    // block boundaries.
 +
 +    EdgePool()
@@ -83,10 +56,10 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +        }
 +        Block*& Next()
 +            { return mPointers[BlockSize - 1].block; }
-+        PtrInfo** Start()
-+            { return &mPointers[0].ptrInfo; }
-+        PtrInfo** End()
-+            { return &mPointers[BlockSize - 2].ptrInfo; }
++        PtrInfoOrBlock* Start()
++            { return &mPointers[0]; }
++        PtrInfoOrBlock* End()
++            { return &mPointers[BlockSize - 2]; }
 +    };
 +
 +    // Store the null sentinel so that we can have valid iterators
@@ -96,18 +69,45 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    Block*& Blocks() { return mSentinelAndBlocks[1].block; }
 +
 +public:
++    class Iterator
++    {
++    public:
++        Iterator() : mPointer(nsnull) {}
++        Iterator(PtrInfoOrBlock *aPointer) : mPointer(aPointer) {}
++        Iterator(const Iterator& aOther) : mPointer(aOther.mPointer) {}
++
++        Iterator& operator++()
++        {
++            if (mPointer->ptrInfo == nsnull) {
++                // Null pointer is a sentinel for link to the next block.
++                mPointer = (mPointer + 1)->block->mPointers;
++            }
++            return *this;
++        }
++
++        PtrInfo* operator*() const
++            { return mPointer->ptrInfo; }
++        PRBool operator==(const Iterator& aOther) const
++            { return mPointer == aOther.mPointer; }
++        PRBool operator!=(const Iterator& aOther) const
++            { return mPointer != aOther.mPointer; }
++
++    private:
++        PtrInfoOrBlock *mPointer;
++    };
++
 +    class Builder;
 +    friend class Builder;
 +    class Builder {
 +    public:
 +        Builder(EdgePool &aPool)
-+          : mCurrent(NS_REINTERPRET_CAST(PtrInfo**, aPool.mSentinelAndBlocks))
-+          , mBlockEnd(NS_REINTERPRET_CAST(PtrInfo**, aPool.mSentinelAndBlocks))
++          : mCurrent(&aPool.mSentinelAndBlocks[0])
++          , mBlockEnd(&aPool.mSentinelAndBlocks[0])
 +          , mNextBlockPtr(&aPool.Blocks())
 +        {
 +        }
 +
-+        EdgeIterator Mark() { return EdgeIterator(mCurrent); }
++        EdgePool::Iterator Mark() { return EdgePool::Iterator(mCurrent); }
 +
 +        void Add(PtrInfo* aEdge) {
 +            if (mCurrent == mBlockEnd) {
@@ -122,11 +122,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +                mBlockEnd = b->End();
 +                mNextBlockPtr = &b->Next();
 +            }
-+            *(mCurrent++) = aEdge;
++            (mCurrent++)->ptrInfo = aEdge;
 +        }
 +    private:
-+        PtrInfo **mCurrent;
-+        PtrInfo **mBlockEnd; // mBlockEnd points to space for null sentinel
++        // mBlockEnd points to space for null sentinel
++        PtrInfoOrBlock *mCurrent, *mBlockEnd;
 +        EdgePool::Block **mNextBlockPtr;
 +    };
 +
@@ -149,8 +149,8 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      // FIXME: mLang expands back to a full word when bug 368774 lands.
      PRUint32 mLang : 2;
      PRUint32 mRefCount : 30;
-+    EdgeIterator mFirstChild; // first
-+    EdgeIterator mLastChild; // one after last
++    EdgePool::Iterator mFirstChild; // first
++    EdgePool::Iterator mLastChild; // one after last
  
  #ifdef DEBUG_CC
      size_t mBytes;
@@ -547,7 +547,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +
 +        if (this->ShouldVisitNode(pi)) {
 +            this->VisitNode(pi);
-+            for (EdgeIterator child = pi->mFirstChild,
++            for (EdgePool::Iterator child = pi->mFirstChild,
 +                          child_end = pi->mLastChild;
 +                 child != child_end; ++child) {
 +                aQueue.Push((*child)->mPointer);
@@ -1158,7 +1158,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      for (PRUint32 i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
          mRuntimes[i] = NULL;
      }
-@@ -1553,34 +1663,73 @@ nsCycleCollector::ForgetRuntime(PRUint32
+@@ -1553,34 +1663,74 @@ nsCycleCollector::ForgetRuntime(PRUint32
  
  
  #ifdef DEBUG_CC
@@ -1226,7 +1226,8 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +                        pi->mInternalRefs, pi->mRefCount,
 +                        (pi->mColor == black ? "black" : "white"),
 +                        (pi->mColor == black ? "white" : "black"));
-+                for (EdgeIterator child = pi->mFirstChild, child_end = pi->mLastChild;
++                for (EdgePool::Iterator child = pi->mFirstChild,
++                                     child_end = pi->mLastChild;
 +                     child != child_end; ++child) {
 +                    fprintf(stream, "n%p -> n%p\n", p, (*child)->mPointer);
 +                }
@@ -1252,7 +1253,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          }
      }
  }
-@@ -1804,14 +1953,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1804,14 +1954,14 @@ nsCycleCollector::Collect(PRUint32 aTryC
  
                  mScanInProgress = PR_TRUE;
  
@@ -1269,7 +1270,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  {
-@@ -1822,7 +1971,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1822,7 +1972,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
                  }
  #endif
  
@@ -1278,7 +1279,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: ScanRoots() took %lldms\n",
-@@ -1830,7 +1979,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1830,7 +1980,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
  #ifdef DEBUG_CC
@@ -1287,7 +1288,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
                  mScanInProgress = PR_FALSE;
-@@ -1839,7 +1988,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1839,7 +1989,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef COLLECT_TIME_DEBUG
                  now = PR_Now();
  #endif
@@ -1296,7 +1297,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef COLLECT_TIME_DEBUG
                  printf("cc: CollectWhite() took %lldms\n",
-@@ -1847,8 +1996,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -1847,8 +1997,6 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #endif
  
                  // Some additional book-keeping.
@@ -1305,7 +1306,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
                  --aTryCollections;
              }
-@@ -1909,45 +2056,6 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
+@@ -1909,45 +2057,6 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
      return PL_DHASH_NEXT;
  }
  
@@ -1351,7 +1352,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  void
  nsCycleCollector::ExplainLiveExpectedGarbage()
  {
-@@ -1968,25 +2076,40 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -1968,25 +2077,40 @@ nsCycleCollector::ExplainLiveExpectedGar
      mCollectionInProgress = PR_TRUE;
      mScanInProgress = PR_TRUE;
  
