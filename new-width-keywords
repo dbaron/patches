@@ -3,34 +3,54 @@ Add support for -moz-intrinsic, -moz-min-intrinsic, -moz-shrink-wrap, and -moz-f
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
 +++ b/layout/base/nsLayoutUtils.cpp
-@@ -1253,6 +1253,26 @@ static PRBool GetAbsoluteCoord(const nsS
+@@ -1253,6 +1253,46 @@ static PRBool GetAbsoluteCoord(const nsS
    return PR_FALSE;
  }
  
 +// Handles only -moz-intrinsic and -moz-min-intrinsic, since the others
 +// (-moz-fill and -moz-shrink-wrap) have no effect on intrinsic widths.
++enum eWidthProperty { PROP_WIDTH, PROP_MAX_WIDTH, PROP_MIN_WIDTH };
 +static PRBool
 +GetIntrinsicCoord(const nsStyleCoord& aStyle,
 +                  nsIRenderingContext* aRenderingContext,
 +                  nsIFrame* aFrame,
++                  eWidthProperty aProperty,
 +                  nscoord& aResult)
 +{
-+  if (aStyle.GetUnit() == eStyleUnit_Enumerated &&
-+      (aStyle.GetIntValue() == NS_STYLE_WIDTH_INTRINSIC ||
-+       aStyle.GetIntValue() == NS_STYLE_WIDTH_MIN_INTRINSIC)) {
-+    if (aStyle.GetIntValue() == NS_STYLE_WIDTH_INTRINSIC)
-+      aResult = aFrame->GetPrefWidth(aRenderingContext);
++  NS_PRECONDITION(aProperty == PROP_WIDTH || aProperty == PROP_MAX_WIDTH ||
++                  aProperty == PROP_MIN_WIDTH, "unexpected property");
++  if (aStyle.GetUnit() != eStyleUnit_Enumerated)
++    return PR_FALSE;
++  PRInt32 val = aStyle.GetIntValue();
++  NS_ASSERTION(val == NS_STYLE_WIDTH_INTRINSIC ||
++               val == NS_STYLE_WIDTH_MIN_INTRINSIC ||
++               val == NS_STYLE_WIDTH_SHRINK_WRAP ||
++               val == NS_STYLE_WIDTH_FILL,
++               "unexpected enumerated value for width property");
++  if (val == NS_STYLE_WIDTH_FILL)
++    return PR_FALSE;
++  if (val == NS_STYLE_WIDTH_SHRINK_WRAP) {
++    if (aProperty == PROP_WIDTH)
++      return PR_FALSE; // handle like 'width: auto'
++    if (aProperty == PROP_MAX_WIDTH)
++      // constrain large 'width' values down to -moz-intrinsic
++      val = NS_STYLE_WIDTH_INTRINSIC;
 +    else
-+      aResult = aFrame->GetMinWidth(aRenderingContext);
-+    return PR_TRUE;
++      // constrain small 'width' or 'max-width' values up to -moz-min-intrinsic
++      val = NS_STYLE_WIDTH_MIN_INTRINSIC;
 +  }
-+  return PR_FALSE;
++
++  if (val == NS_STYLE_WIDTH_INTRINSIC)
++    aResult = aFrame->GetPrefWidth(aRenderingContext);
++  else
++    aResult = aFrame->GetMinWidth(aRenderingContext);
++  return PR_TRUE;
 +}
 +
  #undef  DEBUG_INTRINSIC_WIDTH
  
  #ifdef DEBUG_INTRINSIC_WIDTH
-@@ -1278,7 +1298,7 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+@@ -1278,7 +1318,7 @@ nsLayoutUtils::IntrinsicForContainer(nsI
      aFrame->IntrinsicWidthOffsets(aRenderingContext);
  
    const nsStylePosition *stylePos = aFrame->GetStylePosition();
@@ -39,7 +59,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    const nsStyleCoord &styleWidth = stylePos->mWidth;
    const nsStyleCoord &styleMinWidth = stylePos->mMinWidth;
    const nsStyleCoord &styleMaxWidth = stylePos->mMaxWidth;
-@@ -1298,10 +1318,18 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+@@ -1298,10 +1338,18 @@ nsLayoutUtils::IntrinsicForContainer(nsI
    // If we have a specified width (or a specified 'min-width' greater
    // than the specified 'max-width', which works out to the same thing),
    // don't even bother getting the frame's intrinsic width.
@@ -62,23 +82,25 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  #ifdef DEBUG_INTRINSIC_WIDTH
      ++gNoiseIndent;
  #endif
-@@ -1364,7 +1392,8 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+@@ -1364,7 +1412,9 @@ nsLayoutUtils::IntrinsicForContainer(nsI
    pctTotal += pctOutsideWidth;
  
    nscoord w;
 -  if (GetAbsoluteCoord(styleWidth, aRenderingContext, aFrame, w)) {
 +  if (GetAbsoluteCoord(styleWidth, aRenderingContext, aFrame, w) ||
-+      GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame, w)) {
++      GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
++                        PROP_WIDTH, w)) {
      result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
    }
    else if (aType == MIN_WIDTH && eStyleUnit_Percent == styleWidth.GetUnit() &&
-@@ -1377,14 +1406,16 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+@@ -1377,14 +1427,18 @@ nsLayoutUtils::IntrinsicForContainer(nsI
    }
  
    nscoord maxw;
 -  if (GetAbsoluteCoord(styleMaxWidth, aRenderingContext, aFrame, maxw)) {
 +  if (GetAbsoluteCoord(styleMaxWidth, aRenderingContext, aFrame, maxw) ||
-+      GetIntrinsicCoord(styleMaxWidth, aRenderingContext, aFrame, maxw)) {
++      GetIntrinsicCoord(styleMaxWidth, aRenderingContext, aFrame,
++                        PROP_MAX_WIDTH, maxw)) {
      maxw = AddPercents(aType, maxw + coordOutsideWidth, pctOutsideWidth);
      if (result > maxw)
        result = maxw;
@@ -87,11 +109,12 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    nscoord minw;
 -  if (GetAbsoluteCoord(styleMinWidth, aRenderingContext, aFrame, minw)) {
 +  if (GetAbsoluteCoord(styleMinWidth, aRenderingContext, aFrame, minw) ||
-+      GetIntrinsicCoord(styleMinWidth, aRenderingContext, aFrame, minw)) {
++      GetIntrinsicCoord(styleMinWidth, aRenderingContext, aFrame,
++                        PROP_MIN_WIDTH, minw)) {
      minw = AddPercents(aType, minw + coordOutsideWidth, pctOutsideWidth);
      if (result < minw)
        result = minw;
-@@ -1442,8 +1473,56 @@ nsLayoutUtils::ComputeWidthDependentValu
+@@ -1442,8 +1496,56 @@ nsLayoutUtils::ComputeWidthDependentValu
    if (eStyleUnit_Percent == aCoord.GetUnit()) {
      return NSToCoordFloor(aContainingBlockWidth * aCoord.GetPercentValue());
    }
@@ -148,7 +171,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  
  /* static */ nscoord
  nsLayoutUtils::ComputeHeightDependentValue(
-@@ -1474,6 +1553,7 @@ nsLayoutUtils::ComputeHeightDependentVal
+@@ -1474,6 +1576,7 @@ nsLayoutUtils::ComputeHeightDependentVal
        return NSToCoordFloor(aContainingBlockHeight * aCoord.GetPercentValue());
      }
    }
@@ -156,7 +179,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    return 0;
  }
  
-@@ -1493,7 +1573,7 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
+@@ -1493,7 +1596,7 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
  nsLayoutUtils::ComputeSizeWithIntrinsicDimensions(
                     nsIRenderingContext* aRenderingContext,
                     nsIFrame* aFrame, nsSize aIntrinsicSize, nsSize aCBSize,
@@ -165,7 +188,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  {
    const nsStylePosition *stylePos = aFrame->GetStylePosition();
    // Handle intrinsic sizes and their interaction with
-@@ -1504,8 +1584,8 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
+@@ -1504,8 +1607,8 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
    // a * (b / c) because of its reduced accuracy relative to a * b / c
    // or (a * b) / c (which are equivalent).
  
@@ -176,7 +199,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  
    nsSize boxSizingAdjust(0,0);
    switch (stylePos->mBoxSizing) {
-@@ -1515,30 +1595,32 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
+@@ -1515,30 +1618,32 @@ nsLayoutUtils::ComputeSizeWithIntrinsicD
      case NS_STYLE_BOX_SIZING_PADDING:
        boxSizingAdjust += aPadding;
    }
