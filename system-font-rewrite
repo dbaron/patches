@@ -1,0 +1,301 @@
+Rewrite handling of CSS system fonts to fix bugs in cascading and serialization.  b=377947
+
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -472,6 +472,7 @@ nsCSSDeclaration::AppendCSSValueToString
+     case eCSSUnit_Initial:      aResult.AppendLiteral("-moz-initial"); break;
+     case eCSSUnit_None:         aResult.AppendLiteral("none");     break;
+     case eCSSUnit_Normal:       aResult.AppendLiteral("normal");   break;
++    case eCSSUnit_System_Font:  aResult.AppendLiteral("-moz-use-system-font"); break;
+ 
+     case eCSSUnit_String:       break;
+     case eCSSUnit_URL:          break;
+diff --git a/layout/style/nsCSSKeywordList.h b/layout/style/nsCSSKeywordList.h
+--- a/layout/style/nsCSSKeywordList.h
++++ b/layout/style/nsCSSKeywordList.h
+@@ -173,6 +173,7 @@ CSS_KEY(-moz-trad-chinese-formal, _moz_t
+ CSS_KEY(-moz-trad-chinese-formal, _moz_trad_chinese_formal)
+ CSS_KEY(-moz-trad-chinese-informal, _moz_trad_chinese_informal)
+ CSS_KEY(-moz-urdu, _moz_urdu)
++CSS_KEY(-moz-use-system-font, _moz_use_system_font)
+ CSS_KEY(-moz-use-text-color, _moz_use_text_color)
+ CSS_KEY(-moz-visitedhyperlinktext, _moz_visitedhyperlinktext)
+ CSS_KEY(-moz-window, _moz_window)
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -169,6 +169,8 @@ protected:
+     public:
+       nsAutoParseCompoundProperty(CSSParserImpl* aParser) : mParser(aParser)
+       {
++        NS_ASSERTION(!aParser->IsParsingCompoundProperty(),
++                     "already parsing compound property");
+         NS_ASSERTION(aParser, "Null parser?");
+         aParser->SetParsingCompoundProperty(PR_TRUE);
+       }
+@@ -3472,12 +3474,6 @@ CSSParserImpl::DoTransferTempData(nsCSSD
+       dest->~nsCSSValue();
+       memcpy(dest, source, sizeof(nsCSSValue));
+       new (source) nsCSSValue();
+-      if (dest->GetUnit() == eCSSUnit_Null) {
+-        // Some of our property parsers actually want to _clear_ properties in
+-        // mData (eg the "font" shorthand parser does for system fonts).  We've
+-        // cleared the data; now clear the bit too.
+-        mData.ClearPropertyBit(aPropID);
+-      }
+     } break;
+ 
+     case eCSSType_Rect: {
+@@ -3551,6 +3547,7 @@ CSSParserImpl::DoTransferTempData(nsCSSD
+ #define VARIANT_INHERIT         0x020000  // H eCSSUnit_Initial, eCSSUnit_Inherit
+ #define VARIANT_NONE            0x040000  // O
+ #define VARIANT_NORMAL          0x080000  // M
++#define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
+ 
+ // Common combinations of variants
+ #define VARIANT_AL   (VARIANT_AUTO | VARIANT_LENGTH)
+@@ -3764,6 +3761,9 @@ PRBool CSSParserImpl::ParseVariant(nsres
+         }
+       }
+       if ((aVariantMask & VARIANT_INHERIT) != 0) {
++        // XXX Should we check IsParsingCompoundProperty, or do all
++        // callers handle it?  (Not all callers set it, though, since
++        // they want the quirks that are disabled by setting it.)
+         if (eCSSKeyword_inherit == keyword) {
+           aValue.SetInheritValue();
+           return PR_TRUE;
+@@ -3782,6 +3782,13 @@ PRBool CSSParserImpl::ParseVariant(nsres
+       if ((aVariantMask & VARIANT_NORMAL) != 0) {
+         if (eCSSKeyword_normal == keyword) {
+           aValue.SetNormalValue();
++          return PR_TRUE;
++        }
++      }
++      if ((aVariantMask & VARIANT_SYSFONT) != 0) {
++        if (eCSSKeyword__moz_use_system_font == keyword &&
++            !IsParsingCompoundProperty()) {
++          aValue.SetSystemFontValue();
+           return PR_TRUE;
+         }
+       }
+@@ -4354,6 +4361,7 @@ PRBool CSSParserImpl::ParseProperty(nsre
+ #endif
+ 
+   // Strip out properties we use internally.
++  case eCSSProperty__x_system_font;
+   case eCSSProperty_margin_end_value:
+   case eCSSProperty_margin_left_value:
+   case eCSSProperty_margin_right_value:
+@@ -4674,19 +4682,20 @@ PRBool CSSParserImpl::ParseSingleValuePr
+   case eCSSProperty_font_family:
+     return ParseFamily(aErrorCode, aValue);
+   case eCSSProperty_font_size: 
+-    return ParsePositiveVariant(aErrorCode, aValue, VARIANT_HKLP,
++    return ParsePositiveVariant(aErrorCode, aValue,
++                                VARIANT_HKLP | VARIANT_SYSFONT,
+                                 nsCSSProps::kFontSizeKTable);
+   case eCSSProperty_font_size_adjust:
+-    return ParseVariant(aErrorCode, aValue, VARIANT_HON,
++    return ParseVariant(aErrorCode, aValue, VARIANT_HON | VARIANT_SYSFONT,
+                         nsnull);
+   case eCSSProperty_font_stretch:
+-    return ParseVariant(aErrorCode, aValue, VARIANT_HMK,
++    return ParseVariant(aErrorCode, aValue, VARIANT_HMK | VARIANT_SYSFONT,
+                         nsCSSProps::kFontStretchKTable);
+   case eCSSProperty_font_style:
+-    return ParseVariant(aErrorCode, aValue, VARIANT_HMK,
++    return ParseVariant(aErrorCode, aValue, VARIANT_HMK | VARIANT_SYSFONT,
+                         nsCSSProps::kFontStyleKTable);
+   case eCSSProperty_font_variant:
+-    return ParseVariant(aErrorCode, aValue, VARIANT_HMK,
++    return ParseVariant(aErrorCode, aValue, VARIANT_HMK | VARIANT_SYSFONT,
+                         nsCSSProps::kFontVariantKTable);
+   case eCSSProperty_font_weight:
+     return ParseFontWeight(aErrorCode, aValue);
+@@ -4694,7 +4703,7 @@ PRBool CSSParserImpl::ParseSingleValuePr
+   case eCSSProperty_word_spacing:
+     return ParseVariant(aErrorCode, aValue, VARIANT_HL | VARIANT_NORMAL, nsnull);
+   case eCSSProperty_line_height:
+-    return ParsePositiveVariant(aErrorCode, aValue, VARIANT_HLPN | VARIANT_NORMAL, nsnull);
++    return ParsePositiveVariant(aErrorCode, aValue, VARIANT_HLPN | VARIANT_NORMAL | VARIANT_SYSFONT, nsnull);
+   case eCSSProperty_list_style_image:
+     return ParseVariant(aErrorCode, aValue, VARIANT_HUO, nsnull);
+   case eCSSProperty_list_style_position:
+@@ -5587,7 +5596,9 @@ PRBool CSSParserImpl::ParseFont(nsresult
+   nsCSSValue  family;
+   if (ParseVariant(aErrorCode, family, VARIANT_HK, nsCSSProps::kFontKTable)) {
+     if (ExpectEndProperty(aErrorCode, PR_TRUE)) {
+-      if (eCSSUnit_Inherit == family.GetUnit()) {
++      if (eCSSUnit_Inherit == family.GetUnit() ||
++          eCSSUnit_Initial == family.GetUnit()) {
++        AppendValue(eCSSProperty__x_system_font, nsCSSValue(eCSSUnit_None));
+         AppendValue(eCSSProperty_font_family, family);
+         AppendValue(eCSSProperty_font_style, family);
+         AppendValue(eCSSProperty_font_variant, family);
+@@ -5598,22 +5609,16 @@ PRBool CSSParserImpl::ParseFont(nsresult
+         AppendValue(eCSSProperty_font_size_adjust, family);
+       }
+       else {
+-        AppendValue(eCSSProperty_font_family, family);  // keyword value overrides everything else
+-        nsCSSValue empty;
+-        // XXXbz this is actually _clearing_ the values for the following
+-        // properties in mTempData, but setting the bit for them.  We need that
+-        // because we want to clear out the values in mData when all is said
+-        // and done.  See the code in TransferTempData that handles this.  The
+-        // end result is that mData always has its property bits set like it
+-        // should, but mTempData can, in fact, have bits set for properties
+-        // that are not set...
+-        AppendValue(eCSSProperty_font_style, empty);
+-        AppendValue(eCSSProperty_font_variant, empty);
+-        AppendValue(eCSSProperty_font_weight, empty);
+-        AppendValue(eCSSProperty_font_size, empty);
+-        AppendValue(eCSSProperty_line_height, empty);
+-        AppendValue(eCSSProperty_font_stretch, empty);
+-        AppendValue(eCSSProperty_font_size_adjust, empty);
++        AppendValue(eCSSProperty_x_system_font, family);
++        nsCSSValue systemFont(eCSSUnit_System_Font);
++        AppendValue(eCSSProperty_font_family, systemFont);
++        AppendValue(eCSSProperty_font_style, systemFont);
++        AppendValue(eCSSProperty_font_variant, systemFont);
++        AppendValue(eCSSProperty_font_weight, systemFont);
++        AppendValue(eCSSProperty_font_size, systemFont);
++        AppendValue(eCSSProperty_line_height, systemFont);
++        AppendValue(eCSSProperty_font_stretch, systemFont);
++        AppendValue(eCSSProperty_font_size_adjust, systemFont);
+       }
+       return PR_TRUE;
+     }
+@@ -5661,6 +5666,7 @@ PRBool CSSParserImpl::ParseFont(nsresult
+   }
+ 
+   // Get final mandatory font-family
++  nsAutoParseCompoundProperty compound(this);
+   if (ParseFamily(aErrorCode, family)) {
+     if ((eCSSUnit_Inherit != family.GetUnit()) && (eCSSUnit_Initial != family.GetUnit()) &&
+         ExpectEndProperty(aErrorCode, PR_TRUE)) {
+@@ -5680,7 +5686,7 @@ PRBool CSSParserImpl::ParseFont(nsresult
+ 
+ PRBool CSSParserImpl::ParseFontWeight(nsresult& aErrorCode, nsCSSValue& aValue)
+ {
+-  if (ParseVariant(aErrorCode, aValue, VARIANT_HMKI, nsCSSProps::kFontWeightKTable)) {
++  if (ParseVariant(aErrorCode, aValue, VARIANT_HMKI | VARIANT_SYSFONT, nsCSSProps::kFontWeightKTable)) {
+     if (eCSSUnit_Integer == aValue.GetUnit()) { // ensure unit value
+       PRInt32 intValue = aValue.GetIntValue();
+       if ((100 <= intValue) &&
+@@ -5713,8 +5719,13 @@ PRBool CSSParserImpl::ParseFamily(nsresu
+           aValue.SetInheritValue();
+           return PR_TRUE;
+         }
+-        else if (keyword == eCSSKeyword__moz_initial) {
++        if (keyword == eCSSKeyword__moz_initial) {
+           aValue.SetInitialValue();
++          return PR_TRUE;
++        }
++        if (keyword == eCSSKeyword__moz_use_system_font &&
++            !IsParsingCompoundProperty()) {
++          aValue.SetSystemFontValue();
+           return PR_TRUE;
+         }
+       }
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -269,6 +269,7 @@ CSS_PROP_OUTLINE(-moz-outline-radius-top
+ CSS_PROP_OUTLINE(-moz-outline-radius-topright, _moz_outline_radius_topRight, MozOutlineRadiusTopright, Margin, mOutlineRadius.mRight, eCSSType_Value, nsnull)
+ CSS_PROP_OUTLINE(-moz-outline-radius-bottomleft, _moz_outline_radius_bottomLeft, MozOutlineRadiusBottomleft, Margin, mOutlineRadius.mLeft, eCSSType_Value, nsnull)
+ CSS_PROP_OUTLINE(-moz-outline-radius-bottomright, _moz_outline_radius_bottomRight, MozOutlineRadiusBottomright, Margin, mOutlineRadius.mBottom, eCSSType_Value, nsnull)
++CSS_PROP_FONT(-x-system-font, _x_system_font, MozSystemFont, Font, mSystemFont, eCSSType_Value, kFontKTable)
+ CSS_PROP_BACKENDONLY(azimuth, azimuth, Azimuth, Aural, mAzimuth, eCSSType_Value, kAzimuthKTable)
+ CSS_PROP_SHORTHAND(background, background, Background)
+ CSS_PROP_BACKGROUND(background-attachment, background_attachment, BackgroundAttachment, Color, mBackAttachment, eCSSType_Value, kBackgroundAttachmentKTable)
+@@ -329,7 +330,7 @@ CSS_PROP_DISPLAY(float, float, CssFloat,
+ CSS_PROP_DISPLAY(float, float, CssFloat, Display, mFloat, eCSSType_Value, kFloatKTable)
+ CSS_PROP_BORDER(-moz-float-edge, float_edge, MozFloatEdge, Margin, mFloatEdge, eCSSType_Value, kFloatEdgeKTable) // XXX bug 3935
+ CSS_PROP_SHORTHAND(font, font, Font)
+-CSS_PROP_FONT(font-family, font_family, FontFamily, Font, mFamily, eCSSType_Value, kFontKTable)
++CSS_PROP_FONT(font-family, font_family, FontFamily, Font, mFamily, eCSSType_Value, nsnull)
+ CSS_PROP_FONT(font-size, font_size, FontSize, Font, mSize, eCSSType_Value, kFontSizeKTable)
+ CSS_PROP_FONT(font-size-adjust, font_size_adjust, FontSizeAdjust, Font, mSizeAdjust, eCSSType_Value, nsnull)
+ CSS_PROP_BACKENDONLY(font-stretch, font_stretch, FontStretch, Font, mStretch, eCSSType_Value, kFontStretchKTable)
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -1326,6 +1326,7 @@ static const nsCSSProperty gFontSubpropT
+   eCSSProperty_line_height,
+   eCSSProperty_font_size_adjust, // XXX Added LDB.
+   eCSSProperty_font_stretch, // XXX Added LDB.
++  eCSSProperty_x_system_font,
+   eCSSProperty_UNKNOWN
+ };
+ 
+diff --git a/layout/style/nsCSSStruct.h b/layout/style/nsCSSStruct.h
+--- a/layout/style/nsCSSStruct.h
++++ b/layout/style/nsCSSStruct.h
+@@ -202,6 +202,7 @@ struct nsCSSFont : public nsCSSStruct {
+   nsCSSFont(const nsCSSFont& aCopy);
+   ~nsCSSFont(void);
+ 
++  nsCSSValue mSystemFont;
+   nsCSSValue mFamily;
+   nsCSSValue mStyle;
+   nsCSSValue mVariant;
+diff --git a/layout/style/nsCSSValue.cpp b/layout/style/nsCSSValue.cpp
+--- a/layout/style/nsCSSValue.cpp
++++ b/layout/style/nsCSSValue.cpp
+@@ -349,6 +349,12 @@ void nsCSSValue::SetNormalValue()
+   mUnit = eCSSUnit_Normal;
+ }
+ 
++void nsCSSValue::SetSystemFontValue()
++{
++  Reset();
++  mUnit = eCSSUnit_System_Font;
++}
++
+ void nsCSSValue::StartImageLoad(nsIDocument* aDocument, PRBool aIsBGImage) const
+ {
+   NS_PRECONDITION(eCSSUnit_URL == mUnit, "Not a URL value!");
+diff --git a/layout/style/nsCSSValue.h b/layout/style/nsCSSValue.h
+--- a/layout/style/nsCSSValue.h
++++ b/layout/style/nsCSSValue.h
+@@ -62,6 +62,7 @@ enum nsCSSUnit {
+   eCSSUnit_Initial      = 3,      // (n/a) value is default UA value
+   eCSSUnit_None         = 4,      // (n/a) value is none
+   eCSSUnit_Normal       = 5,      // (n/a) value is normal (algorithmic, different than auto)
++  eCSSUnit_System_Font  = 6,      // (n/a) value is -moz-use-system-font
+   eCSSUnit_String       = 10,     // (PRUnichar*) a string value
+   eCSSUnit_Attr         = 11,     // (PRUnichar*) a attr(string) value
+   eCSSUnit_Array        = 20,     // (nsCSSValue::Array*) a list of values
+@@ -138,8 +139,8 @@ public:
+   explicit nsCSSValue(nsCSSUnit aUnit = eCSSUnit_Null)
+     : mUnit(aUnit)
+   {
+-    NS_ASSERTION(aUnit <= eCSSUnit_Normal, "not a valueless unit");
+-    if (aUnit > eCSSUnit_Normal) {
++    NS_ASSERTION(aUnit <= eCSSUnit_System_Font, "not a valueless unit");
++    if (aUnit > eCSSUnit_System_Font) {
+       mUnit = eCSSUnit_Null;
+     }
+     mValue.mInt = 0;
+@@ -278,6 +279,7 @@ public:
+   NS_HIDDEN_(void)  SetInitialValue();
+   NS_HIDDEN_(void)  SetNoneValue();
+   NS_HIDDEN_(void)  SetNormalValue();
++  NS_HIDDEN_(void)  SetSystemFontValue();
+   NS_HIDDEN_(void)  StartImageLoad(nsIDocument* aDocument,
+                                    PRBool aIsBGImage = PR_FALSE)
+                                    const;  // Not really const, but pretending
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -1901,6 +1901,9 @@ nsRuleNode::SetFont(nsPresContext* aPres
+ {
+   const nsFont* defaultVariableFont =
+     aPresContext->GetDefaultFont(kPresContext_DefaultVariableFont_ID);
++
++  // -moz-use-system-font:
++
+ 
+   // font-family: string list, enum, inherit
+   if (eCSSUnit_String == aFontData.mFamily.GetUnit()) {
