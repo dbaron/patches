@@ -1,0 +1,130 @@
+Add assertions that we don't execute script, fire events, or mutate the document during frame construction, reflow, or painting.  b=335053,335054
+
+diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsContentUtils.h
+--- a/content/base/public/nsContentUtils.h
++++ b/content/base/public/nsContentUtils.h
+@@ -1011,6 +1011,18 @@ public:
+    * FALSE.
+    */
+   static void NotifyInstalledMenuKeyboardListener(PRBool aInstalling);
++
++  /**
++   * Assert that no presentation of the given document is currently in
++   * layout operation during which it is not safe to execute script.
++   */
++#ifdef DEBUG
++  static void AssertLayoutSafeForScript(nsIDocument *aDocument);
++#else
++  static inline void AssertLayoutSafeForScript(nsIDocument *aDocument) {}
++#endif
++
++
+ private:
+ 
+   static PRBool InitializeEventTable();
+diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUtils.cpp
+--- a/content/base/src/nsContentUtils.cpp
++++ b/content/base/src/nsContentUtils.cpp
+@@ -137,6 +137,8 @@ static NS_DEFINE_CID(kXTFServiceCID, NS_
+ #include "nsMutationEvent.h"
+ #include "nsIKBStateControl.h"
+ #include "nsIMEStateManager.h"
++#include "nsIPresShell.h"
++#include "nsPresContext.h"
+ 
+ #ifdef IBMBIDI
+ #include "nsIBidiKeyboard.h"
+@@ -3552,3 +3554,19 @@ nsContentUtils::NotifyInstalledMenuKeybo
+ {
+   nsIMEStateManager::OnInstalledMenuKeyboardListener(aInstalling);
+ }
++
++#ifdef DEBUG
++static void
++nsContentUtils::AssertLayoutSafeForScript(nsIDocument *aDocument)
++{
++  for (PRUint32 i = 0, iEnd = aDocument->GetNumberOfShells(); i < iEnd; ++i) {
++    nsPresContext *presContext = aDocument->GetShellAt(i)->GetPresContext();
++    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_Paint) == 0,
++                 "should not execute script during paint");
++    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_Reflow) == 0,
++                 "should not execute script during reflow");
++    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_FrameC) == 0,
++                 "should not execute script during frame construction");
++  }
++}
++#endif
+diff --git a/content/base/src/nsDocument.h b/content/base/src/nsDocument.h
+--- a/content/base/src/nsDocument.h
++++ b/content/base/src/nsDocument.h
+@@ -709,9 +709,12 @@ protected:
+ 
+   static void DestroyClassNameArray(void* aData);
+ 
+-#define NS_DOCUMENT_NOTIFY_OBSERVERS(func_, params_)                  \
+-  NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(mObservers, nsIDocumentObserver, \
+-                                     func_, params_);
++#define NS_DOCUMENT_NOTIFY_OBSERVERS(func_, params_)                          \
++  PR_BEGIN_MACRO                                                              \
++    nsContentUtils::AssertLayoutSafeForScript(this);                          \
++    NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(mObservers, nsIDocumentObserver,       \
++                                       func_, params_);                       \
++  PR_END_MACRO
+   
+ #ifdef DEBUG
+   void VerifyRootContentState();
+diff --git a/content/base/src/nsNodeUtils.cpp b/content/base/src/nsNodeUtils.cpp
+--- a/content/base/src/nsNodeUtils.cpp
++++ b/content/base/src/nsNodeUtils.cpp
+@@ -54,22 +54,23 @@
+ #include "nsXULElement.h"
+ #endif
+ 
+-#define IMPL_MUTATION_NOTIFICATION(func_, content_, params_)      \
+-  PR_BEGIN_MACRO                                                  \
+-  nsINode* node = content_;                                       \
+-  nsINode* prev;                                                  \
+-  do {                                                            \
+-    nsINode::nsSlots* slots = node->GetExistingSlots();           \
+-    if (slots && !slots->mMutationObservers.IsEmpty()) {          \
+-      /* No need to explicitly notify the first observer first    \
+-         since that'll happen anyway. */                          \
+-      NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(                         \
+-        slots->mMutationObservers, nsIMutationObserver,           \
+-        func_, params_);                                          \
+-    }                                                             \
+-    prev = node;                                                  \
+-    node = node->GetNodeParent();                                 \
+-  } while (node);                                                 \
++#define IMPL_MUTATION_NOTIFICATION(func_, content_, params_)                  \
++  PR_BEGIN_MACRO                                                              \
++  nsContentUtils::AssertLayoutSafeForScript(content_->GetOwnerDoc())          \
++  nsINode* node = content_;                                                   \
++  nsINode* prev;                                                              \
++  do {                                                                        \
++    nsINode::nsSlots* slots = node->GetExistingSlots();                       \
++    if (slots && !slots->mMutationObservers.IsEmpty()) {                      \
++      /* No need to explicitly notify the first observer first                \
++         since that'll happen anyway. */                                      \
++      NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(                                     \
++        slots->mMutationObservers, nsIMutationObserver,                       \
++        func_, params_);                                                      \
++    }                                                                         \
++    prev = node;                                                              \
++    node = node->GetNodeParent();                                             \
++  } while (node);                                                             \
+   PR_END_MACRO
+ 
+ 
+diff --git a/content/events/src/nsEventDispatcher.cpp b/content/events/src/nsEventDispatcher.cpp
+--- a/content/events/src/nsEventDispatcher.cpp
++++ b/content/events/src/nsEventDispatcher.cpp
+@@ -364,6 +364,8 @@ nsEventDispatcher::Dispatch(nsISupports*
+                             nsDispatchingCallback* aCallback)
+ {
+   NS_ASSERTION(aEvent, "Trying to dispatch without nsEvent!");
++  if (aPresContext) // XXX And otherwise?
++    nsContentUtils::AssertLayoutSafeForScript(aPresContext->Document());
+   NS_ENSURE_TRUE(!NS_IS_EVENT_IN_DISPATCH(aEvent),
+                  NS_ERROR_ILLEGAL_VALUE);
+   // This is strange, but nsEvents are sometimes reused and they don't need
