@@ -1,0 +1,127 @@
+Call SetGeometryDirty if we need to call DistributeHeightToRows, since DistributeHeightToRows can't deal with rows that have already had height distributed to them.  Patch by Daniel Holbert <dholbert@mozilla.com>.  b=380227  r+sr=dbaron
+
+diff --git a/layout/reftests/bugs/380227-1-ref.html b/layout/reftests/bugs/380227-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/380227-1-ref.html
+@@ -0,0 +1,8 @@
++<html>
++ <body>
++  <iframe id="myFrame" 
++          style="height: 200px"
++          src="380227-iframe.html"/>
++ </body>
++</html>
++
+diff --git a/layout/reftests/bugs/380227-1.html b/layout/reftests/bugs/380227-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/380227-1.html
+@@ -0,0 +1,17 @@
++<html class="reftest-wait">
++ <body onload="HandleLoad()">
++  <script>
++    function HandleLoad() {
++      setTimeout(function() {
++	var myFrame = document.getElementById("myFrame");
++	myFrame.style.height = "200px";
++        document.documentElement.className = "";
++      }, 0);
++    }
++  </script>
++
++  <iframe id="myFrame" 
++          style="height: 300px"
++          src="380227-iframe.html"/>
++ </body>
++</html>
+diff --git a/layout/reftests/bugs/380227-iframe.html b/layout/reftests/bugs/380227-iframe.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/380227-iframe.html
+@@ -0,0 +1,9 @@
++<html>
++ <body>
++  <table height="50%">
++   <tr><td bgcolor="blue">
++   x
++   </td></tr>
++  </table>
++ </body>
++</html>
+diff --git a/layout/reftests/bugs/reftest.list b/layout/reftests/bugs/reftest.list
+--- a/layout/reftests/bugs/reftest.list
++++ b/layout/reftests/bugs/reftest.list
+@@ -237,4 +237,5 @@ random-if(MOZ_WIDGET_TOOLKIT=="cocoa") =
+ random-if(MOZ_WIDGET_TOOLKIT=="cocoa") == 379316-2.html 379316-2-ref.html # bug 379786
+ == 379328-1.html 379328-1-ref.html
+ == 380004-1.html 380004-1-ref.html
++== 380227-1.html 380227-1-ref.html
+ == 380842-1.html 380842-1-ref.html
+diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp
++++ b/layout/tables/nsTableFrame.cpp
+@@ -1872,6 +1872,16 @@ NS_METHOD nsTableFrame::Reflow(nsPresCon
+   PRBool haveDesiredHeight = PR_FALSE;
+   PRBool reflowedChildren  = PR_FALSE;
+ 
++  if (aReflowState.mComputedHeight != NS_UNCONSTRAINEDSIZE) {
++    // Note: Eventually, we should modify DistributeHeightToRows to use
++    // nsTableRowFrame::GetHeight instead of .height member variables.  That
++    // way, it will make its calculations based on internal table frame heights
++    // as they are before they ever had any extra height distributed to them.
++    // In the meantime, until that function gets rewritten, this should have
++    // the same effect.
++    SetGeometryDirty();
++  }
++
+   // Reflow the entire table (pass 2 and possibly pass 3). This phase is necessary during a 
+   // constrained initial reflow and other reflows which require either a strategy init or balance. 
+   // This isn't done during an unconstrained reflow, because it will occur later when the parent 
+@@ -2729,7 +2739,8 @@ nsTableFrame::ReflowChildren(nsTableRefl
+   aOverflowArea = nsRect (0, 0, 0, 0);
+ 
+   PRBool reflowAllKids = aReflowState.reflowState.ShouldReflowAllKids() ||
+-                         mBits.mResizedColumns;
++                         mBits.mResizedColumns ||
++                         IsGeometryDirty();
+ 
+   nsAutoVoidArray rowGroups;
+   PRUint32 numRowGroups;
+@@ -3017,14 +3028,12 @@ nsTableFrame::CalcDesiredHeight(const ns
+         (tableSpecifiedHeight != NS_UNCONSTRAINEDSIZE) &&
+         (tableSpecifiedHeight > desiredHeight)) {
+       // proportionately distribute the excess height to unconstrained rows in each
+-      // unconstrained row group.We don't need to do this if it's an unconstrained reflow
+-      if (NS_UNCONSTRAINEDSIZE != aReflowState.availableWidth) { 
+-        DistributeHeightToRows(aReflowState, tableSpecifiedHeight - desiredHeight);
+-        // this might have changed the overflow area incorporate the childframe overflow area.
+-        for (nsIFrame* kidFrame = mFrames.FirstChild(); kidFrame; kidFrame = kidFrame->GetNextSibling()) {
+-          ConsiderChildOverflow(aDesiredSize.mOverflowArea, kidFrame);
+-        } 
+-      }
++      // unconstrained row group.
++      DistributeHeightToRows(aReflowState, tableSpecifiedHeight - desiredHeight);
++      // this might have changed the overflow area incorporate the childframe overflow area.
++      for (nsIFrame* kidFrame = mFrames.FirstChild(); kidFrame; kidFrame = kidFrame->GetNextSibling()) {
++        ConsiderChildOverflow(aDesiredSize.mOverflowArea, kidFrame);
++      } 
+       desiredHeight = tableSpecifiedHeight;
+     }
+   }
+diff --git a/layout/tables/nsTableFrame.h b/layout/tables/nsTableFrame.h
+--- a/layout/tables/nsTableFrame.h
++++ b/layout/tables/nsTableFrame.h
+@@ -606,6 +606,12 @@ public:
+   PRBool NeedColSpanExpansion() const;
+   void SetNeedColSpanExpansion(PRBool aValue);
+ 
++  /** The GeometryDirty flag is intended to allow efficient resizing of a table.
++   *  The NS_FRAME_IS_DIRTY bit implies that all descendants are dirty.  The
++   *  GeometryDirty flag differs from NS_FRAME_IS_DIRTY by implying that all the
++   *  parts of the table are dirty, but that resizing optimizations should still
++   *  apply to the contents of the individual cells.
++   */
+   void SetGeometryDirty() { mBits.mGeometryDirty = PR_TRUE; }
+   void ClearGeometryDirty() { mBits.mGeometryDirty = PR_FALSE; }
+   PRBool IsGeometryDirty() const { return mBits.mGeometryDirty; }
