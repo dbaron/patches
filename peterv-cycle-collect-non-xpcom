@@ -1,0 +1,1861 @@
+Make cycle collector work with refcounted non-XPCOM objects.  b=368774
+
+diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsContentUtils.h
+--- a/content/base/public/nsContentUtils.h
++++ b/content/base/public/nsContentUtils.h
+@@ -996,6 +996,10 @@ public:
+       }
+       return rv;
+     }
++    void traverse(nsCycleCollectionTraversalCallback &cb)
++    {
++      cb.NoteScriptChild(mLangID, mObject);
++    }
+     PRUint32 mLangID;
+     void *mObject;
+   };
+diff --git a/content/html/content/src/nsGenericHTMLElement.h b/content/html/content/src/nsGenericHTMLElement.h
+--- a/content/html/content/src/nsGenericHTMLElement.h
++++ b/content/html/content/src/nsGenericHTMLElement.h
+@@ -1062,7 +1062,7 @@ NS_NewHTML##_elementName##Element(nsINod
+   {                                                                           \
+     NS_ENSURE_ARG_POINTER(aInstancePtr);                                      \
+                                                                               \
+-    if ( aIID.Equals(NS_GET_IID(nsCycleCollectionParticipant)) ) {            \
++    if ( aIID.Equals(NS_GET_IID(nsXPCOMCycleCollectionParticipant)) ) {       \
+       *aInstancePtr = &NS_CYCLE_COLLECTION_NAME(_class);                      \
+       return NS_OK;                                                           \
+     }                                                                         \
+diff --git a/content/xbl/src/nsBindingManager.cpp b/content/xbl/src/nsBindingManager.cpp
+--- a/content/xbl/src/nsBindingManager.cpp
++++ b/content/xbl/src/nsBindingManager.cpp
+@@ -87,12 +87,14 @@
+ // = nsAnonymousContentList 
+ // ==================================================================
+ 
+-class nsAnonymousContentList : public nsGenericDOMNodeList
++class nsAnonymousContentList : public nsIDOMNodeList
+ {
+ public:
+   nsAnonymousContentList(nsInsertionPointList* aElements);
+   virtual ~nsAnonymousContentList();
+ 
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_CLASS(nsAnonymousContentList)
+   // nsIDOMNodeList interface
+   NS_DECL_NSIDOMNODELIST
+ 
+@@ -119,6 +121,29 @@ nsAnonymousContentList::~nsAnonymousCont
+   MOZ_COUNT_DTOR(nsAnonymousContentList);
+   delete mElements;
+ }
++
++NS_IMPL_CYCLE_COLLECTION_CLASS(nsAnonymousContentList)
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(nsAnonymousContentList)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(nsAnonymousContentList)
++
++NS_INTERFACE_MAP_BEGIN(nsAnonymousContentList)
++  NS_INTERFACE_MAP_ENTRY(nsIDOMNodeList)
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++  NS_INTERFACE_MAP_ENTRY_CONTENT_CLASSINFO(NodeList)
++  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(nsAnonymousContentList)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsAnonymousContentList)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsAnonymousContentList)
++  {
++    PRInt32 i, count = tmp->mElements->Length();
++    for (i = 0; i < count; ++i) {
++      NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_MEMBER(mElements->ElementAt(i),
++                                                      nsXBLInsertionPoint);
++    }
++  }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMETHODIMP
+ nsAnonymousContentList::GetLength(PRUint32* aLength)
+@@ -309,7 +334,7 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+     PL_DHashTableFinish(&(tmp->mWrapperTable));
+   tmp->mWrapperTable.ops = nsnull;
+ 
+-  tmp->mAttachedStack.Clear();
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSTARRAY(mAttachedStack)
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+ 
+@@ -341,6 +366,7 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(
+       tmp->mDocumentTable.EnumerateRead(&DocumentInfoHashtableTraverser, &cb);
+   if (tmp->mLoadingDocTable.IsInitialized())
+       tmp->mLoadingDocTable.EnumerateRead(&LoadingDocHashtableTraverser, &cb);
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSTARRAY(mAttachedStack, nsXBLBinding)
+   // No need to traverse mProcessAttachedQueueEvent, since it'll just
+   // fire at some point.
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+@@ -1368,9 +1394,8 @@ nsBindingManager::Traverse(nsIContent *a
+ 
+   nsXBLBinding *binding = GetBinding(aContent);
+   if (binding) {
+-    // XXX nsXBLBinding isn't nsISupports but it is refcounted, so we can't
+-    //     traverse it.
+     cb.NoteXPCOMChild(aContent);
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(binding, nsXBLBinding)
+   }
+   nsISupports *value;
+   if (mContentListTable.ops &&
+diff --git a/content/xbl/src/nsXBLBinding.cpp b/content/xbl/src/nsXBLBinding.cpp
+--- a/content/xbl/src/nsXBLBinding.cpp
++++ b/content/xbl/src/nsXBLBinding.cpp
+@@ -173,6 +173,40 @@ nsXBLBinding::~nsXBLBinding(void)
+   NS_RELEASE(info);
+ }
+ 
++PR_STATIC_CALLBACK(PLDHashOperator)
++TraverseKey(nsISupports* aKey, nsInsertionPointList* aData, void* aClosure)
++{
++  nsCycleCollectionTraversalCallback &cb = 
++    *NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++
++  cb.NoteXPCOMChild(aKey);
++  if (aData) {
++    PRInt32 i, count = aData->Length();
++    for (i = 0; i < count; ++i) {
++      NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(aData->ElementAt(i),
++                                                   nsXBLInsertionPoint);
++    }
++  }
++  return PL_DHASH_NEXT;
++}
++
++NS_IMPL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLBinding)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_NATIVE(nsXBLBinding)
++  // XXX Probably can't unlink mPrototypeBinding->XBLDocumentInfo(), because
++  //     mPrototypeBinding is weak.
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mContent)
++  // XXX What about mNextBinding and mInsertionPointTable?
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_BEGIN(nsXBLBinding)
++  cb.NoteXPCOMChild(tmp->mPrototypeBinding->XBLDocumentInfo());
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mContent)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_MEMBER(mNextBinding, nsXBLBinding)
++  if (tmp->mInsertionPointTable)
++    tmp->mInsertionPointTable->EnumerateRead(TraverseKey, &cb);
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsXBLBinding, AddRef)
++NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsXBLBinding, Release)
++
+ void
+ nsXBLBinding::SetBaseBinding(nsXBLBinding* aBinding)
+ {
+diff --git a/content/xbl/src/nsXBLBinding.h b/content/xbl/src/nsXBLBinding.h
+--- a/content/xbl/src/nsXBLBinding.h
++++ b/content/xbl/src/nsXBLBinding.h
+@@ -45,6 +45,7 @@
+ #include "nsIStyleRuleProcessor.h"
+ #include "nsClassHashtable.h"
+ #include "nsTArray.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsXBLPrototypeBinding;
+ class nsIContent;
+@@ -94,6 +95,8 @@ public:
+     }
+     return mRefCnt;
+   }
++
++  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLBinding)
+ 
+   nsXBLPrototypeBinding* PrototypeBinding() { return mPrototypeBinding; }
+   nsIContent* GetAnonymousContent() { return mContent.get(); }
+diff --git a/content/xbl/src/nsXBLInsertionPoint.cpp b/content/xbl/src/nsXBLInsertionPoint.cpp
+--- a/content/xbl/src/nsXBLInsertionPoint.cpp
++++ b/content/xbl/src/nsXBLInsertionPoint.cpp
+@@ -64,6 +64,20 @@ nsXBLInsertionPoint::Release()
+   return mRefCnt;
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLInsertionPoint)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_NATIVE(nsXBLInsertionPoint)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(mElements)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mDefaultContentTemplate)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mDefaultContent)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_BEGIN(nsXBLInsertionPoint)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(mElements)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDefaultContentTemplate)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDefaultContent)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsXBLInsertionPoint, AddRef)
++NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsXBLInsertionPoint, Release)
++
+ already_AddRefed<nsIContent>
+ nsXBLInsertionPoint::GetInsertionParent()
+ {
+diff --git a/content/xbl/src/nsXBLInsertionPoint.h b/content/xbl/src/nsXBLInsertionPoint.h
+--- a/content/xbl/src/nsXBLInsertionPoint.h
++++ b/content/xbl/src/nsXBLInsertionPoint.h
+@@ -42,6 +42,7 @@
+ #include "nsCOMArray.h"
+ #include "nsIContent.h"
+ #include "nsCOMPtr.h"
++#include "nsCycleCollectionParticipant.h"
+ 
+ class nsXBLInsertionPoint
+ {
+@@ -58,6 +59,8 @@ public:
+   }
+ 
+   nsrefcnt Release();
++
++  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLInsertionPoint)
+ 
+   already_AddRefed<nsIContent> GetInsertionParent();
+   PRInt32 GetInsertionIndex() { return mIndex; }
+diff --git a/content/xbl/src/nsXBLProtoImpl.cpp b/content/xbl/src/nsXBLProtoImpl.cpp
+--- a/content/xbl/src/nsXBLProtoImpl.cpp
++++ b/content/xbl/src/nsXBLProtoImpl.cpp
+@@ -199,6 +199,15 @@ nsXBLProtoImpl::CompilePrototypeMembers(
+ }
+ 
+ void
++nsXBLProtoImpl::Traverse(nsCycleCollectionTraversalCallback &cb) const
++{
++  nsXBLProtoImplMember *member;
++  for (member = mMembers; member; member = member->GetNext()) {
++    member->Traverse(cb);
++  }
++}
++
++void
+ nsXBLProtoImpl::DestroyMembers(nsXBLProtoImplMember* aBrokenMember)
+ {
+   NS_ASSERTION(mClassObject, "This should never be called when there is no class object");
+diff --git a/content/xbl/src/nsXBLProtoImpl.h b/content/xbl/src/nsXBLProtoImpl.h
+--- a/content/xbl/src/nsXBLProtoImpl.h
++++ b/content/xbl/src/nsXBLProtoImpl.h
+@@ -76,6 +76,8 @@ public:
+ 
+   void SetMemberList(nsXBLProtoImplMember* aMemberList) { delete mMembers; mMembers = aMemberList; }
+ 
++  void Traverse(nsCycleCollectionTraversalCallback &cb) const;
++
+ protected:
+   // Function to call if compilation of a member fails.  When this is called,
+   // all members before aBrokenMember are compiled, compilation of
+diff --git a/content/xbl/src/nsXBLProtoImplField.cpp b/content/xbl/src/nsXBLProtoImplField.cpp
+--- a/content/xbl/src/nsXBLProtoImplField.cpp
++++ b/content/xbl/src/nsXBLProtoImplField.cpp
+@@ -151,3 +151,8 @@ nsXBLProtoImplField::CompileMember(nsISc
+ {
+   return NS_OK;
+ }
++
++void
++nsXBLProtoImplField::Traverse(nsCycleCollectionTraversalCallback &cb) const
++{
++}
+diff --git a/content/xbl/src/nsXBLProtoImplField.h b/content/xbl/src/nsXBLProtoImplField.h
+--- a/content/xbl/src/nsXBLProtoImplField.h
++++ b/content/xbl/src/nsXBLProtoImplField.h
+@@ -67,6 +67,8 @@ public:
+                                  const nsCString& aClassStr,
+                                  void* aClassObject);
+ 
++  virtual void Traverse(nsCycleCollectionTraversalCallback &cb) const;
++
+ protected:
+   PRUnichar* mFieldText;
+   PRUint32 mFieldTextLength;
+diff --git a/content/xbl/src/nsXBLProtoImplMember.h b/content/xbl/src/nsXBLProtoImplMember.h
+--- a/content/xbl/src/nsXBLProtoImplMember.h
++++ b/content/xbl/src/nsXBLProtoImplMember.h
+@@ -51,6 +51,7 @@ class nsIScriptContext;
+ class nsIScriptContext;
+ struct JSRuntime;
+ class nsIJSRuntimeService;
++struct nsCycleCollectionTraversalCallback;
+ 
+ struct nsXBLTextWithLineNumber
+ {
+@@ -113,6 +114,8 @@ public:
+                                  const nsCString& aClassStr,
+                                  void* aClassObject)=0;
+ 
++  virtual void Traverse(nsCycleCollectionTraversalCallback &cb) const = 0;
++
+ protected:
+   friend class nsAutoGCRoot;
+   
+diff --git a/content/xbl/src/nsXBLProtoImplMethod.cpp b/content/xbl/src/nsXBLProtoImplMethod.cpp
+--- a/content/xbl/src/nsXBLProtoImplMethod.cpp
++++ b/content/xbl/src/nsXBLProtoImplMethod.cpp
+@@ -276,6 +276,14 @@ nsXBLProtoImplMethod::CompileMember(nsIS
+   return rv;
+ }
+ 
++void
++nsXBLProtoImplMethod::Traverse(nsCycleCollectionTraversalCallback &cb) const
++{
++  if (mIsCompiled) {
++    cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, mJSMethodObject);
++  }
++}
++
+ nsresult
+ nsXBLProtoImplAnonymousMethod::Execute(nsIContent* aBoundElement)
+ {
+diff --git a/content/xbl/src/nsXBLProtoImplMethod.h b/content/xbl/src/nsXBLProtoImplMethod.h
+--- a/content/xbl/src/nsXBLProtoImplMethod.h
++++ b/content/xbl/src/nsXBLProtoImplMethod.h
+@@ -129,6 +129,8 @@ public:
+                                  const nsCString& aClassStr,
+                                  void* aClassObject);
+ 
++  virtual void Traverse(nsCycleCollectionTraversalCallback &cb) const;
++
+ protected:
+   union {
+     nsXBLUncompiledMethod* mUncompiledMethod; // An object that represents the method before being compiled.
+diff --git a/content/xbl/src/nsXBLProtoImplProperty.cpp b/content/xbl/src/nsXBLProtoImplProperty.cpp
+--- a/content/xbl/src/nsXBLProtoImplProperty.cpp
++++ b/content/xbl/src/nsXBLProtoImplProperty.cpp
+@@ -343,3 +343,15 @@ nsXBLProtoImplProperty::CompileMember(ns
+   
+   return rv;
+ }
++
++void
++nsXBLProtoImplProperty::Traverse(nsCycleCollectionTraversalCallback &cb) const
++{
++  if (mJSAttributes & JSPROP_GETTER) {
++    cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, mJSGetterObject);
++  }
++
++  if (mJSAttributes & JSPROP_SETTER) {
++    cb.NoteScriptChild(nsIProgrammingLanguage::JAVASCRIPT, mJSSetterObject);
++  }
++}
+diff --git a/content/xbl/src/nsXBLProtoImplProperty.h b/content/xbl/src/nsXBLProtoImplProperty.h
+--- a/content/xbl/src/nsXBLProtoImplProperty.h
++++ b/content/xbl/src/nsXBLProtoImplProperty.h
+@@ -72,6 +72,8 @@ public:
+                                  const nsCString& aClassStr,
+                                  void* aClassObject);
+ 
++  virtual void Traverse(nsCycleCollectionTraversalCallback &cb) const;
++
+ protected:
+   union {
+     // The raw text for the getter (prior to compilation).
+diff --git a/content/xbl/src/nsXBLPrototypeBinding.cpp b/content/xbl/src/nsXBLPrototypeBinding.cpp
+--- a/content/xbl/src/nsXBLPrototypeBinding.cpp
++++ b/content/xbl/src/nsXBLPrototypeBinding.cpp
+@@ -147,7 +147,9 @@ public:
+       mDefaultContent->UnbindFromTree();
+     }      
+   }
+-  
++
++  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLInsertionPointEntry)
++
+   nsIContent* GetInsertionParent() { return mInsertionParent; }
+   PRUint32 GetInsertionIndex() { return mInsertionIndex; }
+   void SetInsertionIndex(PRUint32 aIndex) { mInsertionIndex = aIndex; }
+@@ -188,12 +190,11 @@ protected:
+   nsCOMPtr<nsIContent> mInsertionParent;
+   nsCOMPtr<nsIContent> mDefaultContent;
+   PRUint32 mInsertionIndex;
+-  nsrefcnt mRefCnt;
++  nsAutoRefCnt mRefCnt;
+ 
+   nsXBLInsertionPointEntry(nsIContent* aParent)
+     : mInsertionParent(aParent),
+-      mInsertionIndex(0),
+-      mRefCnt(0) { }
++      mInsertionIndex(0) { }
+ 
+ private:
+   // Hide so that only Create() and Destroy() can be used to
+@@ -201,6 +202,24 @@ private:
+   static void* operator new(size_t) CPP_THROW_NEW { return 0; }
+   static void operator delete(void*, size_t) {}
+ };
++
++NS_IMPL_CYCLE_COLLECTION_NATIVE_CLASS(nsXBLInsertionPointEntry)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_NATIVE(nsXBLInsertionPointEntry)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mInsertionParent)
++  if (tmp->mDefaultContent) {
++    // mDefaultContent is a sort of anonymous content within the XBL
++    // document, and we own and manage it.  Unhook it here, since we're going
++    // away.
++    tmp->mDefaultContent->UnbindFromTree();
++    tmp->mDefaultContent = nsnull;
++  }      
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_BEGIN(nsXBLInsertionPointEntry)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mInsertionParent)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDefaultContent)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsXBLInsertionPointEntry, AddRef)
++NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsXBLInsertionPointEntry, Release)
+ 
+ // =============================================================================
+ 
+@@ -279,13 +298,39 @@ nsXBLPrototypeBinding::Init(const nsACSt
+   return NS_OK;
+ }
+ 
++PR_STATIC_CALLBACK(PRIntn)
++TraverseInsertionPoint(nsHashKey* aKey, void* aData, void* aClosure)
++{
++  nsCycleCollectionTraversalCallback &cb = 
++    *NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++  nsXBLInsertionPointEntry* entry =
++    NS_STATIC_CAST(nsXBLInsertionPointEntry*, aData);
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(entry,
++                                               nsXBLInsertionPointEntry)
++  return kHashEnumerateNext;
++}
++
++PR_STATIC_CALLBACK(PRBool)
++TraverseBinding(nsHashKey *aKey, void *aData, void* aClosure)
++{
++  nsCycleCollectionTraversalCallback *cb = 
++    NS_STATIC_CAST(nsCycleCollectionTraversalCallback*, aClosure);
++  cb->NoteXPCOMChild(NS_STATIC_CAST(nsISupports*, aData));
++  return kHashEnumerateNext;
++}
++
+ void
+ nsXBLPrototypeBinding::Traverse(nsCycleCollectionTraversalCallback &cb) const
+ {
+   cb.NoteXPCOMChild(mBinding);
+-  // XXX mInsertionPointTable!
++  if (mImplementation)
++    mImplementation->Traverse(cb);
+   if (mResources)
+     cb.NoteXPCOMChild(mResources->mLoader);
++  if (mInsertionPointTable)
++    mInsertionPointTable->Enumerate(TraverseInsertionPoint, &cb);
++  if (mInterfaceTable)
++    mInterfaceTable->Enumerate(TraverseBinding, &cb);
+ }
+ 
+ void
+diff --git a/content/xul/content/src/nsXULElement.cpp b/content/xul/content/src/nsXULElement.cpp
+--- a/content/xul/content/src/nsXULElement.cpp
++++ b/content/xul/content/src/nsXULElement.cpp
+@@ -2261,6 +2261,29 @@ nsXULElement::RecompileScriptEventListen
+     }
+ }
+ 
++NS_IMPL_CYCLE_COLLECTION_NATIVE_CLASS(nsXULPrototypeNode)
++NS_IMPL_CYCLE_COLLECTION_UNLINK_NATIVE_0(nsXULPrototypeNode)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_BEGIN(nsXULPrototypeNode)
++    if (tmp->mType == nsXULPrototypeNode::eType_Element) {
++        nsXULPrototypeElement *elem =
++            NS_STATIC_CAST(nsXULPrototypeElement*, tmp);
++        PRUint32 i;
++        for (i = 0; i < elem->mNumAttributes; ++i) {
++            cb.NoteScriptChild(elem->mScriptTypeID,
++                               elem->mAttributes[i].mEventHandler);
++        }
++        for (i = 0; i < elem->mNumChildren; ++i) {
++            NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(elem->mChildren[i],
++                                                         nsXULPrototypeNode)
++        }
++    }
++    else if (tmp->mType == nsXULPrototypeNode::eType_Script) {
++        NS_STATIC_CAST(nsXULPrototypeScript*, tmp)->mScriptObject.traverse(cb);
++    }
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
++NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(nsXULPrototypeNode, AddRef)
++NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(nsXULPrototypeNode, Release)
++
+ //----------------------------------------------------------------------
+ //
+ // nsXULPrototypeAttribute
+diff --git a/content/xul/content/src/nsXULElement.h b/content/xul/content/src/nsXULElement.h
+--- a/content/xul/content/src/nsXULElement.h
++++ b/content/xul/content/src/nsXULElement.h
+@@ -193,7 +193,7 @@ public:
+ 
+     Type                     mType;
+ 
+-    PRInt32                  mRefCnt;
++    nsAutoRefCnt             mRefCnt;
+ 
+     virtual ~nsXULPrototypeNode() {}
+     virtual nsresult Serialize(nsIObjectOutputStream* aStream,
+@@ -221,6 +221,8 @@ public:
+             delete this;
+     }
+     virtual void ReleaseSubtree() { Release(); }
++
++    NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(nsXULPrototypeNode)
+ 
+ protected:
+     nsXULPrototypeNode(Type aType)
+diff --git a/content/xul/document/src/nsXULContentSink.cpp b/content/xul/document/src/nsXULContentSink.cpp
+--- a/content/xul/document/src/nsXULContentSink.cpp
++++ b/content/xul/document/src/nsXULContentSink.cpp
+@@ -240,13 +240,14 @@ XULContentSinkImpl::~XULContentSinkImpl(
+                 nsXULPrototypeNode* child =
+                     NS_REINTERPRET_CAST(nsXULPrototypeNode*, children->ElementAt(i));
+ 
+-                delete child;
++                child->Release();
+             }
+         }
+ 
+         nsXULPrototypeNode* node;
+         rv = mContextStack.GetTopNode(&node);
+-        if (NS_SUCCEEDED(rv)) delete node;
++        if (NS_SUCCEEDED(rv))
++            node->Release();
+ 
+         State state;
+         mContextStack.Pop(&state);
+@@ -761,7 +762,7 @@ XULContentSinkImpl::ReportError(const PR
+         nsXULPrototypeNode* child =
+             NS_REINTERPRET_CAST(nsXULPrototypeNode*, children->ElementAt(i));
+ 
+-        delete child;
++        child->Release();
+       }
+     }
+ 
+@@ -909,7 +910,7 @@ XULContentSinkImpl::OpenRoot(const PRUni
+     // containers will hook up to us as their parent.
+     rv = mContextStack.Push(element, mState);
+     if (NS_FAILED(rv)) {
+-        delete element;
++        element->Release();
+         return rv;
+     }
+ 
+diff --git a/content/xul/document/src/nsXULPrototypeDocument.cpp b/content/xul/document/src/nsXULPrototypeDocument.cpp
+--- a/content/xul/document/src/nsXULPrototypeDocument.cpp
++++ b/content/xul/document/src/nsXULPrototypeDocument.cpp
+@@ -196,8 +196,9 @@ NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULProt
+ NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULPrototypeDocument)
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsXULPrototypeDocument)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULPrototypeDocument)
+-  // XXX Can't traverse tmp->mRoot, non-XPCOM refcounted object
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mGlobalObject)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_MEMBER(mRoot,
++                                                    nsXULPrototypeElement)
++    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mGlobalObject)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXULPrototypeDocument)
+diff --git a/js/src/xpconnect/src/nsXPConnect.cpp b/js/src/xpconnect/src/nsXPConnect.cpp
+--- a/js/src/xpconnect/src/nsXPConnect.cpp
++++ b/js/src/xpconnect/src/nsXPConnect.cpp
+@@ -601,59 +601,31 @@ nsXPConnect::FinishCycleCollection()
+     return NS_OK;
+ }
+ 
+-nsresult 
+-nsXPConnect::Root(const nsDeque &nodes)
++NS_IMETHODIMP 
++nsXPConnect::Root(void *p)
++{
++    if(!mCycleCollectionContext ||
++       !JS_LockGCThing(*mCycleCollectionContext, NS_STATIC_CAST(JSObject*, p)))
++        return NS_ERROR_FAILURE;
++    return NS_OK;
++}
++
++NS_IMETHODIMP 
++nsXPConnect::Unlink(void *p)
+ {
+     if(!mCycleCollectionContext)
+         return NS_ERROR_FAILURE;
+-
+-    JSContext *cx = mCycleCollectionContext->GetJSContext();
+-    for (PRInt32 i = 0; i < nodes.GetSize(); ++i)
+-    {
+-        void *p = nodes.ObjectAt(i);
+-        if (!p)
+-            continue;
+-        JSObject *obj = NS_STATIC_CAST(JSObject*, p);
+-        if (!JS_LockGCThing(cx, obj))
+-            return NS_ERROR_FAILURE;
+-    }
+-    return NS_OK;
+-}
+-
+-nsresult 
+-nsXPConnect::Unlink(const nsDeque &nodes)
+-{
+-    if(!mCycleCollectionContext)
++    JS_ClearScope(*mCycleCollectionContext, NS_STATIC_CAST(JSObject*, p));
++    return NS_OK;
++}
++
++NS_IMETHODIMP 
++nsXPConnect::Unroot(void *p)
++{
++    if(!mCycleCollectionContext ||
++       !JS_UnlockGCThing(*mCycleCollectionContext,
++                         NS_STATIC_CAST(JSObject*, p)))
+         return NS_ERROR_FAILURE;
+-
+-    JSContext *cx = mCycleCollectionContext->GetJSContext();
+-    for (PRInt32 i = 0; i < nodes.GetSize(); ++i)
+-    {
+-        void *p = nodes.ObjectAt(i);
+-        if (!p)
+-            continue;
+-        JSObject *obj = NS_STATIC_CAST(JSObject*, p);
+-        JS_ClearScope(cx, obj);
+-    }
+-    return NS_OK;
+-}
+-
+-nsresult 
+-nsXPConnect::Unroot(const nsDeque &nodes)
+-{
+-    if(!mCycleCollectionContext)
+-        return NS_ERROR_FAILURE;
+-
+-    JSContext *cx = mCycleCollectionContext->GetJSContext();
+-    for (PRInt32 i = 0; i < nodes.GetSize(); ++i)
+-    {
+-        void *p = nodes.ObjectAt(i);
+-        if (!p)
+-            continue;
+-        JSObject *obj = NS_STATIC_CAST(JSObject*, p);
+-        if (!JS_UnlockGCThing(cx, obj))
+-            return NS_ERROR_FAILURE;
+-    }
+     return NS_OK;
+ }
+ 
+@@ -673,8 +645,9 @@ TraverseJSScript(JSScript* script, nsCyc
+     }
+ }
+ 
+-nsresult 
+-nsXPConnect::Traverse(void *p, nsCycleCollectionTraversalCallback &cb)
++NS_IMETHODIMP 
++nsXPConnect::Traverse(void *p,
++                      nsCycleCollectionTraversalCallback &cb)
+ {
+     if(!mCycleCollectionContext)
+         return NS_ERROR_FAILURE;
+diff --git a/js/src/xpconnect/src/xpcprivate.h b/js/src/xpconnect/src/xpcprivate.h
+--- a/js/src/xpconnect/src/xpcprivate.h
++++ b/js/src/xpconnect/src/xpcprivate.h
+@@ -427,7 +427,8 @@ struct JSObjectRefcounts;
+ 
+ class nsXPConnect : public nsIXPConnect,
+                     public nsSupportsWeakReference,
+-                    public nsCycleCollectionLanguageRuntime
++                    public nsCycleCollectionLanguageRuntime,
++                    public nsCycleCollectionParticipant
+ {
+ public:
+     // all the interface method declarations...
+@@ -475,13 +476,16 @@ public:
+     nsresult GetInfoForIID(const nsIID * aIID, nsIInterfaceInfo** info);
+     nsresult GetInfoForName(const char * name, nsIInterfaceInfo** info);
+ 
+-    // from nsCycleCollectionLanguageRuntime
++    // from nsCycleCollectionLanguageRuntime and nsCycleCollectionParticipant
+     nsresult BeginCycleCollection();
+-    nsresult Root(const nsDeque &nodes);
+-    nsresult Unlink(const nsDeque &nodes);
+-    nsresult Unroot(const nsDeque &nodes);
+-    nsresult Traverse(void *p, nsCycleCollectionTraversalCallback &cb);
++    NS_IMETHOD Root(void *p);
++    NS_IMETHOD Unlink(void *p);
++    NS_IMETHOD Unroot(void *p);
++    NS_IMETHOD Traverse(void *p,
++                        nsCycleCollectionTraversalCallback &cb);
+     nsresult FinishCycleCollection();
++    nsCycleCollectionParticipant *ToParticipant(void *p) {return this;}
++
+     JSObjectRefcounts* GetJSObjectRefcounts() {return mObjRefcounts;}
+ #ifndef XPCONNECT_STANDALONE
+     void RecordTraversal(void *p, nsISupports *s);
+diff --git a/js/src/xpconnect/src/xpcwrappedjs.cpp b/js/src/xpconnect/src/xpcwrappedjs.cpp
+--- a/js/src/xpconnect/src/xpcwrappedjs.cpp
++++ b/js/src/xpconnect/src/xpcwrappedjs.cpp
+@@ -49,7 +49,7 @@ NS_IMPL_CYCLE_COLLECTION_CLASS(nsXPCWrap
+ 
+ NS_IMETHODIMP
+ NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Traverse
+-   (nsISupports *s, nsCycleCollectionTraversalCallback &cb)
++   (void *p, nsCycleCollectionTraversalCallback &cb)
+ {
+     // REVIEW ME PLEASE: this is a very odd area and it's easy to get
+     // it wrong. I'm not sure I got it right.
+@@ -68,7 +68,8 @@ NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrapp
+     {
+         // Put the nsCOMPtr in a local scope, to avoid messing up the refcount
+         // below.
+-        nsCOMPtr<nsIXPConnectWrappedJS> owner = do_QueryInterface(s, &rv);
++        nsCOMPtr<nsIXPConnectWrappedJS> owner =
++            do_QueryInterface(NS_STATIC_CAST(nsISupports*, p), &rv);
+         if (NS_FAILED(rv))
+             return rv;
+ 
+@@ -112,7 +113,7 @@ NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrapp
+ }
+ 
+ NS_IMETHODIMP
+-NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Unlink(nsISupports *s)
++NS_CYCLE_COLLECTION_CLASSNAME(nsXPCWrappedJS)::Unlink(void *p)
+ {
+     // NB: We might unlink our outgoing references in the future; for
+     // now we do nothing. This is a harmless conservative behavior; it
+@@ -156,7 +157,7 @@ nsXPCWrappedJS::QueryInterface(REFNSIID 
+         return NS_ERROR_NULL_POINTER;
+     }
+ 
+-    if ( aIID.Equals(NS_GET_IID(nsCycleCollectionParticipant)) ) {
++    if ( aIID.Equals(NS_GET_IID(nsXPCOMCycleCollectionParticipant)) ) {
+         *aInstancePtr = & NS_CYCLE_COLLECTION_NAME(nsXPCWrappedJS);
+         return NS_OK;
+     }
+diff --git a/js/src/xpconnect/src/xpcwrappednative.cpp b/js/src/xpconnect/src/xpcwrappednative.cpp
+--- a/js/src/xpconnect/src/xpcwrappednative.cpp
++++ b/js/src/xpconnect/src/xpcwrappednative.cpp
+@@ -50,10 +50,10 @@ NS_IMPL_CYCLE_COLLECTION_CLASS(XPCWrappe
+ NS_IMPL_CYCLE_COLLECTION_CLASS(XPCWrappedNative)
+ 
+ NS_IMETHODIMP
+-NS_CYCLE_COLLECTION_CLASSNAME(XPCWrappedNative)::Traverse(nsISupports *s,
++NS_CYCLE_COLLECTION_CLASSNAME(XPCWrappedNative)::Traverse(void *p,
+                                                           nsCycleCollectionTraversalCallback &cb)
+ {
+-    XPCWrappedNative *tmp = NS_STATIC_CAST(XPCWrappedNative*, s);
++    XPCWrappedNative *tmp = NS_STATIC_CAST(XPCWrappedNative*, p);
+     if(!tmp->IsValid())
+         return NS_OK;
+ 
+@@ -113,7 +113,7 @@ NS_CYCLE_COLLECTION_CLASSNAME(XPCWrapped
+ }
+ 
+ NS_IMETHODIMP
+-NS_CYCLE_COLLECTION_CLASSNAME(XPCWrappedNative)::Unlink(nsISupports *s)
++NS_CYCLE_COLLECTION_CLASSNAME(XPCWrappedNative)::Unlink(void *p)
+ {
+     // NB: We might unlink our outgoing references in the future; for
+     // now we do nothing. This is a harmless conservative behavior; it
+diff --git a/xpcom/base/nsAgg.h b/xpcom/base/nsAgg.h
+--- a/xpcom/base/nsAgg.h
++++ b/xpcom/base/nsAgg.h
+@@ -100,11 +100,11 @@ public:                                 
+ 
+ #define NS_DECL_AGGREGATED_CYCLE_COLLECTION_CLASS(_class)                   \
+ class NS_CYCLE_COLLECTION_INNERCLASS                                        \
+- : public nsCycleCollectionParticipant                                      \
++ : public nsXPCOMCycleCollectionParticipant                                 \
+ {                                                                           \
+ public:                                                                     \
+-  NS_IMETHOD Unlink(nsISupports *p);                                        \
+-  NS_IMETHOD Traverse(nsISupports *p,                                       \
++  NS_IMETHOD Unlink(void *p);                                               \
++  NS_IMETHOD Traverse(void *p,                                              \
+                       nsCycleCollectionTraversalCallback &cb);              \
+   NS_IMETHOD_(void) UnmarkPurple(nsISupports *p)                            \
+   {                                                                         \
+@@ -297,12 +297,13 @@ _class::AggregatedQueryInterface(REFNSII
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_AGGREGATED(_class)          \
+   NS_IMETHODIMP                                                             \
+   NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                           \
+-                         (nsISupports *p,                                   \
++                         (void *p,                                          \
+                           nsCycleCollectionTraversalCallback &cb)           \
+   {                                                                         \
+-    NS_ASSERTION(CheckForRightISupports(p),                                 \
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);                       \
++    NS_ASSERTION(CheckForRightISupports(s),                                 \
+                  "not the nsISupports pointer we expect");                  \
+-    _class *tmp = NS_STATIC_CAST(_class*, Downcast(p));                     \
++    _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                     \
+     if (!tmp->IsPartOfAggregated())                                         \
+         NS_IMPL_CYCLE_COLLECTION_DESCRIBE(_class)
+ 
+diff --git a/xpcom/base/nsCycleCollectionParticipant.cpp b/xpcom/base/nsCycleCollectionParticipant.cpp
+--- a/xpcom/base/nsCycleCollectionParticipant.cpp
++++ b/xpcom/base/nsCycleCollectionParticipant.cpp
+@@ -38,41 +38,43 @@
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsCOMPtr.h"
+ 
+-NS_INTERFACE_MAP_BEGIN(nsCycleCollectionParticipant)
+-  NS_INTERFACE_MAP_ENTRY(nsCycleCollectionParticipant)
+-NS_INTERFACE_MAP_END
+-
+-NS_IMETHODIMP_(nsrefcnt) nsCycleCollectionParticipant::AddRef(void)
++NS_IMETHODIMP
++nsXPCOMCycleCollectionParticipant::Root(void *p)
+ {
+-  // Do nothing, it's a singleton.
+-  return 1;
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);
++    NS_ADDREF(s);
++    return NS_OK;
+ }
+ 
+-NS_IMETHODIMP_(nsrefcnt) nsCycleCollectionParticipant::Release(void)
+-{
+-  // Do nothing, it's a singleton.
+-  return 1;
+-}
+-
+-NS_IMETHODIMP nsCycleCollectionParticipant::Unlink(nsISupports *n)
++NS_IMETHODIMP
++nsXPCOMCycleCollectionParticipant::Unlink(void *p)
+ {
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++nsXPCOMCycleCollectionParticipant::Unroot(void *p)
++{
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);
++    NS_RELEASE(s);
++    return NS_OK;
++}
++
+ NS_IMETHODIMP 
+-nsCycleCollectionParticipant::Traverse(nsISupports *n, 
+-                                       nsCycleCollectionTraversalCallback &cb)
++nsXPCOMCycleCollectionParticipant::Traverse
++    (void *p, nsCycleCollectionTraversalCallback &cb)
+ {
+   return NS_OK;
+ }
+ 
+-NS_IMETHODIMP_(void) nsCycleCollectionParticipant::UnmarkPurple(nsISupports *n)
++NS_IMETHODIMP_(void)
++nsXPCOMCycleCollectionParticipant::UnmarkPurple(nsISupports *n)
+ {
+ }
+ 
+ #ifdef DEBUG
+ PRBool
+-nsCycleCollectionParticipant::CheckForRightISupports(nsISupports *s)
++nsXPCOMCycleCollectionParticipant::CheckForRightISupports(nsISupports *s)
+ {
+     nsCOMPtr<nsISupports> foo;
+     s->QueryInterface(NS_GET_IID(nsCycleCollectionISupports),
+diff --git a/xpcom/base/nsCycleCollectionParticipant.h b/xpcom/base/nsCycleCollectionParticipant.h
+--- a/xpcom/base/nsCycleCollectionParticipant.h
++++ b/xpcom/base/nsCycleCollectionParticipant.h
+@@ -77,6 +77,8 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ 
+ #undef  IMETHOD_VISIBILITY
+ #define IMETHOD_VISIBILITY NS_VISIBILITY_DEFAULT
++
++struct nsCycleCollectionParticipant;
+ 
+ struct nsCycleCollectionTraversalCallback
+ {
+@@ -91,18 +93,32 @@ struct nsCycleCollectionTraversalCallbac
+ #endif
+     virtual void NoteScriptChild(PRUint32 langID, void *child) = 0;
+     virtual void NoteXPCOMChild(nsISupports *child) = 0;
+-};
+-
+-class NS_COM nsCycleCollectionParticipant
+-    : public nsISupports
++    virtual void NoteNativeChild(void *child,
++                                 nsCycleCollectionParticipant *helper) = 0;
++};
++
++class NS_NO_VTABLE nsCycleCollectionParticipant
++{
++public:
++    NS_IMETHOD Traverse(void *p, nsCycleCollectionTraversalCallback &cb) = 0;
++
++    NS_IMETHOD Root(void *p) = 0;
++    NS_IMETHOD Unlink(void *p) = 0;
++    NS_IMETHOD Unroot(void *p) = 0;
++};
++
++class NS_COM nsXPCOMCycleCollectionParticipant
++    : public nsCycleCollectionParticipant
+ {
+ public:
+     NS_DECLARE_STATIC_IID_ACCESSOR(NS_CYCLECOLLECTIONPARTICIPANT_IID)
+-    NS_DECL_ISUPPORTS
+-
+-    NS_IMETHOD Unlink(nsISupports *p);
+-    NS_IMETHOD Traverse(nsISupports *p, 
+-                        nsCycleCollectionTraversalCallback &cb);
++
++    NS_IMETHOD Traverse(void *p, nsCycleCollectionTraversalCallback &cb);
++
++    NS_IMETHOD Root(void *p);
++    NS_IMETHOD Unlink(void *p);
++    NS_IMETHOD Unroot(void *p);
++
+     NS_IMETHOD_(void) UnmarkPurple(nsISupports *p);
+ 
+ #ifdef DEBUG
+@@ -110,7 +126,7 @@ public:
+ #endif
+ };
+ 
+-NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCollectionParticipant, 
++NS_DEFINE_STATIC_IID_ACCESSOR(nsXPCOMCycleCollectionParticipant, 
+                               NS_CYCLECOLLECTIONPARTICIPANT_IID)
+ 
+ #undef  IMETHOD_VISIBILITY
+@@ -118,7 +134,7 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ 
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+-// Helpers for implementing a QI to nsCycleCollectionParticipant
++// Helpers for implementing a QI to nsXPCOMCycleCollectionParticipant
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ #define NS_CYCLE_COLLECTION_INNERCLASS                                         \
+@@ -131,8 +147,9 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+         _class##_cycleCollectorGlobal
+ 
+ #define NS_IMPL_QUERY_CYCLE_COLLECTION(_class)                                 \
+-  if ( aIID.Equals(NS_GET_IID(nsCycleCollectionParticipant)) ) {               \
+-    foundInterface = & NS_CYCLE_COLLECTION_NAME(_class);                       \
++  if ( aIID.Equals(NS_GET_IID(nsXPCOMCycleCollectionParticipant)) ) {          \
++    *aInstancePtr = & NS_CYCLE_COLLECTION_NAME(_class);                        \
++    return NS_OK;                                                              \
+   } else
+ 
+ #define NS_IMPL_QUERY_CYCLE_COLLECTION_ISUPPORTS(_class)                       \
+@@ -165,37 +182,55 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(_class)                          \
+   NS_IMETHODIMP                                                                \
+-  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(nsISupports *s)                \
+-  {                                                                            \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(void *p)                       \
++  {                                                                            \
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);                          \
+     NS_ASSERTION(CheckForRightISupports(s),                                    \
+                  "not the nsISupports pointer we expect");                     \
+     _class *tmp = Downcast(s);
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(_class, _base_class)   \
+   NS_IMETHODIMP                                                                \
+-  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(nsISupports *s)                \
+-  {                                                                            \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(void *p)                       \
++  {                                                                            \
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);                          \
+     NS_ASSERTION(CheckForRightISupports(s),                                    \
+                  "not the nsISupports pointer we expect");                     \
+     _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                        \
+     NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Unlink(s);
+ 
++#define NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_NATIVE(_class)                   \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(void *p)                       \
++  {                                                                            \
++    _class *tmp = NS_STATIC_CAST(_class*, p);
++
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(_field)                       \
+     tmp->_field = NULL;    
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMARRAY(_field)                     \
+     tmp->_field.Clear();
+ 
++#define NS_IMPL_CYCLE_COLLECTION_UNLINK_NSTARRAY(_field)                       \
++    tmp->_field.Clear();
++
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_END                                    \
+     return NS_OK;                                                              \
+   }
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_UNLINK_0(_class)                              \
+   NS_IMETHODIMP                                                                \
+-  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(nsISupports *s)                \
+-  {                                                                            \
+-    NS_ASSERTION(CheckForRightISupports(s),                                    \
+-                 "not the nsISupports pointer we expect");                     \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(void *p)                       \
++  {                                                                            \
++    NS_ASSERTION(CheckForRightISupports(NS_STATIC_CAST(nsISupports*, p)),      \
++                 "not the nsISupports pointer we expect");                     \
++    return NS_OK;                                                              \
++  }
++
++#define NS_IMPL_CYCLE_COLLECTION_UNLINK_NATIVE_0(_class)                       \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unlink(void *p)                       \
++  {                                                                            \
+     return NS_OK;                                                              \
+   }
+ 
+@@ -215,9 +250,10 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(_class)                        \
+   NS_IMETHODIMP                                                                \
+   NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                              \
+-                         (nsISupports *s,                                      \
++                         (void *p,                                             \
+                           nsCycleCollectionTraversalCallback &cb)              \
+   {                                                                            \
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);                          \
+     NS_ASSERTION(CheckForRightISupports(s),                                    \
+                  "not the nsISupports pointer we expect");                     \
+     _class *tmp = Downcast(s);                                                 \
+@@ -226,13 +262,23 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(_class, _base_class) \
+   NS_IMETHODIMP                                                                \
+   NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                              \
+-                         (nsISupports *s,                                      \
++                         (void *p,                                             \
+                           nsCycleCollectionTraversalCallback &cb)              \
+   {                                                                            \
++    nsISupports *s = NS_STATIC_CAST(nsISupports*, p);                          \
+     NS_ASSERTION(CheckForRightISupports(s),                                    \
+                  "not the nsISupports pointer we expect");                     \
+     _class *tmp = NS_STATIC_CAST(_class*, Downcast(s));                        \
+     NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Traverse(s, cb);
++
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_BEGIN(_class)                 \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Traverse                              \
++                         (void *p,                                             \
++                          nsCycleCollectionTraversalCallback &cb)              \
++  {                                                                            \
++    _class *tmp = NS_STATIC_CAST(_class*, p);                                  \
++    NS_IMPL_CYCLE_COLLECTION_DESCRIBE(_class)
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(_field)                       \
+     cb.NoteXPCOMChild(tmp->_field);
+@@ -250,6 +296,20 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+         cb.NoteXPCOMChild(tmp->_field[i]);                                     \
+     }
+ 
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(_ptr, _ptr_class)         \
++  cb.NoteNativeChild(_ptr, &NS_CYCLE_COLLECTION_NATIVE_NAME(_ptr_class));
++
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_MEMBER(_field, _field_class)  \
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(tmp->_field, _field_class)
++
++#define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSTARRAY(_field, _element_class)     \
++    {                                                                          \
++      PRUint32 i, length = tmp->_field.Length();                               \
++      for (i = 0; i < length; ++i)                                             \
++        NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(tmp->_field[i],           \
++                                                     _element_class);          \
++    }
++
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END                                  \
+     return NS_OK;                                                              \
+   }
+@@ -260,15 +320,15 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsCycleCol
+ 
+ #define NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(_class, _base)                \
+ class NS_CYCLE_COLLECTION_INNERCLASS                                           \
+- : public nsCycleCollectionParticipant                                         \
++ : public nsXPCOMCycleCollectionParticipant                                    \
+ {                                                                              \
+ public:                                                                        \
+-  NS_IMETHOD Unlink(nsISupports *n);                                           \
+-  NS_IMETHOD Traverse(nsISupports *n,                                          \
++  NS_IMETHOD Unlink(void *p);                                                  \
++  NS_IMETHOD Traverse(void *p,                                                 \
+                       nsCycleCollectionTraversalCallback &cb);                 \
+-  NS_IMETHOD_(void) UnmarkPurple(nsISupports *n)                               \
+-  {                                                                            \
+-    Downcast(n)->UnmarkPurple();                                               \
++  NS_IMETHOD_(void) UnmarkPurple(nsISupports *s)                               \
++  {                                                                            \
++    Downcast(s)->UnmarkPurple();                                               \
+   }                                                                            \
+   static _class* Downcast(nsISupports* s)                                      \
+   {                                                                            \
+@@ -288,8 +348,8 @@ class NS_CYCLE_COLLECTION_INNERCLASS    
+  : public NS_CYCLE_COLLECTION_CLASSNAME(_base_class)                           \
+ {                                                                              \
+ public:                                                                        \
+-  NS_IMETHOD Unlink(nsISupports *n);                                           \
+-  NS_IMETHOD Traverse(nsISupports *n,                                          \
++  NS_IMETHOD Unlink(void *p);                                                  \
++  NS_IMETHOD Traverse(void *p,                                                 \
+                       nsCycleCollectionTraversalCallback &cb);                 \
+   static _class* Downcast(nsISupports* s)                                      \
+   {                                                                            \
+@@ -304,7 +364,7 @@ class NS_CYCLE_COLLECTION_INNERCLASS    
+  : public NS_CYCLE_COLLECTION_CLASSNAME(_base_class)                           \
+ {                                                                              \
+ public:                                                                        \
+-  NS_IMETHOD Traverse(nsISupports *n,                                          \
++  NS_IMETHOD Traverse(void *p,                                                 \
+                       nsCycleCollectionTraversalCallback &cb);                 \
+   static _class* Downcast(nsISupports* s)                                      \
+   {                                                                            \
+@@ -320,13 +380,54 @@ public:                                 
+  * then you don't need this.
+  */
+ #define NS_DECL_CYCLE_COLLECTION_UNMARK_PURPLE_STUB(_class)                    \
+-  void UnmarkPurple()                                                          \
++  NS_IMETHODIMP_(void) UnmarkPurple()                                          \
+   {                                                                            \
+   }                                                                            \
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_CLASS(_class)                                 \
+   static NS_CYCLE_COLLECTION_CLASSNAME(_class)                                 \
+     NS_CYCLE_COLLECTION_NAME(_class);
++
++#define NS_CYCLE_COLLECTION_NATIVE_INNERNAME                                   \
++        _cycleCollectorGlobal
++
++#define NS_CYCLE_COLLECTION_NATIVE_NAME(_class)                                \
++        _class::NS_CYCLE_COLLECTION_NATIVE_INNERNAME
++
++#define NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(_class)                          \
++  class NS_CYCLE_COLLECTION_INNERCLASS                                         \
++   : public nsCycleCollectionParticipant                                       \
++  {                                                                            \
++  public:                                                                      \
++    NS_IMETHOD Root(void *n);                                                  \
++    NS_IMETHOD Unlink(void *n);                                                \
++    NS_IMETHOD Unroot(void *n);                                                \
++    NS_IMETHOD Traverse(void *n,                                               \
++                      nsCycleCollectionTraversalCallback &cb);                 \
++  };                                                                           \
++  static NS_CYCLE_COLLECTION_INNERCLASS                                        \
++      NS_CYCLE_COLLECTION_NATIVE_INNERNAME;
++
++#define NS_IMPL_CYCLE_COLLECTION_NATIVE_CLASS(_class)                          \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class) NS_CYCLE_COLLECTION_NATIVE_NAME(_class);
++
++#define NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(_class, _root_function)           \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Root(void *p)                         \
++  {                                                                            \
++    _class *tmp = NS_STATIC_CAST(_class*, p);                                  \
++    tmp->_root_function();                                                     \
++    return NS_OK;                                                              \
++  }
++
++#define NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(_class, _unroot_function)       \
++  NS_IMETHODIMP                                                                \
++  NS_CYCLE_COLLECTION_CLASSNAME(_class)::Unroot(void *p)                       \
++  {                                                                            \
++    _class *tmp = NS_STATIC_CAST(_class*, p);                                  \
++    tmp->_unroot_function();                                                   \
++    return NS_OK;                                                              \
++  }
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_0(_class)                                     \
+  NS_IMPL_CYCLE_COLLECTION_CLASS(_class)                                        \
+diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
+--- a/xpcom/base/nsCycleCollector.cpp
++++ b/xpcom/base/nsCycleCollector.cpp
+@@ -80,10 +80,10 @@
+ //
+ // An object is scan-safe if:
+ //
+-//  - It can be QI'ed to |nsCycleCollectionParticipant|, though this
++//  - It can be QI'ed to |nsXPCOMCycleCollectionParticipant|, though this
+ //    operation loses ISupports identity (like nsIClassInfo).
+ //  - The operation |traverse| on the resulting
+-//    nsCycleCollectionParticipant does not cause *any* refcount
++//    nsXPCOMCycleCollectionParticipant does not cause *any* refcount
+ //    adjustment to occur (no AddRef / Release calls).
+ //
+ // An object is purple-safe if it satisfies the following properties:
+@@ -280,8 +280,22 @@ struct nsCycleCollectorStats
+ };
+ #endif
+ 
+-static void
+-ToParticipant(nsISupports *s, nsCycleCollectionParticipant **cp);
++static inline void
++ToParticipant(nsISupports *s, nsXPCOMCycleCollectionParticipant **cp)
++{
++    // We use QI to move from an nsISupports to an
++    // nsXPCOMCycleCollectionParticipant, which is a per-class singleton helper
++    // object that implements traversal and unlinking logic for the nsISupports
++    // in question.
++    CallQueryInterface(s, cp);
++#ifdef DEBUG_CC
++    if (cp)
++        ++sCollector->mStats.mSuccessfulQI;
++    else
++        ++sCollector->mStats.mFailedQI;
++#endif
++}
++
+ 
+ #ifdef DEBUG_CC
+ static PRBool
+@@ -430,11 +444,11 @@ struct PtrInfo
+ struct PtrInfo
+ {
+     void *mPointer;
++    nsCycleCollectionParticipant *mParticipant;
+     PRUint32 mColor : 2;
+     PRUint32 mInternalRefs : 30;
+-    // FIXME: mLang expands back to a full word when bug 368774 lands.
+-    PRUint32 mLang : 2;
+-    PRUint32 mRefCount : 30;
++    PRUint32 mRefCount : 31;
++    PRUint32 mWasPurple : 1;
+     EdgePool::Iterator mFirstChild; // first
+     EdgePool::Iterator mLastChild; // one after last
+ 
+@@ -443,12 +457,13 @@ struct PtrInfo
+     const char *mName;
+ #endif
+ 
+-    PtrInfo(void *aPointer)
++    PtrInfo(void *aPointer, nsCycleCollectionParticipant *aParticipant)
+         : mPointer(aPointer),
++          mParticipant(aParticipant),
+           mColor(grey),
+           mInternalRefs(0),
+-          mLang(nsIProgrammingLanguage::CPLUSPLUS),
+           mRefCount(0),
++          mWasPurple(PR_FALSE),
+           mFirstChild(),
+           mLastChild()
+ #ifdef DEBUG_CC
+@@ -507,7 +522,7 @@ public:
+             NS_ASSERTION(aPool.mBlocks == nsnull && aPool.mLast == nsnull,
+                          "pool not empty");
+         }
+-        PtrInfo *Add(void *aPointer)
++        PtrInfo *Add(void *aPointer, nsCycleCollectionParticipant *aParticipant)
+         {
+             if (mNext == mBlockEnd) {
+                 Block *block;
+@@ -517,7 +532,7 @@ public:
+                 mBlockEnd = block->mEntries + BlockSize;
+                 mNextBlock = &block->mNext;
+             }
+-            return new (mNext++) PtrInfo(aPointer);
++            return new (mNext++) PtrInfo(aPointer, aParticipant);
+         }
+     private:
+         Block **mNextBlock;
+@@ -776,74 +791,16 @@ struct nsCycleCollectionXPCOMRuntime :
+         return NS_OK;
+     }
+ 
+-    nsresult Traverse(void *p, nsCycleCollectionTraversalCallback &cb) 
+-    {
+-        nsresult rv;
+-
+-        nsISupports *s = NS_STATIC_CAST(nsISupports *, p);        
+-        nsCycleCollectionParticipant *cp;
+-        ToParticipant(s, &cp);
+-        if (!cp) {
+-            Fault("walking wrong type of pointer", s);
+-            return NS_ERROR_FAILURE;
+-        }
+-
+-        rv = cp->Traverse(s, cb);
+-        if (NS_FAILED(rv)) {
+-            Fault("XPCOM pointer traversal failed", s);
+-            return NS_ERROR_FAILURE;
+-        }
++    nsresult FinishCycleCollection() 
++    {
+         return NS_OK;
+     }
+ 
+-    nsresult Root(const nsDeque &nodes)
+-    {
+-        for (PRInt32 i = 0; i < nodes.GetSize(); ++i) {
+-            void *p = nodes.ObjectAt(i);
+-            nsISupports *s = NS_STATIC_CAST(nsISupports *, p);
+-            NS_ADDREF(s);
+-        }
+-        return NS_OK;
+-    }
+-
+-    nsresult Unlink(const nsDeque &nodes)
+-    {
+-        nsresult rv;
+-
+-        for (PRInt32 i = 0; i < nodes.GetSize(); ++i) {
+-            void *p = nodes.ObjectAt(i);
+-
+-            nsISupports *s = NS_STATIC_CAST(nsISupports *, p);
+-            nsCycleCollectionParticipant *cp;
+-            ToParticipant(s, &cp);
+-            if (!cp) {
+-                Fault("unlinking wrong kind of pointer", s);
+-                return NS_ERROR_FAILURE;
+-            }
+-
+-            rv = cp->Unlink(s);
+-
+-            if (NS_FAILED(rv)) {
+-                Fault("failed unlink", s);
+-                return NS_ERROR_FAILURE;
+-            }
+-        }
+-        return NS_OK;
+-    }
+-
+-    nsresult Unroot(const nsDeque &nodes)
+-    {
+-        for (PRInt32 i = 0; i < nodes.GetSize(); ++i) {
+-            void *p = nodes.ObjectAt(i);
+-            nsISupports *s = NS_STATIC_CAST(nsISupports *, p);
+-            NS_RELEASE(s);
+-        }
+-        return NS_OK;
+-    }
+-
+-    nsresult FinishCycleCollection() 
+-    {
+-        return NS_OK;
++    nsCycleCollectionParticipant *ToParticipant(void *p)
++    {
++        nsXPCOMCycleCollectionParticipant *cp;
++        ::ToParticipant(NS_STATIC_CAST(nsISupports*, p), &cp);
++        return cp;
+     }
+ };
+ 
+@@ -855,14 +812,11 @@ struct nsCycleCollector
+     nsCycleCollectionLanguageRuntime *mRuntimes[nsIProgrammingLanguage::MAX+1];
+     nsCycleCollectionXPCOMRuntime mXPCOMRuntime;
+ 
+-    // The set of buffers |mBufs| serves a variety of purposes; mostly
+-    // involving the transfer of pointers from a hashtable iterator
+-    // routine to some outer logic that might also need to mutate the
+-    // hashtable. In some contexts, only buffer 0 is used (as a
+-    // set-of-all-pointers); in other contexts, one buffer is used
+-    // per-language (as a set-of-pointers-in-language-N).
+-
+-    nsDeque mBufs[nsIProgrammingLanguage::MAX + 1];
++    // The buffer |mBuf| serves a variety of purposes; mostly involving the
++    // transfer of pointers from a hashtable iterator routine to some outer
++    // logic that might also need to mutate the hashtable.
++
++    nsDeque mBuf;
+     
+     nsCycleCollectorParams mParams;
+ 
+@@ -1063,7 +1017,7 @@ public:
+ 
+     PRUint32 Count() const { return mPtrToNodeMap.entryCount; }
+ 
+-    PtrInfo* AddNode(void *s);
++    PtrInfo* AddNode(void *s, nsCycleCollectionParticipant *aParticipant);
+     void Traverse(PtrInfo* aPtrInfo);
+ 
+ private:
+@@ -1074,6 +1028,8 @@ private:
+     void DescribeNode(size_t refCount);
+ #endif
+     void NoteXPCOMChild(nsISupports *child);
++    void NoteNativeChild(void *child,
++                         nsCycleCollectionParticipant *participant);
+     void NoteScriptChild(PRUint32 langID, void *child);
+ };
+ 
+@@ -1095,14 +1051,14 @@ GCGraphBuilder::~GCGraphBuilder()
+ }
+ 
+ PtrInfo*
+-GCGraphBuilder::AddNode(void *s)
++GCGraphBuilder::AddNode(void *s, nsCycleCollectionParticipant *aParticipant)
+ {
+     PtrToNodeEntry *e = NS_STATIC_CAST(PtrToNodeEntry*, 
+         PL_DHashTableOperate(&mPtrToNodeMap, s, PL_DHASH_ADD));
+     PtrInfo *result;
+     if (!e->mNode) {
+         // New entry.
+-        result = mNodeBuilder.Add(s);
++        result = mNodeBuilder.Add(s, aParticipant);
+         if (!result) {
+             PL_DHashTableRawRemove(&mPtrToNodeMap, e);
+             return nsnull;
+@@ -1110,6 +1066,8 @@ GCGraphBuilder::AddNode(void *s)
+         e->mNode = result;
+     } else {
+         result = e->mNode;
++        NS_ASSERTION(result->mParticipant == aParticipant,
++                     "nsCycleCollectionParticipant shouldn't change!");
+     }
+     return result;
+ }
+@@ -1120,21 +1078,15 @@ GCGraphBuilder::Traverse(PtrInfo* aPtrIn
+     mCurrPi = aPtrInfo;
+ 
+ #ifdef DEBUG_CC
+-    if (mCurrPi->mLang > nsIProgrammingLanguage::MAX ) {
+-        Fault("unknown language during walk");
+-        return;
+-    }
+-
+-    if (!mRuntimes[mCurrPi->mLang]) {
+-        Fault("script pointer for unregistered language");
++    if (!mCurrPi->mParticipant) {
++        Fault("unknown pointer during walk");
+         return;
+     }
+ #endif
+ 
+     mCurrPi->mFirstChild = mEdgeBuilder.Mark();
+     
+-    nsresult rv =
+-        mRuntimes[aPtrInfo->mLang]->Traverse(aPtrInfo->mPointer, *this);
++    nsresult rv = aPtrInfo->mParticipant->Traverse(aPtrInfo->mPointer, *this);
+     if (NS_FAILED(rv)) {
+         Fault("script pointer traversal failed", aPtrInfo->mPointer);
+     }
+@@ -1160,7 +1112,7 @@ GCGraphBuilder::DescribeNode(size_t refC
+     mCurrPi->mRefCount = refCount;
+ #ifdef DEBUG_CC
+     sCollector->mStats.mVisitedNode++;
+-    if (mCurrPi->mLang == nsIProgrammingLanguage::JAVASCRIPT)
++    if (mCurrPi->mParticipant == mRuntimes[nsIProgrammingLanguage::JAVASCRIPT])
+         sCollector->mStats.mVisitedJSNode++;
+ #endif
+ }
+@@ -1168,17 +1120,18 @@ void
+ void 
+ GCGraphBuilder::NoteXPCOMChild(nsISupports *child) 
+ {
+-    if (!child)
++    if (!child || !(child = canonicalize(child)))
+         return; 
+-   
+-    child = canonicalize(child);
+-
+-    PRBool scanSafe = nsCycleCollector_isScanSafe(child);
+-#ifdef DEBUG_CC
+-    scanSafe &= !nsCycleCollector_shouldSuppress(child);
+-#endif
+-    if (scanSafe) {
+-        PtrInfo *childPi = AddNode(child);
++
++#ifdef DEBUG_CC
++    if (nsCycleCollector_shouldSuppress(child))
++        return;
++#endif
++    
++    nsXPCOMCycleCollectionParticipant *cp;
++    ToParticipant(child, &cp);
++    if (cp) {
++        PtrInfo *childPi = AddNode(child, cp);
+         if (!childPi)
+             return;
+         mEdgeBuilder.Add(childPi);
+@@ -1187,43 +1140,68 @@ GCGraphBuilder::NoteXPCOMChild(nsISuppor
+ }
+ 
+ void
+-GCGraphBuilder::NoteScriptChild(PRUint32 langID, void *child) 
++GCGraphBuilder::NoteNativeChild(void *child,
++                                nsCycleCollectionParticipant *participant)
+ {
+     if (!child)
+         return;
+ 
+-    if (langID > nsIProgrammingLanguage::MAX || !mRuntimes[langID]) {
+-        Fault("traversing pointer for unregistered language", child);
+-        return;
+-    }
+-
+-    PtrInfo *childPi = AddNode(child);
++    NS_ASSERTION(participant, "Need a nsCycleCollectionParticipant!");
++
++    PtrInfo *childPi = AddNode(child, participant);
+     if (!childPi)
+         return;
+     mEdgeBuilder.Add(childPi);
+     ++childPi->mInternalRefs;
+-    childPi->mLang = langID;
++}
++
++void
++GCGraphBuilder::NoteScriptChild(PRUint32 langID, void *child) 
++{
++    if (!child)
++        return;
++
++    if (langID > nsIProgrammingLanguage::MAX || !mRuntimes[langID]) {
++        Fault("traversing pointer for unregistered language", child);
++        return;
++    }
++
++    nsCycleCollectionParticipant *cp = mRuntimes[langID]->ToParticipant(child);
++    if (!cp)
++        return;
++
++    PtrInfo *childPi = AddNode(child, cp);
++    if (!childPi)
++        return;
++    mEdgeBuilder.Add(childPi);
++    ++childPi->mInternalRefs;
+ }
+ 
+ 
+ void 
+ nsCycleCollector::CollectPurple()
+ {
+-    mPurpleBuf.SelectAgedPointers(&mBufs[0]);
++    mPurpleBuf.SelectAgedPointers(&mBuf);
+ }
+ 
+ void
+ nsCycleCollector::MarkRoots(GCGraph &graph)
+ {
+-    if (mBufs[0].GetSize() == 0)
++    if (mBuf.GetSize() == 0)
+         return;
+ 
+     GCGraphBuilder builder(graph, mRuntimes);
+ 
+     int i;
+-    for (i = 0; i < mBufs[0].GetSize(); ++i) {
+-        nsISupports *s = NS_STATIC_CAST(nsISupports *, mBufs[0].ObjectAt(i));
+-        PtrInfo *pi = builder.AddNode(canonicalize(s));
++    for (i = 0; i < mBuf.GetSize(); ++i) {
++        nsISupports *s = NS_STATIC_CAST(nsISupports *, mBuf.ObjectAt(i));
++        nsXPCOMCycleCollectionParticipant *cp;
++        ToParticipant(s, &cp);
++        if (cp) {
++            PtrInfo *pinfo = builder.AddNode(canonicalize(s), cp);
++            if (pinfo)
++                pinfo->mWasPurple = PR_TRUE;
++        }
+     }
+ 
+     graph.mRootCount = builder.Count();
+@@ -1331,11 +1309,9 @@ nsCycleCollector::CollectWhite(GCGraph &
+     //   - Unlink(whites), which drops outgoing links on each white.
+     //   - Unroot(whites), which returns the whites to normal GC.
+ 
+-    PRUint32 i;
+     nsresult rv;
+ 
+-    for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i)
+-        mBufs[i].Empty();
++    mBuf.Empty();
+ 
+ #if defined(DEBUG_CC) && !defined(__MINGW32__) && defined(WIN32)
+     struct _CrtMemState ms1, ms2;
+@@ -1348,67 +1324,62 @@ nsCycleCollector::CollectWhite(GCGraph &
+         PtrInfo *pinfo = etor.GetNext();
+         void *p = pinfo->mPointer;
+ 
+-        NS_ASSERTION(pinfo->mLang == nsIProgrammingLanguage::CPLUSPLUS ||
+-                     !mPurpleBuf.Exists(p),
+-                     "Need to remove non-CPLUSPLUS objects from purple buffer!");
+         if (pinfo->mColor == white) {
+-            if (pinfo->mLang > nsIProgrammingLanguage::MAX)
+-                Fault("White node has bad language ID", p);
+-            else
+-                mBufs[pinfo->mLang].Push(p);
+-
+-            if (pinfo->mLang == nsIProgrammingLanguage::CPLUSPLUS) {
++            mBuf.Push(pinfo);
++
++            if (pinfo->mWasPurple) {
+                 nsISupports* s = NS_STATIC_CAST(nsISupports*, p);
+                 Forget(s);
+             }
+         }
+-        else if (pinfo->mLang == nsIProgrammingLanguage::CPLUSPLUS) {
++        else if (pinfo->mWasPurple) {
+             nsISupports* s = NS_STATIC_CAST(nsISupports*, p);
+-            nsCycleCollectionParticipant* cp;
+-            CallQueryInterface(s, &cp);
+-            if (cp)
+-                cp->UnmarkPurple(s);
++            nsXPCOMCycleCollectionParticipant* cp =
++                NS_STATIC_CAST(nsXPCOMCycleCollectionParticipant*,
++                               pinfo->mParticipant);
++#ifdef DEBUG
++            nsXPCOMCycleCollectionParticipant* checkcp;
++            CallQueryInterface(s, &checkcp);
++            NS_ASSERTION(checkcp == cp,
++                         "QI should return the same participant!");
++#endif
++            cp->UnmarkPurple(s);
+             Forget(s);
+         }
+     }
+ 
+-    for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
+-        if (mRuntimes[i] &&
+-            mBufs[i].GetSize() > 0) {
+-            rv = mRuntimes[i]->Root(mBufs[i]);
+-            if (NS_FAILED(rv))
+-                Fault("Failed root call while unlinking");
+-        }
+-    }
+-
+-    for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
+-        if (mRuntimes[i] &&
+-            mBufs[i].GetSize() > 0) {
+-            rv = mRuntimes[i]->Unlink(mBufs[i]);
+-            if (NS_FAILED(rv)) {
+-                Fault("Failed unlink call while unlinking");
+-#ifdef DEBUG_CC
+-                mStats.mFailedUnlink++;
+-#endif
+-            } else {
+-#ifdef DEBUG_CC
+-                mStats.mCollectedNode += mBufs[i].GetSize();
+-#endif
+-            }
+-        }
+-    }
+-
+-    for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
+-        if (mRuntimes[i] &&
+-            mBufs[i].GetSize() > 0) {
+-            rv = mRuntimes[i]->Unroot(mBufs[i]);
+-            if (NS_FAILED(rv))
+-                Fault("Failed unroot call while unlinking");
+-        }
+-    }
+-
+-    for (i = 0; i < nsIProgrammingLanguage::MAX+1; ++i)
+-        mBufs[i].Empty();
++    PRUint32 i, count = mBuf.GetSize();
++    for (i = 0; i < count; ++i) {
++        PtrInfo *pinfo = NS_STATIC_CAST(PtrInfo*, mBuf.ObjectAt(i));
++        rv = pinfo->mParticipant->Root(pinfo->mPointer);
++        if (NS_FAILED(rv))
++            Fault("Failed root call while unlinking");
++    }
++
++    for (i = 0; i < count; ++i) {
++        PtrInfo *pinfo = NS_STATIC_CAST(PtrInfo*, mBuf.ObjectAt(i));
++        rv = pinfo->mParticipant->Unlink(pinfo->mPointer);
++        if (NS_FAILED(rv)) {
++            Fault("Failed unlink call while unlinking");
++#ifdef DEBUG_CC
++            mStats.mFailedUnlink++;
++#endif
++        }
++        else {
++#ifdef DEBUG_CC
++            ++mStats.mCollectedNode;
++#endif
++        }
++    }
++
++    for (i = 0; i < count; ++i) {
++        PtrInfo *pinfo = NS_STATIC_CAST(PtrInfo*, mBuf.ObjectAt(i));
++        rv = pinfo->mParticipant->Unroot(pinfo->mPointer);
++        if (NS_FAILED(rv))
++            Fault("Failed unroot call while unlinking");
++    }
++
++    mBuf.Empty();
+ 
+ #if defined(DEBUG_CC) && !defined(__MINGW32__) && defined(WIN32)
+     _CrtMemCheckpoint(&ms2);
+@@ -1637,9 +1608,6 @@ nsCycleCollector::nsCycleCollector() :
+ 
+ nsCycleCollector::~nsCycleCollector()
+ {
+-    for (PRUint32 i = 0; i < nsIProgrammingLanguage::MAX+1; ++i) {
+-        mRuntimes[i] = NULL;
+-    }
+ }
+ 
+ 
+@@ -1771,7 +1739,8 @@ public:
+             mSuppressThisNode = PR_FALSE;
+         } else {
+             nsresult rv;
+-            nsCOMPtr<nsCycleCollectionParticipant> cp = do_QueryInterface(s, &rv);
++            nsXPCOMCycleCollectionParticipant *cp;
++            rv = CallQueryInterface(s, &cp);
+             if (NS_FAILED(rv)) {
+                 Fault("checking suppression on wrong type of pointer", s);
+                 return PR_TRUE;
+@@ -1788,6 +1757,8 @@ public:
+ 
+     void NoteXPCOMChild(nsISupports *child) {}
+     void NoteScriptChild(PRUint32 langID, void *child) {}
++    void NoteNativeChild(void *child,
++                         nsCycleCollectionParticipant *participant) {}
+ };
+ 
+ char *Suppressor::sSuppressionList = nsnull;
+@@ -1798,6 +1769,20 @@ nsCycleCollector_shouldSuppress(nsISuppo
+ {
+     Suppressor supp;
+     return supp.shouldSuppress(s);
++}
++#endif
++
++#ifdef DEBUG
++static PRBool
++nsCycleCollector_isScanSafe(nsISupports *s)
++{
++    if (!s)
++        return PR_FALSE;
++
++    nsXPCOMCycleCollectionParticipant *cp;
++    ToParticipant(s, &cp);
++
++    return cp != nsnull;
+ }
+ #endif
+ 
+@@ -1837,7 +1822,7 @@ nsCycleCollector::Suspect(nsISupports *n
+ #endif
+ 
+     if (current)
+-        mBufs[0].Push(n);
++        mBuf.Push(n);
+     else
+         mPurpleBuf.Put(n);
+ }
+@@ -1932,10 +1917,10 @@ nsCycleCollector::Collect(PRUint32 aTryC
+         // GC calls -- so it's essential that we actually execute this
+         // step!
+         //
+-        // It is also essential to empty mBufs[0] here because starting up
++        // It is also essential to empty mBuf here because starting up
+         // collection in language runtimes may force some "current" suspects
+-        // into mBufs[0].
+-        mBufs[0].Empty();
++        // into mBuf.
++        mBuf.Empty();
+ 
+ #ifdef COLLECT_TIME_DEBUG
+         now = PR_Now();
+@@ -1964,7 +1949,7 @@ nsCycleCollector::Collect(PRUint32 aTryC
+                    (PR_Now() - now) / PR_USEC_PER_MSEC);
+ #endif
+ 
+-            if (mBufs[0].GetSize() == 0) {
++            if (mBuf.GetSize() == 0) {
+                 aTryCollections = 0;
+             } else {
+                 if (mCollectionInProgress)
+@@ -2057,7 +2042,7 @@ nsCycleCollector::Shutdown()
+ 
+ #ifdef DEBUG_CC
+     CollectPurple();
+-    if (mBufs[0].GetSize() != 0) {
++    if (mBuf.GetSize() != 0) {
+         printf("Might have been able to release more cycles if the cycle collector would "
+                "run once more at shutdown.\n");
+     }
+@@ -2073,7 +2058,7 @@ AddExpectedGarbage(nsVoidPtrHashKey *p, 
+ AddExpectedGarbage(nsVoidPtrHashKey *p, void *arg)
+ {
+     nsCycleCollector *c = NS_STATIC_CAST(nsCycleCollector*, arg);
+-    c->mBufs[0].Push(NS_CONST_CAST(void*, p->GetKey()));
++    c->mBuf.Push(NS_CONST_CAST(void*, p->GetKey()));
+     return PL_DHASH_NEXT;
+ }
+ 
+@@ -2099,9 +2084,9 @@ nsCycleCollector::ExplainLiveExpectedGar
+ 
+     {
+         GCGraph graph;
+-        mBufs[0].Empty();
+-
+-        // Instead of filling mBufs[0] from the purple buffer, we fill it
++        mBuf.Empty();
++
++        // Instead of filling mBuf from the purple buffer, we fill it
+         // from the list of nodes we were expected to collect.
+         mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, this);
+ 
+@@ -2249,31 +2234,3 @@ nsCycleCollector_DEBUG_wasFreed(nsISuppo
+ #endif
+ }
+ #endif
+-
+-PRBool
+-nsCycleCollector_isScanSafe(nsISupports *s)
+-{
+-    if (!s)
+-        return PR_FALSE;
+-
+-    nsCycleCollectionParticipant *cp;
+-    ToParticipant(s, &cp);
+-
+-    return cp != nsnull;
+-}
+-
+-static void
+-ToParticipant(nsISupports *s, nsCycleCollectionParticipant **cp)
+-{
+-    // We use QI to move from an nsISupports to an
+-    // nsCycleCollectionParticipant, which is a per-class singleton helper
+-    // object that implements traversal and unlinking logic for the nsISupports
+-    // in question.
+-    CallQueryInterface(s, cp);
+-#ifdef DEBUG_CC
+-    if (cp)
+-        ++sCollector->mStats.mSuccessfulQI;
+-    else
+-        ++sCollector->mStats.mFailedQI;
+-#endif
+-}
+diff --git a/xpcom/base/nsCycleCollector.h b/xpcom/base/nsCycleCollector.h
+--- a/xpcom/base/nsCycleCollector.h
++++ b/xpcom/base/nsCycleCollector.h
+@@ -39,8 +39,7 @@
+ #define nsCycleCollector_h__
+ 
+ class nsISupports;
+-class nsDeque;
+-struct nsCycleCollectionTraversalCallback;
++class nsCycleCollectionParticipant;
+ 
+ // An nsCycleCollectionLanguageRuntime is a per-language object that
+ // implements language-specific aspects of the cycle collection task.
+@@ -48,18 +47,10 @@ struct nsCycleCollectionLanguageRuntime
+ struct nsCycleCollectionLanguageRuntime
+ {
+     virtual nsresult BeginCycleCollection() = 0;
+-
+-    virtual nsresult Traverse(void *p, nsCycleCollectionTraversalCallback &cb) = 0;
+-
+-    virtual nsresult Root(const nsDeque &nodes) = 0;
+-    virtual nsresult Unlink(const nsDeque &nodes) = 0;
+-    virtual nsresult Unroot(const nsDeque &nodes) = 0;
+-
+     virtual nsresult FinishCycleCollection() = 0;
++    virtual nsCycleCollectionParticipant *ToParticipant(void *p) = 0;
+ };
+ 
+-
+-NS_COM PRBool nsCycleCollector_isScanSafe(nsISupports *n);
+ NS_COM void nsCycleCollector_suspect(nsISupports *n);
+ NS_COM void nsCycleCollector_suspectCurrent(nsISupports *n);
+ NS_COM void nsCycleCollector_forget(nsISupports *n);
+diff --git a/xpcom/build/dlldeps.cpp b/xpcom/build/dlldeps.cpp
+--- a/xpcom/build/dlldeps.cpp
++++ b/xpcom/build/dlldeps.cpp
+@@ -272,7 +272,7 @@ void XXXNeverCalled()
+       b.ToString(0, y);
+     }
+ 
+-    nsCycleCollectionParticipant();
++    nsXPCOMCycleCollectionParticipant();
+     nsCycleCollector_collect();
+ 
+ #if !defined(WINCE) && !defined(XP_OS2)
+diff --git a/xpcom/ds/nsVariant.h b/xpcom/ds/nsVariant.h
+--- a/xpcom/ds/nsVariant.h
++++ b/xpcom/ds/nsVariant.h
+@@ -42,6 +42,8 @@
+ #include "nsIVariant.h"
+ #include "nsStringFwd.h"
+ #include "xpt_struct.h"
++
++struct nsCycleCollectionTraversalCallback;
+ 
+ /** 
+  * Map the nsAUTF8String, nsUTF8String classes to the nsACString and
