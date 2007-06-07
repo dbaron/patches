@@ -1,0 +1,224 @@
+Make text-indent contribute to intrinsic widths, and handle negative text-indent and negative margin properly by distinguishing forced and optional breaks when accumulating minimum widths.
+
+diff --git a/layout/generic/nsBRFrame.cpp b/layout/generic/nsBRFrame.cpp
+--- a/layout/generic/nsBRFrame.cpp
++++ b/layout/generic/nsBRFrame.cpp
+@@ -193,14 +193,14 @@ BRFrame::AddInlineMinWidth(nsIRenderingC
+ BRFrame::AddInlineMinWidth(nsIRenderingContext *aRenderingContext,
+                            nsIFrame::InlineMinWidthData *aData)
+ {
+-  aData->Break(aRenderingContext);
++  aData->ForcedBreak(aRenderingContext);
+ }
+ 
+ /* virtual */ void
+ BRFrame::AddInlinePrefWidth(nsIRenderingContext *aRenderingContext,
+                             nsIFrame::InlinePrefWidthData *aData)
+ {
+-  aData->Break(aRenderingContext);
++  aData->ForcedBreak(aRenderingContext);
+ }
+ 
+ /* virtual */ nscoord
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -656,10 +656,10 @@ nsBlockFrame::GetMinWidth(nsIRenderingCo
+     AutoNoisyIndenter lineindent(gNoisyIntrinsic);
+ #endif
+     if (line->IsBlock()) {
+-      data.Break(aRenderingContext);
++      data.ForceBreak(aRenderingContext);
+       data.currentLine = nsLayoutUtils::IntrinsicForContainer(aRenderingContext,
+           line->mFirstChild, nsLayoutUtils::MIN_WIDTH);
+-      data.Break(aRenderingContext);
++      data.ForceBreak(aRenderingContext);
+     } else {
+ 
+       nsIFrame *kid = line->mFirstChild;
+@@ -676,7 +676,7 @@ nsBlockFrame::GetMinWidth(nsIRenderingCo
+     }
+ #endif
+   }
+-  data.Break(aRenderingContext);
++  data.ForceBreak(aRenderingContext);
+ 
+   mMinWidth = data.prevLines;
+   return mMinWidth;
+@@ -717,10 +717,10 @@ nsBlockFrame::GetPrefWidth(nsIRenderingC
+     AutoNoisyIndenter lineindent(gNoisyIntrinsic);
+ #endif
+     if (line->IsBlock()) {
+-      data.Break(aRenderingContext);
++      data.ForceBreak(aRenderingContext);
+       data.currentLine = nsLayoutUtils::IntrinsicForContainer(aRenderingContext,
+                       line->mFirstChild, nsLayoutUtils::PREF_WIDTH);
+-      data.Break(aRenderingContext);
++      data.ForceBreak(aRenderingContext);
+     } else {
+ 
+       nsIFrame *kid = line->mFirstChild;
+@@ -737,7 +737,7 @@ nsBlockFrame::GetPrefWidth(nsIRenderingC
+     }
+ #endif
+   }
+-  data.Break(aRenderingContext);
++  data.ForceBreak(aRenderingContext);
+ 
+   mPrefWidth = data.prevLines;
+   return mPrefWidth;
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -2945,14 +2945,14 @@ nsFrame::AddInlineMinWidth(nsIRenderingC
+     GetParent()->GetStyleText()->WhiteSpaceCanWrap();
+   
+   if (canBreak)
+-    aData->Break(aRenderingContext);
++    aData->OptionallyBreak(aRenderingContext);
+   aData->trailingWhitespace = 0;
+   aData->skipWhitespace = PR_FALSE;
+   aData->trailingTextFrame = nsnull;
+   aData->currentLine += nsLayoutUtils::IntrinsicForContainer(aRenderingContext,
+                             this, nsLayoutUtils::MIN_WIDTH);
+   if (canBreak)
+-    aData->Break(aRenderingContext);
++    aData->OptionallyBreak(aRenderingContext);
+ }
+ 
+ /* virtual */ void
+@@ -2966,7 +2966,7 @@ nsFrame::AddInlinePrefWidth(nsIRendering
+ }
+ 
+ void
+-nsIFrame::InlineMinWidthData::Break(nsIRenderingContext *aRenderingContext)
++nsIFrame::InlineMinWidthData::ForceBreak(nsIRenderingContext *aRenderingContext)
+ {
+   currentLine -= trailingWhitespace;
+   prevLines = PR_MAX(prevLines, currentLine);
+@@ -2985,7 +2985,22 @@ nsIFrame::InlineMinWidthData::Break(nsIR
+ }
+ 
+ void
+-nsIFrame::InlinePrefWidthData::Break(nsIRenderingContext *aRenderingContext)
++nsIFrame::InlineMinWidthData::OptionallyBreak(nsIRenderingContext *aRenderingContext)
++{
++  trailingTextFrame = nsnull;
++
++  // If we can fit more content into a smaller width by staying on this
++  // line (because we're still at a negative offset due to negative
++  // text-indent or negative margin), don't break.  Otherwise, do the
++  // same as ForceBreak.  it doesn't really matter when we accumulate
++  // floats.
++  if (currentLine < 0)
++    return;
++  ForceBreak();
++}
++
++void
++nsIFrame::InlinePrefWidthData::ForceBreak(nsIRenderingContext *aRenderingContext)
+ {
+   if (floats.Count() != 0) {
+             // preferred widths accumulated for floats that have already
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -1121,7 +1121,12 @@ public:
+       : trailingTextFrame(nsnull)
+     {}
+ 
+-    void Break(nsIRenderingContext *aRenderingContext);
++    // We need to distinguish forced and optional breaks for cases where the
++    // current line total is negative.  When it is, we need to ignore
++    // optional breaks to prevent min-width from ending up bigger than
++    // pref-width.
++    void ForceBreak(nsIRenderingContext *aRenderingContext);
++    void OptionallyBreak(nsIRenderingContext *aRenderingContext);
+ 
+     // The last text frame processed so far in the current line, when
+     // the last characters in that text frame are relevant for line
+@@ -1130,7 +1135,7 @@ public:
+   };
+ 
+   struct InlinePrefWidthData : public InlineIntrinsicWidthData {
+-    void Break(nsIRenderingContext *aRenderingContext);
++    void ForceBreak(nsIRenderingContext *aRenderingContext);
+   };
+ 
+   /**
+diff --git a/layout/generic/nsTextFrame.cpp b/layout/generic/nsTextFrame.cpp
+--- a/layout/generic/nsTextFrame.cpp
++++ b/layout/generic/nsTextFrame.cpp
+@@ -5728,7 +5728,7 @@ nsTextFrame::AddInlineMinWidth(nsIRender
+                       aData->skipWhitespace, // XXX ???
+                       nsnull)) // XXX Better to pass real frame
+   {
+-    aData->Break(aRenderingContext);
++    aData->OptionallyBreak(aRenderingContext);
+   }
+ 
+   for (;;) {
+@@ -5754,7 +5754,7 @@ nsTextFrame::AddInlineMinWidth(nsIRender
+         firstChar = *bp2;
+       }
+       if ('\n' == firstChar) {
+-        aData->Break(aRenderingContext);
++        aData->ForceBreak(aRenderingContext);
+         aData->skipWhitespace = PR_TRUE;
+         aData->trailingWhitespace = 0;
+       } else if (!aData->skipWhitespace || wsSignificant) {
+@@ -5781,12 +5781,12 @@ nsTextFrame::AddInlineMinWidth(nsIRender
+         }
+ 
+         if (wrapping) {
+-          aData->Break(aRenderingContext);
++          aData->OptionallyBreak(aRenderingContext);
+         }
+       }
+     } else {
+       if (!atStart && wrapping) {
+-        aData->Break(aRenderingContext);
++        aData->OptionallyBreak(aRenderingContext);
+       }
+ 
+       atStart = PR_FALSE;
+@@ -5879,7 +5879,7 @@ nsTextFrame::AddInlinePrefWidth(nsIRende
+         firstChar = *bp2;
+       }
+       if ('\n' == firstChar) {
+-        aData->Break(aRenderingContext);
++        aData->ForceBreak(aRenderingContext);
+       } else if (!aData->skipWhitespace) {
+         nscoord width;
+         if ('\t' == firstChar) {
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4585,7 +4585,7 @@ nsTextFrame::AddInlineMinWidthForFlow(ns
+     return;
+ 
+   if (mTextRun->CanBreakLineBefore(start)) {
+-    aData->Break(aRenderingContext);
++    aData->OptionallyBreak(aRenderingContext);
+   }
+ 
+   PRUint32 i;
+@@ -4613,7 +4613,7 @@ nsTextFrame::AddInlineMinWidthForFlow(ns
+       aData->trailingWhitespace = 0;
+     }
+     if (i < flowEndInTextRun) {
+-      aData->Break(aRenderingContext);
++      aData->OptionallyBreak(aRenderingContext);
+       wordStart = i;
+     }
+   }
+@@ -4698,7 +4698,8 @@ nsTextFrame::AddInlinePrefWidthForFlow(n
+         PRUint32 endRun = iter.GetSkippedOffset();
+         aData->currentLine +=
+           NSToCoordCeil(mTextRun->GetAdvanceWidth(startRun, endRun - startRun, &provider));
+-        aData->Break(aRenderingContext);
++        // XXXldb Where is the equivalent code in GetInlineMinWidth?
++        aData->ForceBreak(aRenderingContext);
+         startRun = endRun;
+       }
+       iter.AdvanceOriginal(1);
