@@ -65,7 +65,108 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      void ShouldBeFreed(nsISupports *n);
      void WasFreed(nsISupports *n);
      PointerSet mExpectedGarbage;
-@@ -2342,6 +2365,53 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -2195,7 +2218,7 @@ nsCycleCollector::ExplainLiveExpectedGar
+ 
+         mScanInProgress = PR_FALSE;
+ 
+-        PRBool giveKnownReferences = PR_FALSE;
++        PRBool describeExtraRefcounts = PR_FALSE;
+         PRBool findCycleRoots = PR_FALSE;
+         {
+             NodePool::Enumerator queue(graph.mNodes);
+@@ -2206,34 +2229,61 @@ nsCycleCollector::ExplainLiveExpectedGar
+                 }
+ 
+                 if (pi->mInternalRefs != pi->mRefCount) {
+-                    // Note that the external references may have been external
+-                    // to a different node in the cycle collection that just
+-                    // happened, if that different node was purple and then
+-                    // black.
+-                    printf("nsCycleCollector: %s %p was not collected due to %d\n"
+-                           "  external references\n",
+-                           pi->mName, pi->mPointer,
+-                           pi->mRefCount - pi->mInternalRefs);
+-                    giveKnownReferences = PR_TRUE;
++                    describeExtraRefcounts = PR_TRUE;
+                 }
+             }
+         }
+ 
+-        if (giveKnownReferences) {
+-            printf("The known references to the objects above not collected\n"
+-                   "due to external references are:\n");
+-            NodePool::Enumerator queue(graph.mNodes);
+-            while (!queue.IsDone()) {
+-                PtrInfo *pi = queue.GetNext();
+-                for (EdgePool::Iterator child = pi->mFirstChild,
+-                                    child_end = pi->mLastChild;
+-                     child != child_end; ++child) {
+-                    if ((*child)->mInternalRefs != (*child)->mRefCount) {
+-                        printf("  to: %p from %s %p\n",
+-                               (*child)->mPointer, pi->mName, pi->mPointer);
++        if (describeExtraRefcounts && CreateReversedEdges()) {
++            // Note that the external references may have been external
++            // to a different node in the cycle collection that just
++            // happened, if that different node was purple and then
++            // black.
++
++            // Use mSCCIndex temporarily to track the DFS numbering:
++            const PRUint32 INDEX_UNREACHED = 0;
++            const PRUint32 INDEX_REACHED = 1;
++            NodePool::Enumerator etor_clear(graph.mNodes);
++            while (!etor_clear.IsDone()) {
++                PtrInfo *pi = etor_clear.GetNext();
++                pi->mSCCIndex = INDEX_UNREACHED;
++            }
++
++            nsDeque queue; // for breadth-first search
++            NodePool::Enumerator etor_roots(graph.mNodes);
++            for (PRUint32 i = 0; i < graph.mRootCount; ++i) {
++                PtrInfo *root_pi = etor_roots.GetNext();
++                root_pi->mSCCIndex = INDEX_REACHED;
++                stack.Push(root_pi);
++            }
++
++            while (queue.GetSize() > 0) {
++                PtrInfo *pi = (PtrInfo*)stack.PopFront();
++                for (ReversedEdge *e = pi->mReversedEdges; e; e = e->mNext) {
++                    if (e->mNode->mSCCIndex == INDEX_UNREACHED) {
++                        e->mNode->mSCCIndex = INDEX_REACHED;
++                        stack.Push(e->mNode);
++                    }
++                }
++
++                if (pi->mInternalRefs != pi->mRefCount) {
++                    printf("nsCycleCollector: %s %p was not collected due "
++                           "to %d\n"
++                           "  external references (%d total - %d known)\n",
++                           pi->mName, pi->mPointer,
++                           pi->mRefCount - pi->mInternalRefs,
++                           pi->mRefCount, pi->mInternalRefs);
++                    printf("  The %d known references to it were from:\n",
++                           pi->mInternalRefs);
++                    for (ReversedEdge *e = pi->mReversedEdges;
++                         e; e = e->mNext) {
++                        printf("  %s %p\n",
++                               e->mNode->mName, e->mNode->mPointer);
+                     }
+                 }
+             }
++
++            DestroyReversedEdges();
+         }
+ 
+         if (findCycleRoots) {
+@@ -2277,6 +2327,8 @@ nsCycleCollector::ExplainLiveExpectedGar
+                         stack.Pop();
+                         // Somebody else might have numbered it already
+                         // (since this is depth-first, not breadth-first).
++                        // XXXldb I don't think we should need this
++                        // check (or the INDEX_NUMBERED state).
+                         if (pi->mSCCIndex == INDEX_REACHED) {
+                             pi->mSCCIndex = INDEX_NUMBERED;
+                             DFSPostOrder.Push(pi);
+@@ -2342,6 +2394,56 @@ nsCycleCollector::ExplainLiveExpectedGar
      }    
  }
  
@@ -84,8 +185,10 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +
 +    // Allocate a pool to hold all of the edges.
 +    graph.mReversedEdges = new ReversedEdge[edgeCount];
-+    if (graph.mReversedEdges == nsnull)
++    if (graph.mReversedEdges == nsnull) {
++        NS_NOTREACHED("allocation failure creating reversed edges");
 +        return PR_FALSE;
++    }
 +
 +    // Fill in the reversed edges by scanning all forward edges.
 +    ReversedEdge *current = graph.mReversedEdges;
@@ -101,6 +204,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +        }
 +    }
 +    NS_ASSERTION(current - graph.mReversedEdges == edgeCount, "misallocation");
++    return PR_TRUE;
 +}
 +
 +void
