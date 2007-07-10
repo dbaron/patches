@@ -1,0 +1,162 @@
+Work on removing case sensitivity from CSS parsing-time.
+
+diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
+--- a/content/base/public/nsINode.h
++++ b/content/base/public/nsINode.h
+@@ -168,7 +168,9 @@ public:
+     eDOCUMENT_FRAGMENT   = 1 << 11,
+     /** data nodes (comments, PIs, text). Nodes of this type always
+      returns a non-null value for nsIContent::GetText() */
+-    eDATA_NODE           = 1 << 12
++    eDATA_NODE           = 1 << 12,
++    /** html elements from non-XML documents (that is, from "tag soup") */
++    eTAG_SOUP_HTML       = 1 << 13
+   };
+ 
+   /**
+diff --git a/content/html/content/src/nsGenericHTMLElement.cpp b/content/html/content/src/nsGenericHTMLElement.cpp
+--- a/content/html/content/src/nsGenericHTMLElement.cpp
++++ b/content/html/content/src/nsGenericHTMLElement.cpp
+@@ -1611,12 +1611,6 @@ nsGenericHTMLElement::GetBaseTarget(nsAS
+   }
+ }
+ 
+-PRBool
+-nsGenericHTMLElement::IsNodeOfType(PRUint32 aFlags) const
+-{
+-  return !(aFlags & ~(eCONTENT | eELEMENT | eHTML));
+-}
+-
+ //----------------------------------------------------------------------
+ 
+ 
+@@ -2714,12 +2708,6 @@ NS_INTERFACE_MAP_END_INHERITING(nsGeneri
+ NS_INTERFACE_MAP_END_INHERITING(nsGenericHTMLElement)
+ 
+ 
+-PRBool
+-nsGenericHTMLFormElement::IsNodeOfType(PRUint32 aFlags) const
+-{
+-  return !(aFlags & ~(eCONTENT | eELEMENT | eHTML | eHTML_FORM_CONTROL));
+-}
+-
+ NS_IMETHODIMP
+ nsGenericHTMLFormElement::SetForm(nsIDOMHTMLFormElement* aForm,
+                                   PRBool aRemoveFromForm,
+diff --git a/content/html/content/src/nsGenericHTMLElement.h b/content/html/content/src/nsGenericHTMLElement.h
+--- a/content/html/content/src/nsGenericHTMLElement.h
++++ b/content/html/content/src/nsGenericHTMLElement.h
+@@ -211,7 +211,13 @@ public:
+                            PRBool aNotify);
+   virtual nsresult UnsetAttr(PRInt32 aNameSpaceID, nsIAtom* aName,
+                              PRBool aNotify);
+-  virtual PRBool IsNodeOfType(PRUint32 aFlags) const;
++  virtual PRBool IsNodeOfType(PRUint32 aFlags) const
++  {
++    if ((aFlags & eTAG_SOUP_HTML) && GetNameSpaceID() == kNameSpaceID_None)
++      aFlags &= ~(eTAG_SOUP_HTML);
++    return !(aFlags & ~(eCONTENT | eELEMENT | eHTML));
++  }
++
+   virtual void RemoveFocus(nsPresContext *aPresContext);
+   virtual PRBool IsFocusable(PRInt32 *aTabIndex = nsnull);
+   virtual void PerformAccesskey(PRBool aKeyCausesActivation,
+@@ -844,7 +850,11 @@ public:
+ 
+   NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr);
+ 
+-  virtual PRBool IsNodeOfType(PRUint32 aFlags) const;
++  virtual PRBool IsNodeOfType(PRUint32 aFlags) const
++  {
++    return nsGenericHTMLElement::IsNodeOfType(aFlags & ~(eHTML_FORM_CONTROL));
++  }
++
+ 
+   // nsIFormControl
+   NS_IMETHOD GetForm(nsIDOMHTMLFormElement** aForm);
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -759,6 +759,7 @@ RuleProcessorData::RuleProcessorData(nsP
+   mContentID = nsnull;
+   mHasAttributes = PR_FALSE;
+   mIsHTMLContent = PR_FALSE;
++  mIsTagSoupHTMLContent = PR_FALSE;
+   mIsLink = PR_FALSE;
+   mLinkState = eLinkState_Unknown;
+   mEventState = 0;
+@@ -794,6 +795,7 @@ RuleProcessorData::RuleProcessorData(nsP
+     // check for HTMLContent and Link status
+     if (aContent->IsNodeOfType(nsINode::eHTML)) {
+       mIsHTMLContent = PR_TRUE;
++      mIsTagSoupHTMLContent = aContent->IsNodeOfType(nsINode::eTAG_SOUP_HTML);
+       // Note that we want to treat non-XML HTML content as XHTML for namespace
+       // purposes, since html.css has that namespace declared.
+       mNameSpaceID = kNameSpaceID_XHTML;
+@@ -958,12 +960,14 @@ static PRBool IsSignificantChild(nsICont
+ // whose namespace and name match those of aAttrSelector.  This function
+ // performs comparisons on the value only, based on aAttrSelector->mFunction.
+ static PRBool AttrMatchesValue(const nsAttrSelector* aAttrSelector,
+-                               const nsString& aValue)
++                               const nsString& aValue,
++                               PRBool aIsTagSoupHTML)
+ {
+   NS_PRECONDITION(aAttrSelector, "Must have an attribute selector");
+   const nsDefaultStringComparator defaultComparator;
+   const nsCaseInsensitiveStringComparator ciComparator;
+-  const nsStringComparator& comparator = aAttrSelector->mCaseSensitive
++  const nsStringComparator& comparator =
++    aAttrSelector->mCaseSensitive || !aIsTagSoupHTML
+                 ? static_cast<const nsStringComparator&>(defaultComparator)
+                 : static_cast<const nsStringComparator&>(ciComparator);
+   switch (aAttrSelector->mFunction) {
+@@ -1274,8 +1278,7 @@ static PRBool SelectorMatches(RuleProces
+       stateToCheck = NS_EVENT_STATE_MOZ_READWRITE;
+     }
+     else if (nsCSSPseudoClasses::mozIsHTML == pseudoClass->mAtom) {
+-      result = data.mIsHTMLContent &&
+-        data.mContent->GetNameSpaceID() == kNameSpaceID_None;
++      result = data.mIsTagSoupHTMLContent;
+     }
+     else {
+       NS_ERROR("CSS parser parsed a pseudo-class that we do not handle");
+@@ -1356,7 +1359,8 @@ static PRBool SelectorMatches(RuleProces
+                 data.mContent->GetAttr(attrName->NamespaceID(),
+                                        attrName->LocalName(), value);
+               NS_ASSERTION(hasAttr, "GetAttrNameAt lied");
+-              result = AttrMatchesValue(attr, value);
++              // Check case.
++              result = AttrMatchesValue(attr, value, data.mIsTagSoupHTML);
+             }
+ 
+             // At this point |result| has been set by us
+@@ -1373,7 +1377,8 @@ static PRBool SelectorMatches(RuleProces
+           result =
+             data.mContent->
+               AttrValueIs(attr->mNameSpace, attr->mAttr, attr->mValue,
+-                          attr->mCaseSensitive ? eCaseMatters : eIgnoreCase);
++                          (attr->mCaseSensitive || !data.mIsTagSoupHTML)
++                            ? eCaseMatters : eIgnoreCase);
+         }
+         else if (!data.mContent->HasAttr(attr->mNameSpace, attr->mAttr)) {
+           result = PR_FALSE;
+@@ -1385,7 +1390,7 @@ static PRBool SelectorMatches(RuleProces
+ #endif
+               data.mContent->GetAttr(attr->mNameSpace, attr->mAttr, value);
+           NS_ASSERTION(hasAttr, "HasAttr lied");
+-          result = AttrMatchesValue(attr, value);
++          result = AttrMatchesValue(attr, value, data.mIsTagSoupHTML);
+         }
+         
+         attr = attr->mNext;
+diff --git a/layout/style/nsIStyleRuleProcessor.h b/layout/style/nsIStyleRuleProcessor.h
+--- a/layout/style/nsIStyleRuleProcessor.h
++++ b/layout/style/nsIStyleRuleProcessor.h
+@@ -91,6 +91,7 @@ struct RuleProcessorData {
+   nsIAtom*          mContentTag;    // if content, then content->GetTag()
+   nsIAtom*          mContentID;     // if styled content, then weak reference to styledcontent->GetID()
+   PRPackedBool      mIsHTMLContent; // if content, then does QI on HTMLContent, true or false
++  PRPackedBool      mIsTagSoupHTMLContent; // if content, IsNodeOfType(eTAG_SOUP_HTML)
+   PRPackedBool      mIsLink;        // if content, calls nsStyleUtil::IsHTMLLink or nsStyleUtil::IsLink
+   PRPackedBool      mHasAttributes; // if content, content->GetAttrCount() > 0
+   nsCompatibility   mCompatMode;    // Possibly remove use of this in SelectorMatches?
