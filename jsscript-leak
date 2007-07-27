@@ -1,0 +1,123 @@
+Attempt at fixing leak of JSScript.  b=389757
+
+diff --git a/js/src/jsfun.c b/js/src/jsfun.c
+--- a/js/src/jsfun.c
++++ b/js/src/jsfun.c
+@@ -1260,23 +1260,12 @@ fun_finalize(JSContext *cx, JSObject *ob
+     if (!fun)
+         return;
+ 
++    /*
++     * This works because obj is finalized before JSFunction. See
++     * comments in js_GC before the finalization loop.
++     */
+     if (fun->object == obj)
+         fun->object = NULL;
+-
+-    /*
+-     * Null-check of i.script is required since the parser sets interpreted
+-     * very early.
+-     *
+-     * Here js_IsAboutToBeFinalized works because obj is finalized before
+-     * JSFunction. See comments in js_GC before the finalization loop.
+-     */
+-    if (FUN_INTERPRETED(fun) && fun->u.i.script &&
+-        js_IsAboutToBeFinalized(cx, fun))
+-    {
+-        script = fun->u.i.script;
+-        fun->u.i.script = NULL;
+-        js_DestroyScript(cx, script);
+-    }
+ }
+ 
+ #if JS_HAS_XDR
+@@ -2197,9 +2186,9 @@ js_NewFunction(JSContext *cx, JSObject *
+ 
+     /*
+      * Allocate fun after allocating funobj so slot allocation in js_NewObject
+-     * does not wipe out fun from newborn[GCX_PRIVATE].
+-     */
+-    fun = (JSFunction *) js_NewGCThing(cx, GCX_PRIVATE, sizeof(JSFunction));
++     * does not wipe out fun from newborn[GCX_FUNCTION].
++     */
++    fun = (JSFunction *) js_NewGCThing(cx, GCX_FUNCTION, sizeof(JSFunction));
+     if (!fun)
+         goto out;
+ 
+@@ -2222,6 +2211,21 @@ out:
+ out:
+     JS_POP_TEMP_ROOT(cx, &tvr);
+     return fun;
++}
++
++void
++js_FinalizeFunction(JSContext *cx, JSFunction *fun)
++{
++    /*
++     * Null-check of i.script is required since the parser sets interpreted
++     * very early.
++     */
++    if (FUN_INTERPRETED(fun) && fun->u.i.script)
++    {
++        script = fun->u.i.script;
++        fun->u.i.script = NULL;
++        js_DestroyScript(cx, script);
++    }
+ }
+ 
+ JSObject *
+diff --git a/js/src/jsfun.h b/js/src/jsfun.h
+--- a/js/src/jsfun.h
++++ b/js/src/jsfun.h
+@@ -104,6 +104,9 @@ js_NewFunction(JSContext *cx, JSObject *
+ js_NewFunction(JSContext *cx, JSObject *funobj, JSNative native, uintN nargs,
+                uintN flags, JSObject *parent, JSAtom *atom);
+ 
++extern void
++js_FinalizeFunction(JSContext *cx, JSFunction *fun);
++
+ extern JSObject *
+ js_CloneFunctionObject(JSContext *cx, JSObject *funobj, JSObject *parent);
+ 
+diff --git a/js/src/jsgc.c b/js/src/jsgc.c
+--- a/js/src/jsgc.c
++++ b/js/src/jsgc.c
+@@ -252,7 +252,7 @@ static uint8 GCTypeToTraceKindMap[GCX_NT
+     JSTRACE_STRING,     /* GCX_STRING */
+     JSTRACE_DOUBLE,     /* GCX_DOUBLE */
+     JSTRACE_STRING,     /* GCX_MUTABLE_STRING */
+-    JSTRACE_FUNCTION,   /* GCX_PRIVATE */
++    JSTRACE_FUNCTION,   /* GCX_FUNCTION */
+     JSTRACE_NAMESPACE,  /* GCX_NAMESPACE */
+     JSTRACE_QNAME,      /* GCX_QNAME */
+     JSTRACE_XML,        /* GCX_XML */
+@@ -564,7 +564,7 @@ static GCFinalizeOp gc_finalizers[GCX_NT
+     (GCFinalizeOp) js_FinalizeString,           /* GCX_STRING */
+     (GCFinalizeOp) js_FinalizeDouble,           /* GCX_DOUBLE */
+     (GCFinalizeOp) js_FinalizeString,           /* GCX_MUTABLE_STRING */
+-    NULL,                                       /* GCX_PRIVATE */
++    (GCFinalizeOp) js_FinalizeFunction,         /* GCX_FUNCTION */
+     (GCFinalizeOp) js_FinalizeXMLNamespace,     /* GCX_NAMESPACE */
+     (GCFinalizeOp) js_FinalizeXMLQName,         /* GCX_QNAME */
+     (GCFinalizeOp) js_FinalizeXML,              /* GCX_XML */
+@@ -586,7 +586,7 @@ static const char *gc_typenames[GCX_NTYP
+     "newborn string",
+     "newborn double",
+     "newborn mutable string",
+-    "newborn private",
++    "newborn function",
+     "newborn Namespace",
+     "newborn QName",
+     "newborn XML",
+diff --git a/js/src/jsgc.h b/js/src/jsgc.h
+--- a/js/src/jsgc.h
++++ b/js/src/jsgc.h
+@@ -55,7 +55,7 @@ JS_BEGIN_EXTERN_C
+ #define GCX_DOUBLE              2               /* jsdouble */
+ #define GCX_MUTABLE_STRING      3               /* JSString that's mutable --
+                                                    single-threaded only! */
+-#define GCX_PRIVATE             4               /* private (unscanned) data */
++#define GCX_FUNCTION            4               /* JSFunction */
+ #define GCX_NAMESPACE           5               /* JSXMLNamespace */
+ #define GCX_QNAME               6               /* JSXMLQName */
+ #define GCX_XML                 7               /* JSXML */
