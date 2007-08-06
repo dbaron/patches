@@ -1,0 +1,523 @@
+Use thread-local storage for tracing suppression.  b=376874
+
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
+--- a/tools/trace-malloc/lib/nsTraceMalloc.c
++++ b/tools/trace-malloc/lib/nsTraceMalloc.c
+@@ -67,6 +67,7 @@
+ #include "nsTraceMalloc.h"
+ #include "nscore.h"
+ #include "prinit.h"
++#include "prthread.h"
+ 
+ #ifdef XP_WIN32
+ #include "nsStackFrameWin.h"
+@@ -299,12 +300,6 @@ static char      *sdlogname = NULL; /* f
+ static char      *sdlogname = NULL; /* filename for shutdown leak log */
+ 
+ /*
+- * This counter suppresses tracing, in case any tracing code needs to malloc,
+- * and it must be tested and manipulated only within tmmon.
+- */
+-static uint32 suppress_tracing = 0;
+-
+-/*
+  * This enables/disables trace-malloc logging.
+  *
+  * It is separate from suppress_tracing so that we do not have to pay
+@@ -324,6 +319,79 @@ static int tracing_enabled = 1;
+         if (tmmon)                                                            \
+             PR_ExitMonitor(tmmon);                                            \
+     PR_END_MACRO
++
++/*
++ * Thread-local storage.
++ */
++typedef struct tm_thread tm_thread;
++struct tm_thread {
++    /*
++     * This counter suppresses tracing, in case any tracing code needs
++     * to malloc.
++     */
++    uint32 suppress_tracing;
++
++    /*
++     * Whether this tm_thread is stack-allocated (which it is
++     * temporarily during get_tm_thread).
++     */
++    PRBool on_stack;
++};
++
++static PRUintn tpIndex;
++static PRBool tpIndexInitialized = PR_FALSE;
++
++PR_STATIC_CALLBACK(void)
++free_tm_thread(void *priv)
++{
++    tm_thread *t = (tm_thread*) priv;
++
++    if (!t->on_stack) {
++        PR_ASSERT(t->suppress_tracing == 0);
++        t->suppress_tracing = 1;
++        __libc_free(t);
++    }
++}
++
++static tm_thread *
++get_tm_thread()
++{
++    tm_thread *t;
++    tm_thread stack_tm_thread;
++
++    if (!tpIndexInitialized) {
++        /*
++         * In theory multiple threads could race into this block, but it
++         * should be safe to presume with both initialize NSPR and call
++         * malloc before initializing additional threads.
++         */
++        tpIndexInitialized = PR_TRUE;
++
++        PR_NewThreadPrivateIndex(&tpIndex, free_tm_thread);
++    }
++
++    t = PR_GetThreadPrivate(tpIndex);
++
++    if (!t) {
++        /* 
++         * First set the thread to a tm_thread allocated on the stack,
++         * so that we can call malloc with tracing suppressed.  We can't
++         * rely on __libc_malloc not calling our hooks on Windows.
++         */
++        stack_tm_thread.suppress_tracing = 1;
++        stack_tm_thread.on_stack = PR_TRUE;
++        PR_SetThreadPrivate(tpIndex, &stack_tm_thread);
++
++        t = (tm_thread*) __libc_malloc(sizeof(tm_thread));
++        t->suppress_tracing = 0;
++        t->on_stack = PR_FALSE;
++        PR_SetThreadPrivate(tpIndex, t);
++
++        PR_ASSERT(stack_tm_thread.suppress_tracing == 1); /* unbalanced */
++    }
++
++    return t;
++}
+ 
+ /* We don't want more than 32 logfiles open at once, ok? */
+ typedef uint32          lfd_set;
+@@ -1355,26 +1423,26 @@ static callsite *calltree(void **bp)
+ #ifdef XP_WIN32
+ 
+ callsite *
+-backtrace(int skip)
++backtrace(int skip, tm_thread *t)
+ {
+     callsite *site;
+ 
+     tmstats.backtrace_calls++;
+-    suppress_tracing++;
++    t->suppress_tracing++;
+ 
+     site = calltree(skip);
+     if (!site) {
+         tmstats.backtrace_failures++;
+         /* PR_ASSERT(tmstats.backtrace_failures < 100); */
+     }
+-    suppress_tracing--;
++    t->suppress_tracing--;
+     return site;
+ }
+ 
+ #else /*XP_UNIX*/
+ 
+ callsite *
+-backtrace(int skip)
++backtrace(int skip, tm_thread *t)
+ {
+     void **bp, **bpdown;
+     callsite *site, **key;
+@@ -1383,7 +1451,7 @@ backtrace(int skip)
+     int i, n;
+ 
+     tmstats.backtrace_calls++;
+-    suppress_tracing++;
++    t->suppress_tracing++;
+ 
+     /* Stack walking code adapted from Kipp's "leaky". */
+ #if defined(__i386) 
+@@ -1410,7 +1478,7 @@ backtrace(int skip)
+         tmstats.backtrace_failures++;
+         PR_ASSERT(tmstats.backtrace_failures < 100);
+     }
+-    suppress_tracing--;
++    t->suppress_tracing--;
+     return site;
+ }
+ 
+@@ -1501,10 +1569,13 @@ malloc(size_t size)
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled || !PR_Initialized()) {
+         return __libc_malloc(size);
+     }
++
++    t = get_tm_thread()
+ 
+     start = PR_IntervalNow();
+     ptr = __libc_malloc(size);
+@@ -1513,16 +1584,16 @@ malloc(size_t size)
+     tmstats.malloc_calls++;
+     if (!ptr) {
+         tmstats.malloc_failures++;
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         if (site)
+             log_event5(logfp, TM_EVENT_MALLOC,
+                        site->serial, start, end - start,
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -1542,6 +1613,7 @@ calloc(size_t count, size_t size)
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     /**
+      * During the initialization of the glibc/libpthread, and
+@@ -1558,6 +1630,8 @@ calloc(size_t count, size_t size)
+         return __libc_calloc(count, size);
+     }
+ 
++    t = get_tm_thread()
++
+     start = PR_IntervalNow();
+     ptr = __libc_calloc(count, size);
+     end = PR_IntervalNow();
+@@ -1565,8 +1639,8 @@ calloc(size_t count, size_t size)
+     tmstats.calloc_calls++;
+     if (!ptr) {
+         tmstats.calloc_failures++;
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         size *= count;
+         if (site) {
+             log_event5(logfp, TM_EVENT_CALLOC,
+@@ -1574,9 +1648,9 @@ calloc(size_t count, size_t size)
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         }
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -1599,14 +1673,17 @@ realloc(__ptr_t ptr, size_t size)
+     PLHashEntry **hep, *he;
+     allocation *alloc;
+     FILE *trackfp = NULL;
++    tm_thread *t;
+ 
+     if (!tracing_enabled || !PR_Initialized()) {
+         return __libc_realloc(ptr, size);
+     }
+ 
++    t = get_tm_thread()
++
+     TM_ENTER_MONITOR();
+     tmstats.realloc_calls++;
+-    if (suppress_tracing == 0) {
++    if (t->suppress_tracing == 0) {
+         oldptr = ptr;
+         oldsite = NULL;
+         oldsize = 0;
+@@ -1643,8 +1720,8 @@ realloc(__ptr_t ptr, size_t size)
+          * we'll leave the allocation entry untouched.
+          */
+         tmstats.realloc_failures++;
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         if (site) {
+             log_event8(logfp, TM_EVENT_REALLOC,
+                        site->serial, start, end - start,
+@@ -1653,7 +1730,7 @@ realloc(__ptr_t ptr, size_t size)
+                        (uint32)NS_PTR_TO_INT32(oldptr), oldsize);
+         }
+         if (ptr && allocations) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             if (ptr != oldptr) {
+                 /*
+                  * If we're reallocating (not merely allocating new space by
+@@ -1673,7 +1750,7 @@ realloc(__ptr_t ptr, size_t size)
+                 if (!he)
+                     he = PL_HashTableAdd(allocations, ptr, site);
+             }
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -1693,10 +1770,13 @@ valloc(size_t size)
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled || !PR_Initialized()) {
+         return __libc_valloc(size);
+     }
++
++    t = get_tm_thread()
+ 
+     start = PR_IntervalNow();
+     ptr = __libc_valloc(size);
+@@ -1705,16 +1785,16 @@ valloc(size_t size)
+     tmstats.malloc_calls++; /* XXX valloc_calls ? */
+     if (!ptr) {
+         tmstats.malloc_failures++; /* XXX valloc_failures ? */
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         if (site)
+             log_event5(logfp, TM_EVENT_MALLOC, /* XXX TM_EVENT_VALLOC? */
+                        site->serial, start, end - start,
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -1734,10 +1814,13 @@ memalign(size_t boundary, size_t size)
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled || !PR_Initialized()) {
+         return __libc_memalign(boundary, size);
+     }
++
++    t = get_tm_thread()
+ 
+     start = PR_IntervalNow();
+     ptr = __libc_memalign(boundary, size);
+@@ -1746,17 +1829,17 @@ memalign(size_t boundary, size_t size)
+     tmstats.malloc_calls++; /* XXX memalign_calls ? */
+     if (!ptr) {
+         tmstats.malloc_failures++; /* XXX memalign_failures ? */
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         if (site) {
+             log_event5(logfp, TM_EVENT_MALLOC, /* XXX TM_EVENT_MEMALIGN? */
+                        site->serial, start, end - start,
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         }
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -1786,17 +1869,20 @@ free(__ptr_t ptr)
+     allocation *alloc;
+     uint32 serial = 0, size = 0;
+     PRUint32 start, end;
++    tm_thread *t;
+ 
+     if (!tracing_enabled || !PR_Initialized()) {
+         __libc_free(ptr);
+         return;
+     }
++
++    t = get_tm_thread()
+ 
+     TM_ENTER_MONITOR();
+     tmstats.free_calls++;
+     if (!ptr) {
+         tmstats.null_free_calls++;
+-    } else if (suppress_tracing == 0) {
++    } else if (t->suppress_tracing == 0) {
+         if (get_allocations()) {
+             hep = PL_HashTableRawLookup(allocations, hash_pointer(ptr), ptr);
+             he = *hep;
+@@ -1852,7 +1938,6 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
+ PR_IMPLEMENT(void) NS_TraceMallocStartup(int logfd)
+ {
+     /* We must be running on the primordial thread. */
+-    PR_ASSERT(suppress_tracing == 0);
+     PR_ASSERT(tracing_enabled == 1);
+     PR_ASSERT(logfp == &default_logfile);
+     tracing_enabled = (logfd >= 0);
+@@ -2226,8 +2311,9 @@ NS_TraceStack(int skip, FILE *ofp)
+ NS_TraceStack(int skip, FILE *ofp)
+ {
+     callsite *site;
+-
+-    site = backtrace(skip + 1);
++    tm_thread *t = get_tm_thread()
++
++    site = backtrace(skip + 1, t);
+     while (site) {
+         if (site->name || site->parent) {
+             fprintf(ofp, "%s[%s +0x%X]\n",
+@@ -2296,24 +2382,27 @@ MallocCallback(void *ptr, size_t size, P
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled)
+         return;
++
++    t = get_tm_thread()
+ 
+     TM_ENTER_MONITOR();
+     tmstats.malloc_calls++;
+     if (!ptr) {
+         tmstats.malloc_failures++;
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(4);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(4, t);
+         if (site)
+             log_event5(logfp, TM_EVENT_MALLOC,
+                        site->serial, start, end - start,
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -2329,25 +2418,28 @@ CallocCallback(void *ptr, size_t count, 
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled)
+         return;
++
++    t = get_tm_thread()
+ 
+     TM_ENTER_MONITOR();
+     tmstats.calloc_calls++;
+     if (!ptr) {
+         tmstats.calloc_failures++;
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         size *= count;
+         if (site)
+             log_event5(logfp, TM_EVENT_CALLOC,
+                        site->serial, start, end - start,
+                        (uint32)NS_PTR_TO_INT32(ptr), size);
+         if (get_allocations()) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             he = PL_HashTableAdd(allocations, ptr, site);
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -2365,13 +2457,16 @@ ReallocCallback(void * oldptr, void *ptr
+     PLHashNumber hash;
+     PLHashEntry **hep, *he;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled)
+         return;
+ 
++    t = get_tm_thread()
++
+     TM_ENTER_MONITOR();
+     tmstats.realloc_calls++;
+-    if (suppress_tracing == 0) {
++    if (t->suppress_tracing == 0) {
+         oldsite = NULL;
+         oldsize = 0;
+         he = NULL;
+@@ -2393,8 +2488,8 @@ ReallocCallback(void * oldptr, void *ptr
+          * When realloc() fails, the original block is not freed or moved, so
+          * we'll leave the allocation entry untouched.
+          */
+-    } else if (suppress_tracing == 0) {
+-        site = backtrace(1);
++    } else if (t->suppress_tracing == 0) {
++        site = backtrace(1, t);
+         if (site) {
+             log_event8(logfp, TM_EVENT_REALLOC,
+                        site->serial, start, end - start,
+@@ -2403,7 +2498,7 @@ ReallocCallback(void * oldptr, void *ptr
+                        (uint32)NS_PTR_TO_INT32(oldptr), oldsize);
+         }
+         if (ptr && allocations) {
+-            suppress_tracing++;
++            t->suppress_tracing++;
+             if (ptr != oldptr) {
+                 /*
+                  * If we're reallocating (not allocating new space by passing
+@@ -2422,7 +2517,7 @@ ReallocCallback(void * oldptr, void *ptr
+                 if (!he)
+                     he = PL_HashTableAdd(allocations, ptr, site);
+             }
+-            suppress_tracing--;
++            t->suppress_tracing--;
+             if (he) {
+                 alloc = (allocation*) he;
+                 alloc->size = size;
+@@ -2438,15 +2533,18 @@ FreeCallback(void * ptr, PRUint32 start,
+     PLHashEntry **hep, *he;
+     callsite *site;
+     allocation *alloc;
++    tm_thread *t;
+ 
+     if (!tracing_enabled)
+         return;
++
++    t = get_tm_thread()
+ 
+     TM_ENTER_MONITOR();
+     tmstats.free_calls++;
+     if (!ptr) {
+         tmstats.null_free_calls++;
+-    } else if (suppress_tracing == 0) {
++    } else if (t->suppress_tracing == 0) {
+         if (get_allocations()) {
+             hep = PL_HashTableRawLookup(allocations, hash_pointer(ptr), ptr);
+             he = *hep;
