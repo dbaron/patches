@@ -24,7 +24,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
   * This enables/disables trace-malloc logging.
   *
   * It is separate from suppress_tracing so that we do not have to pay
-@@ -324,6 +319,73 @@ static int tracing_enabled = 1;
+@@ -324,6 +319,81 @@ static int tracing_enabled = 1;
          if (tmmon)                                                            \
              PR_ExitMonitor(tmmon);                                            \
      PR_END_MACRO
@@ -39,25 +39,23 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 +     * to malloc.
 +     */
 +    uint32 suppress_tracing;
-+
-+    /*
-+     * Whether this tm_thread is heap-allocated (there are stack
-+     * temporaries in get_tm_thread, and the static main_thread).
-+     */
-+    PRBool in_heap;
 +};
 +
 +static PRUintn tpIndex;
-+
 +static tm_thread main_thread; /* 0-initialization is correct */
++static tm_thread suppressed_thread; /* initialized below */
++
++static PRMonitor *tlsmon = NULL; /* protects initializingtls */
++static PRBool initializingtls = PR_FALSE;
 +
 +PR_STATIC_CALLBACK(void)
 +free_tm_thread(void *priv)
 +{
 +    tm_thread *t = (tm_thread*) priv;
 +
-+    if (t->in_heap) {
-+        PR_ASSERT(t->suppress_tracing == 0);
++    PR_ASSERT(t->suppress_tracing == 0);
++
++    if (t != &main_thread) {
 +        t->suppress_tracing = 1;
 +        __libc_free(t);
 +    }
@@ -77,20 +75,30 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 +
 +    if (!t) {
 +        /* 
-+         * First set the thread to a tm_thread allocated on the stack,
-+         * so that we can call malloc with tracing suppressed.  We can't
-+         * rely on __libc_malloc not calling our hooks on Windows.
++         * We need to malloc here, but so does PR_SetThreadPrivate.
++         * (And we can't rely on __libc_malloc not calling our hooks on
++         * Windows.)
 +         */
-+        stack_tm_thread.suppress_tracing = 1;
-+        stack_tm_thread.in_heap = PR_FALSE;
-+        PR_SetThreadPrivate(tpIndex, &stack_tm_thread);
++        PR_EnterMonitor(tlsmon);
 +
-+        t = (tm_thread*) __libc_malloc(sizeof(tm_thread));
-+        t->suppress_tracing = 0;
-+        t->in_heap = PR_TRUE;
-+        PR_SetThreadPrivate(tpIndex, t);
++        if (initializingtls) {
++            /*
++             * This is a callback from the __libc_malloc or
++             * PR_SetThreadPrivate call below.  So return a tmthread
++             * that will be marked as suppressed.
++             */
++            t = &suppressed_thread;
++        } else {
++            initializingtls = PR_TRUE;
 +
-+        PR_ASSERT(stack_tm_thread.suppress_tracing == 1); /* unbalanced */
++            t = (tm_thread*) __libc_malloc(sizeof(tm_thread));
++            t->suppress_tracing = 0;
++            PR_SetThreadPrivate(tpIndex, t);
++
++            initializingtls = PR_FALSE;
++        }
++
++        PR_ExitMonitor(tlsmon);
 +    }
 +
 +    return t;
@@ -98,7 +106,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  /* We don't want more than 32 logfiles open at once, ok? */
  typedef uint32          lfd_set;
-@@ -1355,26 +1417,26 @@ static callsite *calltree(void **bp)
+@@ -1355,26 +1425,26 @@ static callsite *calltree(void **bp)
  #ifdef XP_WIN32
  
  callsite *
@@ -129,7 +137,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  {
      void **bp, **bpdown;
      callsite *site, **key;
-@@ -1383,7 +1445,7 @@ backtrace(int skip)
+@@ -1383,7 +1453,7 @@ backtrace(int skip)
      int i, n;
  
      tmstats.backtrace_calls++;
@@ -138,7 +146,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      /* Stack walking code adapted from Kipp's "leaky". */
  #if defined(__i386) 
-@@ -1410,7 +1472,7 @@ backtrace(int skip)
+@@ -1410,7 +1480,7 @@ backtrace(int skip)
          tmstats.backtrace_failures++;
          PR_ASSERT(tmstats.backtrace_failures < 100);
      }
@@ -147,7 +155,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      return site;
  }
  
-@@ -1501,10 +1563,13 @@ malloc(size_t size)
+@@ -1501,10 +1571,13 @@ malloc(size_t size)
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -161,7 +169,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      start = PR_IntervalNow();
      ptr = __libc_malloc(size);
-@@ -1513,16 +1578,16 @@ malloc(size_t size)
+@@ -1513,16 +1586,16 @@ malloc(size_t size)
      tmstats.malloc_calls++;
      if (!ptr) {
          tmstats.malloc_failures++;
@@ -182,7 +190,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -1542,6 +1607,7 @@ calloc(size_t count, size_t size)
+@@ -1542,6 +1615,7 @@ calloc(size_t count, size_t size)
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -190,7 +198,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      /**
       * During the initialization of the glibc/libpthread, and
-@@ -1558,6 +1624,8 @@ calloc(size_t count, size_t size)
+@@ -1558,6 +1632,8 @@ calloc(size_t count, size_t size)
          return __libc_calloc(count, size);
      }
  
@@ -199,7 +207,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      start = PR_IntervalNow();
      ptr = __libc_calloc(count, size);
      end = PR_IntervalNow();
-@@ -1565,8 +1633,8 @@ calloc(size_t count, size_t size)
+@@ -1565,8 +1641,8 @@ calloc(size_t count, size_t size)
      tmstats.calloc_calls++;
      if (!ptr) {
          tmstats.calloc_failures++;
@@ -210,7 +218,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          size *= count;
          if (site) {
              log_event5(logfp, TM_EVENT_CALLOC,
-@@ -1574,9 +1642,9 @@ calloc(size_t count, size_t size)
+@@ -1574,9 +1650,9 @@ calloc(size_t count, size_t size)
                         (uint32)NS_PTR_TO_INT32(ptr), size);
          }
          if (get_allocations()) {
@@ -222,7 +230,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -1599,14 +1667,17 @@ realloc(__ptr_t ptr, size_t size)
+@@ -1599,14 +1675,17 @@ realloc(__ptr_t ptr, size_t size)
      PLHashEntry **hep, *he;
      allocation *alloc;
      FILE *trackfp = NULL;
@@ -241,7 +249,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          oldptr = ptr;
          oldsite = NULL;
          oldsize = 0;
-@@ -1643,8 +1714,8 @@ realloc(__ptr_t ptr, size_t size)
+@@ -1643,8 +1722,8 @@ realloc(__ptr_t ptr, size_t size)
           * we'll leave the allocation entry untouched.
           */
          tmstats.realloc_failures++;
@@ -252,7 +260,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          if (site) {
              log_event8(logfp, TM_EVENT_REALLOC,
                         site->serial, start, end - start,
-@@ -1653,7 +1724,7 @@ realloc(__ptr_t ptr, size_t size)
+@@ -1653,7 +1732,7 @@ realloc(__ptr_t ptr, size_t size)
                         (uint32)NS_PTR_TO_INT32(oldptr), oldsize);
          }
          if (ptr && allocations) {
@@ -261,7 +269,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (ptr != oldptr) {
                  /*
                   * If we're reallocating (not merely allocating new space by
-@@ -1673,7 +1744,7 @@ realloc(__ptr_t ptr, size_t size)
+@@ -1673,7 +1752,7 @@ realloc(__ptr_t ptr, size_t size)
                  if (!he)
                      he = PL_HashTableAdd(allocations, ptr, site);
              }
@@ -270,7 +278,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -1693,10 +1764,13 @@ valloc(size_t size)
+@@ -1693,10 +1772,13 @@ valloc(size_t size)
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -284,7 +292,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      start = PR_IntervalNow();
      ptr = __libc_valloc(size);
-@@ -1705,16 +1779,16 @@ valloc(size_t size)
+@@ -1705,16 +1787,16 @@ valloc(size_t size)
      tmstats.malloc_calls++; /* XXX valloc_calls ? */
      if (!ptr) {
          tmstats.malloc_failures++; /* XXX valloc_failures ? */
@@ -305,7 +313,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -1734,10 +1808,13 @@ memalign(size_t boundary, size_t size)
+@@ -1734,10 +1816,13 @@ memalign(size_t boundary, size_t size)
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -319,7 +327,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      start = PR_IntervalNow();
      ptr = __libc_memalign(boundary, size);
-@@ -1746,17 +1823,17 @@ memalign(size_t boundary, size_t size)
+@@ -1746,17 +1831,17 @@ memalign(size_t boundary, size_t size)
      tmstats.malloc_calls++; /* XXX memalign_calls ? */
      if (!ptr) {
          tmstats.malloc_failures++; /* XXX memalign_failures ? */
@@ -341,7 +349,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -1786,17 +1863,20 @@ free(__ptr_t ptr)
+@@ -1786,17 +1871,20 @@ free(__ptr_t ptr)
      allocation *alloc;
      uint32 serial = 0, size = 0;
      PRUint32 start, end;
@@ -363,7 +371,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          if (get_allocations()) {
              hep = PL_HashTableRawLookup(allocations, hash_pointer(ptr), ptr);
              he = *hep;
-@@ -1852,7 +1932,6 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
+@@ -1852,7 +1940,6 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
  PR_IMPLEMENT(void) NS_TraceMallocStartup(int logfd)
  {
      /* We must be running on the primordial thread. */
@@ -371,7 +379,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      PR_ASSERT(tracing_enabled == 1);
      PR_ASSERT(logfp == &default_logfile);
      tracing_enabled = (logfd >= 0);
-@@ -1869,7 +1948,18 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
+@@ -1869,7 +1956,20 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
      }
  
      atexit(NS_TraceMallocShutdown);
@@ -383,6 +391,8 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 +     * uninitialized.
 +     */
 +    main_thread.suppress_tracing++;
++    suppressed_thread.suppress_tracing = 1;
++    tlsmon = PR_NewMonitor();
 +    PR_NewThreadPrivateIndex(&tpIndex, free_tm_thread);
 +    PR_SetThreadPrivate(tpIndex, &main_thread);
      tmmon = PR_NewMonitor();
@@ -390,7 +400,18 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  #ifdef XP_WIN32
      /* Register listeners for win32. */
-@@ -2226,8 +2316,9 @@ NS_TraceStack(int skip, FILE *ofp)
+@@ -2055,6 +2155,10 @@ PR_IMPLEMENT(void) NS_TraceMallocShutdow
+         tmmon = NULL;
+         PR_DestroyMonitor(mon);
+     }
++    if (tlsmon) {
++        PR_DestroyMonitor(tlsmon);
++        tlsmon = NULL;
++    }
+ #ifdef XP_WIN32
+     if (tracing_enabled) {
+         ShutdownHooker();
+@@ -2226,8 +2330,9 @@ NS_TraceStack(int skip, FILE *ofp)
  NS_TraceStack(int skip, FILE *ofp)
  {
      callsite *site;
@@ -402,7 +423,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
      while (site) {
          if (site->name || site->parent) {
              fprintf(ofp, "%s[%s +0x%X]\n",
-@@ -2296,24 +2387,27 @@ MallocCallback(void *ptr, size_t size, P
+@@ -2296,24 +2401,27 @@ MallocCallback(void *ptr, size_t size, P
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -434,7 +455,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -2329,25 +2423,28 @@ CallocCallback(void *ptr, size_t count, 
+@@ -2329,25 +2437,28 @@ CallocCallback(void *ptr, size_t count, 
      callsite *site;
      PLHashEntry *he;
      allocation *alloc;
@@ -467,7 +488,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -2365,13 +2462,16 @@ ReallocCallback(void * oldptr, void *ptr
+@@ -2365,13 +2476,16 @@ ReallocCallback(void * oldptr, void *ptr
      PLHashNumber hash;
      PLHashEntry **hep, *he;
      allocation *alloc;
@@ -485,7 +506,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          oldsite = NULL;
          oldsize = 0;
          he = NULL;
-@@ -2393,8 +2493,8 @@ ReallocCallback(void * oldptr, void *ptr
+@@ -2393,8 +2507,8 @@ ReallocCallback(void * oldptr, void *ptr
           * When realloc() fails, the original block is not freed or moved, so
           * we'll leave the allocation entry untouched.
           */
@@ -496,7 +517,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
          if (site) {
              log_event8(logfp, TM_EVENT_REALLOC,
                         site->serial, start, end - start,
-@@ -2403,7 +2503,7 @@ ReallocCallback(void * oldptr, void *ptr
+@@ -2403,7 +2517,7 @@ ReallocCallback(void * oldptr, void *ptr
                         (uint32)NS_PTR_TO_INT32(oldptr), oldsize);
          }
          if (ptr && allocations) {
@@ -505,7 +526,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (ptr != oldptr) {
                  /*
                   * If we're reallocating (not allocating new space by passing
-@@ -2422,7 +2522,7 @@ ReallocCallback(void * oldptr, void *ptr
+@@ -2422,7 +2536,7 @@ ReallocCallback(void * oldptr, void *ptr
                  if (!he)
                      he = PL_HashTableAdd(allocations, ptr, site);
              }
@@ -514,7 +535,7 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
              if (he) {
                  alloc = (allocation*) he;
                  alloc->size = size;
-@@ -2438,15 +2538,18 @@ FreeCallback(void * ptr, PRUint32 start,
+@@ -2438,15 +2552,18 @@ FreeCallback(void * ptr, PRUint32 start,
      PLHashEntry **hep, *he;
      callsite *site;
      allocation *alloc;
