@@ -3,16 +3,17 @@ Do stack walking on a single thread to avoid deadlocks during thread creation.  
 diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 --- a/xpcom/base/nsStackFrameWin.cpp
 +++ b/xpcom/base/nsStackFrameWin.cpp
-@@ -118,7 +118,7 @@ SYMGETLINEFROMADDRPROC64 _SymGetLineFrom
+@@ -118,7 +118,8 @@ SYMGETLINEFROMADDRPROC64 _SymGetLineFrom
  #define _SymGetLineFromAddr64 0
  #endif
  
 -HANDLE hStackWalkMutex;
 +DWORD gStackWalkThread;
++CRITICAL_SECTION gDbgHelpCS;
  
  PR_END_EXTERN_C
  
-@@ -150,16 +150,13 @@ EnsureImageHlpInitialized()
+@@ -150,16 +151,15 @@ EnsureImageHlpInitialized()
      if (gInitialized)
          return gInitialized;
  
@@ -31,10 +32,12 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
          return PR_FALSE;
      }
 +    ::CloseHandle(hStackWalkThread);
++
++    ::InitializeCriticalSection(&gDbgHelpCS);
  
      HMODULE module = ::LoadLibrary("DBGHELP.DLL");
      if (!module) {
-@@ -443,6 +440,8 @@ EnsureSymInitialized()
+@@ -443,6 +443,8 @@ EnsureSymInitialized()
   * whose in memory address doesn't match its in-file address.
   */
  
@@ -43,7 +46,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
  EXPORT_XPCOM_API(nsresult)
  NS_StackWalk(NS_WalkStackCallback aCallback, PRUint32 aSkipFrames,
               void *aClosure)
-@@ -473,47 +472,75 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+@@ -473,47 +475,75 @@ NS_StackWalk(NS_WalkStackCallback aCallb
          return NS_ERROR_FAILURE;
      }
  
@@ -148,7 +151,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
          }
      }
  
-@@ -566,67 +593,52 @@ WalkStackMain64(struct WalkStackData* da
+@@ -566,67 +596,52 @@ WalkStackMain64(struct WalkStackData* da
      frame64.AddrFrame.Mode   = AddrModeFlat;
      frame64.AddrReturn.Mode  = AddrModeFlat;
  
@@ -256,7 +259,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
      }
      return;
  #endif
-@@ -669,60 +681,43 @@ WalkStackMain(struct WalkStackData* data
+@@ -669,60 +684,45 @@ WalkStackMain(struct WalkStackData* data
      return;
  #endif
  
@@ -266,7 +269,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
  
 -        ok = 0;
 -
--        // debug routines are not threadsafe, so grab the lock.
+         // debug routines are not threadsafe, so grab the lock.
 -        DWORD dwWaitResult;
 -        dwWaitResult = WaitForSingleObject(hStackWalkMutex, INFINITE);
 -        if (dwWaitResult == WAIT_OBJECT_0) {
@@ -311,7 +314,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 -                break;
 -#endif
 -        }
-+        // debug routines are not threadsafe, but we're the only calling thread
++        EnterCriticalSection(&gDbgHelpCS);
 +        ok = _StackWalk(
 +            IMAGE_FILE_MACHINE_I386,
 +            myProcess,
@@ -323,6 +326,7 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
 +            _SymGetModuleBase,        // module base routine
 +            0                         // translate address routine
 +          );
++        LeaveCriticalSection(&gDbgHelpCS);
 +
 +        if (ok)
 +            addr = frame.AddrPC.Offset;
@@ -351,6 +355,27 @@ diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
      }
  
      return;
+@@ -743,10 +743,7 @@ NS_DescribeCodeAddress(void *aPC, nsCode
+     BOOL ok;
+ 
+     // debug routines are not threadsafe, so grab the lock.
+-    DWORD dwWaitResult;
+-    dwWaitResult = WaitForSingleObject(hStackWalkMutex, INFINITE);
+-    if (dwWaitResult != WAIT_OBJECT_0)
+-        return NS_ERROR_UNEXPECTED;
++    EnterCriticalSection(&gDbgHelpCS);
+ 
+ #ifdef USING_WXP_VERSION
+     if (_StackWalk64) {
+@@ -840,7 +837,7 @@ NS_DescribeCodeAddress(void *aPC, nsCode
+         }
+     }
+ 
+-    ReleaseMutex(hStackWalkMutex);  // release our lock
++    LeaveCriticalSection(&gDbgHelpCS); // release our lock
+     return NS_OK;
+ }
+ 
 diff --git a/xpcom/base/nsStackFrameWin.h b/xpcom/base/nsStackFrameWin.h
 --- a/xpcom/base/nsStackFrameWin.h
 +++ b/xpcom/base/nsStackFrameWin.h
