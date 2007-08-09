@@ -1,0 +1,422 @@
+Readd suppression code around calls to original allocation functions, but threadsafe this time, to handle things like new[] calling new.
+
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
+--- a/tools/trace-malloc/lib/nsTraceMalloc.c
++++ b/tools/trace-malloc/lib/nsTraceMalloc.c
+@@ -49,7 +49,6 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+-#include <stdlib.h>
+ #include <string.h>
+ #ifdef XP_UNIX
+ #include <unistd.h>
+@@ -69,13 +68,13 @@
+ #include "prinit.h"
+ #include "prthread.h"
+ #include "nsStackWalk.h"
++#include "nsTraceMallocCallbacks.h"
+ 
+ #ifdef XP_WIN32
+ #include <sys/timeb.h>/*for timeb*/
+ #include <sys/stat.h>/*for fstat*/
+ 
+ #include <io.h> /*for write*/
+-#include "nsTraceMallocCallbacks.h"
+ 
+ #define WRITE_FLAGS "w"
+ 
+@@ -101,12 +100,6 @@ extern __ptr_t __libc_valloc(size_t);
+ 
+ #ifdef XP_WIN32
+ 
+-/* defined in nsWinTraceMalloc.cpp */
+-void* dhw_orig_malloc(size_t);
+-void* dhw_orig_calloc(size_t, size_t);
+-void* dhw_orig_realloc(void*, size_t);
+-void dhw_orig_free(void*);
+-
+ #define __libc_malloc(x) dhw_orig_malloc(x)
+ #define __libc_calloc(x, y) dhw_orig_calloc(x,y)
+ #define __libc_realloc(x, y) dhw_orig_realloc(x,y)
+@@ -169,13 +162,6 @@ static int tracing_enabled = 1;
+             PR_Unlock(tmlock);                                                \
+     PR_END_MACRO
+ 
+-/* Used by backtrace. */
+-typedef struct stack_buffer_info {
+-    void **buffer;
+-    size_t size;
+-    size_t entries;
+-} stack_buffer_info;
+-
+ /*
+  * Thread-local storage.
+  *
+@@ -211,18 +197,6 @@ typedef struct stack_buffer_info {
+ 
+ #endif
+ 
+-typedef struct tm_thread tm_thread;
+-struct tm_thread {
+-    /*
+-     * This counter suppresses tracing, in case any tracing code needs
+-     * to malloc.
+-     */
+-    uint32 suppress_tracing;
+-
+-    /* buffer for backtrace, below */
+-    stack_buffer_info backtrace_buf;
+-};
+-
+ static TM_TLS_INDEX_TYPE tpIndex;
+ static tm_thread main_thread; /* 0-initialization is correct */
+ 
+@@ -245,7 +219,7 @@ free_tm_thread(void *priv)
+ }
+ #endif
+ 
+-static tm_thread *
++tm_thread *
+ get_tm_thread(void)
+ {
+     tm_thread *t;
+@@ -1923,14 +1897,14 @@ NS_TrackAllocation(void* ptr, FILE *ofp)
+ #ifdef XP_WIN32
+ 
+ PR_IMPLEMENT(void)
+-MallocCallback(void *ptr, size_t size, PRUint32 start, PRUint32 end)
++MallocCallback(void *ptr, size_t size, PRUint32 start, PRUint32 end, tm_thread *t)
+ {
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
+     tm_thread *t;
+ 
+-    if (!tracing_enabled || (t = get_tm_thread())->suppress_tracing != 0)
++    if (!tracing_enabled || t->suppress_tracing != 0)
+         return;
+ 
+     site = backtrace(2, t);
+@@ -1958,14 +1932,14 @@ MallocCallback(void *ptr, size_t size, P
+ }
+ 
+ PR_IMPLEMENT(void)
+-CallocCallback(void *ptr, size_t count, size_t size, PRUint32 start, PRUint32 end)
++CallocCallback(void *ptr, size_t count, size_t size, PRUint32 start, PRUint32 end, tm_thread *t)
+ {
+     callsite *site;
+     PLHashEntry *he;
+     allocation *alloc;
+     tm_thread *t;
+ 
+-    if (!tracing_enabled || (t = get_tm_thread())->suppress_tracing != 0)
++    if (!tracing_enabled || t->suppress_tracing != 0)
+         return;
+ 
+     site = backtrace(2, t);
+@@ -1994,7 +1968,7 @@ CallocCallback(void *ptr, size_t count, 
+ }
+ 
+ PR_IMPLEMENT(void)
+-ReallocCallback(void * oldptr, void *ptr, size_t size, PRUint32 start, PRUint32 end)
++ReallocCallback(void * oldptr, void *ptr, size_t size, PRUint32 start, PRUint32 end, tm_thread *t)
+ {
+     callsite *oldsite, *site;
+     size_t oldsize;
+@@ -2003,7 +1977,7 @@ ReallocCallback(void * oldptr, void *ptr
+     allocation *alloc;
+     tm_thread *t;
+ 
+-    if (!tracing_enabled || (t = get_tm_thread())->suppress_tracing != 0)
++    if (!tracing_enabled || t->suppress_tracing != 0)
+         return;
+ 
+     site = backtrace(2, t);
+@@ -2071,14 +2045,14 @@ ReallocCallback(void * oldptr, void *ptr
+ }
+ 
+ PR_IMPLEMENT(void)
+-FreeCallback(void * ptr, PRUint32 start, PRUint32 end)
++FreeCallback(void * ptr, PRUint32 start, PRUint32 end, tm_thread *t)
+ {
+     PLHashEntry **hep, *he;
+     callsite *site;
+     allocation *alloc;
+     tm_thread *t;
+ 
+-    if (!tracing_enabled || (t = get_tm_thread())->suppress_tracing != 0)
++    if (!tracing_enabled || t->suppress_tracing != 0)
+         return;
+ 
+     t->suppress_tracing++;
+diff --git a/tools/trace-malloc/lib/nsTraceMallocCallbacks.h b/tools/trace-malloc/lib/nsTraceMallocCallbacks.h
+--- a/tools/trace-malloc/lib/nsTraceMallocCallbacks.h
++++ b/tools/trace-malloc/lib/nsTraceMallocCallbacks.h
+@@ -1,20 +1,93 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
++ *
++ * ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is the Windows port of trace-malloc.
++ *
++ * The Initial Developer of the Original Code is
++ * Netscape Communications Corporation.
++ * Portions created by the Initial Developer are Copyright (C) 2001
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   Michael Judge (original author)
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either of the GNU General Public License Version 2 or later (the "GPL"),
++ * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++/* declarations needed by both nsTraceMalloc.c and nsWinTraceMalloc.cpp */
++
+ #ifndef NSTRACEMALLOCCALLBACKS_H
+ #define NSTRACEMALLOCCALLBACKS_H
+ 
++#include <stdlib.h>
++
+ PR_BEGIN_EXTERN_C
+ 
++/* Used by backtrace. */
++typedef struct stack_buffer_info {
++    void **buffer;
++    size_t size;
++    size_t entries;
++} stack_buffer_info;
+ 
+-PR_EXTERN(void) StartupHooker();/*implemented in TraceMalloc.cpp*/
++typedef struct tm_thread tm_thread;
++struct tm_thread {
++    /*
++     * This counter suppresses tracing, in case any tracing code needs
++     * to malloc.
++     */
++    uint32 suppress_tracing;
++
++    /* buffer for backtrace, below */
++    stack_buffer_info backtrace_buf;
++};
++
++/* implemented in nsTraceMalloc.c */
++tm_thread * get_tm_thread(void)
++
++#ifdef XP_WIN32
++/* implemented in nsTraceMalloc.c */
++PR_EXTERN(void) StartupHooker();
+ PR_EXTERN(void) ShutdownHooker();
+ 
+-PR_EXTERN(void) MallocCallback(void *aPtr, size_t aSize, PRUint32 start, PRUint32 end);/*implemented in nsTraceMalloc.c*/
+-PR_EXTERN(void) CallocCallback(void *aPtr, size_t aCount, size_t aSize, PRUint32 start, PRUint32 end);
+-PR_EXTERN(void) ReallocCallback(void *aPin, void* aPout, size_t aSize, PRUint32 start, PRUint32 end);
+-PR_EXTERN(void) FreeCallback(void *aPtr, PRUint32 start, PRUint32 end);
++/* implemented in nsTraceMalloc.c */
++PR_EXTERN(void) MallocCallback(void *aPtr, size_t aSize, PRUint32 start, PRUint32 end, tm_thread *t);
++PR_EXTERN(void) CallocCallback(void *aPtr, size_t aCount, size_t aSize, PRUint32 start, PRUint32 end, tm_thread *t);
++PR_EXTERN(void) ReallocCallback(void *aPin, void* aPout, size_t aSize, PRUint32 start, PRUint32 end, tm_thread *t);
++PR_EXTERN(void) FreeCallback(void *aPtr, PRUint32 start, PRUint32 end, tm_thread *t);
+ 
++/* implemented in nsWinTraceMalloc.cpp */
++void* dhw_orig_malloc(size_t);
++void* dhw_orig_calloc(size_t, size_t);
++void* dhw_orig_realloc(void*, size_t);
++void dhw_orig_free(void*);
++
++#endif /* defined(XP_WIN32) */
+ 
+ PR_END_EXTERN_C
+ 
+-
+ #endif //NSTRACEMALLOCCALLBACKS_H
+-
+diff --git a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
+--- a/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
++++ b/tools/trace-malloc/lib/nsWinTraceMalloc.cpp
+@@ -1,3 +1,42 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
++ *
++ * ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is the Windows port of trace-malloc.
++ *
++ * The Initial Developer of the Original Code is
++ * Netscape Communications Corporation.
++ * Portions created by the Initial Developer are Copyright (C) 2001
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   Michael Judge (original author)
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either of the GNU General Public License Version 2 or later (the "GPL"),
++ * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -37,10 +76,13 @@ DHWImportHooker &getMallocHooker()
+ 
+ void * __cdecl dhw_malloc( size_t size )
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     void* result = DHW_ORIGINAL(MALLOC_, getMallocHooker())(size);
+     PRUint32 end = PR_IntervalNow();
+-    MallocCallback(result, size, start, end);
++    --t->suppress_tracing;
++    MallocCallback(result, size, start, end, t);
+     return result;    
+ }
+ 
+@@ -54,10 +96,13 @@ DHWImportHooker &getCallocHooker()
+ 
+ void * __cdecl dhw_calloc( size_t count, size_t size )
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     void* result = DHW_ORIGINAL(CALLOC_, getCallocHooker())(count,size);
+     PRUint32 end = PR_IntervalNow();
+-    CallocCallback(result, count, size, start, end);
++    --t->suppress_tracing;
++    CallocCallback(result, count, size, start, end, t);
+     return result;    
+ }
+ 
+@@ -70,10 +115,13 @@ DHWImportHooker &getFreeHooker()
+ 
+ void __cdecl dhw_free( void* p )
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     DHW_ORIGINAL(FREE_, getFreeHooker())(p);
+     PRUint32 end = PR_IntervalNow();
+-    FreeCallback(p, start, end);
++    --t->suppress_tracing;
++    FreeCallback(p, start, end, t);
+ }
+ 
+ 
+@@ -86,10 +134,13 @@ DHWImportHooker &getReallocHooker()
+ 
+ void * __cdecl dhw_realloc(void * pin, size_t size)
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     void* pout = DHW_ORIGINAL(REALLOC_, getReallocHooker())(pin, size);
+     PRUint32 end = PR_IntervalNow();
+-    ReallocCallback(pin, pout, size, start, end);
++    --t->suppress_tracing;
++    ReallocCallback(pin, pout, size, start, end, t);
+     return pout;
+ }
+ 
+@@ -103,10 +154,13 @@ DHWImportHooker &getNewHooker()
+ 
+ void * __cdecl dhw_new(size_t size)
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     void* result = DHW_ORIGINAL(NEW_, getNewHooker())(size);
+     PRUint32 end = PR_IntervalNow();
+-    MallocCallback(result, size, start, end);//do we need a different one for new?
++    --t->suppress_tracing;
++    MallocCallback(result, size, start, end, t);//do we need a different one for new?
+     return result;
+ }
+ 
+@@ -120,10 +174,13 @@ DHWImportHooker &getDeleteHooker()
+ 
+ void __cdecl dhw_delete(void* p)
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     DHW_ORIGINAL(DELETE_, getDeleteHooker())(p);
+     PRUint32 end = PR_IntervalNow();
+-    FreeCallback(p, start, end);
++    --t->suppress_tracing;
++    FreeCallback(p, start, end, t);
+ }
+ 
+ // Note the mangled name!
+@@ -136,10 +193,13 @@ DHWImportHooker &getVecNewHooker()
+ 
+ void * __cdecl dhw_vec_new(size_t size)
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing; // need to suppress since new[] calls new
+     PRUint32 start = PR_IntervalNow();
+     void* result = DHW_ORIGINAL(VEC_NEW_, getVecNewHooker())(size);
+     PRUint32 end = PR_IntervalNow();
+-    MallocCallback(result, size, start, end);//do we need a different one for new[]?
++    --t->suppress_tracing;
++    MallocCallback(result, size, start, end, t);//do we need a different one for new[]?
+     return result;
+ }
+ 
+@@ -153,10 +213,13 @@ DHWImportHooker &getVecDeleteHooker()
+ 
+ void __cdecl dhw_vec_delete(void* p)
+ {
++    tm_thread *t = get_tm_thread();
++    ++t->suppress_tracing;
+     PRUint32 start = PR_IntervalNow();
+     DHW_ORIGINAL(VEC_DELETE_, getVecDeleteHooker())(p);
+     PRUint32 end = PR_IntervalNow();
+-    FreeCallback(p, start, end);
++    --t->suppress_tracing;
++    FreeCallback(p, start, end, t);
+ }
+ 
+ /*C Callbacks*/
