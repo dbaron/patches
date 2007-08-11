@@ -1,0 +1,119 @@
+Fix Windows stack traces to work on VC8-compiled builds in addition to VC7.1-compiled builds.
+
+diff --git a/xpcom/base/nsStackFrameWin.cpp b/xpcom/base/nsStackFrameWin.cpp
+--- a/xpcom/base/nsStackFrameWin.cpp
++++ b/xpcom/base/nsStackFrameWin.cpp
+@@ -120,10 +120,11 @@ SYMGETLINEFROMADDRPROC64 _SymGetLineFrom
+ #define _SymGetLineFromAddr64 0
+ #endif
+ 
++PR_END_EXTERN_C
++
+ DWORD gStackWalkThread;
+ CRITICAL_SECTION gDbgHelpCS;
+-
+-PR_END_EXTERN_C
++HANDLE gCurrentProcess;
+ 
+ // Routine to print an error message to standard error.
+ // Will also call callback with error, if data supplied.
+@@ -154,6 +155,17 @@ EnsureImageHlpInitialized()
+     if (gInitialized)
+         return gInitialized;
+ 
++    // StackWalk64 requires a real handle, not the GetCurrentProcess
++    // pseudo-handle; the symbol functions require a consistent handle
++    if (!::DuplicateHandle(::GetCurrentProcess(),
++                           ::GetCurrentProcess(),
++                           ::GetCurrentProcess(),
++                           &gCurrentProcess,
++                           0, TRUE, DUPLICATE_SAME_ACCESS)) {
++        PrintError("DuplicateHandle (process)");
++        return PR_FALSE;
++    }
++
+     // Hope that our first call doesn't happen during static
+     // initialization.  If it does, this CreateThread call won't
+     // actually start the thread until after the static initialization
+@@ -270,7 +282,7 @@ static BOOL CALLBACK callbackEspecial(
+        ? (addr >= aModuleBase && addr <= (aModuleBase + aModuleSize))
+        : (addr <= aModuleBase && addr >= (aModuleBase - aModuleSize))
+         ) {
+-        retval = _SymLoadModule(GetCurrentProcess(), NULL, aModuleName, NULL, aModuleBase, aModuleSize);
++        retval = _SymLoadModule(gCurrentProcess, NULL, aModuleName, NULL, aModuleBase, aModuleSize);
+         if (!retval)
+             PrintError("SymLoadModule");
+     }
+@@ -302,7 +314,7 @@ static BOOL CALLBACK callbackEspecial64(
+        ? (addr >= aModuleBase && addr <= (aModuleBase + aModuleSize))
+        : (addr <= aModuleBase && addr >= (aModuleBase - aModuleSize))
+         ) {
+-        retval = _SymLoadModule64(GetCurrentProcess(), NULL, aModuleName, NULL, aModuleBase, aModuleSize);
++        retval = _SymLoadModule64(gCurrentProcess, NULL, aModuleName, NULL, aModuleBase, aModuleSize);
+         if (!retval)
+             PrintError("SymLoadModule64");
+     }
+@@ -430,7 +442,7 @@ GetCurrentPIDorHandle()
+ GetCurrentPIDorHandle()
+ {
+     if (_SymGetModuleBase64)
+-        return GetCurrentProcess();  // winxp and friends use process handle
++        return gCurrentProcess;  // winxp and friends use process handle
+ 
+     return (HANDLE) GetCurrentProcessId(); // winme win98 win95 etc use process identifier
+ }
+@@ -471,7 +483,7 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+ NS_StackWalk(NS_WalkStackCallback aCallback, PRUint32 aSkipFrames,
+              void *aClosure)
+ {
+-    HANDLE myProcess, myThread;
++    HANDLE myThread;
+     DWORD walkerReturn;
+     struct WalkStackData data;
+ 
+@@ -479,27 +491,18 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+         return PR_FALSE;
+ 
+     // Have to duplicate handle to get a real handle.
+-    if (!::DuplicateHandle(::GetCurrentProcess(),
+-                           ::GetCurrentProcess(),
+-                           ::GetCurrentProcess(),
+-                           &myProcess,
+-                           PROCESS_ALL_ACCESS, FALSE, 0)) {
+-        PrintError("DuplicateHandle (process)");
+-        return NS_ERROR_FAILURE;
+-    }
+     if (!::DuplicateHandle(::GetCurrentProcess(),
+                            ::GetCurrentThread(),
+                            ::GetCurrentProcess(),
+                            &myThread,
+                            THREAD_ALL_ACCESS, FALSE, 0)) {
+         PrintError("DuplicateHandle (thread)");
+-        ::CloseHandle(myProcess);
+         return NS_ERROR_FAILURE;
+     }
+ 
+     data.skipFrames = aSkipFrames;
+     data.thread = myThread;
+-    data.process = myProcess;
++    data.process = gCurrentProcess;
+     data.eventStart = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+     data.eventEnd = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+     void *local_pcs[1024];
+@@ -525,7 +528,6 @@ NS_StackWalk(NS_WalkStackCallback aCallb
+     }
+ 
+     ::CloseHandle(myThread);
+-    ::CloseHandle(myProcess);
+     ::CloseHandle(data.eventStart);
+     ::CloseHandle(data.eventEnd);
+ 
+@@ -783,7 +785,7 @@ NS_DescribeCodeAddress(void *aPC, nsCode
+     if (!EnsureSymInitialized())
+         return NS_ERROR_FAILURE;
+ 
+-    HANDLE myProcess = ::GetCurrentProcess();
++    HANDLE myProcess = gCurrentProcess;
+     BOOL ok;
+ 
+     // debug routines are not threadsafe, so grab the lock.
