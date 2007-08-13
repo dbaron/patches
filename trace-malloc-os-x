@@ -3,7 +3,7 @@ Port trace-malloc to Mac OS X.
 diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
 --- a/tools/trace-malloc/lib/nsTraceMalloc.c
 +++ b/tools/trace-malloc/lib/nsTraceMalloc.c
-@@ -70,17 +70,31 @@
+@@ -70,17 +70,19 @@
  #include "nsStackWalk.h"
  #include "nsTraceMallocCallbacks.h"
  
@@ -21,29 +21,17 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
 -#endif /* WIN32 */
 -
 -#ifdef XP_UNIX
-+static malloc_zone_t *default_zone = NULL;
-+
-+static malloc_zone_t *
-+get_default_zone()
-+{
-+    if (!default_zone)
-+        default_zone = malloc_default_zone();
-+    return default_zone;
-+}
-+
-+typedef void *__ptr_t;
-+#define __libc_malloc(x)      (get_default_zone()->malloc)(default_zone, x)
-+#define __libc_calloc(x, y)   (get_default_zone()->calloc)(default_zone, x, y)
-+#define __libc_valloc(x)      (get_default_zone()->valloc)(default_zone, x)
-+#define __libc_realloc(x, y)  (get_default_zone()->realloc)(default_zone, x, y)
-+#define __libc_free(x)        (get_default_zone()->free)(default_zone, x)
++#define __libc_malloc(x)                malloc(x)
++#define __libc_calloc(x, y)             calloc(x, y)
++#define __libc_realloc(x, y)            realloc(x, y)
++#define __libc_free(x)                  free(x)
 +
 +#elif defined(XP_UNIX)
 +
  #define WRITE_FLAGS "w"
  
  #ifdef WRAP_SYSTEM_INCLUDES
-@@ -96,9 +110,14 @@ extern __ptr_t __libc_valloc(size_t);
+@@ -96,9 +98,14 @@ extern __ptr_t __libc_valloc(size_t);
  #pragma GCC visibility pop
  #endif
  
@@ -61,36 +49,86 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
  #define __libc_malloc(x)                dhw_orig_malloc(x)
  #define __libc_calloc(x, y)             dhw_orig_calloc(x,y)
-@@ -1274,6 +1293,7 @@ valloc(size_t size)
-     return ptr;
- }
+@@ -1021,7 +1028,7 @@ static PLHashTable *new_allocations(void
  
-+#ifndef XP_MACOSX
- NS_EXTERNAL_VIS_(void*)
- memalign(size_t boundary, size_t size)
- {
-@@ -1329,6 +1349,7 @@ posix_memalign(void **memptr, size_t ali
-     *memptr = ptr;
-     return 0;
- }
-+#endif
+ #define get_allocations() (allocations ? allocations : new_allocations())
  
- NS_EXTERNAL_VIS_(void)
- free(__ptr_t ptr)
-@@ -1389,11 +1410,13 @@ free(__ptr_t ptr)
-     }
- }
+-#ifdef XP_UNIX
++#if defined(XP_UNIX) && !defined(XP_MACOSX)
  
-+#ifndef XP_MACOSX
- NS_EXTERNAL_VIS_(void)
- cfree(void *ptr)
- {
-     free(ptr);
- }
-+#endif
+ NS_EXTERNAL_VIS_(__ptr_t)
+ malloc(size_t size)
+@@ -1397,6 +1404,43 @@ cfree(void *ptr)
  
  #endif /* XP_UNIX */
  
++#ifdef XP_MACOSX
++
++/* from malloc.c in Libc */
++typedef void (malloc_logger_t)(unsigned type, unsigned arg1, unsigned arg2, unsigned arg3, unsigned result, unsigned num_hot_frames_to_skip);
++extern malloc_logger_t *malloc_logger;
++
++#define MALLOC_LOG_TYPE_ALLOCATE        2
++#define MALLOC_LOG_TYPE_DEALLOCATE      4
++#define MALLOC_LOG_TYPE_HAS_ZONE        8
++#define MALLOC_LOG_TYPE_CLEARED         64
++
++static void
++my_malloc_logger(unsigned type, unsigned arg1, unsigned arg2, unsigned arg3,
++                 unsigned result, unsigned num_hot_frames_to_skip)
++{
++    unsigned all_args[3] = { arg1, arg2, arg3 };
++    unsigned *args = args + ((type & MALLOC_LOG_TYPE_HAS_ZONE) ? 1 : 0);
++
++    unsigned alloc_type =
++        type & (MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_DEALLOCATE);
++    tm_thread *t = get_tm_thread();
++
++    if (alloc_type == (MALLOC_LOG_TYPE_ALLOCATE | MALLOC_LOG_TYPE_DEALLOCATE)) {
++        ReallocCallback(args[0], result, args[1], 0, 0, t);
++    } else if (alloc_type == MALLOC_LOG_TYPE_ALLOCATE) {
++        /*
++         * We don't get size/count information for calloc, so just use
++         * MallocCallback.
++         */
++        MallocCallback(result, args[0], 0, 0, t);
++    } else if (alloc_type == MALLOC_LOG_TYPE_DEALLOCATE) {
++        FreeCallback(args[0], 0, 0, t);
++    }
++}
++
++#endif
++
+ static const char magic[] = NS_TRACE_MALLOC_MAGIC;
+ 
+ static void
+@@ -1444,6 +1488,9 @@ PR_IMPLEMENT(void) NS_TraceMallocStartup
+     if (tracing_enabled) {
+         StartupHooker();
+     }
++#endif
++#ifdef XP_MACOSX
++    malloc_logger = my_malloc_logger;
+ #endif
+ }
+ 
+@@ -1896,7 +1943,7 @@ NS_TrackAllocation(void* ptr, FILE *ofp)
+     t->suppress_tracing--;
+ }
+ 
+-#ifdef XP_WIN32
++#if defined(XP_WIN32) || defined(XP_MACOSX)
+ 
+ PR_IMPLEMENT(void)
+ MallocCallback(void *ptr, size_t size, PRUint32 start, PRUint32 end, tm_thread *t)
+@@ -2078,6 +2125,6 @@ FreeCallback(void * ptr, PRUint32 start,
+     t->suppress_tracing--;
+ }
+ 
+-#endif /*XP_WIN32*/
++#endif /* defined(XP_WIN32) || defined(XP_MACOSX) */
+ 
+ #endif /* NS_TRACE_MALLOC */
 diff --git a/tools/trace-malloc/lib/nsTypeInfo.cpp b/tools/trace-malloc/lib/nsTypeInfo.cpp
 --- a/tools/trace-malloc/lib/nsTypeInfo.cpp
 +++ b/tools/trace-malloc/lib/nsTypeInfo.cpp
