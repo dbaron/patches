@@ -3,11 +3,12 @@ Make boxes that have non-box non-block children wrap all their children in a blo
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
-@@ -6182,10 +6182,24 @@ nsCSSFrameConstructor::ConstructXULFrame
+@@ -6181,20 +6181,37 @@ nsCSSFrameConstructor::ConstructXULFrame
+ 
      // Process the child content if requested
      nsFrameItems childItems;
++    nsIFrame *insertionPoint = newFrame;
      if (!newFrame->IsLeaf()) {
-+      nsIFrame *insertionPoint = newFrame;
 +      if (aContent == mXULContentReframingForWrapper) {
 +        nsRefPtr<nsStyleContext> blockSC = mPresShell->StyleSet()->
 +          ResolvePseudoStyleFor(aContent, nsCSSAnonBoxes::mozAnonymousBlock,
@@ -27,9 +28,33 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -        rv = ProcessChildren(aState, aContent, newFrame, PR_FALSE,
 +        rv = ProcessChildren(aState, aContent, insertionPoint, PR_FALSE,
                               childItems, PR_FALSE);
++        if (AnyKidsNeedBlockParent(childItems.frameList)) {
++        }
        }
      }
-@@ -12841,6 +12855,55 @@ nsCSSFrameConstructor::ProcessInlineChil
+       
++    // XXX These should go after the wrapper!
+     CreateAnonymousFrames(aTag, aState, aContent, newFrame, PR_FALSE,
+                           childItems);
+ 
+     // Set the frame's initial child list
+-    newFrame->SetInitialChildList(nsnull, childItems.childList);
++    insertionPoint->SetInitialChildList(nsnull, childItems.childList);
+   }
+ 
+ #ifdef MOZ_XUL
+@@ -12513,8 +12530,8 @@ nsCSSFrameConstructor::ConstructBlock(ns
+   return rv;
+ }
+ 
+-PRBool
+-nsCSSFrameConstructor::AreAllKidsInline(nsIFrame* aFrameList)
++static PRBool
++AreAllKidsInline(nsIFrame* aFrameList)
+ {
+   nsIFrame* kid = aFrameList;
+   while (kid) {
+@@ -12841,6 +12858,68 @@ nsCSSFrameConstructor::ProcessInlineChil
    return rv;
  }
  
@@ -82,10 +107,23 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +#endif
 +}
 +
++static PRBool
++AnyKidsNeedBlockParent(nsIFrame *aFrameList)
++{
++  for (nsIFrame *k = aFrameList; k; k = k->GetNextSibling()) {
++    // XXX Should we really need to do this for text frames?  Will we
++    // ever do it for whitespace-only text frames?
++    if (k->IsFrameOfType(nsIFrame::eLineParticipant)) {
++      return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
  PRBool
  nsCSSFrameConstructor::WipeContainingBlock(nsFrameConstructorState& aState,
                                             nsIFrame* aContainingBlock,
-@@ -12853,8 +12916,34 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12853,8 +12932,23 @@ nsCSSFrameConstructor::WipeContainingBlo
      return PR_FALSE;
    }
    
@@ -97,32 +135,21 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +  // Situation #1 is a XUL frame that contains frames that are required
 +  // to be wrapped in blocks.
 +  if (aFrame->IsBoxFrame() &&
-+      !(aFrame->GetStateBits() & NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK)) {
-+    PRBool needWrapper = PR_FALSE;
-+    for (nsIFrame *k = aFrameList.childList; k; k = k->GetNextSibling()) {
-+      // XXX Should we really need to do this for text frames?  Will we
-+      // ever do it for whitespace-only text frames?
-+      if (k->IsFrameOfType(nsIFrame::eLineParticipant)) {
-+        needWrapper = PR_TRUE;
-+        break;
-+      }
-+    }
-+
-+    if (needWrapper) {
-+      // XXX print warning to the JS console.
-+      DestroyNewlyCreatedFrames(aState, aFrame, aFrameList);
-+      mXULContentReframingForWrapper = aFrame->GetContent();
-+      RecreateFramesForContent(mXULContentReframingForWrapper);
-+      mXULContentReframingForWrapper = nsnull;
-+      return PR_TRUE;
-+    }
++      !(aFrame->GetStateBits() & NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK) &&
++      AnyKidsNeedBlockParent(aFrameList.childList)) {
++    // XXX print warning to the JS console.
++    DestroyNewlyCreatedFrames(aState, aFrame, aFrameList);
++    mXULContentReframingForWrapper = aFrame->GetContent();
++    RecreateFramesForContent(mXULContentReframingForWrapper);
++    mXULContentReframingForWrapper = nsnull;
++    return PR_TRUE;
 +  }
 +
 +  // Situation #2 is an inline frame that will now contain block
    // frames. This is a no-no and the frame construction logic knows
    // how to fix this.  See defition of IsInlineFrame() for what "an
    // inline" is.  Whether we have "a block" is tested for by
-@@ -12916,48 +13005,7 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12916,48 +13010,7 @@ nsCSSFrameConstructor::WipeContainingBlo
      }
    }
  
@@ -175,7 +202,16 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
 --- a/layout/base/nsCSSFrameConstructor.h
 +++ b/layout/base/nsCSSFrameConstructor.h
-@@ -1115,6 +1115,7 @@ private:
+@@ -885,8 +885,6 @@ private:
+                                  nsFrameItems&            aFrameItems,
+                                  PRBool*                  aKidsAllInline);
+ 
+-  PRBool AreAllKidsInline(nsIFrame* aFrameList);
+-
+   // Determine whether we need to wipe out what we just did and start over
+   // because we're doing something like adding block kids to an inline frame
+   // (and therefore need an {ib} split).  If aIsAppend is true, aPrevSibling is
+@@ -1115,6 +1113,7 @@ private:
    nsRevocableEventPtr<RestyleEvent> mRestyleEvent;
  
    nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
