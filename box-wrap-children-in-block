@@ -3,25 +3,7 @@ Make boxes that have non-box non-block children wrap all their children in a blo
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
-@@ -6181,20 +6181,37 @@ nsCSSFrameConstructor::ConstructXULFrame
- 
-     // Process the child content if requested
-     nsFrameItems childItems;
-+    nsIFrame *insertionPoint = newFrame;
-     if (!newFrame->IsLeaf()) {
-+      if (aContent == mXULContentReframingForWrapper) {
-+        nsRefPtr<nsStyleContext> blockSC = mPresShell->StyleSet()->
-+          ResolvePseudoStyleFor(aContent, nsCSSAnonBoxes::mozAnonymousBlock,
-+                                aStyleContext);
-+        nsIFrame *blockFrame = NS_NewBlockFrame(mPresShell, blockSC);
-+        // We might, in theory, want to set NS_BLOCK_SPACE_MGR and
-+        // NS_BLOCK_MARGIN_ROOT, but I think it's a bad idea given that
-+        // a real block placed here wouldn't get those set on it.
-+        newFrame->AppendFrames(nsnull, blockFrame);
-+        newFrame->AddStateBits(NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK);
-+        insertionPoint = blockFrame;
-+      }
-+
+@@ -6185,11 +6185,36 @@ nsCSSFrameConstructor::ConstructXULFrame
        // XXXbz don't we need calls to ShouldBuildChildFrames
        // elsewhere too?  Why only for XUL?
        if (mDocument->BindingManager()->ShouldBuildChildFrames(aContent)) {
@@ -29,6 +11,28 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +        rv = ProcessChildren(aState, aContent, insertionPoint, PR_FALSE,
                               childItems, PR_FALSE);
 +        if (AnyKidsNeedBlockParent(childItems.frameList)) {
++
++          // XXX print warning to the JS console.
++
++          nsRefPtr<nsStyleContext> blockSC = mPresShell->StyleSet()->
++            ResolvePseudoStyleFor(aContent, nsCSSAnonBoxes::mozAnonymousBlock,
++                                  aStyleContext);
++          nsIFrame *blockFrame = NS_NewBlockFrame(mPresShell, blockSC);
++          // We might, in theory, want to set NS_BLOCK_SPACE_MGR and
++          // NS_BLOCK_MARGIN_ROOT, but I think it's a bad idea given that
++          // a real block placed here wouldn't get those set on it.
++
++          for (nsIFrame *f = childItems.childList; f; f = f->GetNextSibling()) {
++            f->SetParent(blockFrame);
++          }
++          blockFrame->AddStateBits(newFrame->GetStateBits() &
++                                   NS_FRAME_HAS_CHILD_WITH_VIEW);
++          blockFrame->AppendFrames(nsnull, childItems.childList);
++          childItems->~nsFrameItems();
++          new (&childItems) nsFrameItems();
++
++          childItems.AddChild(blockFrame);
++          newFrame->AddStateBits(NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK);
 +        }
        }
      }
@@ -37,13 +41,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      CreateAnonymousFrames(aTag, aState, aContent, newFrame, PR_FALSE,
                            childItems);
  
-     // Set the frame's initial child list
--    newFrame->SetInitialChildList(nsnull, childItems.childList);
-+    insertionPoint->SetInitialChildList(nsnull, childItems.childList);
-   }
- 
- #ifdef MOZ_XUL
-@@ -12513,8 +12530,8 @@ nsCSSFrameConstructor::ConstructBlock(ns
+@@ -12513,8 +12538,8 @@ nsCSSFrameConstructor::ConstructBlock(ns
    return rv;
  }
  
@@ -54,7 +52,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    nsIFrame* kid = aFrameList;
    while (kid) {
-@@ -12841,6 +12858,68 @@ nsCSSFrameConstructor::ProcessInlineChil
+@@ -12841,6 +12866,68 @@ nsCSSFrameConstructor::ProcessInlineChil
    return rv;
  }
  
@@ -123,7 +121,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  PRBool
  nsCSSFrameConstructor::WipeContainingBlock(nsFrameConstructorState& aState,
                                             nsIFrame* aContainingBlock,
-@@ -12853,8 +12932,23 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12853,8 +12940,20 @@ nsCSSFrameConstructor::WipeContainingBlo
      return PR_FALSE;
    }
    
@@ -137,11 +135,8 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +  if (aFrame->IsBoxFrame() &&
 +      !(aFrame->GetStateBits() & NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK) &&
 +      AnyKidsNeedBlockParent(aFrameList.childList)) {
-+    // XXX print warning to the JS console.
 +    DestroyNewlyCreatedFrames(aState, aFrame, aFrameList);
-+    mXULContentReframingForWrapper = aFrame->GetContent();
-+    RecreateFramesForContent(mXULContentReframingForWrapper);
-+    mXULContentReframingForWrapper = nsnull;
++    RecreateFramesForContent(aFrame->GetContent());
 +    return PR_TRUE;
 +  }
 +
@@ -149,7 +144,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    // frames. This is a no-no and the frame construction logic knows
    // how to fix this.  See defition of IsInlineFrame() for what "an
    // inline" is.  Whether we have "a block" is tested for by
-@@ -12916,48 +13010,7 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12916,48 +13015,7 @@ nsCSSFrameConstructor::WipeContainingBlo
      }
    }
  
@@ -211,14 +206,6 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
    // Determine whether we need to wipe out what we just did and start over
    // because we're doing something like adding block kids to an inline frame
    // (and therefore need an {ib} split).  If aIsAppend is true, aPrevSibling is
-@@ -1115,6 +1113,7 @@ private:
-   nsRevocableEventPtr<RestyleEvent> mRestyleEvent;
- 
-   nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
-+  nsCOMPtr<nsIContent> mXULContentReframingForWrapper;
- 
-   nsDataHashtable<nsISupportsHashKey, RestyleData> mPendingRestyles;
- 
 diff --git a/layout/xul/base/src/nsBoxFrame.cpp b/layout/xul/base/src/nsBoxFrame.cpp
 --- a/layout/xul/base/src/nsBoxFrame.cpp
 +++ b/layout/xul/base/src/nsBoxFrame.cpp
