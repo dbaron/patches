@@ -19,7 +19,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  #include "nsIDocShell.h"
  #include "nsIDocShellTreeItem.h"
  #include "nsObjectFrame.h"
-@@ -461,6 +462,23 @@ IsInlineFrame(const nsIFrame* aFrame)
+@@ -461,6 +462,24 @@ IsInlineFrame(const nsIFrame* aFrame)
    return aFrame->IsFrameOfType(nsIFrame::eLineParticipant);
  }
  
@@ -31,8 +31,9 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +AnyKidsNeedBlockParent(nsIFrame *aFrameList)
 +{
 +  for (nsIFrame *k = aFrameList; k; k = k->GetNextSibling()) {
-+    // XXX Should we really need to do this for text frames?  Will we
-+    // ever do it for whitespace-only text frames?
++    // Line participants, such as text and inline frames, can't be
++    // directly inside a XUL box; they must be wrapped in an
++    // intermediate block.
 +    if (k->IsFrameOfType(nsIFrame::eLineParticipant)) {
 +      return k->GetContent();
 +    }
@@ -43,7 +44,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  //----------------------------------------------------------------------
  //
  // When inline frames get weird and have block frames in them, we
-@@ -6187,9 +6205,47 @@ nsCSSFrameConstructor::ConstructXULFrame
+@@ -6187,9 +6206,50 @@ nsCSSFrameConstructor::ConstructXULFrame
        if (mDocument->BindingManager()->ShouldBuildChildFrames(aContent)) {
          rv = ProcessChildren(aState, aContent, newFrame, PR_FALSE,
                               childItems, PR_FALSE);
@@ -71,17 +72,20 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +          // NS_BLOCK_MARGIN_ROOT, but I think it's a bad idea given that
 +          // a real block placed here wouldn't get those set on it.
 +
++          InitAndRestoreFrame(aState, aContent, newFrame, nsnull,
++                              blockFrame, PR_FALSE);
++
++          NS_ASSERTION(!blockFrame->HasView(), "need to do view reparenting");
 +          for (nsIFrame *f = childItems.childList; f; f = f->GetNextSibling()) {
 +            f->SetParent(blockFrame);
 +          }
-+          blockFrame->Init(aContent, newFrame, nsnull);
 +          blockFrame->AddStateBits(newFrame->GetStateBits() &
 +                                   NS_FRAME_HAS_CHILD_WITH_VIEW);
-+          blockFrame->AppendFrames(nsnull, childItems.childList);
-+          childItems.~nsFrameItems();
-+          new (&childItems) nsFrameItems();
 +
++          blockFrame->AppendFrames(nsnull, childItems.childList);
++          childItems = nsFrameItems();
 +          childItems.AddChild(blockFrame);
++
 +          newFrame->AddStateBits(NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK);
 +        }
        }
@@ -91,7 +95,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      CreateAnonymousFrames(aTag, aState, aContent, newFrame, PR_FALSE,
                            childItems);
  
-@@ -7489,8 +7545,7 @@ nsCSSFrameConstructor::ConstructSVGFrame
+@@ -7475,8 +7535,7 @@ nsCSSFrameConstructor::ConstructSVGFrame
        // absolute containing block.
        nsFrameConstructorSaveState saveState;
        aState.PushFloatContainingBlock(nsnull, saveState, PR_FALSE, PR_FALSE);
@@ -101,7 +105,24 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
                            newFrame, newFrame, innerPseudoStyle,
                            &blockFrame, childItems, PR_TRUE);
        // Give the blockFrame a view so that GetOffsetTo works for descendants
-@@ -12532,8 +12587,8 @@ nsCSSFrameConstructor::ConstructBlock(ns
+@@ -9586,6 +9645,16 @@ nsCSSFrameConstructor::ContentRemoved(ns
+     if (possibleMathMLAncestor->IsFrameOfType(nsIFrame::eMathML))
+       return RecreateFramesForContent(possibleMathMLAncestor->GetContent());
+ #endif
++
++    // Undo XUL wrapping if it's no longer needed.
++    if (parentFrame->IsBoxFrame() &&
++        (parentFrame->GetStateBits() & NS_STATE_BOX_WRAPS_KIDS_IN_BLOCK) &&
++        // check if this frame is the only one needing wrapping
++        childFrame == AnyKidsNeedBlockParent(parentFrame->GetFirstChild(nsnull)
++                                               ->GetFirstChild(nsnull)) &&
++        !AnyKidsNeedBlockParent(childFrame->GetNextSibling())) {
++      return RecreateFramesForContent(parentFrame->GetContent());
++    }
+     
+     // Examine the containing-block for the removed content and see if
+     // :first-letter style applies.
+@@ -12518,8 +12587,8 @@ nsCSSFrameConstructor::ConstructBlock(ns
    return rv;
  }
  
@@ -112,7 +133,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    nsIFrame* kid = aFrameList;
    while (kid) {
-@@ -12860,6 +12915,55 @@ nsCSSFrameConstructor::ProcessInlineChil
+@@ -12846,6 +12915,55 @@ nsCSSFrameConstructor::ProcessInlineChil
    return rv;
  }
  
@@ -168,7 +189,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  PRBool
  nsCSSFrameConstructor::WipeContainingBlock(nsFrameConstructorState& aState,
                                             nsIFrame* aContainingBlock,
-@@ -12872,8 +12976,20 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12858,8 +12976,20 @@ nsCSSFrameConstructor::WipeContainingBlo
      return PR_FALSE;
    }
    
@@ -191,7 +212,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    // frames. This is a no-no and the frame construction logic knows
    // how to fix this.  See defition of IsInlineFrame() for what "an
    // inline" is.  Whether we have "a block" is tested for by
-@@ -12935,48 +13051,7 @@ nsCSSFrameConstructor::WipeContainingBlo
+@@ -12921,48 +13051,7 @@ nsCSSFrameConstructor::WipeContainingBlo
      }
    }
  
