@@ -1,0 +1,207 @@
+Make text decorations contribute to overflow area to avoid repaint bugs.  b=392785
+
+diff --git a/layout/generic/nsHTMLContainerFrame.cpp b/layout/generic/nsHTMLContainerFrame.cpp
+--- a/layout/generic/nsHTMLContainerFrame.cpp
++++ b/layout/generic/nsHTMLContainerFrame.cpp
+@@ -138,7 +138,7 @@ nsHTMLContainerFrame::DisplayTextDecorat
+   // nsTextFrame::PaintTextDecorations.  (See bug 1777.)
+   nscolor underColor, overColor, strikeColor;
+   PRUint8 decorations = NS_STYLE_TEXT_DECORATION_NONE;
+-  GetTextDecorations(PresContext(), aLine != nsnull, decorations, underColor, 
++  GetTextDecorations(aLine != nsnull, decorations, underColor, 
+                      overColor, strikeColor);
+ 
+   if (decorations & NS_STYLE_TEXT_DECORATION_UNDERLINE) {
+@@ -188,7 +188,7 @@ nsHTMLContainerFrame::BuildDisplayList(n
+ }
+ 
+ static PRBool 
+-HasTextFrameDescendantOrInFlow(nsPresContext* aPresContext, nsIFrame* aFrame);
++HasTextFrameDescendantOrInFlow(nsIFrame* aFrame);
+ 
+ /*virtual*/ void
+ nsHTMLContainerFrame::PaintTextDecorationLine(
+@@ -226,8 +226,7 @@ nsHTMLContainerFrame::PaintTextDecoratio
+ }
+ 
+ void
+-nsHTMLContainerFrame::GetTextDecorations(nsPresContext* aPresContext, 
+-                                         PRBool aIsBlock,
++nsHTMLContainerFrame::GetTextDecorations(PRBool aIsBlock,
+                                          PRUint8& aDecorations,
+                                          nscolor& aUnderColor, 
+                                          nscolor& aOverColor, 
+@@ -297,14 +296,14 @@ nsHTMLContainerFrame::GetTextDecorations
+   
+   if (aDecorations) {
+     // If this frame contains no text, we're required to ignore this property
+-    if (!HasTextFrameDescendantOrInFlow(aPresContext, this)) {
++    if (!HasTextFrameDescendantOrInFlow(this)) {
+       aDecorations = NS_STYLE_TEXT_DECORATION_NONE;
+     }
+   }
+ }
+ 
+ static PRBool 
+-HasTextFrameDescendant(nsPresContext* aPresContext, nsIFrame* aParent)
++HasTextFrameDescendant(nsIFrame* aParent)
+ {
+   for (nsIFrame* kid = aParent->GetFirstChild(nsnull); kid;
+        kid = kid->GetNextSibling())
+@@ -317,7 +316,7 @@ HasTextFrameDescendant(nsPresContext* aP
+         return PR_TRUE;
+       }
+     }
+-    if (HasTextFrameDescendant(aPresContext, kid)) {
++    if (HasTextFrameDescendant(kid)) {
+       return PR_TRUE;
+     }
+   }
+@@ -325,10 +324,10 @@ HasTextFrameDescendant(nsPresContext* aP
+ }
+ 
+ static PRBool 
+-HasTextFrameDescendantOrInFlow(nsPresContext* aPresContext, nsIFrame* aFrame)
++HasTextFrameDescendantOrInFlow(nsIFrame* aFrame)
+ {
+   for (nsIFrame *f = aFrame->GetFirstInFlow(); f; f = f->GetNextInFlow()) {
+-    if (HasTextFrameDescendant(aPresContext, f))
++    if (HasTextFrameDescendant(f))
+       return PR_TRUE;
+   }
+   return PR_FALSE;
+diff --git a/layout/generic/nsHTMLContainerFrame.h b/layout/generic/nsHTMLContainerFrame.h
+--- a/layout/generic/nsHTMLContainerFrame.h
++++ b/layout/generic/nsHTMLContainerFrame.h
+@@ -150,8 +150,7 @@ protected:
+    *        aDecorations for text-less frames.  See bug 20163 for
+    *        details.
+    */
+-  void GetTextDecorations(nsPresContext* aPresContext, 
+-                          PRBool aIsBlock,
++  void GetTextDecorations(PRBool aIsBlock,
+                           PRUint8& aDecorations, 
+                           nscolor& aUnderColor, 
+                           nscolor& aOverColor, 
+diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
+--- a/layout/generic/nsTextFrame.h
++++ b/layout/generic/nsTextFrame.h
+@@ -236,6 +236,16 @@ public:
+                             const gfxPoint& aTextBaselinePt,
+                             nsTextPaintStyle& aTextStyle,
+                             PropertyProvider& aProvider);
++
++  static PRBool TextFramePaintsDecorations(nsIPresContext *aPresContext) const {
++    return eCompatibility_NavQuirks == aPresContext->CompatibilityMode()
++  }
++
++  void GetTextDecorations(PRUint8& aDecorations, 
++                          nscolor& aUnderColor, 
++                          nscolor& aOverColor, 
++                          nscolor& aStrikeColor);
++
+   // helper: paint text frame when we're impacted by at least one selection.
+   // Return PR_FALSE if the text was not painted and we should continue with
+   // the fast path.
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -3531,19 +3531,11 @@ FillClippedRect(gfxContext* aCtx, nsPres
+   aCtx->Fill();
+ }
+ 
+-void 
+-nsTextFrame::PaintTextDecorations(gfxContext* aCtx, const gfxRect& aDirtyRect,
+-                                  const gfxPoint& aFramePt,
+-                                  const gfxPoint& aTextBaselinePt,
+-                                  nsTextPaintStyle& aTextPaintStyle,
+-                                  PropertyProvider& aProvider)
+-{
+-  // Quirks mode text decoration are rendered by children; see bug 1777
+-  // In non-quirks mode, nsHTMLContainer::Paint and nsBlockFrame::Paint
+-  // does the painting of text decorations.
+-  if (eCompatibility_NavQuirks != aTextPaintStyle.PresContext()->CompatibilityMode())
+-    return;
+-
++void nsTextFrame::GetTextDecorations(PRUint8& aDecorations, 
++                                     nscolor& aUnderColor, 
++                                     nscolor& aOverColor, 
++                                     nscolor& aStrikeColor)
++{
+   PRBool useOverride = PR_FALSE;
+   nscolor overrideColor;
+ 
+@@ -3552,11 +3544,9 @@ nsTextFrame::PaintTextDecorations(gfxCon
+   PRUint8 decorMask = NS_STYLE_TEXT_DECORATION_UNDERLINE | 
+                       NS_STYLE_TEXT_DECORATION_OVERLINE |
+                       NS_STYLE_TEXT_DECORATION_LINE_THROUGH;    
+-  nscolor overColor, underColor, strikeColor;
+   nsStyleContext* context = GetStyleContext();
+-  PRBool hasDecorations = context->HasTextDecorations();
+-
+-  while (hasDecorations) {
++
++  while (context->HasTextDecorations()) {
+     const nsStyleTextReset* styleText = context->GetStyleTextReset();
+     if (!useOverride && 
+         (NS_STYLE_TEXT_DECORATION_OVERRIDE_ALL & styleText->mTextDecoration)) {
+@@ -3571,17 +3561,17 @@ nsTextFrame::PaintTextDecorations(gfxCon
+       nscolor color = context->GetStyleColor()->mColor;
+   
+       if (NS_STYLE_TEXT_DECORATION_UNDERLINE & useDecorations) {
+-        underColor = useOverride ? overrideColor : color;
++        aUnderColor = useOverride ? overrideColor : color;
+         decorMask &= ~NS_STYLE_TEXT_DECORATION_UNDERLINE;
+         decorations |= NS_STYLE_TEXT_DECORATION_UNDERLINE;
+       }
+       if (NS_STYLE_TEXT_DECORATION_OVERLINE & useDecorations) {
+-        overColor = useOverride ? overrideColor : color;
++        aOverColor = useOverride ? overrideColor : color;
+         decorMask &= ~NS_STYLE_TEXT_DECORATION_OVERLINE;
+         decorations |= NS_STYLE_TEXT_DECORATION_OVERLINE;
+       }
+       if (NS_STYLE_TEXT_DECORATION_LINE_THROUGH & useDecorations) {
+-        strikeColor = useOverride ? overrideColor : color;
++        aStrikeColor = useOverride ? overrideColor : color;
+         decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_THROUGH;
+         decorations |= NS_STYLE_TEXT_DECORATION_LINE_THROUGH;
+       }
+@@ -3591,8 +3581,26 @@ nsTextFrame::PaintTextDecorations(gfxCon
+     context = context->GetParent();
+     if (!context)
+       break;
+-    hasDecorations = context->HasTextDecorations();
+-  }
++  }
++  *aDecorations = decorations;
++}
++
++void 
++nsTextFrame::PaintTextDecorations(gfxContext* aCtx, const gfxRect& aDirtyRect,
++                                  const gfxPoint& aFramePt,
++                                  const gfxPoint& aTextBaselinePt,
++                                  nsTextPaintStyle& aTextPaintStyle,
++                                  PropertyProvider& aProvider)
++{
++  // Quirks mode text decoration are rendered by children; see bug 1777
++  // In non-quirks mode, nsHTMLContainer::Paint and nsBlockFrame::Paint
++  // does the painting of text decorations.
++  if (!(TextFramePaintsDecorations(aTextPaintStyle.PresContext())))
++    return;
++
++  PRUint8 decorations;
++  nscolor underColor, overColor, strikeColor;
++  GetTextDecorations(decorations, underColor, overColor, strikeColor);
+ 
+   if (!decorations)
+     return;
+@@ -5419,6 +5427,9 @@ nsTextFrame::Reflow(nsPresContext*      
+   aMetrics.mOverflowArea.UnionRect(boundingBox,
+                                    nsRect(0, 0, aMetrics.width, aMetrics.height));
+ 
++  // Include text-decorations in the overflow area.
++  // WRITE ME
++
+   /////////////////////////////////////////////////////////////////////
+   // Clean up, update state
+   /////////////////////////////////////////////////////////////////////
