@@ -3,18 +3,70 @@ Push scrollframes, tables, and other blocks that don't participate in float form
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -2816,6 +2816,10 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+@@ -2799,6 +2799,8 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+   }
+ 
+   // Clear past floats before the block if the clear style is not none
++  // XXX NEED TO FIX ALL USERS OF THIS, INCLUDING ReflowDirtyLines
++  // DO WE WANT A NEW BREAK TYPE FOR "break for width"?
+   aLine->SetBreakTypeBefore(breakType);
+ 
+   // See if we should apply the top margin. If the block frame being
+@@ -2816,14 +2818,24 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
      aLine->ClearHasClearance();
    }
    PRBool treatWithClearance = aLine->HasClearance();
-+  // Change breakType checks to mightClear checks, that are ||ed with
-+  // being a block that gets bumped.
-+  // Change ClearFloats to do the clearing (after it handles the breakType).
++
++  PRBool mightClearFloats = breakType != NS_STYLE_CLEAR_NONE;
++  nscoord replacedWidth = 0;
++  if (nsBlockFrame::BlockCanIntersectFloats(frame)) {
++    mightClearFloats = PR_TRUE;
++    replacedWidth =
++      nsLayoutUtils::IntrinsicForContainer(aState.mReflowState.rendContext,
++                                           frame, nsLayoutUtils::MIN_WIDTH);
++  }
 +
    // If our top margin was counted as part of some parents top-margin
    // collapse and we are being speculatively reflowed assuming this
    // frame DID NOT need clearance, then we need to check that
-@@ -6708,6 +6712,15 @@ nsBlockFrame::BlockNeedsSpaceManager(nsI
+   // assumption.
+-  if (!treatWithClearance && !applyTopMargin && breakType != NS_STYLE_CLEAR_NONE &&
++  if (!treatWithClearance && !applyTopMargin && mightClearFloats &&
+       aState.mReflowState.mDiscoveredClearance) {
+     nscoord curY = aState.mY + aState.mPrevBottomMargin.get();
+-    nscoord clearY = aState.ClearFloats(curY, breakType);
++    nscoord clearY = aState.ClearFloats(curY, breakType, replacedWidth);
+     if (clearY != curY) {
+       // Looks like that assumption was invalid, we do need
+       // clearance. Tell our ancestor so it can reflow again. It is
+@@ -2894,7 +2906,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+         mayNeedRetry = PR_FALSE;
+       }
+       
+-      if (!treatWithClearance && !clearanceFrame && breakType != NS_STYLE_CLEAR_NONE) {
++      if (!treatWithClearance && !clearanceFrame && mightClearFloats) {
+         // We don't know if we need clearance and this is the first,
+         // optimistic pass.  So determine whether *this block* needs
+         // clearance. Note that we do not allow the decision for whether
+@@ -2902,7 +2914,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+         // decision is only allowed to be made under the optimistic
+         // first pass.
+         nscoord curY = aState.mY + aState.mPrevBottomMargin.get();
+-        nscoord clearY = aState.ClearFloats(curY, breakType);
++        nscoord clearY = aState.ClearFloats(curY, breakType, replacedWidth);
+         if (clearY != curY) {
+           // Looks like we need clearance and we didn't know about it already. So
+           // recompute collapsed margin
+@@ -2930,7 +2942,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+       if (treatWithClearance) {
+         nscoord currentY = aState.mY;
+         // advance mY to the clear position.
+-        aState.mY = aState.ClearFloats(aState.mY, breakType);
++        aState.mY = aState.ClearFloats(aState.mY, breakType, replacedWidth);
+         
+         // Compute clearance. It's the amount we need to add to the top
+         // border-edge of the frame, after applying collapsed margins
+@@ -6708,6 +6720,15 @@ nsBlockFrame::BlockNeedsSpaceManager(nsI
    return (aBlock->GetStateBits() & NS_BLOCK_SPACE_MGR) ||
      (parent && !parent->IsFloatContainingBlock());
  }
@@ -78,6 +130,49 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
      if (mBand.GetFloatCount()) {
        // Use the float-edge property to determine how the child block
        // will interact with the float.
+@@ -1035,7 +1027,8 @@ nsBlockReflowState::PlaceBelowCurrentLin
+ }
+ 
+ nscoord
+-nsBlockReflowState::ClearFloats(nscoord aY, PRUint8 aBreakType)
++nsBlockReflowState::ClearFloats(nscoord aY, PRUint8 aBreakType,
++                                nscoord aReplacedWidth)
+ {
+ #ifdef DEBUG
+   if (nsBlockFrame::gNoisyReflow) {
+@@ -1052,7 +1045,16 @@ nsBlockReflowState::ClearFloats(nscoord 
+ #endif
+   
+   const nsMargin& bp = BorderPadding();
+-  nscoord newY = mSpaceManager->ClearFloats(aY - bp.top, aBreakType);
++  nscoord newY = aY - bp.top;
++
++  if (aBreakType != NS_STYLE_CLEAR_NONE) {
++    newY = mSpaceManager->ClearFloats(newY, aBreakType);
++  }
++
++  if (aReplacedWidth > 0) {
++    // XXX WRITE ME
++  }
++
+   newY += bp.top;
+ 
+ #ifdef DEBUG
+diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
+--- a/layout/generic/nsBlockReflowState.h
++++ b/layout/generic/nsBlockReflowState.h
+@@ -109,8 +109,9 @@ public:
+   PRBool PlaceBelowCurrentLineFloats(nsFloatCacheFreeList& aFloats, PRBool aForceFit);
+ 
+   // Returns the first coordinate >= aY that clears the
+-  // indicated floats.
+-  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType);
++  // floats indicated by aBreakType and has enough width between floats
++  // (or no floats remaining) to accomodate aReplacedWidth.
++  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType, nscoord aReplacedWidth = 0);
+ 
+   PRBool IsAdjacentWithTop() const {
+     return mY ==
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
