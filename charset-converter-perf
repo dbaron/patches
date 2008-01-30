@@ -61,31 +61,12 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
  
  nsCharsetConverterManager::nsCharsetConverterManager() 
    :mDataBundle(NULL), mTitleBundle(NULL)
-@@ -78,10 +118,36 @@ nsCharsetConverterManager::nsCharsetConv
+@@ -78,18 +118,37 @@ nsCharsetConverterManager::nsCharsetConv
  #ifdef MOZ_USE_NATIVE_UCONV
    mNativeUC = do_GetService(NS_NATIVE_UCONV_SERVICE_CONTRACT_ID);
  #endif
 +  mEncoderTable.ops = nsnull;
 +  mDecoderTable.ops = nsnull;
-+}
-+
-+nsresult nsCharsetConverterManager::Init()
-+{
-+  if (!PL_DHashTableInit(&mEncoderTable, &EncoderDecoderOps, nsnull,
-+                         sizeof(EncoderDecoderEntry), 16)) {
-+    mEncoderTable.ops = nsnull;
-+    return NS_ERROR_OUT_OF_MEMORY;
-+  }
-+  if (!PL_DHashTableInit(&mDecoderTable, &EncoderDecoderOps, nsnull,
-+                         sizeof(EncoderDecoderEntry), 16)) {
-+    mDecoderTable.ops = nsnull;
-+    return NS_ERROR_OUT_OF_MEMORY;
-+  }
-+
-+  // It's OK if this fails -- we just won't resolve aliases.
-+  mCSAlias = do_GetService(NS_CHARSETALIAS_CONTRACTID);
-+
-+  return NS_OK;
  }
  
  nsCharsetConverterManager::~nsCharsetConverterManager() 
@@ -98,7 +79,28 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
    NS_IF_RELEASE(mDataBundle);
    NS_IF_RELEASE(mTitleBundle);
  }
-@@ -156,6 +222,15 @@ nsresult nsCharsetConverterManager::GetB
+ 
+ nsresult nsCharsetConverterManager::Init()
+ {
+-  if (!mDecoderHash.Init())
++  if (!PL_DHashTableInit(&mEncoderTable, &EncoderDecoderOps, nsnull,
++                         sizeof(EncoderDecoderEntry), 16)) {
++    mEncoderTable.ops = nsnull;
+     return NS_ERROR_OUT_OF_MEMORY;
++  }
++  if (!PL_DHashTableInit(&mDecoderTable, &EncoderDecoderOps, nsnull,
++                         sizeof(EncoderDecoderEntry), 16)) {
++    mDecoderTable.ops = nsnull;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++
++  // It's OK if this fails -- we just won't resolve aliases.
++  mCSAlias = do_GetService(NS_CHARSETALIAS_CONTRACTID);
++
+   return NS_OK;
+ }
+ 
+@@ -162,6 +221,15 @@ nsresult nsCharsetConverterManager::GetB
    return NS_OK;
  }
  
@@ -114,7 +116,7 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
  
  //----------------------------------------------------------------------------//----------------------------------------------------------------------------
  // Interface nsICharsetConverterManager [implementation]
-@@ -164,121 +239,129 @@ nsCharsetConverterManager::GetUnicodeEnc
+@@ -170,119 +238,129 @@ nsCharsetConverterManager::GetUnicodeEnc
  nsCharsetConverterManager::GetUnicodeEncoder(const char * aDest, 
                                               nsIUnicodeEncoder ** aResult)
  {
@@ -309,37 +311,35 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 -#endif
 -  nsresult rv = NS_OK;
 -
--  NS_NAMED_LITERAL_CSTRING(kUnicodeDecoderContractIDBase,
--                           NS_UNICODEDECODER_CONTRACTID_BASE);
--
--  nsCAutoString contractid(kUnicodeDecoderContractIDBase +
--                           nsDependentCString(aSrc));
--
--  if (!strncmp(aSrc,
--               NS_1BYTE_CODER_PATTERN,
--               NS_1BYTE_CODER_PATTERN_LEN))
+-  NS_NAMED_LITERAL_CSTRING(contractbase, NS_UNICODEDECODER_CONTRACTID_BASE);
+-  nsDependentCString src(aSrc);
+-  
+-  if (!strncmp(aSrc, NS_1BYTE_CODER_PATTERN, NS_1BYTE_CODER_PATTERN_LEN))
 -  {
--    // Single byte decoders dont hold state. Optimize by using a service.
--    decoder = do_GetService(contractid.get(), &rv);
+-    // Single byte decoders don't hold state. Optimize by using a service, and
+-    // cache it in our hash to avoid repeated trips through the service manager.
+-    if (!mDecoderHash.Get(aSrc, getter_AddRefs(decoder))) {
+-      decoder = do_GetService(PromiseFlatCString(contractbase + src).get(),
+-                              &rv);
+-      if (NS_SUCCEEDED(rv))
+-        mDecoderHash.Put(aSrc, decoder);
+-    }
 -  }
 -  else
 -  {
--    decoder = do_CreateInstance(contractid.get(), &rv);
+-    decoder = do_CreateInstance(PromiseFlatCString(contractbase + src).get(),
+-                                &rv);
 -  }
--  if(NS_FAILED(rv))
--    rv = NS_ERROR_UCONV_NOCONV;
--  else
--  {
--    *aResult = decoder.get();
--    NS_ADDREF(*aResult);
--  }
+-  NS_ENSURE_SUCCESS(rv, NS_ERROR_UCONV_NOCONV);
+-
+-  decoder.forget(aResult);
 -  return rv;
 +  NS_ASSERTION(IsCanonical(aSrc), "not canonical form");
 +  return nsCharsetConverterManager::GetUnicodeDecoder(aSrc, aResult);
  }
  
  nsresult 
-@@ -369,11 +452,9 @@ nsCharsetConverterManager::GetCharsetAli
+@@ -373,11 +451,9 @@ nsCharsetConverterManager::GetCharsetAli
    // We try to obtain the preferred name for this charset from the charset 
    // aliases. If we don't get it from there, we just use the original string
    nsDependentCString charset(aCharset);
@@ -356,25 +356,19 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsCharsetConverterManager.h
 --- a/intl/uconv/src/nsCharsetConverterManager.h
 +++ b/intl/uconv/src/nsCharsetConverterManager.h
-@@ -40,6 +40,7 @@
+@@ -40,7 +40,7 @@
  #include "nsISupports.h"
  #include "nsICharsetConverterManager.h"
  #include "nsIStringBundle.h"
+-#include "nsInterfaceHashtable.h"
 +#include "pldhash.h"
  
  #ifdef MOZ_USE_NATIVE_UCONV
  #include "nsINativeUConvService.h"
-@@ -55,10 +56,54 @@ public:
-   nsCharsetConverterManager();
-   virtual ~nsCharsetConverterManager();
- 
-+  nsresult Init();
-+
- private:
- 
+@@ -63,11 +63,51 @@ private:
    nsIStringBundle * mDataBundle;
    nsIStringBundle * mTitleBundle;
-+
+ 
 +  PLDHashTable mEncoderTable;
 +  PLDHashTable mDecoderTable;
 +
@@ -416,18 +410,12 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
 +#ifdef DEBUG
 +  PRBool IsCanonical(const char* aCharset);
 +#endif
- 
++
  #ifdef MOZ_USE_NATIVE_UCONV
    nsCOMPtr<nsINativeUConvService> mNativeUC;
-diff --git a/intl/uconv/src/nsUConvModule.cpp b/intl/uconv/src/nsUConvModule.cpp
---- a/intl/uconv/src/nsUConvModule.cpp
-+++ b/intl/uconv/src/nsUConvModule.cpp
-@@ -610,7 +610,7 @@ nsConverterManagerDataRegister(nsICompon
-   return nsCharsetConverterManager::RegisterConverterManagerData();
- }
+ #endif
+-
+-  nsInterfaceHashtable<nsCharPtrHashKey, nsIUnicodeDecoder> mDecoderHash;
  
--NS_GENERIC_FACTORY_CONSTRUCTOR(nsCharsetConverterManager)
-+NS_GENERIC_FACTORY_CONSTRUCTOR_INIT(nsCharsetConverterManager, Init)
- NS_GENERIC_FACTORY_CONSTRUCTOR(nsTextToSubURI)
- NS_GENERIC_FACTORY_CONSTRUCTOR(nsUTF8ConverterService)
- NS_GENERIC_FACTORY_CONSTRUCTOR(nsCharsetAlias2)
+   nsresult LoadExtensibleBundle(const char * aRegistryKey, 
+       nsIStringBundle ** aResult);
