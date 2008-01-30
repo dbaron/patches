@@ -1,0 +1,433 @@
+Improve performance of nsCharsetConverterManager?
+
+diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCharsetConverterManager.cpp
+--- a/intl/uconv/src/nsCharsetConverterManager.cpp
++++ b/intl/uconv/src/nsCharsetConverterManager.cpp
+@@ -64,13 +64,53 @@
+ #endif
+ 
+ // Pattern of cached, commonly used, single byte decoder
+-#define NS_1BYTE_CODER_PATTERN "ISO-8859"
+-#define NS_1BYTE_CODER_PATTERN_LEN 8
++static const char k1ByteCoderPattern[] = "ISO-8859";
++
++inline PRBool IsDecoderStateless(const char *aEncoding)
++{
++  return !strncmp(aEncoding, k1ByteCoderPattern,
++                  sizeof(k1ByteCoderPattern) - 1);
++}
++
++/* static */ void PR_CALLBACK
++nsCharsetConverterManager::ClearEntry(PLDHashTable *table,
++                                      PLDHashEntryHdr *entry)
++{
++  EncoderDecoderEntry *e = static_cast<EncoderDecoderEntry*>(entry);
++  if (e->mCharset) {
++    NS_RELEASE(e->mFactoryOrService);
++    nsCRT::free(e->mCharset);
++  }
++  memset(entry, 0, table->entrySize);
++}
++
++/* static */ PRBool PR_CALLBACK
++nsCharsetConverterManager::MatchEntry(PLDHashTable *table,
++                                      const PLDHashEntryHdr *entry,
++                                      const void* key)
++{
++  const EncoderDecoderEntry *e =
++    static_cast<const EncoderDecoderEntry*>(entry);
++  const char *s = static_cast<const char*>(key);
++
++  return !strcmp(s, e->mCharset);
++}
++
++/* static */ PLDHashTableOps nsCharsetConverterManager::EncoderDecoderOps = {
++  PL_DHashAllocTable,
++  PL_DHashFreeTable,
++  PL_DHashStringKey,
++  MatchEntry,
++  PL_DHashMoveEntryStub,
++  ClearEntry,
++  PL_DHashFinalizeStub,
++  NULL
++};
+ 
+ // Class nsCharsetConverterManager [implementation]
+ 
+-NS_IMPL_THREADSAFE_ISUPPORTS1(nsCharsetConverterManager,
+-                              nsICharsetConverterManager)
++NS_IMPL_ISUPPORTS1(nsCharsetConverterManager,
++                   nsICharsetConverterManager)
+ 
+ nsCharsetConverterManager::nsCharsetConverterManager() 
+   :mDataBundle(NULL), mTitleBundle(NULL)
+@@ -78,10 +118,36 @@ nsCharsetConverterManager::nsCharsetConv
+ #ifdef MOZ_USE_NATIVE_UCONV
+   mNativeUC = do_GetService(NS_NATIVE_UCONV_SERVICE_CONTRACT_ID);
+ #endif
++  mEncoderTable.ops = nsnull;
++  mDecoderTable.ops = nsnull;
++}
++
++nsresult nsCharsetConverterManager::Init()
++{
++  if (!PL_DHashTableInit(&mEncoderTable, &EncoderDecoderOps, nsnull,
++                         sizeof(EncoderDecoderEntry), 16)) {
++    mEncoderTable.ops = nsnull;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++  if (!PL_DHashTableInit(&mDecoderTable, &EncoderDecoderOps, nsnull,
++                         sizeof(EncoderDecoderEntry), 16)) {
++    mDecoderTable.ops = nsnull;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++
++  // It's OK if this fails -- we just won't resolve aliases.
++  mCSAlias = do_GetService(NS_CHARSETALIAS_CONTRACTID);
++
++  return NS_OK;
+ }
+ 
+ nsCharsetConverterManager::~nsCharsetConverterManager() 
+ {
++  if (mEncoderTable.ops)
++    PL_DHashTableFinish(&mEncoderTable);
++  if (mDecoderTable.ops)
++    PL_DHashTableFinish(&mDecoderTable);
++
+   NS_IF_RELEASE(mDataBundle);
+   NS_IF_RELEASE(mTitleBundle);
+ }
+@@ -156,6 +222,15 @@ nsresult nsCharsetConverterManager::GetB
+   return NS_OK;
+ }
+ 
++#ifdef DEBUG
++PRBool nsCharsetConverterManager::IsCanonical(const char* aCharset)
++{
++  nsCAutoString charset;
++  nsCharsetConverterManager::GetCharsetAlias(aCharset, charset);
++  return !strcmp(aCharset, charset.get());
++}
++#endif
++
+ 
+ //----------------------------------------------------------------------------//----------------------------------------------------------------------------
+ // Interface nsICharsetConverterManager [implementation]
+@@ -164,121 +239,129 @@ nsCharsetConverterManager::GetUnicodeEnc
+ nsCharsetConverterManager::GetUnicodeEncoder(const char * aDest, 
+                                              nsIUnicodeEncoder ** aResult)
+ {
+-  // resolve the charset first
+-  nsCAutoString charset;
+-  
+-  // fully qualify to possibly avoid vtable call
+-  nsCharsetConverterManager::GetCharsetAlias(aDest, charset);
++#ifdef MOZ_USE_NATIVE_UCONV
++  if (mNativeUC) {
++    nsCAutoString charset;
++    // fully qualify to possibly avoid vtable call
++    nsCharsetConverterManager::GetCharsetAlias(aDest, charset);
+ 
+-  return nsCharsetConverterManager::GetUnicodeEncoderRaw(charset.get(),
+-                                                         aResult);
++    nsCOMPtr<nsISupports> supports;
++    mNativeUC->GetNativeConverter("UCS-2", 
++                                  charset.get(),
++                                  getter_AddRefs(supports));
++
++    if (supports && NS_SUCCEEDED(CallQueryInterface(supports, aResult))) {
++      return NS_OK;
++    }
++  }
++#endif  
++
++  *aResult = nsnull;
++
++  EncoderDecoderEntry *entry = GetEncoderEntry(aDest, PL_DHASH_ADD);
++  NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
++  if (!entry->mCharset) {
++    nsCAutoString charset;
++    // fully qualify to possibly avoid vtable call
++    nsCharsetConverterManager::GetCharsetAlias(aDest, charset);
++
++    nsCAutoString
++      contractid(NS_LITERAL_CSTRING(NS_UNICODEENCODER_CONTRACTID_BASE) +
++                 charset);
++
++    nsCOMPtr<nsIComponentManager> cm;
++    NS_GetComponentManager(getter_AddRefs(cm));
++    nsresult rv =
++      cm->GetClassObjectByContractID(contractid.get(), NS_GET_IID(nsIFactory),
++                                     (void**) &entry->mFactory);
++    if (NS_FAILED(rv)) {
++      PL_DHashTableRawRemove(&mEncoderTable, entry);
++      return rv;
++    }
++
++    entry->mCharset = nsCRT::strdup(aDest);
++  }
++
++  // Always create an instance since encoders hold state.
++  return entry->mFactory->CreateInstance(nsnull, NS_GET_IID(nsIUnicodeEncoder),
++                                         (void**)aResult);
+ }
+-
+ 
+ NS_IMETHODIMP
+ nsCharsetConverterManager::GetUnicodeEncoderRaw(const char * aDest, 
+                                                 nsIUnicodeEncoder ** aResult)
+ {
+-  *aResult= nsnull;
+-  nsCOMPtr<nsIUnicodeEncoder> encoder;
+-
+-#ifdef MOZ_USE_NATIVE_UCONV
+-  if (mNativeUC) {
+-    nsCOMPtr<nsISupports> supports;
+-    mNativeUC->GetNativeConverter("UCS-2", 
+-                                  aDest,
+-                                  getter_AddRefs(supports));
+-
+-    encoder = do_QueryInterface(supports);
+-
+-    if (encoder) {
+-      NS_ADDREF(*aResult = encoder);
+-      return NS_OK;
+-    }
+-  }
+-#endif  
+-  nsresult rv = NS_OK;
+-
+-  nsCAutoString
+-    contractid(NS_LITERAL_CSTRING(NS_UNICODEENCODER_CONTRACTID_BASE) +
+-               nsDependentCString(aDest));
+-
+-  // Always create an instance since encoders hold state.
+-  encoder = do_CreateInstance(contractid.get(), &rv);
+-
+-  if (NS_FAILED(rv))
+-    rv = NS_ERROR_UCONV_NOCONV;
+-  else
+-  {
+-    *aResult = encoder.get();
+-    NS_ADDREF(*aResult);
+-  }
+-  return rv;
++  NS_ASSERTION(IsCanonical(aDest), "not canonical form");
++  return nsCharsetConverterManager::GetUnicodeEncoder(aDest, aResult);
+ }
+ 
+ NS_IMETHODIMP
+ nsCharsetConverterManager::GetUnicodeDecoder(const char * aSrc, 
+                                              nsIUnicodeDecoder ** aResult)
+ {
+-  // resolve the charset first
+-  nsCAutoString charset;
+-  
+-  // fully qualify to possibly avoid vtable call
+-  nsCharsetConverterManager::GetCharsetAlias(aSrc, charset);
++#ifdef MOZ_USE_NATIVE_UCONV
++  if (mNativeUC) {
++    nsCAutoString charset;
++    // fully qualify to possibly avoid vtable call
++    nsCharsetConverterManager::GetCharsetAlias(aSrc, charset);
+ 
+-  return nsCharsetConverterManager::GetUnicodeDecoderRaw(charset.get(),
+-                                                         aResult);
++    nsCOMPtr<nsISupports> supports;
++    mNativeUC->GetNativeConverter(charset.get(),
++                                  "UCS-2", 
++                                  getter_AddRefs(supports));
++    
++    if (supports && NS_SUCCEEDED(CallQueryInterface(supports, aResult))) {
++      return NS_OK;
++    }
++  }
++#endif
++
++  *aResult = nsnull;
++
++  PRBool stateless = IsDecoderStateless(aSrc);
++  EncoderDecoderEntry *entry = GetDecoderEntry(aSrc, PL_DHASH_ADD);
++  NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
++  if (!entry->mCharset) {
++    nsCAutoString charset;
++    // fully qualify to possibly avoid vtable call
++    nsCharsetConverterManager::GetCharsetAlias(aSrc, charset);
++
++    NS_NAMED_LITERAL_CSTRING(kUnicodeDecoderContractIDBase,
++                             NS_UNICODEDECODER_CONTRACTID_BASE);
++    nsCAutoString contractid(kUnicodeDecoderContractIDBase + charset);
++
++    nsresult rv;
++    if (stateless) {
++      rv = CallGetService(contractid.get(), &entry->mService);
++    } else {
++      nsCOMPtr<nsIComponentManager> cm;
++      NS_GetComponentManager(getter_AddRefs(cm));
++      rv = cm->GetClassObjectByContractID(contractid.get(),
++                                          NS_GET_IID(nsIFactory),
++                                          (void**) &entry->mFactory);
++    }
++    if (NS_FAILED(rv)) {
++      PL_DHashTableRawRemove(&mEncoderTable, entry);
++      return rv;
++    }
++    entry->mCharset = nsCRT::strdup(aSrc);
++  }
++
++  if (stateless) {
++    *aResult = entry->mService;
++    NS_ADDREF(*aResult);
++    return NS_OK;
++  }
++  return entry->mFactory->CreateInstance(nsnull, NS_GET_IID(nsIUnicodeDecoder),
++                                         (void**)aResult);
+ }
+ 
+ NS_IMETHODIMP
+ nsCharsetConverterManager::GetUnicodeDecoderRaw(const char * aSrc, 
+                                                 nsIUnicodeDecoder ** aResult)
+ {
+-  *aResult= nsnull;
+-  nsCOMPtr<nsIUnicodeDecoder> decoder;
+-
+-#ifdef MOZ_USE_NATIVE_UCONV
+-  if (mNativeUC) {
+-    nsCOMPtr<nsISupports> supports;
+-    mNativeUC->GetNativeConverter(aSrc,
+-                                  "UCS-2", 
+-                                  getter_AddRefs(supports));
+-    
+-    decoder = do_QueryInterface(supports);
+-
+-    if (decoder) {
+-      NS_ADDREF(*aResult = decoder);
+-      return NS_OK;
+-    }
+-  }
+-#endif
+-  nsresult rv = NS_OK;
+-
+-  NS_NAMED_LITERAL_CSTRING(kUnicodeDecoderContractIDBase,
+-                           NS_UNICODEDECODER_CONTRACTID_BASE);
+-
+-  nsCAutoString contractid(kUnicodeDecoderContractIDBase +
+-                           nsDependentCString(aSrc));
+-
+-  if (!strncmp(aSrc,
+-               NS_1BYTE_CODER_PATTERN,
+-               NS_1BYTE_CODER_PATTERN_LEN))
+-  {
+-    // Single byte decoders dont hold state. Optimize by using a service.
+-    decoder = do_GetService(contractid.get(), &rv);
+-  }
+-  else
+-  {
+-    decoder = do_CreateInstance(contractid.get(), &rv);
+-  }
+-  if(NS_FAILED(rv))
+-    rv = NS_ERROR_UCONV_NOCONV;
+-  else
+-  {
+-    *aResult = decoder.get();
+-    NS_ADDREF(*aResult);
+-  }
+-  return rv;
++  NS_ASSERTION(IsCanonical(aSrc), "not canonical form");
++  return nsCharsetConverterManager::GetUnicodeDecoder(aSrc, aResult);
+ }
+ 
+ nsresult 
+@@ -369,11 +452,9 @@ nsCharsetConverterManager::GetCharsetAli
+   // We try to obtain the preferred name for this charset from the charset 
+   // aliases. If we don't get it from there, we just use the original string
+   nsDependentCString charset(aCharset);
+-  nsCOMPtr<nsICharsetAlias> csAlias(do_GetService(NS_CHARSETALIAS_CONTRACTID));
+-  NS_ASSERTION(csAlias, "failed to get the CharsetAlias service");
+-  if (csAlias) {
++  if (mCSAlias) {
+     nsAutoString pref;
+-    nsresult rv = csAlias->GetPreferred(charset, aResult);
++    nsresult rv = mCSAlias->GetPreferred(charset, aResult);
+     if (NS_SUCCEEDED(rv)) {
+       return (!aResult.IsEmpty()) ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+     }
+diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsCharsetConverterManager.h
+--- a/intl/uconv/src/nsCharsetConverterManager.h
++++ b/intl/uconv/src/nsCharsetConverterManager.h
+@@ -40,6 +40,7 @@
+ #include "nsISupports.h"
+ #include "nsICharsetConverterManager.h"
+ #include "nsIStringBundle.h"
++#include "pldhash.h"
+ 
+ #ifdef MOZ_USE_NATIVE_UCONV
+ #include "nsINativeUConvService.h"
+@@ -55,10 +56,54 @@ public:
+   nsCharsetConverterManager();
+   virtual ~nsCharsetConverterManager();
+ 
++  nsresult Init();
++
+ private:
+ 
+   nsIStringBundle * mDataBundle;
+   nsIStringBundle * mTitleBundle;
++
++  PLDHashTable mEncoderTable;
++  PLDHashTable mDecoderTable;
++
++  nsCOMPtr<nsICharsetAlias> mCSAlias;
++
++  struct EncoderDecoderEntry : public PLDHashEntryHdr {
++    char *mCharset; // owns
++    union { // owns a reference
++      // In |mEncoderTable|, we always have a factory.  In
++      // |mDecoderTable|, we have a decoder service if
++      // |IsDecoderStateless(mCharset)|, and otherwise we have a factory.
++
++      nsIFactory *mFactory;
++      nsIUnicodeDecoder *mService;
++      nsISupports *mFactoryOrService;
++    };
++  };
++
++  PR_STATIC_CALLBACK(void)   ClearEntry(PLDHashTable *table,
++                                        PLDHashEntryHdr *entry);
++  PR_STATIC_CALLBACK(PRBool) MatchEntry(PLDHashTable *table,
++                                        const PLDHashEntryHdr *entry,
++                                        const void* key);
++
++  static PLDHashTableOps EncoderDecoderOps;
++
++  inline EncoderDecoderEntry*
++  GetEncoderEntry(const char* aCharset, PLDHashOperator aOperator) {
++    return static_cast<EncoderDecoderEntry*>
++      (PL_DHashTableOperate(&mEncoderTable, aCharset, aOperator));
++  }
++
++  inline EncoderDecoderEntry*
++  GetDecoderEntry(const char* aCharset, PLDHashOperator aOperator) {
++    return static_cast<EncoderDecoderEntry*>
++      (PL_DHashTableOperate(&mDecoderTable, aCharset, aOperator));
++  }
++
++#ifdef DEBUG
++  PRBool IsCanonical(const char* aCharset);
++#endif
+ 
+ #ifdef MOZ_USE_NATIVE_UCONV
+   nsCOMPtr<nsINativeUConvService> mNativeUC;
+diff --git a/intl/uconv/src/nsUConvModule.cpp b/intl/uconv/src/nsUConvModule.cpp
+--- a/intl/uconv/src/nsUConvModule.cpp
++++ b/intl/uconv/src/nsUConvModule.cpp
+@@ -610,7 +610,7 @@ nsConverterManagerDataRegister(nsICompon
+   return nsCharsetConverterManager::RegisterConverterManagerData();
+ }
+ 
+-NS_GENERIC_FACTORY_CONSTRUCTOR(nsCharsetConverterManager)
++NS_GENERIC_FACTORY_CONSTRUCTOR_INIT(nsCharsetConverterManager, Init)
+ NS_GENERIC_FACTORY_CONSTRUCTOR(nsTextToSubURI)
+ NS_GENERIC_FACTORY_CONSTRUCTOR(nsUTF8ConverterService)
+ NS_GENERIC_FACTORY_CONSTRUCTOR(nsCharsetAlias2)
