@@ -3,7 +3,34 @@ Force reflow on default font change, since style data comparison is not sufficie
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
-@@ -13193,7 +13193,7 @@ nsCSSFrameConstructor::ProcessOneRestyle
+@@ -10054,22 +10054,15 @@ nsCSSFrameConstructor::RestyleElement(ns
+                                       nsIFrame       *aPrimaryFrame,
+                                       nsChangeHint   aMinHint)
+ {
++  NS_ASSERTION(aPrimaryFrame->GetContent() == aContent, "content mismatch");
++
+   if (aMinHint & nsChangeHint_ReconstructFrame) {
+     RecreateFramesForContent(aContent);
+   } else if (aPrimaryFrame) {
+     nsStyleChangeList changeList;
+-    if (aMinHint) {
+-      changeList.AppendChange(aPrimaryFrame, aContent, aMinHint);
+-    }
+-    nsChangeHint frameChange = mPresShell->FrameManager()->
++    mPresShell->FrameManager()->
+       ComputeStyleChangeFor(aPrimaryFrame, &changeList, aMinHint);
+-
+-    if (frameChange & nsChangeHint_ReconstructFrame) {
+-      RecreateFramesForContent(aContent);
+-      changeList.Clear();
+-    } else {
+-      ProcessRestyledFrames(changeList);
+-    }
++    ProcessRestyledFrames(changeList);
+   } else {
+     // no frames, reconstruct for content
+     MaybeRecreateFramesForContent(aContent);
+@@ -13193,7 +13186,7 @@ nsCSSFrameConstructor::ProcessOneRestyle
  #define RESTYLE_ARRAY_STACKSIZE 128
  
  void
@@ -12,23 +39,18 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    mRebuildAllStyleData = PR_FALSE;
  
-@@ -13213,7 +13213,15 @@ nsCSSFrameConstructor::RebuildAllStyleDa
+@@ -13213,8 +13206,10 @@ nsCSSFrameConstructor::RebuildAllStyleDa
    // (but note that nsPresShell::SetPreferenceStyleRules currently depends
    // on us re-running rule matching here
    nsStyleChangeList changeList;
--  mPresShell->FrameManager()->ComputeStyleChangeFor(mPresShell->GetRootFrame(),
-+  nsIFrame *rootFrame = mPresShell->GetRootFrame();
-+  if (aExtraHint != nsChangeHint(0)) {
-+    // XXX Could we just pass this as aMinChange?
-+    // XXX Does it matter that this is really the root frame and not the
-+    // root node's primary frame?
-+    changeList.AppendChange(rootFrame, rootFrame->GetContent(), aExtraHint);
-+  }
-+  // XXX DOES IT MATTER THAT WE IGNORE THE RETURN VALUE?
-+  mPresShell->FrameManager()->ComputeStyleChangeFor(rootFrame,
-                                                     &changeList, nsChangeHint(0));
++  // XXX Does it matter that we're passing aExtraHint to the real root
++  // frame and not the root node's primary frame?
+   mPresShell->FrameManager()->ComputeStyleChangeFor(mPresShell->GetRootFrame(),
+-                                                    &changeList, nsChangeHint(0));
++                                                    &changeList, aExtraHint);
    // Process the required changes
    ProcessRestyledFrames(changeList);
+   // Tell the style set it's safe to destroy the old rule tree.  We
 diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
 --- a/layout/base/nsCSSFrameConstructor.h
 +++ b/layout/base/nsCSSFrameConstructor.h
@@ -41,6 +63,69 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    void PostRestyleEvent(nsIContent* aContent, nsReStyleHint aRestyleHint,
                          nsChangeHint aMinChangeHint);
+diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
+--- a/layout/base/nsFrameManager.cpp
++++ b/layout/base/nsFrameManager.cpp
+@@ -1439,11 +1439,15 @@ nsFrameManager::ReResolveStyleContext(ns
+   return aMinChange;
+ }
+ 
+-nsChangeHint
++void
+ nsFrameManager::ComputeStyleChangeFor(nsIFrame          *aFrame, 
+                                       nsStyleChangeList *aChangeList,
+                                       nsChangeHint       aMinChange)
+ {
++  if (aMinChange) {
++    changeList.AppendChange(aFrame, aFrame->GetContent(), aMinChange);
++  }
++
+   nsChangeHint topLevelChange = aMinChange;
+ 
+   nsIFrame* frame = aFrame;
+@@ -1472,7 +1476,7 @@ nsFrameManager::ComputeStyleChangeFor(ns
+         // clobbered by the frame reconstruct anyway.
+         NS_ASSERTION(!frame->GetPrevContinuation(),
+                      "continuing frame had more severe impact than first-in-flow");
+-        return topLevelChange;
++        return;
+       }
+ 
+       frame = frame->GetNextContinuation();
+@@ -1481,14 +1485,13 @@ nsFrameManager::ComputeStyleChangeFor(ns
+     // Might we have special siblings?
+     if (!(frame2->GetStateBits() & NS_FRAME_IS_SPECIAL)) {
+       // nothing more to do here
+-      return topLevelChange;
++      return;
+     }
+     
+     frame2 = static_cast<nsIFrame*>
+                         (propTable->GetProperty(frame2, nsGkAtoms::IBSplitSpecialSibling));
+     frame = frame2;
+   } while (frame2);
+-  return topLevelChange;
+ }
+ 
+ 
+diff --git a/layout/base/nsFrameManager.h b/layout/base/nsFrameManager.h
+--- a/layout/base/nsFrameManager.h
++++ b/layout/base/nsFrameManager.h
+@@ -181,10 +181,11 @@ public:
+   NS_HIDDEN_(nsresult) ReParentStyleContext(nsIFrame* aFrame);
+ 
+   /*
+-   * Re-resolve the style contexts for a frame tree.  Returns the top-level
+-   * change hint resulting from the style re-resolution.
++   * Re-resolve the style contexts for a frame tree, building
++   * aChangeList based on the resulting style changes, plus aMinChange
++   * applied to aFrame.
+    */
+-  NS_HIDDEN_(nsChangeHint)
++  NS_HIDDEN_(void)
+     ComputeStyleChangeFor(nsIFrame* aFrame,
+                           nsStyleChangeList* aChangeList,
+                           nsChangeHint aMinChange);
 diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 --- a/layout/base/nsPresContext.cpp
 +++ b/layout/base/nsPresContext.cpp
