@@ -1,0 +1,195 @@
+Force reflow on default font change, since style data comparison is not sufficient for things not reflected in style data.  b=394057
+
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -13193,7 +13193,7 @@ nsCSSFrameConstructor::ProcessOneRestyle
+ #define RESTYLE_ARRAY_STACKSIZE 128
+ 
+ void
+-nsCSSFrameConstructor::RebuildAllStyleData()
++nsCSSFrameConstructor::RebuildAllStyleData(nsChangeHint aExtraHint)
+ {
+   mRebuildAllStyleData = PR_FALSE;
+ 
+@@ -13213,7 +13213,15 @@ nsCSSFrameConstructor::RebuildAllStyleDa
+   // (but note that nsPresShell::SetPreferenceStyleRules currently depends
+   // on us re-running rule matching here
+   nsStyleChangeList changeList;
+-  mPresShell->FrameManager()->ComputeStyleChangeFor(mPresShell->GetRootFrame(),
++  nsIFrame *rootFrame = mPresShell->GetRootFrame();
++  if (aExtraHint != nsChangeHint(0)) {
++    // XXX Could we just pass this as aMinChange?
++    // XXX Does it matter that this is really the root frame and not the
++    // root node's primary frame?
++    changeList.AppendChange(rootFrame, rootFrame->GetContent(), aExtraHint);
++  }
++  // XXX DOES IT MATTER THAT WE IGNORE THE RETURN VALUE?
++  mPresShell->FrameManager()->ComputeStyleChangeFor(rootFrame,
+                                                     &changeList, nsChangeHint(0));
+   // Process the required changes
+   ProcessRestyledFrames(changeList);
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -178,7 +178,7 @@ public:
+   // itself.
+   void ProcessPendingRestyles();
+   
+-  void RebuildAllStyleData();
++  void RebuildAllStyleData(nsChangeHint aExtraHint = nsChangeHint(0));
+ 
+   void PostRestyleEvent(nsIContent* aContent, nsReStyleHint aRestyleHint,
+                         nsChangeHint aMinChangeHint);
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -584,6 +584,10 @@ nsPresContext::GetUserPreferences()
+     nsContentUtils::GetIntPref("browser.display.base_font_scaler",
+                                mFontScaler);
+ 
++
++  mAutoQualityMinFontSizePixelsPref =
++    nsContentUtils::GetIntPref("browser.display.auto_quality_min_font_size");
++
+   // * document colors
+   GetDocumentColorPreferences();
+ 
+@@ -661,6 +665,8 @@ nsPresContext::GetUserPreferences()
+     mImageAnimationModePref = imgIContainer::kDontAnimMode;
+   else if (animatePref.Equals("once"))
+     mImageAnimationModePref = imgIContainer::kLoopOnceAnimMode;
++  else // dynamic change to invalid value should act like it does initially
++    mImageAnimationModePref = imgIContainer::kNormalAnimMode;
+ 
+   PRUint32 bidiOptions = GetBidi();
+ 
+@@ -701,12 +707,11 @@ nsPresContext::GetUserPreferences()
+   SetBidi(bidiOptions, PR_FALSE);
+ }
+ 
+-static const char sMinFontSizePref[] = "browser.display.auto_quality_min_font_size";
+-
+ void
+ nsPresContext::PreferenceChanged(const char* aPrefName)
+ {
+-  if (!nsCRT::strcmp(aPrefName, "layout.css.dpi")) {
++  nsDependentCString prefName(aPrefName);
++  if (prefName == NS_LITERAL_CSTRING("layout.css.dpi")) {
+     PRInt32 oldAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+     if (mDeviceContext->CheckDPIChange() && mShell) {
+       mDeviceContext->FlushFontCache();
+@@ -727,10 +732,11 @@ nsPresContext::PreferenceChanged(const c
+     }
+     return;
+   }
+-  if (!nsCRT::strcmp(aPrefName, sMinFontSizePref)) {
+-    mAutoQualityMinFontSizePixelsPref = nsContentUtils::GetIntPref(sMinFontSizePref);
+-    RebuildAllStyleData();
+-    return;
++  if (StringBeginsWith(prefName, NS_LITERAL_CSTRING("font."))) {
++    // Changes to font family preferences don't change anything in the
++    // computed style data, so the style system won't generate a reflow
++    // hint for us.  We need to do that manually.
++    mPrefChangePendingRequiresReflow = PR_TRUE;
+   }
+   // we use a zero-delay timer to coalesce multiple pref updates
+   if (!mPrefChangedTimer)
+@@ -764,7 +770,14 @@ nsPresContext::UpdateAfterPreferencesCha
+   }
+ 
+   mDeviceContext->FlushFontCache();
+-  RebuildAllStyleData();
++
++  nsChangeHint hint(0);
++
++  if (mPrefChangePendingRequiresReflow) {
++    hint |= NS_STYLE_HINT_REFLOW;
++  }
++
++  RebuildAllStyleData(hint);
+ }
+ 
+ nsresult
+@@ -828,9 +841,6 @@ nsPresContext::Init(nsIDeviceContext* aD
+   nsContentUtils::RegisterPrefCallback("layout.css.dpi",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+-
+-  // This is observed thanks to the browser.display. observer above.
+-  mAutoQualityMinFontSizePixelsPref = nsContentUtils::GetIntPref(sMinFontSizePref);
+ 
+   rv = mEventManager->Init();
+   NS_ENSURE_SUCCESS(rv, rv);
+@@ -1347,6 +1357,7 @@ nsPresContext::ThemeChangedInternal()
+   // immutability has been violated since any style rule that uses
+   // system colors or fonts (and probably -moz-appearance as well) has
+   // changed.
++  // XXX WHAT'S UP HERE?
+   RebuildAllStyleData();
+ }
+ 
+@@ -1379,23 +1390,19 @@ nsPresContext::SysColorChangedInternal()
+   // they may be using system colors
+   GetDocumentColorPreferences();
+ 
+-  // We need to do a full reflow (and view update) here. Clearing the style
+-  // data without reflowing/updating views will lead to incorrect change hints
+-  // later, because when generating change hints, any style structs which have
+-  // been cleared and not reread are assumed to not be used at all.
+-  // XXXroc not sure what to make of the above comment, because we don't reflow
+-  // synchronously here
++  // The system color values are computed to colors in the style data,
++  // so normal style data comparison is sufficient here.
+   RebuildAllStyleData();
+ }
+ 
+ void
+-nsPresContext::RebuildAllStyleData()
++nsPresContext::RebuildAllStyleData(nsChangeHint aHint)
+ {
+   if (!mShell) {
+     // We must have been torn down. Nothing to do here.
+     return;
+   }
+-  mShell->FrameConstructor()->RebuildAllStyleData();
++  mShell->FrameConstructor()->RebuildAllStyleData(aHint);
+ }
+ 
+ void
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -200,7 +200,7 @@ public:
+     { return GetPresShell()->FrameManager(); } 
+ #endif
+ 
+-  void RebuildAllStyleData();
++  void RebuildAllStyleData(nsChangeHint aHint = nsChangeHint(0));
+   void PostRebuildAllStyleDataEvent();
+ 
+   /**
+@@ -849,6 +849,7 @@ protected:
+   unsigned              mPrefScrollbarSide : 2;
+   unsigned              mPendingSysColorChanged : 1;
+   unsigned              mPendingThemeChanged : 1;
++  unsigned              mPrefChangePendingNeedsReflow : 1;
+   unsigned              mRenderedPositionVaryingContent : 1;
+ 
+   // resize reflow is supressed when the only change has been to zoom
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -391,7 +391,11 @@ nsStyleContext::CalcStyleDifference(nsSt
+   // We must always ensure that we populate the structs on the new style
+   // context that are filled in on the old context, so that if we get
+   // two style changes in succession, the second of which causes a real
+-  // style change, the PeekStyleData doesn't fail.
++  // style change, the PeekStyleData doesn't return null (implying that
++  // nobody ever looked at that struct's data).  In other words, we
++  // can't skip later structs if we get a big change up front, because
++  // we could later get a small change in one of those structs that we
++  // don't want to miss.
+ 
+   // If our rule nodes are the same, then we are looking at the same
+   // style data.  We know this because CalcStyleDifference is always
