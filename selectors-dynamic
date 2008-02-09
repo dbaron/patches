@@ -3,7 +3,7 @@ Fix handling of dynamic changes for advanced CSS selectors (and avoid the cost o
 diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
 --- a/content/base/public/nsINode.h
 +++ b/content/base/public/nsINode.h
-@@ -101,9 +101,25 @@ enum {
+@@ -101,9 +101,30 @@ enum {
  
    NODE_SCRIPT_TYPE_SIZE =                  4,
  
@@ -23,6 +23,11 @@ diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
 +  // OK).
 +  NODE_HAS_SLOW_SELECTOR_NOAPPEND
 +                               = 0x00080000U,
++
++  NODE_ALL_SELECTOR_FLAGS =      NODE_HAS_EMPTY_SELECTOR |
++                                 NODE_HAS_SLOW_SELECTOR |
++                                 NODE_HAS_EDGE_CHILD_SELECTOR |
++                                 NODE_HAS_SLOW_SELECTOR_NOAPPEND,
 +
    // Remaining bits are node type specific.
 -  NODE_TYPE_SPECIFIC_BITS_OFFSET =
@@ -73,10 +78,206 @@ diff --git a/content/xul/content/src/nsXULElement.h b/content/xul/content/src/ns
  
      // nsIDOMNode
      NS_FORWARD_NSIDOMNODE(nsGenericElement::)
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -120,6 +120,7 @@
+ #include "nsContentErrors.h"
+ #include "nsIPrincipal.h"
+ #include "nsIDOMWindowInternal.h"
++#include "nsStyleUtil.h"
+ 
+ #include "nsBox.h"
+ 
+@@ -152,7 +153,6 @@ NS_NewHTMLCanvasFrame (nsIPresShell* aPr
+ 
+ #ifdef MOZ_SVG
+ #include "nsISVGTextContentMetrics.h"
+-#include "nsStyleUtil.h"
+ 
+ PRBool
+ NS_SVGEnabled();
+@@ -8533,6 +8533,40 @@ nsCSSFrameConstructor::ContentAppended(n
+   }
+ #endif
+ 
++  PRUint32 selectorFlags =
++    aContainer->GetFlags() & (nsINode::NODE_ALL_SELECTOR_FLAGS &
++                              ~nsINode::NODE_HAS_SLOW_SELECTOR_NOAPPEND);
++  if (selectorFlags != 0) {
++    if (selectorFlags & nsINode::NODE_HAS_SLOW_SELECTOR) {
++      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++    } else {
++      if (selectorFlags & nsINode::NODE_HAS_EMPTY_SELECTOR) {
++        // see if we need to re-resolve the container
++        PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
++        for (PRInt32 index = 0; index < aNewIndexInContainer; ++index) {
++          if (nsStyleUtil::IsSignificantChild(aContainer->GetChildAt(index),
++                                              PR_TRUE, PR_FALSE)) {
++            wasEmpty = PR_FALSE;
++            break;
++          }
++        }
++        if (wasEmpty) {
++          PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++        }
++      }
++      if (selectorFlags & nsINode::NODE_HAS_EDGE_CHILD_SELECTOR) {
++        // resolve the last element child before this node
++        for (PRInt32 index = aNewIndexInContainer - 1; index >= 0; --index) {
++          nsIContent *content = aContainer->GetChildAt(index);
++          if (content->IsNodeOfType(nsINode::eELEMENT)) {
++            PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
++            break;
++          }
++        }
++      }
++    }
++  }
++
+ #ifdef MOZ_XUL
+   if (aContainer) {
+     PRInt32 namespaceID;
+@@ -8882,6 +8916,74 @@ PRBool NotifyListBoxBody(nsPresContext* 
+ }
+ #endif // MOZ_XUL
+ 
++// Restyling for a ContentInserted (notification after insertion) or
++// for a ContentRemoved (notification before removal) is exactly the
++// same; this is the shared code.
++// The comments are written and variables are named in terms of it being
++// a ContentInserted notification.
++void
++nsCSSFrameConstructor::RestyleForInsertOrRemove(nsIContent* aContainer,
++                                                PRInt32 aIndexInContainer)
++{
++  PRUint32 selectorFlags =
++    aContainer->GetFlags() & nsINode::NODE_ALL_SELECTOR_FLAGS;
++  if (selectorFlags != 0) {
++    if (selectorFlags & (nsINode::NODE_HAS_SLOW_SELECTOR |
++                         nsINode::NODE_HAS_SLOW_SELECTOR_NOAPPEND)) {
++      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++    } else {
++      if (selectorFlags & nsINode::NODE_HAS_EMPTY_SELECTOR) {
++        // see if we need to re-resolve the container
++        PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
++        for (PRInt32 index = 0; ; ++index) {
++          if (index == aNewIndexInContainer)
++            continue;
++          nsIContent *child = aContainer->GetChildAt(index);
++          if (!child) // last child
++            break;
++          if (nsStyleUtil::IsSignificantChild(child, PR_TRUE, PR_FALSE)) {
++            wasEmpty = PR_FALSE;
++            break;
++          }
++        }
++        if (wasEmpty) {
++          PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++        }
++      }
++      if (selectorFlags & nsINode::NODE_HAS_EDGE_CHILD_SELECTOR) {
++        // resolve the previously-first element child if it is after this node
++        for (PRInt32 index = 0; ; ++index) {
++          if (index == aNewIndexInContainer)
++            continue;
++          nsIContent *content = aContainer->GetChildAt(index);
++          if (!content)
++            break; // went through all children
++          if (content->IsNodeOfType(nsINode::eELEMENT)) {
++            if (index > aNewIndexInContainer) {
++              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
++            }
++            break;
++          }
++        }
++        // resolve the previously-last element child if it is before this node
++        for (PRInt32 index = aContainer->GetChildCount() - 1;
++             index >= 0; --index) {
++          if (index == aNewIndexInContainer)
++            continue;
++          nsIContent *content = aContainer->GetChildAt(index);
++          if (content->IsNodeOfType(nsINode::eELEMENT)) {
++            if (index < aNewIndexInContainer) {
++              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
++            }
++            break;
++          }
++        }
++      }
++    }
++  }
++
++}
++
+ nsresult
+ nsCSSFrameConstructor::ContentInserted(nsIContent*            aContainer,
+                                        nsIContent*            aChild,
+@@ -8905,6 +9007,8 @@ nsCSSFrameConstructor::ContentInserted(n
+     }
+   }
+ #endif
++
++  RestyleForInsertOrRemove(aContainer, aIndexInContainer);
+ 
+   nsresult rv = NS_OK;
+ 
+@@ -9475,6 +9579,8 @@ nsCSSFrameConstructor::ContentRemoved(ns
+     }
+   }
+ #endif
++
++  RestyleForInsertOrRemove(aContainer, aIndexInContainer);
+ 
+   nsFrameManager *frameManager = mPresShell->FrameManager();
+   nsPresContext *presContext = mPresShell->GetPresContext();
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -169,6 +169,12 @@ private:
+   // itself.
+   void ProcessOneRestyle(nsIContent* aContent, nsReStyleHint aRestyleHint,
+                          nsChangeHint aChangeHint);
++
++  // Restyling for a ContentInserted (notification after insertion) or
++  // for a ContentRemoved (notification before removal) is exactly the
++  // same; this is the shared code.
++  void RestyleForInsertOrRemove(nsIContent* aContainer,
++                                PRInt32 aIndexInContainer);
+ 
+ public:
+   // Note: It's the caller's responsibility to make sure to wrap a
 diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
 --- a/layout/style/nsCSSRuleProcessor.cpp
 +++ b/layout/style/nsCSSRuleProcessor.cpp
-@@ -1064,6 +1064,12 @@ static PRBool SelectorMatches(RuleProces
+@@ -986,21 +986,12 @@ inline PRBool IsQuirkEventSensitive(nsIA
+ }
+ 
+ 
+-static PRBool IsSignificantChild(nsIContent* aChild, PRBool aTextIsSignificant, PRBool aWhitespaceIsSignificant)
++static inline PRBool
++IsSignificantChild(nsIContent* aChild, PRBool aTextIsSignificant,
++                   PRBool aWhitespaceIsSignificant)
+ {
+-  NS_ASSERTION(!aWhitespaceIsSignificant || aTextIsSignificant,
+-               "Nonsensical arguments");
+-
+-  PRBool isText = aChild->IsNodeOfType(nsINode::eTEXT);
+-
+-  if (!isText && !aChild->IsNodeOfType(nsINode::eCOMMENT) &&
+-      !aChild->IsNodeOfType(nsINode::ePROCESSING_INSTRUCTION)) {
+-    return PR_TRUE;
+-  }
+-
+-  return aTextIsSignificant && isText && aChild->TextLength() != 0 &&
+-         (aWhitespaceIsSignificant ||
+-          !aChild->TextIsOnlyWhitespace());
++  return nsStyleUtil::IsSignificantChild(aChild, aTextIsSignificant,
++                                         aWhitespaceIsSignificant);
+ }
+ 
+ // This function is to be called once we have fetched a value for an attribute
+@@ -1064,6 +1055,12 @@ static PRBool SelectorMatches(RuleProces
  
    PRBool result = PR_TRUE;
    const PRBool isNegated = (aDependence != nsnull);
@@ -89,7 +290,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
  
    // test for pseudo class match
    // first-child, root, lang, active, focus, hover, link, visited...
-@@ -1076,6 +1082,9 @@ static PRBool SelectorMatches(RuleProces
+@@ -1076,6 +1073,9 @@ static PRBool SelectorMatches(RuleProces
        nsIContent *firstChild = nsnull;
        nsIContent *parent = data.mParentContent;
        if (parent) {
@@ -99,7 +300,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
          PRBool acceptNonWhitespace =
            nsCSSPseudoClasses::firstNode == pseudoClass->mAtom;
          PRInt32 index = -1;
-@@ -1093,6 +1102,9 @@ static PRBool SelectorMatches(RuleProces
+@@ -1093,6 +1093,9 @@ static PRBool SelectorMatches(RuleProces
        nsIContent *lastChild = nsnull;
        nsIContent *parent = data.mParentContent;
        if (parent) {
@@ -109,7 +310,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
          PRBool acceptNonWhitespace =
            nsCSSPseudoClasses::lastNode == pseudoClass->mAtom;
          PRUint32 index = parent->GetChildCount();
-@@ -1110,6 +1122,9 @@ static PRBool SelectorMatches(RuleProces
+@@ -1110,6 +1113,9 @@ static PRBool SelectorMatches(RuleProces
        nsIContent *moreChild = nsnull;
        nsIContent *parent = data.mParentContent;
        if (parent) {
@@ -119,7 +320,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
          PRInt32 index = -1;
          do {
            onlyChild = parent->GetChildAt(++index);
-@@ -1133,6 +1148,9 @@ static PRBool SelectorMatches(RuleProces
+@@ -1133,6 +1139,9 @@ static PRBool SelectorMatches(RuleProces
          nsCSSPseudoClasses::empty == pseudoClass->mAtom;
        PRInt32 index = -1;
  
@@ -129,7 +330,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
        do {
          child = element->GetChildAt(++index);
          // stop at first non-comment (and non-whitespace for
-@@ -1145,6 +1163,9 @@ static PRBool SelectorMatches(RuleProces
+@@ -1145,6 +1154,9 @@ static PRBool SelectorMatches(RuleProces
        nsIContent *child = nsnull;
        nsIContent *element = data.mContent;
        PRInt32 index = -1;
@@ -139,7 +340,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
  
        do {
          child = element->GetChildAt(++index);
-@@ -1566,6 +1587,8 @@ static PRBool SelectorMatchesTree(RulePr
+@@ -1566,6 +1578,8 @@ static PRBool SelectorMatchesTree(RulePr
          nsIContent* content = prevdata->mContent;
          nsIContent* parent = content->GetParent();
          if (parent) {
@@ -148,3 +349,46 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
            PRInt32 index = parent->IndexOf(content);
            while (0 <= --index) {
              content = parent->GetChildAt(index);
+diff --git a/layout/style/nsStyleUtil.cpp b/layout/style/nsStyleUtil.cpp
+--- a/layout/style/nsStyleUtil.cpp
++++ b/layout/style/nsStyleUtil.cpp
+@@ -568,3 +568,23 @@ nsStyleUtil::ColorComponentToFloat(PRUin
+   }
+   return rounded;
+ }
++
++/* static */ PRBool
++nsStyleUtil::IsSignificantChild(nsIContent* aChild, PRBool aTextIsSignificant,
++                                PRBool aWhitespaceIsSignificant)
++{
++  NS_ASSERTION(!aWhitespaceIsSignificant || aTextIsSignificant,
++               "Nonsensical arguments");
++
++  PRBool isText = aChild->IsNodeOfType(nsINode::eTEXT);
++
++  if (!isText && !aChild->IsNodeOfType(nsINode::eCOMMENT) &&
++      !aChild->IsNodeOfType(nsINode::ePROCESSING_INSTRUCTION)) {
++    return PR_TRUE;
++  }
++
++  return aTextIsSignificant && isText && aChild->TextLength() != 0 &&
++         (aWhitespaceIsSignificant ||
++          !aChild->TextIsOnlyWhitespace());
++}
++
+diff --git a/layout/style/nsStyleUtil.h b/layout/style/nsStyleUtil.h
+--- a/layout/style/nsStyleUtil.h
++++ b/layout/style/nsStyleUtil.h
+@@ -97,6 +97,12 @@ public:
+    */
+   static float ColorComponentToFloat(PRUint8 aAlpha);
+ 
++  /*
++   * Does this child count as significant for selector matching?
++   */
++  static PRBool IsSignificantChild(nsIContent* aChild,
++                                   PRBool aTextIsSignificant,
++                                   PRBool aWhitespaceIsSignificant);
+ };
+ 
+ 
