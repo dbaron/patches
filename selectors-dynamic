@@ -1,0 +1,150 @@
+Fix handling of dynamic changes for advanced CSS selectors (and avoid the cost of doing so in the normal case).  b=401291, 75386, 98997, 229915, 404418 (blocking1.9+)
+
+diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
+--- a/content/base/public/nsINode.h
++++ b/content/base/public/nsINode.h
+@@ -101,9 +101,25 @@ enum {
+ 
+   NODE_SCRIPT_TYPE_SIZE =                  4,
+ 
++  // Node has an :empty or :-moz-only-whitespace selector
++  NODE_HAS_EMPTY_SELECTOR =      0x00010000U,
++
++  // A child of the node has a selector such that any insertion,
++  // removal, or appending of children requires reresolving the parent.
++  NODE_HAS_SLOW_SELECTOR =       0x00020000U,
++
++  // A child of the node has a :first-child, :-moz-first-node,
++  // :only-child, :last-child or :-moz-last-node selector.
++  NODE_HAS_EDGE_CHILD_SELECTOR = 0x00040000U,
++
++  // A child of the node has a selector such that any insertion or
++  // removal of children requires reresolving the parent (but append is
++  // OK).
++  NODE_HAS_SLOW_SELECTOR_NOAPPEND
++                               = 0x00080000U,
++
+   // Remaining bits are node type specific.
+-  NODE_TYPE_SPECIFIC_BITS_OFFSET =
+-    NODE_SCRIPT_TYPE_OFFSET + NODE_SCRIPT_TYPE_SIZE
++  NODE_TYPE_SPECIFIC_BITS_OFFSET = 20
+ };
+ 
+ // Useful inline function for getting a node given an nsIContent and an
+diff --git a/content/html/content/src/nsGenericHTMLElement.h b/content/html/content/src/nsGenericHTMLElement.h
+--- a/content/html/content/src/nsGenericHTMLElement.h
++++ b/content/html/content/src/nsGenericHTMLElement.h
+@@ -883,6 +883,8 @@ protected:
+ // same time, so if it becomes an issue we can probably merge them into the
+ // same bit.  --bz
+ 
++PR_STATIC_ASSERT(NODE_TYPE_SPECIFIC_BITS_OFFSET + 1 < 32);
++
+ //----------------------------------------------------------------------
+ 
+ /**
+diff --git a/content/xul/content/src/nsXULElement.h b/content/xul/content/src/nsXULElement.h
+--- a/content/xul/content/src/nsXULElement.h
++++ b/content/xul/content/src/nsXULElement.h
+@@ -477,6 +477,9 @@ public:
+  */
+ 
+ #define XUL_ELEMENT_LAZY_STATE_OFFSET NODE_TYPE_SPECIFIC_BITS_OFFSET
++#define XUL_ELEMENT_LAZY_STATE_BITS 3
++PR_STATIC_ASSERT(XUL_ELEMENT_LAZY_STATE_OFFSET + XUL_ELEMENT_LAZY_STATE_BITS
++                   <= 32);
+ 
+ class nsScriptEventHandlerOwnerTearoff;
+ 
+@@ -503,6 +506,7 @@ public:
+         eChildrenMustBeRebuilt  = 0x1,
+         eTemplateContentsBuilt  = 0x2,
+         eContainerContentsBuilt = 0x4
++        // see XUL_ELEMENT_LAZY_STATE_BITS above
+     };
+ 
+     /** Typesafe, non-refcounting cast from nsIContent.  Cheaper than QI. **/
+@@ -604,7 +608,7 @@ public:
+     void ClearLazyState(LazyState aFlags)
+     { UnsetFlags(aFlags << XUL_ELEMENT_LAZY_STATE_OFFSET); }
+     PRBool GetLazyState(LazyState aFlag)
+-    { return GetFlags() & (aFlag << XUL_ELEMENT_LAZY_STATE_OFFSET); }
++    { return (GetFlags() & (aFlag << XUL_ELEMENT_LAZY_STATE_OFFSET)) != 0; }
+ 
+     // nsIDOMNode
+     NS_FORWARD_NSIDOMNODE(nsGenericElement::)
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -1064,6 +1064,12 @@ static PRBool SelectorMatches(RuleProces
+ 
+   PRBool result = PR_TRUE;
+   const PRBool isNegated = (aDependence != nsnull);
++  // The selectors for which we set node bits are, unfortunately, early
++  // in this function (because they're pseudo-classes, which are
++  // generally quick to test, and thus earlier).  If they were later,
++  // we'd probably avoid setting those bits in more cases where setting
++  // them is unnecessary.
++  const PRBool setNodeFlags = aStateMask == 0 && !aAttribute;
+ 
+   // test for pseudo class match
+   // first-child, root, lang, active, focus, hover, link, visited...
+@@ -1076,6 +1082,9 @@ static PRBool SelectorMatches(RuleProces
+       nsIContent *firstChild = nsnull;
+       nsIContent *parent = data.mParentContent;
+       if (parent) {
++        if (setNodeFlags)
++          parent->SetFlags(nsINode::NODE_HAS_EDGE_CHILD_SELECTOR);
++
+         PRBool acceptNonWhitespace =
+           nsCSSPseudoClasses::firstNode == pseudoClass->mAtom;
+         PRInt32 index = -1;
+@@ -1093,6 +1102,9 @@ static PRBool SelectorMatches(RuleProces
+       nsIContent *lastChild = nsnull;
+       nsIContent *parent = data.mParentContent;
+       if (parent) {
++        if (setNodeFlags)
++          parent->SetFlags(nsINode::NODE_HAS_EDGE_CHILD_SELECTOR);
++
+         PRBool acceptNonWhitespace =
+           nsCSSPseudoClasses::lastNode == pseudoClass->mAtom;
+         PRUint32 index = parent->GetChildCount();
+@@ -1110,6 +1122,9 @@ static PRBool SelectorMatches(RuleProces
+       nsIContent *moreChild = nsnull;
+       nsIContent *parent = data.mParentContent;
+       if (parent) {
++        if (setNodeFlags)
++          parent->SetFlags(nsINode::NODE_HAS_EDGE_CHILD_SELECTOR);
++
+         PRInt32 index = -1;
+         do {
+           onlyChild = parent->GetChildAt(++index);
+@@ -1133,6 +1148,9 @@ static PRBool SelectorMatches(RuleProces
+         nsCSSPseudoClasses::empty == pseudoClass->mAtom;
+       PRInt32 index = -1;
+ 
++      if (setNodeFlags)
++        element->SetFlags(nsINode::NODE_HAS_EMPTY_SELECTOR);
++
+       do {
+         child = element->GetChildAt(++index);
+         // stop at first non-comment (and non-whitespace for
+@@ -1145,6 +1163,9 @@ static PRBool SelectorMatches(RuleProces
+       nsIContent *child = nsnull;
+       nsIContent *element = data.mContent;
+       PRInt32 index = -1;
++
++      if (setNodeFlags)
++        element->SetFlags(nsINode::NODE_HAS_SLOW_SELECTOR);
+ 
+       do {
+         child = element->GetChildAt(++index);
+@@ -1566,6 +1587,8 @@ static PRBool SelectorMatchesTree(RulePr
+         nsIContent* content = prevdata->mContent;
+         nsIContent* parent = content->GetParent();
+         if (parent) {
++          parent->SetNodeFlags(nsINode::NODE_HAS_SLOW_SELECTOR_NOAPPEND);
++
+           PRInt32 index = parent->IndexOf(content);
+           while (0 <= --index) {
+             content = parent->GetChildAt(index);
