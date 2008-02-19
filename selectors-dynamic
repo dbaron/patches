@@ -3,39 +3,38 @@ Fix handling of dynamic changes for advanced CSS selectors (and avoid the cost o
 diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
 --- a/content/base/public/nsINode.h
 +++ b/content/base/public/nsINode.h
-@@ -101,9 +101,30 @@ enum {
+@@ -96,8 +96,30 @@ enum {
  
-   NODE_SCRIPT_TYPE_SIZE =                  4,
+   NODE_IS_INSERTION_PARENT =     0x00000800U,
  
 +  // Node has an :empty or :-moz-only-whitespace selector
-+  NODE_HAS_EMPTY_SELECTOR =      0x00010000U,
++  NODE_HAS_EMPTY_SELECTOR =      0x00001000U,
 +
 +  // A child of the node has a selector such that any insertion,
 +  // removal, or appending of children requires restyling the parent.
-+  NODE_HAS_SLOW_SELECTOR =       0x00020000U,
++  NODE_HAS_SLOW_SELECTOR =       0x00002000U,
 +
 +  // A child of the node has a :first-child, :-moz-first-node,
 +  // :only-child, :last-child or :-moz-last-node selector.
-+  NODE_HAS_EDGE_CHILD_SELECTOR = 0x00040000U,
++  NODE_HAS_EDGE_CHILD_SELECTOR = 0x00004000U,
 +
 +  // A child of the node has a selector such that any insertion or
 +  // removal of children requires restyling the parent (but append is
 +  // OK).
 +  NODE_HAS_SLOW_SELECTOR_NOAPPEND
-+                               = 0x00080000U,
++                               = 0x00008000U,
 +
 +  NODE_ALL_SELECTOR_FLAGS =      NODE_HAS_EMPTY_SELECTOR |
 +                                 NODE_HAS_SLOW_SELECTOR |
 +                                 NODE_HAS_EDGE_CHILD_SELECTOR |
 +                                 NODE_HAS_SLOW_SELECTOR_NOAPPEND,
 +
-   // Remaining bits are node type specific.
--  NODE_TYPE_SPECIFIC_BITS_OFFSET =
--    NODE_SCRIPT_TYPE_OFFSET + NODE_SCRIPT_TYPE_SIZE
-+  NODE_TYPE_SPECIFIC_BITS_OFFSET = 20
- };
+   // Four bits for the script-type ID
+-  NODE_SCRIPT_TYPE_OFFSET =               12,
++  NODE_SCRIPT_TYPE_OFFSET =               16,
  
- // Useful inline function for getting a node given an nsIContent and an
+   NODE_SCRIPT_TYPE_SIZE =                  4,
+ 
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
@@ -55,54 +54,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  PRBool
  NS_SVGEnabled();
-@@ -8532,6 +8532,8 @@ nsCSSFrameConstructor::ContentAppended(n
-   }
- #endif
- 
-+  RestyleForAppend(aContainer, aNewIndexInContainer);
-+
- #ifdef MOZ_XUL
-   if (aContainer) {
-     PRInt32 namespaceID;
-@@ -8905,6 +8907,8 @@ nsCSSFrameConstructor::ContentInserted(n
-   }
- #endif
- 
-+  RestyleForInsertOrChange(aContainer, aChild);
-+
-   nsresult rv = NS_OK;
- 
- #ifdef MOZ_XUL
-@@ -9475,6 +9479,8 @@ nsCSSFrameConstructor::ContentRemoved(ns
-   }
- #endif
- 
-+  RestyleForRemove(aContainer, aChild, aIndexInContainer);
-+
-   nsFrameManager *frameManager = mPresShell->FrameManager();
-   nsPresContext *presContext = mPresShell->GetPresContext();
-   nsresult                  rv = NS_OK;
-@@ -9899,6 +9905,19 @@ nsCSSFrameConstructor::CharacterDataChan
- {
-   AUTO_LAYOUT_PHASE_ENTRY_POINT(mPresShell->GetPresContext(), FrameC);
-   nsresult      rv = NS_OK;
-+
-+  nsIContent *container = aContent->GetParent();
-+  PRUint32 selectorFlags =
-+    container ? (container->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
-+  if (selectorFlags != 0) {
-+    PRUint32 index;
-+    if (aAppend &&
-+        container->GetChildAt((index = container->GetChildCount() - 1)) ==
-+          aContent)
-+      RestyleForAppend(container, index);
-+    else
-+      RestyleForInsertOrChange(container, aContent);
-+  }
- 
-   // Find the child frame
-   nsIFrame* frame = mPresShell->GetPrimaryFrameFor(aContent);
-@@ -13134,6 +13153,178 @@ nsresult nsCSSFrameConstructor::RemoveFi
+@@ -13134,6 +13134,207 @@ nsresult nsCSSFrameConstructor::RemoveFi
    return rv;
  }
  
@@ -110,36 +62,46 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +nsCSSFrameConstructor::RestyleForAppend(nsIContent* aContainer,
 +                                        PRInt32 aNewIndexInContainer)
 +{
-+  PRUint32 selectorFlags = aContainer ?
-+    (aContainer->GetFlags() & (NODE_ALL_SELECTOR_FLAGS &
-+                               ~NODE_HAS_SLOW_SELECTOR_NOAPPEND)) : 0;
-+  if (selectorFlags != 0) {
-+    if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
-+      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+    } else {
-+      if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
-+        // see if we need to restyle the container
-+        PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
-+        for (PRInt32 index = 0; index < aNewIndexInContainer; ++index) {
-+          if (nsStyleUtil::IsSignificantChild(aContainer->GetChildAt(index),
-+                                              PR_TRUE, PR_FALSE)) {
-+            wasEmpty = PR_FALSE;
-+            break;
-+          }
-+        }
-+        if (wasEmpty) {
-+          PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+        }
++  NS_ASSERTION(aContainer, "must have container for append");
++  PRUint32 selectorFlags =
++    aContainer->GetFlags() & (NODE_ALL_SELECTOR_FLAGS &
++                              ~NODE_HAS_SLOW_SELECTOR_NOAPPEND);
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
++    PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
++    for (PRInt32 index = 0; index < aNewIndexInContainer; ++index) {
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(aContainer->GetChildAt(index),
++                                          PR_TRUE, PR_FALSE)) {
++        wasEmpty = PR_FALSE;
++        break;
 +      }
-+      if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
-+        // restyle the last element child before this node
-+        for (PRInt32 index = aNewIndexInContainer - 1; index >= 0; --index) {
-+          nsIContent *content = aContainer->GetChildAt(index);
-+          if (content->IsNodeOfType(nsINode::eELEMENT)) {
-+            PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
-+            break;
-+          }
-+        }
++    }
++    if (wasEmpty) {
++      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++      // Restyling the container is the most we can do here, so we're done.
++      return;
++    }
++  }
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the last element child before this node
++    for (PRInt32 index = aNewIndexInContainer - 1; index >= 0; --index) {
++      nsIContent *content = aContainer->GetChildAt(index);
++      if (content->IsNodeOfType(nsINode::eELEMENT)) {
++        PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
++        break;
 +      }
 +    }
 +  }
@@ -157,63 +119,73 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +{
 +  PRUint32 selectorFlags =
 +    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
-+  if (selectorFlags != 0) {
-+    if (selectorFlags & (NODE_HAS_SLOW_SELECTOR |
-+                         NODE_HAS_SLOW_SELECTOR_NOAPPEND)) {
-+      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+    } else {
-+      if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
-+        // see if we need to restyle the container
-+        PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
-+        for (PRInt32 index = 0; ; ++index) {
-+          nsIContent *child = aContainer->GetChildAt(index);
-+          if (!child) // last child
-+            break;
-+          if (child == aChild)
-+            continue;
-+          if (nsStyleUtil::IsSignificantChild(child, PR_TRUE, PR_FALSE)) {
-+            wasEmpty = PR_FALSE;
-+            break;
-+          }
-+        }
-+        if (wasEmpty) {
-+          PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+        }
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & (NODE_HAS_SLOW_SELECTOR |
++                       NODE_HAS_SLOW_SELECTOR_NOAPPEND)) {
++    PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    PRBool wasEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
++    for (PRInt32 index = 0; ; ++index) {
++      nsIContent *child = aContainer->GetChildAt(index);
++      if (!child) // last child
++        break;
++      if (child == aChild)
++        continue;
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(child, PR_TRUE, PR_FALSE)) {
++        wasEmpty = PR_FALSE;
++        break;
 +      }
-+      if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
-+        // restyle the previously-first element child if it is after this node
-+        PRBool passedChild = PR_FALSE;
-+        for (PRInt32 index = 0; ; ++index) {
-+          nsIContent *content = aContainer->GetChildAt(index);
-+          if (!content)
-+            break; // went through all children
-+          if (content == aChild) {
-+            passedChild = PR_TRUE;
-+            continue;
-+          }
-+          if (content->IsNodeOfType(nsINode::eELEMENT)) {
-+            if (passedChild) {
-+              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
-+            }
-+            break;
-+          }
++    }
++    if (wasEmpty) {
++      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++      // Restyling the container is the most we can do here, so we're done.
++      return;
++    }
++  }
++
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the previously-first element child if it is after this node
++    PRBool passedChild = PR_FALSE;
++    for (PRInt32 index = 0; ; ++index) {
++      nsIContent *content = aContainer->GetChildAt(index);
++      if (!content)
++        break; // went through all children
++      if (content == aChild) {
++        passedChild = PR_TRUE;
++        continue;
++      }
++      if (content->IsNodeOfType(nsINode::eELEMENT)) {
++        if (passedChild) {
++          PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
 +        }
-+        // restyle the previously-last element child if it is before this node
-+        passedChild = PR_FALSE;
-+        for (PRInt32 index = aContainer->GetChildCount() - 1;
-+             index >= 0; --index) {
-+          nsIContent *content = aContainer->GetChildAt(index);
-+          if (content == aChild) {
-+            passedChild = PR_TRUE;
-+            continue;
-+          }
-+          if (content->IsNodeOfType(nsINode::eELEMENT)) {
-+            if (passedChild) {
-+              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
-+            }
-+            break;
-+          }
++        break;
++      }
++    }
++    // restyle the previously-last element child if it is before this node
++    passedChild = PR_FALSE;
++    for (PRInt32 index = aContainer->GetChildCount() - 1;
++         index >= 0; --index) {
++      nsIContent *content = aContainer->GetChildAt(index);
++      if (content == aChild) {
++        passedChild = PR_TRUE;
++        continue;
++      }
++      if (content->IsNodeOfType(nsINode::eELEMENT)) {
++        if (passedChild) {
++          PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
 +        }
++        break;
 +      }
 +    }
 +  }
@@ -226,52 +198,61 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 +{
 +  PRUint32 selectorFlags =
 +    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
-+  if (selectorFlags != 0) {
-+    if (selectorFlags & (NODE_HAS_SLOW_SELECTOR |
-+                         NODE_HAS_SLOW_SELECTOR_NOAPPEND)) {
-+      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+    } else {
-+      if ((selectorFlags & NODE_HAS_EMPTY_SELECTOR) &&
-+          nsStyleUtil::IsSignificantChild(aOldChild, PR_TRUE, PR_FALSE)) {
-+        // see if we need to restyle the container
-+        PRBool isEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
-+        for (PRInt32 index = 0; ; ++index) {
-+          nsIContent *child = aContainer->GetChildAt(index);
-+          if (!child) // last child
-+            break;
-+          if (nsStyleUtil::IsSignificantChild(child, PR_TRUE, PR_FALSE)) {
-+            isEmpty = PR_FALSE;
-+            break;
-+          }
-+        }
-+        if (isEmpty) {
-+          PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
-+        }
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & (NODE_HAS_SLOW_SELECTOR |
++                       NODE_HAS_SLOW_SELECTOR_NOAPPEND)) {
++    PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    PRBool isEmpty = PR_TRUE; // :empty or :-moz-only-whitespace
++    for (PRInt32 index = 0; ; ++index) {
++      nsIContent *child = aContainer->GetChildAt(index);
++      if (!child) // last child
++        break;
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(child, PR_TRUE, PR_FALSE)) {
++        isEmpty = PR_FALSE;
++        break;
 +      }
-+      if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
-+        // restyle the previously-first element child if it is after aOldChild
-+        for (PRInt32 index = 0; ; ++index) {
-+          nsIContent *content = aContainer->GetChildAt(index);
-+          if (!content)
-+            break; // went through all children
-+          if (content->IsNodeOfType(nsINode::eELEMENT)) {
-+            if (index >= aIndexInContainer) {
-+              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
-+            }
-+            break;
-+          }
++    }
++    if (isEmpty) {
++      PostRestyleEvent(aContainer, eReStyle_Self, NS_STYLE_HINT_NONE);
++      // Restyling the container is the most we can do here, so we're done.
++      return;
++    }
++  }
++
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the previously-first element child if it is after aOldChild
++    for (PRInt32 index = 0; ; ++index) {
++      nsIContent *content = aContainer->GetChildAt(index);
++      if (!content)
++        break; // went through all children
++      if (content->IsNodeOfType(nsINode::eELEMENT)) {
++        if (index >= aIndexInContainer) {
++          PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
 +        }
-+        // restyle the previously-last element child if it is before aOldChild
-+        for (PRInt32 index = aContainer->GetChildCount() - 1;
-+             index >= 0; --index) {
-+          nsIContent *content = aContainer->GetChildAt(index);
-+          if (content->IsNodeOfType(nsINode::eELEMENT)) {
-+            if (index < aIndexInContainer) {
-+              PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
-+            }
-+            break;
-+          }
++        break;
++      }
++    }
++    // restyle the previously-last element child if it is before aOldChild
++    for (PRInt32 index = aContainer->GetChildCount() - 1;
++         index >= 0; --index) {
++      nsIContent *content = aContainer->GetChildAt(index);
++      if (content->IsNodeOfType(nsINode::eELEMENT)) {
++        if (index < aIndexInContainer) {
++          PostRestyleEvent(content, eReStyle_Self, NS_STYLE_HINT_NONE);
 +        }
++        break;
 +      }
 +    }
 +  }
@@ -284,26 +265,104 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
 --- a/layout/base/nsCSSFrameConstructor.h
 +++ b/layout/base/nsCSSFrameConstructor.h
-@@ -169,6 +169,19 @@ private:
-   // itself.
-   void ProcessOneRestyle(nsIContent* aContent, nsReStyleHint aRestyleHint,
+@@ -171,6 +171,22 @@ private:
                           nsChangeHint aChangeHint);
-+
+ 
+ public:
 +  // Restyling for a ContentInserted (notification after insertion) or
-+  // for a CharacterDataChanged.
++  // for a CharacterDataChanged.  |aContainer| must be non-null; when
++  // the container is null, no work is needed.
 +  void RestyleForInsertOrChange(nsIContent* aContainer,
 +                                nsIContent* aChild);
 +  // This would be the same as RestyleForInsertOrChange if we got the
 +  // notification before the removal.  However, we get it after, so we
-+  // have to use the index.
++  // have to use the index.  |aContainer| must be non-null; when the
++  // container is null, no work is needed.
 +  void RestyleForRemove(nsIContent* aContainer, nsIContent* aOldChild,
 +                        PRInt32 aIndexInContainer);
-+  // Same for a ContentAppended.
++  // Same for a ContentAppended.  |aContainer| must be non-null; when
++  // the container is null, no work is needed.
 +  void RestyleForAppend(nsIContent* aContainer,
 +                        PRInt32 aNewIndexInContainer);
- 
- public:
++
    // Note: It's the caller's responsibility to make sure to wrap a
+   // ProcessPendingRestyles call in a view update batch.
+   // This function does not call ProcessAttachedQueue() on the binding manager.
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -4553,6 +4553,23 @@ PresShell::CharacterDataChanged(nsIDocum
+     // frame to the caret.
+     mCaret->InvalidateOutsideCaret();
+   }
++
++  // Call this here so it only happens for real content mutations and
++  // not cases when the frame constructor calls its own methods to force
++  // frame reconstruction.
++  nsIContent *container = aContent->GetParent();
++  PRUint32 selectorFlags =
++    container ? (container->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
++  if (selectorFlags != 0) {
++    PRUint32 index;
++    if (aAppend &&
++        container->GetChildAt((index = container->GetChildCount() - 1)) ==
++          aContent)
++      mFrameConstructor->RestyleForAppend(container, index);
++    else
++      mFrameConstructor->RestyleForInsertOrChange(container, aContent);
++  }
++
+   mFrameConstructor->CharacterDataChanged(aContent, aInfo->mAppend);
+   VERIFY_STYLE_TREE;
+   DidCauseReflow();
+@@ -4606,6 +4623,7 @@ PresShell::ContentAppended(nsIDocument *
+ {
+   NS_PRECONDITION(!mIsDocumentGone, "Unexpected ContentAppended");
+   NS_PRECONDITION(aDocument == mDocument, "Unexpected aDocument");
++  NS_PRECONDITION(aContainer, "must have container");
+   
+   if (!mDidInitialReflow) {
+     return;
+@@ -4614,6 +4632,11 @@ PresShell::ContentAppended(nsIDocument *
+   WillCauseReflow();
+   MOZ_TIMER_DEBUGLOG(("Start: Frame Creation: PresShell::ContentAppended(), this=%p\n", this));
+   MOZ_TIMER_START(mFrameCreationWatch);
++
++  // Call this here so it only happens for real content mutations and
++  // not cases when the frame constructor calls its own methods to force
++  // frame reconstruction.
++  mFrameConstructor->RestyleForAppend(aContainer, aNewIndexInContainer);
+ 
+   mFrameConstructor->ContentAppended(aContainer, aNewIndexInContainer);
+   VERIFY_STYLE_TREE;
+@@ -4637,6 +4660,13 @@ PresShell::ContentInserted(nsIDocument* 
+   }
+   
+   WillCauseReflow();
++
++  // Call this here so it only happens for real content mutations and
++  // not cases when the frame constructor calls its own methods to force
++  // frame reconstruction.
++  if (aContainer)
++    mFrameConstructor->RestyleForInsertOrChange(aContainer, aChild);
++
+   mFrameConstructor->ContentInserted(aContainer, aChild,
+                                      aIndexInContainer, nsnull);
+   VERIFY_STYLE_TREE;
+@@ -4662,6 +4692,13 @@ PresShell::ContentRemoved(nsIDocument *a
+   mPresContext->EventStateManager()->ContentRemoved(aChild);
+ 
+   WillCauseReflow();
++
++  // Call this here so it only happens for real content mutations and
++  // not cases when the frame constructor calls its own methods to force
++  // frame reconstruction.
++  if (aContainer)
++    RestyleForRemove(aContainer, aChild, aIndexInContainer);
++
+   PRBool didReconstruct;
+   mFrameConstructor->ContentRemoved(aContainer, aChild,
+                                     aIndexInContainer, &didReconstruct);
 diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
 --- a/layout/style/nsCSSRuleProcessor.cpp
 +++ b/layout/style/nsCSSRuleProcessor.cpp
