@@ -1,0 +1,128 @@
+Compute the shrink-wrapping size of table outer frames correctly.  b=363402
+
+diff --git a/layout/tables/nsTableOuterFrame.cpp b/layout/tables/nsTableOuterFrame.cpp
+--- a/layout/tables/nsTableOuterFrame.cpp
++++ b/layout/tables/nsTableOuterFrame.cpp
+@@ -686,6 +686,31 @@ nsTableOuterFrame::GetPrefWidth(nsIRende
+   return maxWidth;
+ }
+ 
++static nsSize
++ComputeChildOuterWidth(nsIRenderingContext *aRenderingContext,
++                       nsIFrame *aChildFrame,
++                       nsSize aCBSize, nscoord aAvailableWidth,
++                       nscoord *aMarginResult = nsnull)
++{
++  // The outer table's children do not use it as a containing block.
++  nsCSSOffsetState offsets(aChildFrame, aRenderingContext, aCBSize.width);
++  nsSize size = aChildFrame->ComputeSize(aRenderingContext, aCBSize,
++                  aAvailableWidth,
++                  nsSize(offsets.mComputedMargin.LeftRight(),
++                         offsets.mComputedMargin.TopBottom()),
++                  nsSize(offsets.mComputedBorderPadding.LeftRight() -
++                           offsets.mComputedPadding.LeftRight(),
++                         offsets.mComputedBorderPadding.TopBottom() -
++                           offsets.mComputedPadding.TopBottom()),
++                  nsSize(offsets.mComputedPadding.LeftRight(),
++                         offsets.mComputedPadding.TopBottom()),
++                  aShrinkWrap);
++  if (aMarginResult)
++    *aMarginResult = offsets.mComputedMargin.LeftRight();
++  return size.width + offsets.mComputedMargin.LeftRight() +
++                      offsets.mComputedBorderPadding.LeftRight();
++}
++
+ /* virtual */ nsSize
+ nsTableOuterFrame::ComputeAutoSize(nsIRenderingContext *aRenderingContext,
+                                    nsSize aCBSize, nscoord aAvailableWidth,
+@@ -701,48 +726,40 @@ nsTableOuterFrame::ComputeAutoSize(nsIRe
+   // could be something that is not reflected in our GetMinWidth and
+   // GetPrefWidth.  See bug 349457 for an example.
+ 
+-  // The outer table's children do not use it as a containing block.
+-  nsCSSOffsetState innerOffsets(mInnerTableFrame, aRenderingContext,
+-                                aCBSize.width);
+-  nsSize tableSize = mInnerTableFrame->ComputeSize(aRenderingContext, aCBSize,
+-                       aAvailableWidth,
+-                       nsSize(innerOffsets.mComputedMargin.LeftRight(),
+-                              innerOffsets.mComputedMargin.TopBottom()),
+-                       nsSize(innerOffsets.mComputedBorderPadding.LeftRight() -
+-                                innerOffsets.mComputedPadding.LeftRight(),
+-                              innerOffsets.mComputedBorderPadding.TopBottom() -
+-                                innerOffsets.mComputedPadding.TopBottom()),
+-                       nsSize(innerOffsets.mComputedPadding.LeftRight(),
+-                              innerOffsets.mComputedPadding.TopBottom()),
+-                       aShrinkWrap);
+-  nscoord width = tableSize.width + innerOffsets.mComputedMargin.LeftRight() +
+-                  innerOffsets.mComputedBorderPadding.LeftRight();
+-
+-  if (mCaptionFrame) {
+-    nsCSSOffsetState capOffsets(mCaptionFrame, aRenderingContext,
+-                                aCBSize.width);
+-    PRUint8 captionSide = GetCaptionSide();
+-    // Should we adjust aAvailableWidth before using it (based on captionSide)?
+-    nsSize capSize = mCaptionFrame->ComputeSize(aRenderingContext, aCBSize,
+-                       aAvailableWidth,
+-                       nsSize(capOffsets.mComputedMargin.LeftRight(),
+-                              capOffsets.mComputedMargin.TopBottom()),
+-                       nsSize(capOffsets.mComputedBorderPadding.LeftRight() -
+-                                capOffsets.mComputedPadding.LeftRight(),
+-                              capOffsets.mComputedBorderPadding.TopBottom() -
+-                                capOffsets.mComputedPadding.TopBottom()),
+-                       nsSize(capOffsets.mComputedPadding.LeftRight(),
+-                              capOffsets.mComputedPadding.TopBottom()),
+-                       aShrinkWrap);
+-    nscoord capWidth = capSize.width + capOffsets.mComputedMargin.LeftRight() +
+-                       capOffsets.mComputedBorderPadding.LeftRight();
+-    if (captionSide == NS_STYLE_CAPTION_SIDE_LEFT ||
+-        captionSide == NS_STYLE_CAPTION_SIDE_RIGHT) {
+-      width += capWidth;
+-    } else {
+-      if (capWidth > width)
+-        width = capWidth;
+-    }
++  // Match the availableWidth logic in Reflow.
++  PRUint8 captionSide = GetCaptionSide();
++  nscoord width;
++  if (captionSide == NO_SIDE) {
++    width = ComputeChildOuterWidth(aRenderingContext, mInnerTableFrame,
++                                   aCBSize, aAvailableWidth);
++  } else if (captionSide == NS_STYLE_CAPTION_SIDE_LEFT ||
++             captionSide == NS_STYLE_CAPTION_SIDE_RIGHT) {
++    nscoord capWidth = ComputeChildOuterWidth(aRenderingContext, mCaptionFrame,
++                                              aCBSize, aAvailableWidth);
++    width = capWidth + ComputeChildOuterWidth(aRenderingContext,
++                                              mInnerTableFrame, aCBSize,
++                                              aAvailableWidth - capWidth);
++  } else if (captionSide == NS_STYLE_CAPTION_SIDE_TOP ||
++             captionSide == NS_STYLE_CAPTION_SIDE_BOTTOM) {
++    nscoord margin;
++    width = ComputeChildOuterWidth(aRenderingContext, mInnerTableFrame,
++                                   aCBSize, aAvailableWidth, &margin);
++    nscoord capWidth = ComputeChildOuterWidth(aRenderingContext,
++                                              mInnerTableFrame, aCBSize,
++                                              width - margin);
++    if (capWidth > width)
++      width = capWidth;
++  } else {
++    NS_ASSERTION(captionSide == NS_STYLE_CAPTION_SIDE_TOP_OUTSIDE ||
++                 captionSide == NS_STYLE_CAPTION_SIDE_BOTTOM_OUTSIDE,
++                 "unexpected caption-side");
++    width = ComputeChildOuterWidth(aRenderingContext, mInnerTableFrame,
++                                   aCBSize, aAvailableWidth, &margin);
++    nscoord capWidth = ComputeChildOuterWidth(aRenderingContext,
++                                              mInnerTableFrame, aCBSize,
++                                              aAvailableWidth);
++    if (capWidth > width)
++      width = capWidth;
+   }
+ 
+   return nsSize(width, NS_UNCONSTRAINEDSIZE);
+@@ -1259,6 +1276,7 @@ NS_METHOD nsTableOuterFrame::Reflow(nsPr
+   nsHTMLReflowState *innerRS =
+     static_cast<nsHTMLReflowState*>((void*) innerRSSpace);
+ 
++  // ComputeAutoSize has to match this logic.
+   if (captionSide == NO_SIDE) {
+     // We don't have a caption.
+     OuterBeginReflowChild(aPresContext, mInnerTableFrame, aOuterRS,
