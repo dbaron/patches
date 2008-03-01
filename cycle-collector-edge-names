@@ -1,0 +1,248 @@
+Add knowledge of edge names to cycle collector, ifdef DEBUG_CC.
+
+diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
+--- a/xpcom/base/nsCycleCollector.cpp
++++ b/xpcom/base/nsCycleCollector.cpp
+@@ -432,6 +432,7 @@ public:
+ 
+ struct ReversedEdge {
+     PtrInfo *mTarget;
++    nsCString *mEdgeName;
+     ReversedEdge *mNext;
+ };
+ 
+@@ -467,6 +468,9 @@ struct PtrInfo
+     // expected to be garbage are black).
+     ReversedEdge* mReversedEdges; // linked list
+     PtrInfo* mShortestPathToExpectedGarbage;
++    nsCString* mShortestPathToExpectedGarbageEdgeName;
++
++    nsCStringArray mEdgeNames;
+ #endif
+ 
+     PtrInfo(void *aPointer, nsCycleCollectionParticipant *aParticipant
+@@ -485,7 +489,8 @@ struct PtrInfo
+           mLangID(aLangID),
+           mSCCIndex(0),
+           mReversedEdges(nsnull),
+-          mShortestPathToExpectedGarbage(nsnull)
++          mShortestPathToExpectedGarbage(nsnull),
++          mShortestPathToExpectedGarbageEdgeName(nsnull)
+ #endif
+     {
+     }
+@@ -1194,6 +1199,9 @@ private:
+     PLDHashTable mPtrToNodeMap;
+     PtrInfo *mCurrPi;
+     nsCycleCollectionLanguageRuntime **mRuntimes; // weak, from nsCycleCollector
++#ifdef DEBUG_CC
++    nsCString mNextEdgeName;
++#endif
+ 
+ public:
+     GCGraphBuilder(GCGraph &aGraph,
+@@ -1231,6 +1239,9 @@ private:
+     NS_IMETHOD_(void) NoteNativeChild(void *child,
+                                      nsCycleCollectionParticipant *participant);
+     NS_IMETHOD_(void) NoteScriptChild(PRUint32 langID, void *child);
++#ifdef DEBUG_CC
++    NS_IMETHOD_(void) NoteNextEdgeName(const char* name);
++#endif
+ };
+ 
+ GCGraphBuilder::GCGraphBuilder(GCGraph &aGraph,
+@@ -1360,6 +1371,10 @@ NS_IMETHODIMP_(void)
+ NS_IMETHODIMP_(void)
+ GCGraphBuilder::NoteXPCOMChild(nsISupports *child) 
+ {
++#ifdef DEBUG_CC
++    nsCString edgeName(mNextEdgeName);
++    mNextEdgeName.Truncate();
++#endif
+     if (!child || !(child = canonicalize(child)))
+         return; 
+ 
+@@ -1375,6 +1390,9 @@ GCGraphBuilder::NoteXPCOMChild(nsISuppor
+         if (!childPi)
+             return;
+         mEdgeBuilder.Add(childPi);
++#ifdef DEBUG_CC
++        mCurrPI->mEdgeNames.AppendCString(edgeName);
++#endif
+         ++childPi->mInternalRefs;
+     }
+ }
+@@ -1383,6 +1401,10 @@ GCGraphBuilder::NoteNativeChild(void *ch
+ GCGraphBuilder::NoteNativeChild(void *child,
+                                 nsCycleCollectionParticipant *participant)
+ {
++#ifdef DEBUG_CC
++    nsCString edgeName(mNextEdgeName);
++    mNextEdgeName.Truncate();
++#endif
+     if (!child)
+         return;
+ 
+@@ -1392,12 +1414,19 @@ GCGraphBuilder::NoteNativeChild(void *ch
+     if (!childPi)
+         return;
+     mEdgeBuilder.Add(childPi);
++#ifdef DEBUG_CC
++    mCurrPI->mEdgeNames.AppendCString(edgeName);
++#endif
+     ++childPi->mInternalRefs;
+ }
+ 
+ NS_IMETHODIMP_(void)
+ GCGraphBuilder::NoteScriptChild(PRUint32 langID, void *child) 
+ {
++#ifdef DEBUG_CC
++    nsCString edgeName(mNextEdgeName);
++    mNextEdgeName.Truncate();
++#endif
+     if (!child)
+         return;
+ 
+@@ -1414,8 +1443,19 @@ GCGraphBuilder::NoteScriptChild(PRUint32
+     if (!childPi)
+         return;
+     mEdgeBuilder.Add(childPi);
++#ifdef DEBUG_CC
++    mCurrPI->mEdgeNames.AppendCString(edgeName);
++#endif
+     ++childPi->mInternalRefs;
+ }
++
++#ifdef DEBUG_CC
++NS_IMETHODIMP_(void)
++GCGraphBuilder::NoteNextEdgeName(const char* name)
++{
++    mNextEdgeName = name;
++}
++#endif
+ 
+ static PRBool
+ AddPurpleRoot(GCGraphBuilder &builder, nsISupports *root)
+@@ -2021,6 +2061,7 @@ public:
+     NS_IMETHOD_(void) NoteScriptChild(PRUint32 langID, void *child) {}
+     NS_IMETHOD_(void) NoteNativeChild(void *child,
+                                      nsCycleCollectionParticipant *participant) {}
++    NS_IMETHOD_(void) NoteNextEdgeName(const char* name) {}
+ };
+ 
+ char *Suppressor::sSuppressionList = nsnull;
+@@ -2544,8 +2585,11 @@ nsCycleCollector::ExplainLiveExpectedGar
+                     if (e->mTarget->mSCCIndex == INDEX_UNREACHED) {
+                         e->mTarget->mSCCIndex = INDEX_REACHED;
+                         PtrInfo *target = e->mTarget;
+-                        if (!target->mShortestPathToExpectedGarbage)
++                        if (!target->mShortestPathToExpectedGarbage) {
+                             target->mShortestPathToExpectedGarbage = pi;
++                            target->mShortestPathToExpectedGarbageEdgeName =
++                                e->mEdgeName;
++                        }
+                         queue.Push(target);
+                     }
+                 }
+@@ -2571,8 +2615,16 @@ nsCycleCollector::ExplainLiveExpectedGar
+                            "reached from it by the path:\n");
+                     for (PtrInfo *path = pi, *prev = nsnull; prev != path;
+                          prev = path,
+-                         path = path->mShortestPathToExpectedGarbage)
++                         path = path->mShortestPathToExpectedGarbage) {
++                        if (prev) {
++                            nsCString *edgeName = prev
++                                ->mShortestPathToExpectedGarbage->mEdgeName;
++                            printf("        via %s\n",
++                                   edgeName->IsEmpty() ? "<unknown edge>"
++                                                       : edgeName.get());
++                        }
+                         printf("    %s %p\n", path->mName, path->mPointer);
++                    }
+ 
+                     if (pi->mRefCount == PR_UINT32_MAX) {
+                         printf("  The known references to it were from:\n");
+@@ -2583,8 +2635,12 @@ nsCycleCollector::ExplainLiveExpectedGar
+                     }
+                     for (ReversedEdge *e = pi->mReversedEdges;
+                          e; e = e->mNext) {
+-                        printf("    %s %p\n",
++                        printf("    %s %p",
+                                e->mTarget->mName, e->mTarget->mPointer);
++                        if (!e->mName->IsEmpty()) {
++                            printf(" via %s", e->mEdgeName->get());
++                        }
++                        printf("\n");
+                     }
+                     mRuntimes[pi->mLangID]->PrintAllReferencesTo(pi->mPointer);
+                 }
+@@ -2733,12 +2789,15 @@ nsCycleCollector::CreateReversedEdges()
+     NodePool::Enumerator buildQueue(mGraph.mNodes);
+     while (!buildQueue.IsDone()) {
+         PtrInfo *pi = buildQueue.GetNext();
++        PRInt32 i = 0;
+         for (EdgePool::Iterator e = pi->mFirstChild, e_end = pi->mLastChild;
+              e != e_end; ++e) {
+             current->mTarget = pi;
++            current->mEdgeName = pi->mEdgeNames.CStringAt(i);
+             current->mNext = (*e)->mReversedEdges;
+             (*e)->mReversedEdges = current;
+             ++current;
++            ++i;
+         }
+     }
+     NS_ASSERTION(current - mGraph.mReversedEdges == ptrdiff_t(edgeCount),
+diff --git a/xpcom/glue/nsCycleCollectionParticipant.h b/xpcom/glue/nsCycleCollectionParticipant.h
+--- a/xpcom/glue/nsCycleCollectionParticipant.h
++++ b/xpcom/glue/nsCycleCollectionParticipant.h
+@@ -113,6 +113,11 @@ public:
+     NS_IMETHOD_(void) NoteXPCOMChild(nsISupports *child) = 0;
+     NS_IMETHOD_(void) NoteNativeChild(void *child,
+                                       nsCycleCollectionParticipant *helper) = 0;
++#ifdef DEBUG_CC
++    // Give a name to the edge associated with the next call to
++    // NoteScriptChild, NoteXPCOMChild, or NoteNativeChild.
++    NS_IMETHOD_(void) NoteNextEdgeName(const char* name) = 0;
++#endif
+ };
+ 
+ class NS_NO_VTABLE nsCycleCollectionParticipant
+@@ -357,23 +362,37 @@ public:
+     _class *tmp = static_cast<_class*>(p);                                     \
+     NS_IMPL_CYCLE_COLLECTION_DESCRIBE(_class)
+ 
++#ifdef DEBUG_CC
++  #define NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(_name)                            \
++    PR_BEGIN_MACRO cb.NoteNextEdgeName(_name) PR_END_MACRO
++#else
++  #define NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(_name)                            \
++    PR_BEGIN_MACRO PR_END_MACRO
++#endif
++
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(_field)                       \
++    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(#_field);                               \
+     cb.NoteXPCOMChild(tmp->_field);
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(_field)                     \
++    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(#_field);                               \
+     cb.NoteXPCOMChild(tmp->_field.get());
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR_AMBIGUOUS(_field, _base)    \
++    NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(#_field);                               \
+     cb.NoteXPCOMChild(NS_ISUPPORTS_CAST(_base*, tmp->_field));
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMARRAY(_field)                   \
+     {                                                                          \
+       PRInt32 i;                                                               \
+-      for (i = 0; i < tmp->_field.Count(); ++i)                                \
++      for (i = 0; i < tmp->_field.Count(); ++i) {                              \
++        NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(#_field "[i]");                     \
+         cb.NoteXPCOMChild(tmp->_field[i]);                                     \
++      }                                                                        \
+     }
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_PTR(_ptr, _ptr_class)         \
++  NS_CYCLE_COLLECTION_NOTE_EDGE_NAME("?->" #_ptr);                             \
+   cb.NoteNativeChild(_ptr, &NS_CYCLE_COLLECTION_NAME(_ptr_class));
+ 
+ #define NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NATIVE_MEMBER(_field, _field_class)  \
