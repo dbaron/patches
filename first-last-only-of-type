@@ -1,0 +1,128 @@
+Implement :first-of-type, :last-of-type, and :only-of-type.  b=128585
+
+diff --git a/layout/style/nsCSSPseudoClassList.h b/layout/style/nsCSSPseudoClassList.h
+--- a/layout/style/nsCSSPseudoClassList.h
++++ b/layout/style/nsCSSPseudoClassList.h
+@@ -78,6 +78,9 @@ CSS_PSEUDO_CLASS(lastChild, ":last-child
+ CSS_PSEUDO_CLASS(lastChild, ":last-child")
+ CSS_PSEUDO_CLASS(lastNode, ":-moz-last-node")
+ CSS_PSEUDO_CLASS(onlyChild, ":only-child")
++CSS_PSEUDO_CLASS(firstOfType, ":first-of-type")
++CSS_PSEUDO_CLASS(lastOfType, ":last-of-type")
++CSS_PSEUDO_CLASS(onlyOfType, ":only-of-type")
+ CSS_PSEUDO_CLASS(nthChild, ":nth-child")
+ CSS_PSEUDO_CLASS(nthLastChild, ":nth-last-child")
+ CSS_PSEUDO_CLASS(nthOfType, ":nth-of-type")
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -951,12 +951,13 @@ CSSNameSpaceID(nsIContent *aContent)
+ }
+ 
+ PRInt32
+-RuleProcessorData::GetNthIndex(PRBool aIsOfType, PRBool aIsFromEnd)
++RuleProcessorData::GetNthIndex(PRBool aIsOfType, PRBool aIsFromEnd,
++                               PRBool aCheckEdgeOnly)
+ {
+   NS_ASSERTION(mParentContent, "caller should check mParentContent");
+ 
+   PRInt32 &slot = mNthIndices[aIsOfType][aIsFromEnd];
+-  if (slot != 0)
++  if (slot != 0 && (slot != -1 || aCheckEdgeOnly))
+     return slot;
+ 
+   PRInt32 result = 1;
+@@ -981,8 +982,15 @@ RuleProcessorData::GetNthIndex(PRBool aI
+     if (nsStyleUtil::IsSignificantChild(child, PR_FALSE, PR_FALSE) &&
+         (!aIsOfType ||
+          (child->Tag() == mContentTag &&
+-          CSSNameSpaceID(child) == mNameSpaceID)))
++          CSSNameSpaceID(child) == mNameSpaceID))) {
++      if (aCheckEdgeOnly) {
++        // The caller only cares whether or not the result is 1, and we
++        // now know it's not.
++        result = -1;
++        break;
++      }
+       ++result;
++    }
+   }
+ 
+   slot = result;
+@@ -1206,7 +1214,7 @@ static PRBool SelectorMatches(RuleProces
+             parent->SetFlags(NODE_HAS_SLOW_SELECTOR_NOAPPEND);
+         }
+ 
+-        const PRInt32 index = data.GetNthIndex(isOfType, isFromEnd);
++        const PRInt32 index = data.GetNthIndex(isOfType, isFromEnd, PR_FALSE);
+         const PRInt32 a = pseudoClass->u.mNumbers[0];
+         const PRInt32 b = pseudoClass->u.mNumbers[1];
+         // result should be true if there exists n >= 0 such that
+@@ -1220,6 +1228,30 @@ static PRBool SelectorMatches(RuleProces
+           const PRInt32 n = (index - b) / a;
+           result = n >= 0 && (a * n == index - b);
+         }
++      } else {
++        result = PR_FALSE;
++      }
++    }
++    else if (nsCSSPseudoClasses::firstOfType == pseudoClass->mAtom ||
++             nsCSSPseudoClasses::lastOfType == pseudoClass->mAtom ||
++             nsCSSPseudoClasses::onlyOfType == pseudoClass->mAtom) {
++      nsIContent *parent = data.mParentContent;
++      if (parent) {
++        const PRBool checkFirst =
++          pseudoClass->mAtom != nsCSSPseudoClasses::lastOfType;
++        const PRBool checkLast =
++          pseudoClass->mAtom != nsCSSPseudoClasses::firstOfType;
++        if (setNodeFlags) {
++          if (checkLast)
++            parent->SetFlags(NODE_HAS_SLOW_SELECTOR);
++          else
++            parent->SetFlags(NODE_HAS_SLOW_SELECTOR_NOAPPEND);
++        }
++
++        result = (!checkFirst ||
++                  data.GetNthIndex(PR_TRUE, PR_FALSE, PR_TRUE) == 1) &&
++                 (!checkLast ||
++                  data.GetNthIndex(PR_TRUE, PR_TRUE, PR_TRUE) == 1);
+       } else {
+         result = PR_FALSE;
+       }
+diff --git a/layout/style/nsIStyleRuleProcessor.h b/layout/style/nsIStyleRuleProcessor.h
+--- a/layout/style/nsIStyleRuleProcessor.h
++++ b/layout/style/nsIStyleRuleProcessor.h
+@@ -81,7 +81,11 @@ struct RuleProcessorData {
+   }
+ 
+   const nsString* GetLang();
+-  PRInt32 GetNthIndex(PRBool aIsOfType, PRBool aIsFromEnd);
++  // If aCheckEdgeOnly is true, the function will return 1 if the result
++  // is 1, and something other than 1 (maybe or maybe not a valid
++  // result) otherwise.
++  PRInt32 GetNthIndex(PRBool aIsOfType, PRBool aIsFromEnd,
++                      PRBool aCheckEdgeOnly);
+ 
+   nsPresContext*   mPresContext;
+   nsIContent*       mContent;       // weak ref
+@@ -110,6 +114,7 @@ protected:
+ 
+   // This node's index for :nth-child(), :nth-last-child(),
+   // :nth-of-type(), :nth-last-of-type().  If 0, needs to be computed.
++  // If -1, needs to be computed but known not to be 1.
+   // The first subscript is 0 for -child and 1 for -of-type, the second
+   // subscript is 0 for nth- and 1 for nth-last-.
+   PRInt32 mNthIndices[2][2];
+diff --git a/layout/style/test/test_of_type_selectors.xhtml b/layout/style/test/test_of_type_selectors.xhtml
+--- a/layout/style/test/test_of_type_selectors.xhtml
++++ b/layout/style/test/test_of_type_selectors.xhtml
+@@ -83,6 +83,9 @@ function run() {
+     test_selector(":nth-of-type(even)", [1, 6], [0, 2, 3, 4, 5, 7]);
+     test_selector(":nth-last-of-type(odd)", [0, 2, 3, 4, 6, 7], [1, 5]);
+     test_selector(":nth-last-of-type(n+2)", [0, 1, 5], [2, 3, 4, 6, 7]);
++    test_selector(":first-of-type", [0, 3, 4, 5, 7], [1, 2, 6]);
++    test_selector(":last-of-type", [2, 3, 4, 6, 7], [0, 1, 5]);
++    test_selector(":only-of-type", [3, 4, 7], [0, 1, 2, 5, 6]);
+ }
+ 
+ run();
