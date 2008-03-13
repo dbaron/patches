@@ -1,0 +1,176 @@
+Fix bad reference counting of atoms so we don't manipulate garbage atom pointers.  b=422546
+
+diff --git a/editor/libeditor/base/PlaceholderTxn.cpp b/editor/libeditor/base/PlaceholderTxn.cpp
+--- a/editor/libeditor/base/PlaceholderTxn.cpp
++++ b/editor/libeditor/base/PlaceholderTxn.cpp
+@@ -39,6 +39,7 @@
+ #include "PlaceholderTxn.h"
+ #include "nsEditor.h"
+ #include "IMETextTxn.h"
++#include "nsEditProperty.h"
+ 
+ PlaceholderTxn::PlaceholderTxn() :  EditAggregateTxn(), 
+                                     mAbsorb(PR_TRUE), 
+@@ -170,9 +171,9 @@ NS_IMETHODIMP PlaceholderTxn::Merge(nsIT
+   }
+   else
+   { // merge typing or IME or deletion transactions if the selection matches
+-    if (((mName.get() == nsEditor::gTypingTxnName) ||
+-         (mName.get() == nsEditor::gIMETxnName)    ||
+-         (mName.get() == nsEditor::gDeleteTxnName)) 
++    if (((mName.get() == nsEditProperty::TypingTxnName) ||
++         (mName.get() == nsEditProperty::IMETxnName)    ||
++         (mName.get() == nsEditProperty::DeleteTxnName)) 
+          && !mCommitted ) 
+     {
+       nsCOMPtr<nsIAbsorbingTransaction> plcTxn;// = do_QueryInterface(editTxn);
+diff --git a/editor/libeditor/base/nsEditPropertyAtomList.h b/editor/libeditor/base/nsEditPropertyAtomList.h
+--- a/editor/libeditor/base/nsEditPropertyAtomList.h
++++ b/editor/libeditor/base/nsEditPropertyAtomList.h
+@@ -179,3 +179,7 @@ EDITOR_ATOM(cssPtUnit, "pt")
+ EDITOR_ATOM(cssPtUnit, "pt")
+ EDITOR_ATOM(cssPcUnit, "pc")
+ EDITOR_ATOM(cssExUnit, "ex")
++
++EDITOR_ATOM(TypingTxnName, "Typing")
++EDITOR_ATOM(IMETxnName, "IME")
++EDITOR_ATOM(DeleteTxnName, "Deleting")
+diff --git a/editor/libeditor/base/nsEditor.cpp b/editor/libeditor/base/nsEditor.cpp
+--- a/editor/libeditor/base/nsEditor.cpp
++++ b/editor/libeditor/base/nsEditor.cpp
+@@ -131,10 +131,6 @@ extern nsIParserService *sParserService;
+ //
+ //---------------------------------------------------------------------------
+ 
+-nsIAtom *nsEditor::gTypingTxnName;
+-nsIAtom *nsEditor::gIMETxnName;
+-nsIAtom *nsEditor::gDeleteTxnName;
+-
+ nsEditor::nsEditor()
+ :  mModCount(0)
+ ,  mPresShellWeak(nsnull)
+@@ -161,56 +157,11 @@ nsEditor::nsEditor()
+ ,  mPhonetic(nsnull)
+ {
+   //initialize member variables here
+-  if (!gTypingTxnName)
+-    gTypingTxnName = NS_NewAtom("Typing");
+-  else
+-    NS_ADDREF(gTypingTxnName);
+-  if (!gIMETxnName)
+-    gIMETxnName = NS_NewAtom("IME");
+-  else
+-    NS_ADDREF(gIMETxnName);
+-  if (!gDeleteTxnName)
+-    gDeleteTxnName = NS_NewAtom("Deleting");
+-  else
+-    NS_ADDREF(gDeleteTxnName);
+ }
+ 
+ nsEditor::~nsEditor()
+ {
+-  /* first, delete the transaction manager if there is one.
+-     this will release any remaining transactions.
+-     this is important because transactions can hold onto the atoms (gTypingTxnName, ...)
+-     and to make the optimization (holding refcounted statics) work correctly, 
+-     the editor instance needs to hold the last refcount.
+-     If you get this wrong, expect to deref a garbage gTypingTxnName pointer if you bring up a second editor.
+-  */
+-  if (mTxnMgr) { 
+-    mTxnMgr = 0;
+-  }
+-  nsrefcnt refCount=0;
+-  if (gTypingTxnName)  // we addref'd in the constructor
+-  { // want to release it without nulling out the pointer.
+-    refCount = gTypingTxnName->Release();
+-    if (0==refCount) {
+-      gTypingTxnName = nsnull; 
+-    }
+-  }
+-
+-  if (gIMETxnName)  // we addref'd in the constructor
+-  { // want to release it without nulling out the pointer.
+-    refCount = gIMETxnName->Release();
+-    if (0==refCount) {
+-      gIMETxnName = nsnull;
+-    }
+-  }
+-
+-  if (gDeleteTxnName)  // we addref'd in the constructor
+-  { // want to release it without nulling out the pointer.
+-    refCount = gDeleteTxnName->Release();
+-    if (0==refCount) {
+-      gDeleteTxnName = nsnull;
+-    }
+-  }
++  mTxnMgr = nsnull;
+ 
+   delete mPhonetic;
+  
+diff --git a/editor/libeditor/base/nsEditor.h b/editor/libeditor/base/nsEditor.h
+--- a/editor/libeditor/base/nsEditor.h
++++ b/editor/libeditor/base/nsEditor.h
+@@ -581,13 +581,6 @@ public:
+   // Fast non-refcounting editor root element accessor
+   nsIDOMElement *GetRoot();
+ 
+-public:
+-  // Argh!  These transaction names are used by PlaceholderTxn and
+-  // nsPlaintextEditor.  They should be localized to those classes.
+-  static nsIAtom *gTypingTxnName;
+-  static nsIAtom *gIMETxnName;
+-  static nsIAtom *gDeleteTxnName;
+-
+ protected:
+ 
+   PRUint32        mModCount;		// number of modifications (for undo/redo stack)
+diff --git a/editor/libeditor/html/nsHTMLEditor.cpp b/editor/libeditor/html/nsHTMLEditor.cpp
+--- a/editor/libeditor/html/nsHTMLEditor.cpp
++++ b/editor/libeditor/html/nsHTMLEditor.cpp
+@@ -1345,7 +1345,7 @@ NS_IMETHODIMP nsHTMLEditor::TypedText(co
+ NS_IMETHODIMP nsHTMLEditor::TypedText(const nsAString& aString,
+                                       PRInt32 aAction)
+ {
+-  nsAutoPlaceHolderBatch batch(this, gTypingTxnName);
++  nsAutoPlaceHolderBatch batch(this, nsEditProperty::TypingTxnName);
+ 
+   switch (aAction)
+   {
+diff --git a/editor/libeditor/text/nsPlaintextEditor.cpp b/editor/libeditor/text/nsPlaintextEditor.cpp
+--- a/editor/libeditor/text/nsPlaintextEditor.cpp
++++ b/editor/libeditor/text/nsPlaintextEditor.cpp
+@@ -79,6 +79,7 @@
+ #include "nsAOLCiter.h"
+ #include "nsInternetCiter.h"
+ #include "nsEventDispatcher.h"
++#include "nsEditProperty.h"
+ 
+ // Drag & Drop, Clipboard
+ #include "nsIClipboard.h"
+@@ -417,7 +418,7 @@ NS_IMETHODIMP nsPlaintextEditor::TypedTe
+ NS_IMETHODIMP nsPlaintextEditor::TypedText(const nsAString& aString,
+                                       PRInt32 aAction)
+ {
+-  nsAutoPlaceHolderBatch batch(this, gTypingTxnName);
++  nsAutoPlaceHolderBatch batch(this, nsEditProperty::TypingTxnName);
+ 
+   switch (aAction)
+   {
+@@ -643,7 +644,7 @@ NS_IMETHODIMP nsPlaintextEditor::DeleteS
+   nsresult result;
+ 
+   // delete placeholder txns merge.
+-  nsAutoPlaceHolderBatch batch(this, gDeleteTxnName);
++  nsAutoPlaceHolderBatch batch(this, nsEditProperty::DeleteTxnName);
+   nsAutoRules beginRulesSniffing(this, kOpDeleteSelection, aAction);
+ 
+   // pre-process
+@@ -1712,7 +1713,7 @@ nsPlaintextEditor::SetCompositionString(
+     // GetCaretCoordinates so the states in Frame system sync with content
+     // therefore, we put the nsAutoPlaceHolderBatch into a inner block
+     {
+-      nsAutoPlaceHolderBatch batch(this, gIMETxnName);
++      nsAutoPlaceHolderBatch batch(this, nsEditProperty::IMETxnName);
+ 
+       SetIsIMEComposing(); // We set mIsIMEComposing properly.
+ 
