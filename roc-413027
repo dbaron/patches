@@ -1,0 +1,186 @@
+Bug 413027. The XUL pref and min height for a CSS block should be its height when reflowed at its preferred width, NOT the height of the tallest line. r+sr=dbaron. Relanding with additional XUL box layout fix to increase the frame size to the minimum size required by children even if they don't change size during layout, and a fix to scrollframes so they don't depend on being able to set a size for scrollbars less than their minimum size, and a fix to grid so that grid items in a scrollable container don't contribute to the min/pref height of the grid column frame. r+sr=dbaron  Patch by Robert O'Callahan <roc@ocallahan.org>.
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -5854,32 +5854,7 @@ nsFrame::RefreshSizeCache(nsBoxLayoutSta
+       Redraw(aState, &newRect);
+     }
+ 
+-    metrics->mBlockMinSize.height = 0;
+-    // ok we need the max ascent of the items on the line. So to do this
+-    // ask the block for its line iterator. Get the max ascent.
+-    nsCOMPtr<nsILineIterator> lines = do_QueryInterface(static_cast<nsIFrame*>(this));
+-    if (lines) 
+-    {
+-      metrics->mBlockMinSize.height = 0;
+-      int count = 0;
+-      nsIFrame* firstFrame = nsnull;
+-      PRInt32 framesOnLine;
+-      nsRect lineBounds;
+-      PRUint32 lineFlags;
+-
+-      do {
+-         lines->GetLine(count, &firstFrame, &framesOnLine, lineBounds, &lineFlags);
+-
+-         if (lineBounds.height > metrics->mBlockMinSize.height)
+-           metrics->mBlockMinSize.height = lineBounds.height;
+-
+-         count++;
+-      } while(firstFrame);
+-    } else {
+-      metrics->mBlockMinSize.height = desiredSize.height;
+-    }
+-
+-    metrics->mBlockPrefSize.height = metrics->mBlockMinSize.height;
++    metrics->mBlockMinSize.height = metrics->mBlockPrefSize.height = newRect.height;
+ 
+     if (desiredSize.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE) {
+       if (!nsLayoutUtils::GetFirstLineBaseline(this, &metrics->mBlockAscent))
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -1335,8 +1335,12 @@ nsGfxScrollFrameInner::BuildDisplayList(
+   nsIFrame* kid = mOuter->GetFirstChild(nsnull);
+   // Put each child's background directly onto the content list
+   nsDisplayListSet scrollbarSet(aLists, aLists.Content());
++  nsMargin scrollbarSizes = GetActualScrollbarSizes();
+   while (kid) {
+-    if (kid != mScrolledFrame) {
++    if ((kid == mHScrollbarBox && scrollbarSizes.TopBottom() > 0) ||
++        (kid == mVScrollbarBox && scrollbarSizes.LeftRight() > 0) ||
++        (kid == mScrollCornerBox && scrollbarSizes.TopBottom() > 0 &&
++         scrollbarSizes.LeftRight() > 0)) {
+       rv = mOuter->BuildDisplayListForChild(aBuilder, kid, aDirtyRect, scrollbarSet,
+                                             nsIFrame::DISPLAY_CHILD_FORCE_PSEUDO_STACKING_CONTEXT);
+       NS_ENSURE_SUCCESS(rv, rv);
+@@ -2485,7 +2489,12 @@ nsGfxScrollFrameInner::LayoutScrollbars(
+ {
+   NS_ASSERTION(!mSupppressScrollbarUpdate,
+                "This should have been suppressed");
+-    
++
++  // This code may try to set the scrollbar size to zero. That doesn't
++  // really work since XUL boxes will refuse to shrink below their
++  // minimum size. We compensate for that by refusing to paint or handle
++  // events for hidden scrollbars in our BuildDisplayList.
++
+   if (mVScrollbarBox) {
+     NS_PRECONDITION(mVScrollbarBox->IsBoxFrame(), "Must be a box frame!");
+     nsRect vRect(aScrollArea);
+diff --git a/layout/reftests/bugs/reftest.list b/layout/reftests/bugs/reftest.list
+--- a/layout/reftests/bugs/reftest.list
++++ b/layout/reftests/bugs/reftest.list
+@@ -730,7 +730,8 @@ random == 403134-1.html 403134-1-ref.htm
+ == 412607-1b.html 412607-1-ref.html
+ == 412679-1.html 412679-1-ref.html
+ == 412679-2.html 412679-2-ref.html
+-# == 413027-1.html 413027-1-ref.html
++== 413027-1.html 413027-1-ref.html
++== 413027-2.html 413027-2-ref.html
+ == 413286-1a.html 413286-1-ref.html
+ == 413286-1b.html 413286-1-ref.html
+ == 413286-1c.html 413286-1-ref.html
+diff --git a/layout/xul/base/src/grid/nsGridRowLeafLayout.cpp b/layout/xul/base/src/grid/nsGridRowLeafLayout.cpp
+--- a/layout/xul/base/src/grid/nsGridRowLeafLayout.cpp
++++ b/layout/xul/base/src/grid/nsGridRowLeafLayout.cpp
+@@ -232,6 +232,14 @@ nsGridRowLeafLayout::PopulateBoxSizes(ns
+      current->right = right + bottomMargin;
+      current->collapsed = collapsed;
+ 
++     nsIBox* scrollBox = nsGrid::GetScrollBox(box->GetParentBox());
++     if (scrollBox) {
++       // Don't allow rows in a scrollable container to contribute any
++       // min or pref height. Otherwise we may grow bigger than the
++       // grid needs.
++       current->min = current->pref = 0;
++     }
++
+      if (!start) {
+         start = current;
+         last = start;
+diff --git a/layout/xul/base/src/nsSprocketLayout.cpp b/layout/xul/base/src/nsSprocketLayout.cpp
+--- a/layout/xul/base/src/nsSprocketLayout.cpp
++++ b/layout/xul/base/src/nsSprocketLayout.cpp
+@@ -230,6 +230,8 @@ nsSprocketLayout::Layout(nsIBox* aBox, n
+   // we have 150 pixels left over.  |clientRect| is going to hold a width of 150 and
+   // is going to be adjusted based off the value of the PACK property.  If flexible
+   // objects are in the box, then the two rects will match.
++  // XXX this should really be called "frameBounds" or something, and we
++  // really only need the size
+   nsRect originalClientRect(clientRect);
+ 
+   // The frame state contains cached knowledge about our box, such as our orientation
+@@ -285,6 +287,11 @@ nsSprocketLayout::Layout(nsIBox* aBox, n
+     }
+   }
+ 
++  // Grow the frame size now if necessary
++  NS_ASSERTION(clientRect.TopLeft() == originalClientRect.TopLeft(),
++               "clientRect moved??");
++  originalClientRect.UnionRectIncludeEmpty(originalClientRect, clientRect);
++
+   // With the sizes computed, now it's time to lay out our children.
+   PRBool needsRedraw = PR_FALSE;
+   PRBool finished;
+@@ -298,10 +305,6 @@ nsSprocketLayout::Layout(nsIBox* aBox, n
+   nscoord y = 0;
+   nscoord origX = 0;
+   nscoord origY = 0;
+-
+-  // |childResized| lets us know if a child changed its size after we attempted to lay it out at
+-  // the specified size.  If this happens, we usually have to do another pass.
+-  PRBool childResized = PR_FALSE;
+ 
+   // |passes| stores our number of passes.  If for any reason we end up doing more than, say, 10
+   // passes, we assert to indicate that something is seriously screwed up.
+@@ -549,9 +552,6 @@ nsSprocketLayout::Layout(nsIBox* aBox, n
+                      flexes,
+                      finished);
+ 
+-        // We note that a child changed size, which means that another pass will be required.
+-        childResized = PR_TRUE;
+-
+         // Now that a child resized, it's entirely possible that OUR rect is too small.  Now we
+         // ensure that |originalClientRect| is grown to accommodate the size of |clientRect|.
+         if (clientRect.width > originalClientRect.width || clientRect.height > originalClientRect.height) {
+@@ -644,25 +644,23 @@ nsSprocketLayout::Layout(nsIBox* aBox, n
+     delete toDelete;
+   }
+ 
+-  if (childResized) {
+-    // See if one of our children forced us to get bigger
+-    nsRect tmpClientRect(originalClientRect);
+-    nsMargin bp(0,0,0,0);
+-    aBox->GetBorderAndPadding(bp);
+-    tmpClientRect.Inflate(bp);
++  // See if one of our children forced us to get bigger
++  nsRect tmpClientRect(originalClientRect);
++  nsMargin bp(0,0,0,0);
++  aBox->GetBorderAndPadding(bp);
++  tmpClientRect.Inflate(bp);
+ 
+-    if (tmpClientRect.width > originalSize.width || tmpClientRect.height > originalSize.height)
+-    {
+-      // if it did reset our bounds.
+-      nsRect bounds(aBox->GetRect());
+-      if (tmpClientRect.width > originalSize.width)
+-        bounds.width = tmpClientRect.width;
++  if (tmpClientRect.width > originalSize.width || tmpClientRect.height > originalSize.height)
++  {
++    // if it did reset our bounds.
++    nsRect bounds(aBox->GetRect());
++    if (tmpClientRect.width > originalSize.width)
++      bounds.width = tmpClientRect.width;
+ 
+-      if (tmpClientRect.height > originalSize.height)
+-        bounds.height = tmpClientRect.height;
++    if (tmpClientRect.height > originalSize.height)
++      bounds.height = tmpClientRect.height;
+ 
+-      aBox->SetBounds(aState, bounds);
+-    }
++    aBox->SetBounds(aState, bounds);
+   }
+ 
+   // Because our size grew, we now have to readjust because of box packing.  Repack
