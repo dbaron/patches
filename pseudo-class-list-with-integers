@@ -1,4 +1,4 @@
-Make nsPseudoClassList capable of storing integer pairs for :nth-*().  b=75375
+Make nsPseudoClassList capable of storing integer pairs for :nth-*().  b=75375  r+sr=bzbarsky
 
 diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 --- a/layout/style/nsCSSParser.cpp
@@ -129,7 +129,7 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
  
  #include "nsContentUtils.h"
  #include "nsContentErrors.h"
-@@ -157,20 +158,52 @@ nsAtomList::~nsAtomList(void)
+@@ -157,20 +158,53 @@ nsAtomList::~nsAtomList(void)
    NS_IF_DEEP_DELETE(nsAtomList, mNext);
  }
  
@@ -137,7 +137,6 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
 +  : mAtom(aAtom),
 +    mNext(nsnull)
 +{
-+  // We can't assert that it doesn't have a string arg
 +  NS_ASSERTION(!nsCSSPseudoClasses::HasStringArg(aAtom) &&
 +               !nsCSSPseudoClasses::HasNthPairArg(aAtom),
 +               "unexpected pseudo-class");
@@ -150,7 +149,8 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
 -    mString(nsnull),
      mNext(nsnull)
  {
-+  NS_ASSERTION(nsCSSPseudoClasses::HasStringArg(aAtom), "unexpected pseudo-class");
++  NS_ASSERTION(nsCSSPseudoClasses::HasStringArg(aAtom),
++               "unexpected pseudo-class");
 +  NS_ASSERTION(aString, "string expected");
    MOZ_COUNT_CTOR(nsPseudoClassList);
 -  if (aString)
@@ -162,7 +162,8 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
 +  : mAtom(aAtom),
 +    mNext(nsnull)
 +{
-+  NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(aAtom), "unexpected pseudo-class");
++  NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(aAtom),
++               "unexpected pseudo-class");
 +  NS_ASSERTION(aIntPair, "integer pair expected");
 +  MOZ_COUNT_CTOR(nsPseudoClassList);
 +  u.mNumbers =
@@ -173,20 +174,20 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
  nsPseudoClassList::Clone(PRBool aDeep) const
  {
 -  nsPseudoClassList *result = new nsPseudoClassList(mAtom, mString);
-+  nsPseudoClassList *result = new nsPseudoClassList(mAtom);
-+  if (u.mMemory) {
-+    if (nsCSSPseudoClasses::HasStringArg(mAtom)) {
-+      result->u.mString = NS_strdup(u.mString);
-+    } else {
-+      NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(mAtom), "unexpected pseudo-class");
-+      result->u.mNumbers = static_cast<PRInt32*>(
-+        nsMemory::Clone(u.mNumbers, sizeof(PRInt32) * 2));
-+    }
++  nsPseudoClassList *result;
++  if (!u.mMemory) {
++    result = new nsPseudoClassList(mAtom);
++  } else if (nsCSSPseudoClasses::HasStringArg(mAtom)) {
++    result = new nsPseudoClassList(mAtom, u.mString);
++  } else {
++    NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(mAtom),
++                 "unexpected pseudo-class");
++    result = new nsPseudoClassList(mAtom, u.mNumbers);
 +  }
  
    if (aDeep)
      NS_IF_DEEP_CLONE(nsPseudoClassList, mNext, (PR_FALSE));
-@@ -181,8 +214,8 @@ nsPseudoClassList::~nsPseudoClassList(vo
+@@ -181,8 +215,8 @@ nsPseudoClassList::~nsPseudoClassList(vo
  nsPseudoClassList::~nsPseudoClassList(void)
  {
    MOZ_COUNT_DTOR(nsPseudoClassList);
@@ -197,7 +198,7 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
    NS_IF_DEEP_DELETE(nsPseudoClassList, mNext);
  }
  
-@@ -346,16 +379,30 @@ void nsCSSSelector::AddClass(const nsStr
+@@ -346,16 +380,30 @@ void nsCSSSelector::AddClass(const nsStr
    }
  }
  
@@ -234,7 +235,7 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
  }
  
  void nsCSSSelector::AddAttribute(PRInt32 aNameSpace, const nsString& aAttr)
-@@ -627,9 +674,31 @@ void nsCSSSelector::ToStringInternal(nsA
+@@ -627,9 +675,31 @@ void nsCSSSelector::ToStringInternal(nsA
      while (list != nsnull) {
        list->mAtom->ToString(temp);
        aString.Append(temp);
@@ -271,7 +272,7 @@ diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
 diff --git a/layout/style/nsICSSStyleRule.h b/layout/style/nsICSSStyleRule.h
 --- a/layout/style/nsICSSStyleRule.h
 +++ b/layout/style/nsICSSStyleRule.h
-@@ -77,14 +77,21 @@ private:
+@@ -77,14 +77,27 @@ private:
  
  struct nsPseudoClassList {
  public:
@@ -287,15 +288,21 @@ diff --git a/layout/style/nsICSSStyleRule.h b/layout/style/nsICSSStyleRule.h
    nsCOMPtr<nsIAtom> mAtom;
 -  PRUnichar*        mString;
 +  union {
-+    void*           mMemory; // all pointer types use NS_Alloc/NS_Free
-+    // Which of the following is used depend on mAtom.
++    // For a given value of mAtom, we have either:
++    //   a. no value, which means mMemory is always null
++    //      (if neither of the conditions for (b) or (c) is true)
++    //   b. a string value, which means mString/mMemory is non-null
++    //      (if nsCSSPseudoClasses::HasStringArg(mAtom))
++    //   c. an integer pair value, which means mNumbers/mMemory is non-null
++    //      (if nsCSSPseudoClasses::HasNthPairArg(mAtom))
++    void*           mMemory; // both pointer types use NS_Alloc/NS_Free
 +    PRUnichar*      mString;
 +    PRInt32*        mNumbers;
 +  } u;
    nsPseudoClassList* mNext;
  private: 
    nsPseudoClassList* Clone(PRBool aDeep) const;
-@@ -141,7 +148,9 @@ public:
+@@ -141,7 +154,9 @@ public:
    void SetTag(const nsString& aTag);
    void AddID(const nsString& aID);
    void AddClass(const nsString& aClass);
@@ -306,7 +313,7 @@ diff --git a/layout/style/nsICSSStyleRule.h b/layout/style/nsICSSStyleRule.h
    void AddAttribute(PRInt32 aNameSpace, const nsString& aAttr);
    void AddAttribute(PRInt32 aNameSpace, const nsString& aAttr, PRUint8 aFunc, 
                      const nsString& aValue, PRBool aCaseSensitive);
-@@ -153,6 +162,7 @@ public:
+@@ -153,6 +168,7 @@ public:
                  PRBool aAppend = PR_FALSE) const;
  
  private:
