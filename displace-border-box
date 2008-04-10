@@ -3,8 +3,12 @@ When displacing blocks that don't interact with floats around floats, displace t
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -6789,21 +6789,17 @@ OneWidthToClearPastFloats(nsPresContext*
-                           nscoord aCBWidth,
+@@ -6786,24 +6786,20 @@ static nscoord
+ static nscoord
+ OneWidthToClearPastFloats(nsPresContext* aPresContext,
+                           const nsHTMLReflowState& aParentReflowState,
+-                          nscoord aCBWidth,
++                          nscoord aAvailableWidth,
                            nsIFrame* aFrame)
  {
 -  // We need to compute percent widths, since intrinsic width
@@ -28,7 +32,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +  // All we really need here is the result of ComputeSize, and we
 +  // could *almost* get that from an nsCSSOffsetState, except for the
 +  // last argument.
-+  nsSize availSpace(aCBWidth, NS_UNCONSTRAINEDSIZE);
++  nsSize availSpace(aAvailableWidth, NS_UNCONSTRAINEDSIZE);
 +  nsHTMLReflowState reflowState(aPresContext, aParentReflowState,
 +                                aFrame, availSpace);
 +  return reflowState.ComputedWidth() +
@@ -36,10 +40,78 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
  }
  
  /* static */
+@@ -6811,6 +6807,11 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+ nsBlockFrame::WidthToClearPastFloats(nsBlockReflowState& aState,
+                                      nsIFrame* aFrame)
+ {
++  aState.GetAvailableSpace();
++  nscoord leftOffset, rightOffset;
++  aState.ReplacedBlockOffsetsForFloats(aFrame, leftOffset, rightOffset);
++  nscoord availWidth = aState.mContentArea.width - leftOffset - rightOffset;
++
+   nscoord result;
+   // A table outer frame is an exception in that it is a block child
+   // that is not a containing block for its children.
+@@ -6821,10 +6822,10 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+     nsIFrame *innerTable = aFrame->GetFirstChild(nsnull);
+     nsIFrame *caption = aFrame->GetFirstChild(nsGkAtoms::captionList);
+     result = OneWidthToClearPastFloats(aState.mPresContext, outerRS,
+-                                       aState.mContentArea.width, innerTable);
++                                       availWidth, innerTable);
+     if (caption) {
+       nscoord captionWidth = OneWidthToClearPastFloats(aState.mPresContext,
+-                               outerRS, aState.mContentArea.width, caption);
++                               outerRS, availWidth, caption);
+       PRUint8 captionSide = caption->GetStyleTableBorder()->mCaptionSide;
+       if (captionSide == NS_SIDE_TOP || captionSide == NS_SIDE_BOTTOM)
+         result = PR_MAX(result, captionWidth);
+@@ -6833,7 +6834,7 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+     }
+   } else {
+     result = OneWidthToClearPastFloats(aState.mPresContext,
+-               aState.mReflowState, aState.mContentArea.width, aFrame);
++               aState.mReflowState, availWidth, aFrame);
+   }
+   return result;
+ }
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
-@@ -257,8 +257,27 @@ nsBlockReflowState::ComputeBlockAvailSpa
+@@ -188,6 +188,33 @@ nsBlockReflowState::FreeLineBox(nsLineBo
+   }
+ }
+ 
++void
++nsBlockReflowState::ReplacedBlockOffsetsForFloats(nsIFrame* aFrame,
++                                                  nscoord& aLeftResult,
++                                                  nscoord& aRightResult)
++{
++  nscoord leftOffset, rightOffset;
++  if (mAvailSpaceRect.width == mContentArea.width) {
++    // We don't need to compute margins when there are no floats around.
++    leftOffset = 0;
++    rightOffset = 0;
++  } else {
++    nsCSSOffsetState os(aFrame, mReflowState.rendContext, mContentArea.width);
++    nscoord leftFloatXOffset = mAvailSpaceRect.x;
++    nscoord leftOffset = PR_MAX(leftFloatXOffset,
++                                os.mComputedMargin.left) -
++                         os.mComputedMargin.left;
++    leftOffset = PR_MAX(leftOffset, 0); // in case of negative margin
++    nscoord rightFloatXOffset = mContentArea.width - mAvailSpaceRect.XMost();
++    nscoord rightOffset = PR_MAX(rightFloatXOffset,
++                                 os.mComputedMargin.right) -
++                          os.mComputedMargin.right;
++    rightOffset = PR_MAX(rightOffset, 0); // in case of negative margin
++  }
++  aLeftResult = leftOffset;
++  aRightResult = rightOffset;
++}
++
+ // Compute the amount of available space for reflowing a block frame
+ // at the current Y coordinate. This method assumes that
+ // GetAvailableSpace has already been called.
+@@ -257,8 +284,14 @@ nsBlockReflowState::ComputeBlockAvailSpa
      // The frame is clueless about the space manager and therefore we
      // only give it free space. An example is a table frame - the
      // tables do not flow around floats.
@@ -49,23 +121,26 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
 +    NS_ASSERTION(mAvailSpaceRect.x >= 0, "bad avail space rect x");
 +    NS_ASSERTION(mAvailSpaceRect.XMost() <= mContentArea.width,
 +                 "bad avail space rect width");
-+    if (mAvailSpaceRect.width == mContentArea.width) {
-+      // We don't need to compute margins when there are no floats around.
-+      aResult.x = borderPadding.left;
-+      aResult.width = mContentArea.width;
-+    } else {
-+      nsCSSOffsetState os(aFrame, mReflowState.rendContext, mContentArea.width);
-+      nscoord leftFloatXOffset = mAvailSpaceRect.x;
-+      nscoord leftOffset = PR_MAX(leftFloatXOffset,
-+                                  os.mComputedMargin.left) -
-+                           os.mComputedMargin.left;
-+      nscoord rightFloatXOffset = mContentArea.width - mAvailSpaceRect.XMost();
-+      nscoord rightOffset = PR_MAX(rightFloatXOffset,
-+                                   os.mComputedMargin.right) -
-+                            os.mComputedMargin.right;
-+      aResult.x = borderPadding.left + leftOffset;
-+      aResult.width = mContentArea.width - leftOffset - rightOffset;
-+    }
++    nscoord leftOffset, rightOffset;
++    ReplacedBlockOffsetsForFloats(aFrame, leftOffset, rightOffset);
++    aResult.x = borderPadding.left + leftOffset;
++    aResult.width = mContentArea.width - leftOffset - rightOffset;
    }
  
  #ifdef REALLY_NOISY_REFLOW
+diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
+--- a/layout/generic/nsBlockReflowState.h
++++ b/layout/generic/nsBlockReflowState.h
+@@ -141,6 +141,12 @@ public:
+   // Reconstruct the previous bottom margin that goes above |aLine|.
+   void ReconstructMarginAbove(nsLineList::iterator aLine);
+ 
++  // Caller must have called GetAvailableSpace for the current mY
++  void ReplacedBlockOffsetsForFloats(nsIFrame* aFrame,
++                                     nscoord& aLeftResult,
++                                     nscoord& aRightResult);
++
++  // Caller must have called GetAvailableSpace for the current mY
+   void ComputeBlockAvailSpace(nsIFrame* aFrame,
+                               const nsStyleDisplay* aDisplay,
+                               nsRect& aResult);
