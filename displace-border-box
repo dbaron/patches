@@ -1,0 +1,108 @@
+When displacing blocks that don't interact with floats around floats, displace the border box rather than the margin box.  b=427129, 377664
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -1582,7 +1582,9 @@ static PRInt32 gNoiseIndent = 0;
+ /* static */ nscoord
+ nsLayoutUtils::IntrinsicForContainer(nsIRenderingContext *aRenderingContext,
+                                      nsIFrame *aFrame,
+-                                     IntrinsicWidthType aType)
++                                     IntrinsicWidthType aType,
++                                     const nsIFrame::IntrinsicWidthOffsetData*
++                                       aOffsets)
+ {
+   NS_PRECONDITION(aFrame, "null frame");
+   NS_PRECONDITION(aType == MIN_WIDTH || aType == PREF_WIDTH, "bad type");
+@@ -1594,7 +1596,7 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+          aType == MIN_WIDTH ? "min" : "pref");
+ #endif
+ 
+-  nsIFrame::IntrinsicWidthOffsetData offsets =
++  nsIFrame::IntrinsicWidthOffsetData offsets = aOffsets ? *aOffsets :
+     aFrame->IntrinsicWidthOffsets(aRenderingContext);
+ 
+   const nsStylePosition *stylePos = aFrame->GetStylePosition();
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -595,11 +595,16 @@ public:
+    * width.  This considers the child's intrinsic width, its 'width',
+    * 'min-width', and 'max-width' properties, and its padding, border,
+    * and margin.
++   *
++   * If aOffsets is non-null, it is used instead of the result of
++   * aFrame->IntrinsicWidthOffsets().
+    */
+   enum IntrinsicWidthType { MIN_WIDTH, PREF_WIDTH };
+   static nscoord IntrinsicForContainer(nsIRenderingContext* aRenderingContext,
+                                        nsIFrame* aFrame,
+-                                       IntrinsicWidthType aType);
++                                       IntrinsicWidthType aType,
++                                       const nsIFrame::IntrinsicWidthOffsetData*
++                                         aOffsets = nsnull);
+ 
+   /*
+    * Convert nsStyleCoord to nscoord when percentages depend on the
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -6798,12 +6798,21 @@ OneWidthToClearPastFloats(nsPresContext*
+     nsSize availSpace(aCBWidth, NS_UNCONSTRAINEDSIZE);
+     nsHTMLReflowState reflowState(aPresContext, aParentReflowState,
+                                   aFrame, availSpace);
+-    return reflowState.ComputedWidth();
+-  }
+-
++    return reflowState.ComputedWidth() +
++           reflowState.mComputedBorderPadding.LeftRight();
++  }
++
++  nsCSSOffsetState offsets(aFrame, aParentReflowState.rendContext, aCBWidth);
++  nsIFrame::IntrinsicWidthOffsets iwoffsets;
++  iwoffsets.hMargin = offsets.mComputedMargin.LeftRight();
++  iwoffsets.hPadding = offsets.mComputedPadding.LeftRight();
++  iwoffsets.hBorder = offsets.mComputedBorderPadding.LeftRight() -
++                      iwoffsets.hPadding;
+   return nsLayoutUtils::IntrinsicForContainer(aParentReflowState.rendContext,
+                                               aFrame,
+-                                              nsLayoutUtils::MIN_WIDTH);
++                                              nsLayoutUtils::MIN_WIDTH,
++                                              &iwoffsets) -
++         iwoffsets.hMargin;
+ }
+ 
+ /* static */
+diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
+--- a/layout/generic/nsBlockReflowState.cpp
++++ b/layout/generic/nsBlockReflowState.cpp
+@@ -257,8 +257,27 @@ nsBlockReflowState::ComputeBlockAvailSpa
+     // The frame is clueless about the space manager and therefore we
+     // only give it free space. An example is a table frame - the
+     // tables do not flow around floats.
+-    aResult.x = mAvailSpaceRect.x + borderPadding.left;
+-    aResult.width = mAvailSpaceRect.width;
++    // However, we can let its margins intersect floats.
++    NS_ASSERTION(mAvailSpaceRect.x >= 0, "bad avail space rect x");
++    NS_ASSERTION(mAvailSpaceRect.XMost() <= mContentArea.width,
++                 "bad avail space rect width");
++    if (mAvailSpaceRect.width == mContentArea.width) {
++      // We don't need to compute margins when there are no floats around.
++      aResult.x = borderPadding.left;
++      aResult.width = mContentArea.width;
++    } else {
++      nsCSSOffsetState os(aFrame, mReflowState.rendContext, mContentArea.width);
++      nscoord leftFloatXOffset = mAvailSpaceRect.x;
++      nscoord leftOffset = PR_MAX(leftFloatXOffset,
++                                  os.mComputedMargin.left) -
++                           os.mComputedMargin.left;
++      nscoord rightFloatXOffset = mContentArea.width - mAvailSpaceRect.XMost();
++      nscoord rightOffset = PR_MAX(rightFloatXOffset,
++                                   os.mComputedMargin.right) -
++                            os.mComputedMargin.right;
++      aResult.x = mAvailSpaceRect.x + leftOffset;
++      aResult.width = mContentArea.width - leftOffset - rightOffset;
++    }
+   }
+ 
+ #ifdef REALLY_NOISY_REFLOW
