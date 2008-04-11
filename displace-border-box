@@ -3,8 +3,51 @@ When displacing blocks that don't interact with floats around floats, displace t
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -6786,31 +6786,36 @@ static nscoord
- static nscoord
+@@ -1779,18 +1779,20 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+       line->MarkDirty();
+     }
+ 
+-    nscoord replacedWidth = 0;
++    ReplacedElementWidthToClear replacedWidthStruct;
++    ReplacedElementWidthToClear *replacedWidth = nsnull;
+     if (line->IsBlock() &&
+         !nsBlockFrame::BlockCanIntersectFloats(line->mFirstChild)) {
+-      replacedWidth =
++      replacedWidthStruct =
+         nsBlockFrame::WidthToClearPastFloats(aState, line->mFirstChild);
++      replacedWidth = &replacedWidthStruct;
+     }
+ 
+     // We have to reflow the line if it's a block whose clearance
+     // might have changed, so detect that.
+     if (!line->IsDirty() &&
+         (line->GetBreakTypeBefore() != NS_STYLE_CLEAR_NONE ||
+-         replacedWidth != 0)) {
++         replacedWidth)) {
+       nscoord curY = aState.mY;
+       // See where we would be after applying any clearance due to
+       // BRs.
+@@ -2803,10 +2805,12 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+   PRBool treatWithClearance = aLine->HasClearance();
+ 
+   PRBool mightClearFloats = breakType != NS_STYLE_CLEAR_NONE;
+-  nscoord replacedWidth = 0;
++  ReplacedElementWidthToClear replacedWidthStruct;
++  ReplacedElementWidthToClear *replacedWidth = nsnull;
+   if (!nsBlockFrame::BlockCanIntersectFloats(frame)) {
+     mightClearFloats = PR_TRUE;
+-    replacedWidth = nsBlockFrame::WidthToClearPastFloats(aState, frame);
++    replacedWidthStruct = nsBlockFrame::WidthToClearPastFloats(aState, frame);
++    replacedWidth = &replacedWidthStruct;
+   }
+ 
+   // If our top margin was counted as part of some parents top-margin
+@@ -6783,35 +6787,44 @@ nsBlockFrame::BlockCanIntersectFloats(ns
+          !(aFrame->GetStateBits() & NS_BLOCK_SPACE_MGR);
+ }
+ 
+-static nscoord
++static nsBlockFrame::ReplacedElementWidthToClear
  OneWidthToClearPastFloats(nsPresContext* aPresContext,
                            const nsHTMLReflowState& aParentReflowState,
 -                          nscoord aCBWidth,
@@ -28,6 +71,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 -                                              nsLayoutUtils::MIN_WIDTH);
 -}
 -
++  nsBlockFrame::ReplacedElementWidthToClear result;
 +  // We actually don't want the min width here; see bug 427782; we only
 +  // want to displace if the width won't compute to a value small enough
 +  // to fit.
@@ -37,8 +81,11 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +  nsSize availSpace(aAvailableWidth, NS_UNCONSTRAINEDSIZE);
 +  nsHTMLReflowState reflowState(aPresContext, aParentReflowState,
 +                                aFrame, availSpace);
-+  return reflowState.ComputedWidth() +
-+         reflowState.mComputedBorderPadding.LeftRight();
++  result.borderBoxWidth = reflowState.ComputedWidth() +
++                          reflowState.mComputedBorderPadding.LeftRight();
++  result.marginLeft  = reflowState.mComputedMargin.left;
++  result.marginRight = reflowState.mComputedMargin.right;
++  return result;
 +}
 +
 +// Note that this width can vary based on the vertical position.
@@ -46,32 +93,87 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +// in the available space given, which means that variation shouldn't
 +// matter.
  /* static */
- nscoord
+-nscoord
++nsBlockFrame::ReplacedElementWidthToClear
  nsBlockFrame::WidthToClearPastFloats(nsBlockReflowState& aState,
                                       nsIFrame* aFrame)
  {
+-  nscoord result;
 +  aState.GetAvailableSpace();
 +  nscoord leftOffset, rightOffset;
 +  aState.ReplacedBlockOffsetsForFloats(aFrame, leftOffset, rightOffset);
 +  nscoord availWidth = aState.mContentArea.width - leftOffset - rightOffset;
 +
-   nscoord result;
++  ReplacedElementWidthToClear result;
    // A table outer frame is an exception in that it is a block child
    // that is not a containing block for its children.
-@@ -6821,10 +6826,10 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+   if (aFrame->GetType() == nsGkAtoms::tableOuterFrame) {
+@@ -6820,20 +6833,62 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+                               aFrame, availSpace);
      nsIFrame *innerTable = aFrame->GetFirstChild(nsnull);
      nsIFrame *caption = aFrame->GetFirstChild(nsGkAtoms::captionList);
-     result = OneWidthToClearPastFloats(aState.mPresContext, outerRS,
+-    result = OneWidthToClearPastFloats(aState.mPresContext, outerRS,
 -                                       aState.mContentArea.width, innerTable);
-+                                       availWidth, innerTable);
-     if (caption) {
-       nscoord captionWidth = OneWidthToClearPastFloats(aState.mPresContext,
+-    if (caption) {
+-      nscoord captionWidth = OneWidthToClearPastFloats(aState.mPresContext,
 -                               outerRS, aState.mContentArea.width, caption);
-+                               outerRS, availWidth, caption);
-       PRUint8 captionSide = caption->GetStyleTableBorder()->mCaptionSide;
-       if (captionSide == NS_SIDE_TOP || captionSide == NS_SIDE_BOTTOM)
-         result = PR_MAX(result, captionWidth);
-@@ -6833,7 +6838,7 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+-      PRUint8 captionSide = caption->GetStyleTableBorder()->mCaptionSide;
+-      if (captionSide == NS_SIDE_TOP || captionSide == NS_SIDE_BOTTOM)
+-        result = PR_MAX(result, captionWidth);
+-      else
+-        result += captionWidth;
++    PRUint8 captionSide = caption->GetStyleTableBorder()->mCaptionSide;
++    if (!caption) {
++      result = OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                         availWidth, innerTable);
++    } else if (captionSide == NS_STYLE_CAPTION_SIDE_TOP ||
++               captionSide == NS_STYLE_CAPTION_SIDE_BOTTOM) {
++      ReplacedElementWidthToClear innerTableWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  availWidth, innerTable);
++      ReplacedElementWidthToClear captionWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  innerTableWidth.borderBoxWidth, caption);
++      result.marginLeft = innerTableWidth.marginLeft;
++      result.borderBoxWidth = PR_MAX(innerTableWidth.borderBoxWidth,
++                                     captionWidth.MarginBoxWidth());
++      result.marginRight = innerTableWidth.marginRight;
++    } else if (captionSide == NS_STYLE_CAPTION_SIDE_TOP_OUTSIDE ||
++               captionSide == NS_STYLE_CAPTION_SIDE_BOTTOM_OUTSIDE) {
++      ReplacedElementWidthToClear innerTableWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  availWidth, innerTable);
++      ReplacedElementWidthToClear captionWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  availWidth, caption);
++      result.marginLeft = PR_MIN(innerTableWidth.marginLeft,
++                                 captionWidth.marginLeft);
++      result.marginRight = PR_MIN(innerTableWidth.marginRight,
++                                  captionWidth.marginRight);
++      result.borderBoxWidth = PR_MAX(innerTableWidth.MarginBoxWidth(),
++                                     captionWidth.MarginBoxWidth()) -
++                              (result.marginLeft + result.marginRight);
++    } else {
++      NS_ASSERTION(captionSide == NS_STYLE_CAPTION_SIDE_LEFT ||
++                   captionSide == NS_STYLE_CAPTION_SIDE_RIGHT,
++                   "unexpected caption-side");
++      ReplacedElementWidthToClear captionWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  availWidth, caption);
++      ReplacedElementWidthToClear innerTableWidth =
++        OneWidthToClearPastFloats(aState.mPresContext, outerRS,
++                                  availWidth - captionWidth.MarginBoxWidth(),
++                                  innerTable);
++      if (captionSide == NS_STYLE_CAPTION_SIDE_LEFT) {
++        result.marginLeft = captionWidth.marginLeft;
++        result.marginRight = innerTableWidth.marginRight;
++      } else {
++        result.marginLeft = innerTableWidth.marginLeft;
++        result.marginRight = captionWidth.marginRight;
++      }
++      result.borderBoxWidth = innerTableWidth.MarginBoxWidth() +
++                              captionWidth.MarginBoxWidth() -
++                              (result.marginLeft + result.marginRight);
      }
    } else {
      result = OneWidthToClearPastFloats(aState.mPresContext,
@@ -80,6 +182,25 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    }
    return result;
  }
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -299,8 +299,13 @@ public:
+    * Returns the width that needs to be cleared past floats for blocks
+    * that cannot intersect floats.
+    */
+-  static nscoord WidthToClearPastFloats(nsBlockReflowState& aState,
+-                                        nsIFrame* aFrame);
++  struct ReplacedElementWidthToClear {
++    nscoord marginLeft, borderBoxWidth, marginRight;
++    nscoord MarginBoxWidth() const
++      { return marginLeft + borderBoxWidth + marginRight; }
++  };
++  static ReplacedElementWidthToClear
++    WidthToClearPastFloats(nsBlockReflowState& aState, nsIFrame* aFrame);
+ 
+   /**
+    * Walks up the frame tree, starting with aCandidate, and returns the first
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
@@ -140,10 +261,59 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
    }
  
  #ifdef REALLY_NOISY_REFLOW
+@@ -1004,7 +1037,7 @@ nsBlockReflowState::PlaceBelowCurrentLin
+ 
+ nscoord
+ nsBlockReflowState::ClearFloats(nscoord aY, PRUint8 aBreakType,
+-                                nscoord aReplacedWidth)
++                     nsBlockFrame::ReplacedElementWidthToClear *aReplacedWidth)
+ {
+ #ifdef DEBUG
+   if (nsBlockFrame::gNoisyReflow) {
+@@ -1027,10 +1060,16 @@ nsBlockReflowState::ClearFloats(nscoord 
+     newY = bp.top + mSpaceManager->ClearFloats(newY - bp.top, aBreakType);
+   }
+ 
+-  if (aReplacedWidth > 0) {
++  if (aReplacedWidth) {
+     for (;;) {
+       GetAvailableSpace(newY, PR_FALSE);
+-      if (mAvailSpaceRect.width >= aReplacedWidth || mBand.GetFloatCount() == 0) {
++      if (mBand.GetFloatCount() == 0 ||
++          PR_MAX(mAvailSpaceRect.x, aReplacedWidth->marginLeft) +
++            aReplacedWidth->borderBoxWidth +
++            PR_MAX(mContentArea.width -
++                     PR_MIN(mContentArea.width, mAvailSpaceRect.XMost()),
++                   aReplacedWidth->marginRight) <
++          mContentArea.width) {
+         break;
+       }
+       // See the analogous code for inlines in nsBlockFrame::DoReflowInlineFrames
 diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
 --- a/layout/generic/nsBlockReflowState.h
 +++ b/layout/generic/nsBlockReflowState.h
-@@ -141,6 +141,12 @@ public:
+@@ -46,9 +46,7 @@
+ #include "nsBlockBandData.h"
+ #include "nsLineBox.h"
+ #include "nsFrameList.h"
+-#include "nsContainerFrame.h"
+-
+-class nsBlockFrame;
++#include "nsBlockFrame.h"
+ 
+   // block reflow state flags
+ #define BRS_UNCONSTRAINEDHEIGHT   0x00000001
+@@ -111,7 +109,8 @@ public:
+   // Returns the first coordinate >= aY that clears the
+   // floats indicated by aBreakType and has enough width between floats
+   // (or no floats remaining) to accomodate aReplacedWidth.
+-  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType, nscoord aReplacedWidth = 0);
++  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType,
++    nsBlockFrame::ReplacedElementWidthToClear *aReplacedWidth = nsnull);
+ 
+   PRBool IsAdjacentWithTop() const {
+     return mY ==
+@@ -141,6 +140,12 @@ public:
    // Reconstruct the previous bottom margin that goes above |aLine|.
    void ReconstructMarginAbove(nsLineList::iterator aLine);
  
