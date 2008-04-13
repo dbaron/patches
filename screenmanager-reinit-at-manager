@@ -100,7 +100,7 @@ diff --git a/widget/src/gtk2/nsScreenGtk.cpp b/widget/src/gtk2/nsScreenGtk.cpp
 diff --git a/widget/src/gtk2/nsScreenGtk.h b/widget/src/gtk2/nsScreenGtk.h
 --- a/widget/src/gtk2/nsScreenGtk.h
 +++ b/widget/src/gtk2/nsScreenGtk.h
-@@ -63,16 +63,13 @@ public:
+@@ -63,16 +63,11 @@ public:
    NS_DECL_ISUPPORTS
    NS_DECL_NSISCREEN
  
@@ -109,8 +109,8 @@ diff --git a/widget/src/gtk2/nsScreenGtk.h b/widget/src/gtk2/nsScreenGtk.h
 +  void Init(GdkWindow *aRootWindow);
    void Init(XineramaScreenInfo *aScreenInfo);
  
-   Atom NetWorkareaAtom() { return mNetWorkareaAtom; }
- 
+-  Atom NetWorkareaAtom() { return mNetWorkareaAtom; }
+-
  private:
 -  GdkWindow *mRootWindow;
    PRUint32 mScreenNum;
@@ -130,18 +130,18 @@ diff --git a/widget/src/gtk2/nsScreenManagerGtk.cpp b/widget/src/gtk2/nsScreenMa
 +                         gpointer aClosure)
 +{
 +  XEvent *xevent = static_cast<XEvent*>(aGdkXEvent);
-+  nsScreenGtk *ourScreen = static_cast<nsScreenGtk*>(aClosure);
++  nsScreenManagerGtk *manager = static_cast<nsScreenManagerGtk*>(aClosure);
 +
 +  // See comments in nsScreenGtk::Init below.
 +  switch (xevent->type) {
 +    case ConfigureNotify:
-+      ourScreen->ReInit();
++      manager->Init();
 +      break;
 +    case PropertyNotify:
 +      {
 +        XPropertyEvent *propertyEvent = &xevent->xproperty;
-+        if (propertyEvent->atom == ourScreen->NetWorkareaAtom()) {
-+          ourScreen->ReInit();
++        if (propertyEvent->atom == manager->NetWorkareaAtom()) {
++          manager->Init();
 +        }
 +      }
 +      break;
@@ -170,7 +170,7 @@ diff --git a/widget/src/gtk2/nsScreenManagerGtk.cpp b/widget/src/gtk2/nsScreenMa
    if (mXineramalib && mXineramalib != SCREEN_MANAGER_LIBRARY_LOAD_FAILED) {
      PR_UnloadLibrary(mXineramalib);
    }
-@@ -74,9 +108,34 @@ NS_IMPL_ISUPPORTS1(nsScreenManagerGtk, n
+@@ -74,65 +108,89 @@ NS_IMPL_ISUPPORTS1(nsScreenManagerGtk, n
  
  // this function will make sure that everything has been initialized.
  nsresult
@@ -178,9 +178,10 @@ diff --git a/widget/src/gtk2/nsScreenManagerGtk.cpp b/widget/src/gtk2/nsScreenMa
 +nsScreenManagerGtk :: EnsureInit()
  {
 -  if (mNumScreens == 0) {
+-    XineramaScreenInfo *screenInfo = NULL;
 +  if (mNumScreens > 0)
 +    return NS_OK;
-+
+ 
 +#if GTK_CHECK_VERSION(2,2,0)
 +  mRootWindow = gdk_get_default_root_window();
 +#else
@@ -204,18 +205,105 @@ diff --git a/widget/src/gtk2/nsScreenManagerGtk.cpp b/widget/src/gtk2/nsScreenMa
 +nsresult
 +nsScreenManagerGtk :: Init()
 +{
-     XineramaScreenInfo *screenInfo = NULL;
- 
++  XineramaScreenInfo *screenInfo = NULL;
++
++  if (!mXineramalib) {
++    mXineramalib = PR_LoadLibrary("libXinerama.so.1");
      if (!mXineramalib) {
-@@ -109,7 +168,7 @@ nsScreenManagerGtk :: EnsureInit(void)
+-      mXineramalib = PR_LoadLibrary("libXinerama.so.1");
+-      if (!mXineramalib) {
+-        mXineramalib = SCREEN_MANAGER_LIBRARY_LOAD_FAILED;
+-      }
++      mXineramalib = SCREEN_MANAGER_LIBRARY_LOAD_FAILED;
+     }
+-    if (mXineramalib && mXineramalib != SCREEN_MANAGER_LIBRARY_LOAD_FAILED) {
+-      _XnrmIsActive_fn _XnrmIsActive = (_XnrmIsActive_fn)
+-          PR_FindFunctionSymbol(mXineramalib, "XineramaIsActive");
++  }
++  if (mXineramalib && mXineramalib != SCREEN_MANAGER_LIBRARY_LOAD_FAILED) {
++    _XnrmIsActive_fn _XnrmIsActive = (_XnrmIsActive_fn)
++        PR_FindFunctionSymbol(mXineramalib, "XineramaIsActive");
+ 
+-      _XnrmQueryScreens_fn _XnrmQueryScreens = (_XnrmQueryScreens_fn)
+-          PR_FindFunctionSymbol(mXineramalib, "XineramaQueryScreens");
+-          
+-      // get the number of screens via xinerama
+-      if (_XnrmIsActive && _XnrmQueryScreens &&
+-          _XnrmIsActive(GDK_DISPLAY())) {
+-        screenInfo = _XnrmQueryScreens(GDK_DISPLAY(), &mNumScreens);
+-      }
++    _XnrmQueryScreens_fn _XnrmQueryScreens = (_XnrmQueryScreens_fn)
++        PR_FindFunctionSymbol(mXineramalib, "XineramaQueryScreens");
++        
++    // get the number of screens via xinerama
++    if (_XnrmIsActive && _XnrmQueryScreens &&
++        _XnrmIsActive(GDK_DISPLAY())) {
++      screenInfo = _XnrmQueryScreens(GDK_DISPLAY(), &mNumScreens);
+     }
+-    // screenInfo == NULL if either Xinerama couldn't be loaded or
+-    // isn't running on the current display
+-    if (!screenInfo) {
+-      mNumScreens = 1;
++  }
++  // screenInfo == NULL if either Xinerama couldn't be loaded or
++  // isn't running on the current display
++  if (!screenInfo) {
++    mNumScreens = 1;
+ 
++    nsRefPtr<nsScreenGtk> screen = new nsScreenGtk();
++    if (!screen || !mCachedScreenArray.AppendObject(screen)) {
++      mNumScreens = 0;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    screen->Init(mRootWindow);
++  }
++  // If Xinerama is enabled and there's more than one screen, fill
++  // in the info for all of the screens.  If that's not the case
++  // then nsScreenGTK() defaults to the screen width + height
++  else {
++#ifdef DEBUG
++    printf("Xinerama superpowers activated for %d screens!\n", mNumScreens);
++#endif
++    for (int i = 0; i < mNumScreens; ++i) {
+       nsRefPtr<nsScreenGtk> screen = new nsScreenGtk();
+       if (!screen || !mCachedScreenArray.AppendObject(screen)) {
+         mNumScreens = 0;
          return NS_ERROR_OUT_OF_MEMORY;
        }
  
 -      screen->Init();
-+      screen->Init(mRootWindow);
++      // initialize this screen object
++      screen->Init(&screenInfo[i]);
      }
-     // If Xinerama is enabled and there's more than one screen, fill
-     // in the info for all of the screens.  If that's not the case
+-    // If Xinerama is enabled and there's more than one screen, fill
+-    // in the info for all of the screens.  If that's not the case
+-    // then nsScreenGTK() defaults to the screen width + height
+-    else {
+-#ifdef DEBUG
+-      printf("Xinerama superpowers activated for %d screens!\n", mNumScreens);
+-#endif
+-      for (int i = 0; i < mNumScreens; ++i) {
+-        nsRefPtr<nsScreenGtk> screen = new nsScreenGtk();
+-        if (!screen || !mCachedScreenArray.AppendObject(screen)) {
+-          mNumScreens = 0;
+-          return NS_ERROR_OUT_OF_MEMORY;
+-        }
++  }
+ 
+-        // initialize this screen object
+-        screen->Init(&screenInfo[i]);
+-      }
+-    }
+-
+-    if (screenInfo) {
+-      XFree(screenInfo);
+-    }
++  if (screenInfo) {
++    XFree(screenInfo);
+   }
+ 
+   return NS_OK;
 diff --git a/widget/src/gtk2/nsScreenManagerGtk.h b/widget/src/gtk2/nsScreenManagerGtk.h
 --- a/widget/src/gtk2/nsScreenManagerGtk.h
 +++ b/widget/src/gtk2/nsScreenManagerGtk.h
@@ -228,7 +316,23 @@ diff --git a/widget/src/gtk2/nsScreenManagerGtk.h b/widget/src/gtk2/nsScreenMana
  
  //------------------------------------------------------------------------
  
-@@ -70,6 +72,9 @@ private:
+@@ -56,9 +58,14 @@ public:
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSISCREENMANAGER
+ 
++  Atom NetWorkareaAtom() { return mNetWorkareaAtom; }
++  
++  // For internal use, or reinitialization from change notification.
++  nsresult Init();
++
+ private:
+ 
+-  nsresult EnsureInit(void);
++  nsresult EnsureInit();
+ 
+   // Cached screen array.  This may have more objects in it than the
+   // number of screens if the number of screens changes dynamically over
+@@ -70,6 +77,9 @@ private:
    int mNumScreens;
  
    PRLibrary *mXineramalib;
