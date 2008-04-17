@@ -142,10 +142,145 @@ diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
 diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 --- a/layout/style/nsCSSStyleSheet.cpp
 +++ b/layout/style/nsCSSStyleSheet.cpp
-@@ -165,6 +165,16 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
+@@ -165,6 +165,164 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
    return result;
  }
  
++
++PRBool
++nsMediaExpression::Matches(const nsCSSValue& aActualValue) const
++{
++  const nsCSSValue& actual = aActualValue;
++  const nsCSSValue& required = mValue;
++
++  // If we don't have the feature, the match fails.
++  if (actual.GetUnit() == eCSSUnit_Null) {
++    return PR_FALSE;
++  }
++
++  // If the expression had no value to match, the match succeeds,
++  // unless the value is an integer 0.
++  if (required.GetUnit() == eCSSUnit_Null) {
++    return actual.GetUnit() != eCSSUnit_Integer ||
++           actual.GetIntValue() != 0;
++  }
++
++  NS_ASSERTION(mFeature->mRangeType == nsMediaFeature::eMinMaxAllowed ||
++               mRange == nsMediaExpression::eEqual, "yikes");
++  PRInt32 cmp; // -1 (actual < required)
++               //  0 (actual == required)
++               //  1 (actual > required)
++  switch (mFeature->mValueType) {
++    case nsMediaFeature::eLength:
++      {
++        NS_ASSERTION(actual.IsLengthUnit(), "bad actual value");
++        NS_ASSERTION(required.IsLengthUnit(), "bad required value");
++        nscoord actualCoord = nsRuleNode::CalcLengthWithInitialFont(
++                                aPresContext, actual);
++        nscoord requiredCoord = nsRuleNode::CalcLengthWithInitialFont(
++                                  aPresContext, required);
++        cmp = DoCompare(actualCoord, requiredCoord);
++      }
++      break;
++    case nsMediaFeature::eInteger:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Integer,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Integer,
++                     "bad required value");
++        cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
++      }
++      break;
++    case nsMediaFeature::eIntRatio:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Array &&
++                     actual.GetArrayValue()->Item(0).GetUnit() ==
++                       eCSSUnit_Integer &&
++                     actual.GetArrayValue()->Item(1).GetUnit() ==
++                       eCSSUnit_Integer,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Array &&
++                     required.GetArrayValue()->Item(0).GetUnit() ==
++                       eCSSUnit_Integer &&
++                     required.GetArrayValue()->Item(1).GetUnit() ==
++                       eCSSUnit_Integer,
++                     "bad required value");
++        // Convert to PRInt64 so we can multiply without worry
++        PRInt64 actualNum = actual.GetArrayValue()->Item(0).GetIntValue(),
++                actualDen = actual.GetArrayValue()->Item(1).GetIntValue(),
++                requiredNum = required.GetArrayValue()->Item(0).GetIntValue(),
++                requiredDen = required.GetArrayValue()->Item(1).GetIntValue();
++        cmp = DoCompare(actualNum * requiredDen, requiredNum * actualDen);
++      }
++      break;
++    case nsMediaFeature::eResolution:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Inch ||
++                     actual.GetUnit() == eCSSUnit_Centimeter,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Inch ||
++                     required.GetUnit() == eCSSUnit_Centimeter,
++                     "bad required value");
++        float actualDPI = actual.GetFloatValue();
++        if (actual.GetUnit() == eCSSUnit_Centimeter)
++          actualDPI = actualDPI / 2.54f;
++        float requiredDPI = required.GetFloatValue();
++        if (required.GetUnit() == eCSSUnit_Centimeter)
++          requiredDPI = requiredDPI / 2.54f;
++        cmp = DoCompare(actualDPI, requiredDPI);
++      }
++      break;
++    case nsMediaFeature::eEnumerated:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Enumerated,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Enumerated,
++                     "bad required value");
++        NS_ASSERTION(mFeature->mRangeType == nsMediaFeature::eMinMaxNotAllowed,
++                     "bad range"); // we asserted above about mRange
++        // We don't really need DoCompare, but it doesn't hurt (and
++        // maybe the compiler will condense this case with eInteger).
++        cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
++      }
++      break;
++  }
++  PRBool match;
++  switch (mRange) {
++    case nsMediaExpression::eMin:
++      match = cmp != -1;
++      break;
++    case nsMediaExpression::eMax:
++      match = cmp != 1;
++      break;
++    case nsMediaExpression::eEqual:
++      match = cmp == 0;
++      break;
++  }
++  return match;
++}
++
++void
++nsMediaQueryResultCacheKey::AddExpression(nsMediaExpression* aExpression)
++{
++  const nsMediaFeature *feature = aExpression.mFeature;
++  FeatureEntry *entry;
++  for (PRInt32 i = 0; i < mFeatureCache.Length(); ++i) {
++    if (mFeatureCache[i]->mFeature == feature) {
++      entry = mFeatureCache[i];
++      break;
++    }
++  }
++  if (!entry) {
++    entry = mFeatureCache.AppendElement();
++    if (!entry) {
++      return; /* out of memory */
++    }
++    entry->mFeature = feature;
++  }
++
++  entry->AppendElement(aExpression);
++}
++
 +PRBool
 +nsMediaQueryResultCacheKey::Matches(nsPresContext* aPresContext) const
 +{
@@ -153,13 +288,26 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +    return PR_FALSE;
 +  }
 +
-+  // XXX WRITE ME
++  for (PRUint32 i = 0; i < mFeatureCache.Length(); ++i) {
++    FeatureEntry *entry = mFeatureCache[i];
++    nsCSSValue actual;
++    nsresult rv = (entry->mFeature->mGetter)(aPresContext, actual);
++    NS_ENSURE_SUCCESS(rv, PR_FALSE); // any better ideas?
++
++    for (PRUint32 j = 0; j < entry->mExpressions.Length(); ++j) {
++      if (!entry->mExpressions[j].Matches(actual)) {
++        return PR_FALSE;
++      }
++    }
++  }
++
++  return PR_TRUE;
 +}
 +
  void
  nsMediaQuery::AppendToString(nsAString& aString) const
  {
-@@ -285,7 +295,8 @@ PRInt32 DoCompare(Numeric a, Numeric b)
+@@ -285,7 +443,8 @@ PRInt32 DoCompare(Numeric a, Numeric b)
  }
  
  PRBool
@@ -169,7 +317,126 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  {
    if (mHadUnknownExpression)
      return mNegated;
-@@ -472,10 +483,11 @@ nsMediaList::SetText(const nsAString& aM
+@@ -296,115 +455,12 @@ nsMediaQuery::Matches(nsPresContext* aPr
+   // CHANGES!
+   for (PRUint32 i = 0, i_end = mExpressions.Length(); match && i < i_end; ++i) {
+     const nsMediaExpression &expr = mExpressions[i];
+-    const nsMediaFeature *feature = expr.mFeature;
++    aKey.AddExpression(&expr);
+     nsCSSValue actual;
+-    nsresult rv = (feature->mGetter)(aPresContext, actual);
++    nsresult rv = (expr.mFeature->mGetter)(aPresContext, actual);
+     NS_ENSURE_SUCCESS(rv, PR_FALSE); // any better ideas?
+-    // If we don't have the feature, the match fails.
+-    if (actual.GetUnit() == eCSSUnit_Null) {
+-      match = PR_FALSE;
+-      continue;
+-    }
+ 
+-    // If the expression had no value to match, the match succeeds,
+-    // unless the value is an integer 0.
+-    const nsCSSValue required = expr.mValue;
+-    if (required.GetUnit() == eCSSUnit_Null) {
+-      match = actual.GetUnit() != eCSSUnit_Integer ||
+-              actual.GetIntValue() != 0;
+-      continue;
+-    }
+-
+-    NS_ASSERTION(feature->mRangeType == nsMediaFeature::eMinMaxAllowed ||
+-                 expr.mRange == nsMediaExpression::eEqual, "yikes");
+-    PRInt32 cmp; // -1 (actual < required)
+-                 //  0 (actual == required)
+-                 //  1 (actual > required)
+-    switch (feature->mValueType) {
+-      case nsMediaFeature::eLength:
+-        {
+-          NS_ASSERTION(actual.IsLengthUnit(), "bad actual value");
+-          NS_ASSERTION(required.IsLengthUnit(), "bad required value");
+-          nscoord actualCoord = nsRuleNode::CalcLengthWithInitialFont(
+-                                  aPresContext, actual);
+-          nscoord requiredCoord = nsRuleNode::CalcLengthWithInitialFont(
+-                                    aPresContext, required);
+-          cmp = DoCompare(actualCoord, requiredCoord);
+-        }
+-        break;
+-      case nsMediaFeature::eInteger:
+-        {
+-          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Integer,
+-                       "bad actual value");
+-          NS_ASSERTION(required.GetUnit() == eCSSUnit_Integer,
+-                       "bad required value");
+-          cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
+-        }
+-        break;
+-      case nsMediaFeature::eIntRatio:
+-        {
+-          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Array &&
+-                       actual.GetArrayValue()->Item(0).GetUnit() ==
+-                         eCSSUnit_Integer &&
+-                       actual.GetArrayValue()->Item(1).GetUnit() ==
+-                         eCSSUnit_Integer,
+-                       "bad actual value");
+-          NS_ASSERTION(required.GetUnit() == eCSSUnit_Array &&
+-                       required.GetArrayValue()->Item(0).GetUnit() ==
+-                         eCSSUnit_Integer &&
+-                       required.GetArrayValue()->Item(1).GetUnit() ==
+-                         eCSSUnit_Integer,
+-                       "bad required value");
+-          // Convert to PRInt64 so we can multiply without worry
+-          PRInt64 actualNum = actual.GetArrayValue()->Item(0).GetIntValue(),
+-                  actualDen = actual.GetArrayValue()->Item(1).GetIntValue(),
+-                  requiredNum = required.GetArrayValue()->Item(0).GetIntValue(),
+-                  requiredDen = required.GetArrayValue()->Item(1).GetIntValue();
+-          cmp = DoCompare(actualNum * requiredDen, requiredNum * actualDen);
+-        }
+-        break;
+-      case nsMediaFeature::eResolution:
+-        {
+-          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Inch ||
+-                       actual.GetUnit() == eCSSUnit_Centimeter,
+-                       "bad actual value");
+-          NS_ASSERTION(required.GetUnit() == eCSSUnit_Inch ||
+-                       required.GetUnit() == eCSSUnit_Centimeter,
+-                       "bad required value");
+-          float actualDPI = actual.GetFloatValue();
+-          if (actual.GetUnit() == eCSSUnit_Centimeter)
+-            actualDPI = actualDPI / 2.54f;
+-          float requiredDPI = required.GetFloatValue();
+-          if (required.GetUnit() == eCSSUnit_Centimeter)
+-            requiredDPI = requiredDPI / 2.54f;
+-          cmp = DoCompare(actualDPI, requiredDPI);
+-        }
+-        break;
+-      case nsMediaFeature::eEnumerated:
+-        {
+-          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Enumerated,
+-                       "bad actual value");
+-          NS_ASSERTION(required.GetUnit() == eCSSUnit_Enumerated,
+-                       "bad required value");
+-          NS_ASSERTION(feature->mRangeType == nsMediaFeature::eMinMaxNotAllowed,
+-                       "bad range"); // we asserted above about expr.mRange
+-          // We don't really need DoCompare, but it doesn't hurt (and
+-          // maybe the compiler will condense this case with eInteger).
+-          cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
+-        }
+-        break;
+-    }
+-    switch (expr.mRange) {
+-      case nsMediaExpression::eMin:
+-        match = cmp != -1;
+-        break;
+-      case nsMediaExpression::eMax:
+-        match = cmp != 1;
+-        break;
+-      case nsMediaExpression::eEqual:
+-        match = cmp == 0;
+-        break;
+-    }
++    match = expr.Matches(actual);
+   }
+ 
+   return match == !mNegated;
+@@ -472,10 +528,11 @@ nsMediaList::SetText(const nsAString& aM
  }
  
  PRBool
@@ -183,11 +450,13 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
        return PR_TRUE;
      }
    }
-@@ -1103,10 +1115,11 @@ nsCSSStyleSheet::GetType(nsString& aType
+@@ -1102,11 +1159,12 @@ nsCSSStyleSheet::GetType(nsString& aType
+   return NS_OK;
  }
  
- NS_IMETHODIMP_(PRBool)
+-NS_IMETHODIMP_(PRBool)
 -nsCSSStyleSheet::UseForMedium(nsPresContext* aPresContext) const
++PRBool
 +nsCSSStyleSheet::UseForPresentation(nsPresContext* aPresContext,
 +                                    nsMediaQueryResultCacheKey& aKey) const
  {
@@ -200,62 +469,72 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
 --- a/layout/style/nsCSSStyleSheet.h
 +++ b/layout/style/nsCSSStyleSheet.h
-@@ -109,7 +109,8 @@ public:
+@@ -109,7 +109,6 @@ public:
    NS_IMETHOD GetBaseURI(nsIURI** aBaseURI) const;
    NS_IMETHOD GetTitle(nsString& aTitle) const;
    NS_IMETHOD GetType(nsString& aType) const;
 -  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
-+  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
-+                                       nsMediaQueryResultCacheKey& aKey) const;
    NS_IMETHOD_(PRBool) HasRules() const;
    NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
    NS_IMETHOD SetEnabled(PRBool aEnabled);
+@@ -164,6 +163,9 @@ public:
+                               nsresult aStatus);
+   
+   nsresult EnsureUniqueInner();
++
++  PRBool UseForPresentation(nsPresContext* aPresContext,
++                            nsMediaQueryResultCacheKey& aKey) const;
+ 
+   // nsIDOMStyleSheet interface
+   NS_DECL_NSIDOMSTYLESHEET
 diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
 --- a/layout/style/nsHTMLCSSStyleSheet.cpp
 +++ b/layout/style/nsHTMLCSSStyleSheet.cpp
-@@ -342,7 +342,8 @@ public:
+@@ -342,7 +342,6 @@ public:
    NS_IMETHOD GetBaseURI(nsIURI** aBaseURL) const;
    NS_IMETHOD GetTitle(nsString& aTitle) const;
    NS_IMETHOD GetType(nsString& aType) const;
 -  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
-+  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
-+                                       nsMediaQueryResultCacheKey& aKey) const;
    NS_IMETHOD_(PRBool) HasRules() const;
  
    NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
-@@ -538,7 +539,8 @@ HTMLCSSStyleSheetImpl::GetType(nsString&
+@@ -535,12 +534,6 @@ HTMLCSSStyleSheetImpl::GetType(nsString&
+ {
+   aType.AssignLiteral("text/html");
+   return NS_OK;
+-}
+-
+-NS_IMETHODIMP_(PRBool)
+-HTMLCSSStyleSheetImpl::UseForMedium(nsPresContext* aPresContext) const
+-{
+-  return PR_TRUE; // works for all media
  }
  
  NS_IMETHODIMP_(PRBool)
--HTMLCSSStyleSheetImpl::UseForMedium(nsPresContext* aPresContext) const
-+HTMLCSSStyleSheetImpl::UseForPresentation(nsPresContext* aPresContext,
-+                                        nsMediaQueryResultCacheKey& aKey) const
- {
-   return PR_TRUE; // works for all media
- }
 diff --git a/layout/style/nsHTMLStyleSheet.cpp b/layout/style/nsHTMLStyleSheet.cpp
 --- a/layout/style/nsHTMLStyleSheet.cpp
 +++ b/layout/style/nsHTMLStyleSheet.cpp
-@@ -609,7 +609,8 @@ nsHTMLStyleSheet::GetType(nsString& aTyp
+@@ -609,12 +609,6 @@ nsHTMLStyleSheet::GetType(nsString& aTyp
  }
  
  NS_IMETHODIMP_(PRBool)
 -nsHTMLStyleSheet::UseForMedium(nsPresContext* aPresContext) const
-+nsHTMLStyleSheet::UseForPresentation(nsPresContext* aPresContext,
-+                                     nsMediaQueryResultCacheKey& aKey) const
+-{
+-  return PR_TRUE; // works for all media
+-}
+-
+-NS_IMETHODIMP_(PRBool)
+ nsHTMLStyleSheet::HasRules() const
  {
-   return PR_TRUE; // works for all media
- }
+   return PR_TRUE; // We have rules at all reasonable times
 diff --git a/layout/style/nsHTMLStyleSheet.h b/layout/style/nsHTMLStyleSheet.h
 --- a/layout/style/nsHTMLStyleSheet.h
 +++ b/layout/style/nsHTMLStyleSheet.h
-@@ -64,7 +64,8 @@ public:
+@@ -64,7 +64,6 @@ public:
    NS_IMETHOD GetBaseURI(nsIURI** aBaseURL) const;
    NS_IMETHOD GetTitle(nsString& aTitle) const;
    NS_IMETHOD GetType(nsString& aType) const;
 -  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
-+  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
-+                                       nsMediaQueryResultCacheKey& aKey) const;
    NS_IMETHOD_(PRBool) HasRules() const;
    NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
    NS_IMETHOD SetEnabled(PRBool aEnabled);
@@ -283,16 +562,33 @@ diff --git a/layout/style/nsICSSGroupRule.h b/layout/style/nsICSSGroupRule.h
 diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
 --- a/layout/style/nsIMediaList.h
 +++ b/layout/style/nsIMediaList.h
-@@ -64,6 +64,24 @@ struct nsMediaExpression {
+@@ -62,6 +62,45 @@ struct nsMediaExpression {
+   const nsMediaFeature *mFeature;
+   Range mRange;
    nsCSSValue mValue;
- };
- 
++
++  // aActualValue must be obtained from mFeature->mGetter
++  PRBool Matches(const nsCSSValue& aActualValue) const;
++};
++
 +/**
 + * An nsMediaQueryResultCacheKey records what feature/value combinations
 + * a set of media query results are valid for.  This allows the caller
 + * to quickly learn whether a prior result of media query evaluation is
 + * still valid (e.g., due to a window size change) without rerunning all
 + * of the evaluation and rebuilding the list of rules.
++ *
++ * This object may not be used after any any media rules in any of the
++ * sheets it was given to have been modified.  However, this is
++ * generally not a problem since ClearRuleCascades is called on the
++ * sheet whenever this happens, and these objects are stored inside the
++ * rule cascades.
++ *
++ * The implementation could be further optimized in the future to store
++ * ranges (combinations of less-than, less-than-or-equal, greater-than,
++ * greater-than-or-equal, equal, not-equal, present, not-present) for
++ * each feature rather than simply storing the list of expressions.
++ * However, this requires combining any such ranges.
 + */
 +class nsMediaQueryResultCacheKey {
 +public:
@@ -300,15 +596,19 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
 +    : mMedium(aMedium)
 +  {}
 +
++  void AddExpression(nsMediaExpression* aExpression);
 +  PRBool Matches(nsPresContext* aPresContext) const;
 +private:
++  class FeatureEntry {
++    const nsMediaFeature *mFeature;
++    nsTPtrArray<nsMediaExpression> mExpressions;
++  };
 +  nsCOMPtr<nsIAtom> mMedium;
-+};
-+
++  nsTArray<FeatureEntry> mFeatureCache;
+ };
+ 
  class nsMediaQuery {
- public:
-   nsMediaQuery()
-@@ -106,7 +124,8 @@ public:
+@@ -106,7 +145,8 @@ public:
    nsMediaQuery* Clone() const;
  
    // Does this query apply to the presentation?
@@ -318,7 +618,7 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
  
  private:
    PRPackedBool mNegated;
-@@ -127,7 +146,8 @@ public:
+@@ -127,7 +167,8 @@ public:
  
    nsresult GetText(nsAString& aMediaText);
    nsresult SetText(const nsAString& aMediaText);
@@ -331,13 +631,11 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
 diff --git a/layout/style/nsIStyleSheet.h b/layout/style/nsIStyleSheet.h
 --- a/layout/style/nsIStyleSheet.h
 +++ b/layout/style/nsIStyleSheet.h
-@@ -78,7 +78,8 @@ public:
+@@ -78,7 +78,6 @@ public:
    NS_IMETHOD GetBaseURI(nsIURI** aBaseURI) const = 0;
    NS_IMETHOD GetTitle(nsString& aTitle) const = 0;
    NS_IMETHOD GetType(nsString& aType) const = 0;
 -  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const = 0;
-+  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
-+                                   nsMediaQueryResultCacheKey& aKey) const = 0;
    NS_IMETHOD_(PRBool) HasRules() const = 0;
  
    /**
