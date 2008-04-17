@@ -1,0 +1,343 @@
+Implement Media Queries, part 2: infrastructure for dynamic change handling.  b=156716
+
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -682,7 +682,7 @@ struct RuleCascadeData {
+   RuleCascadeData(nsIAtom *aMedium, PRBool aQuirksMode)
+     : mRuleHash(aQuirksMode),
+       mStateSelectors(),
+-      mMedium(aMedium),
++      mCacheKey(aMedium),
+       mNext(nsnull)
+   {
+     PL_DHashTableInit(&mAttributeSelectors, &AttributeSelectorOps, nsnull,
+@@ -703,7 +703,7 @@ struct RuleCascadeData {
+   // Returns null only on allocation failure.
+   nsVoidArray* AttributeListFor(nsIAtom* aAttribute);
+ 
+-  nsCOMPtr<nsIAtom> mMedium;
++  nsMediaQueryResultCacheKey mCacheKey;
+   RuleCascadeData*  mNext; // for a different medium
+ };
+ 
+@@ -2176,8 +2176,11 @@ static PLDHashTableOps gRulesByWeightOps
+ };
+ 
+ struct CascadeEnumData {
+-  CascadeEnumData(nsPresContext* aPresContext, PLArenaPool& aArena)
++  CascadeEnumData(nsPresContext* aPresContext,
++                  nsMediaQueryResultCacheKey& aKey,
++                  PLArenaPool& aArena)
+     : mPresContext(aPresContext),
++      mCacheKey(aKey),
+       mArena(aArena)
+   {
+     if (!PL_DHashTableInit(&mRulesByWeight, &gRulesByWeightOps, nsnull,
+@@ -2192,6 +2195,7 @@ struct CascadeEnumData {
+   }
+ 
+   nsPresContext* mPresContext;
++  nsMediaQueryResultCacheKey& mCacheKey;
+   // Hooray, a manual PLDHashTable since nsClassHashtable doesn't
+   // provide a getter that gives me a *reference* to the value.
+   PLDHashTable mRulesByWeight; // of RuleValue* linked lists (?)
+@@ -2227,7 +2231,7 @@ InsertRuleByWeight(nsICSSRule* aRule, vo
+   else if (nsICSSRule::MEDIA_RULE == type ||
+            nsICSSRule::DOCUMENT_RULE == type) {
+     nsICSSGroupRule* groupRule = (nsICSSGroupRule*)aRule;
+-    if (groupRule->UseForPresentation(data->mPresContext))
++    if (groupRule->UseForPresentation(data->mPresContext, data->mCacheKey))
+       if (!groupRule->EnumerateRulesForwards(InsertRuleByWeight, aData))
+         return PR_FALSE;
+   }
+@@ -2243,7 +2247,8 @@ CascadeSheetRulesInto(nsICSSStyleSheet* 
+   PRBool bSheetApplicable = PR_TRUE;
+   sheet->GetApplicable(bSheetApplicable);
+ 
+-  if (bSheetApplicable && sheet->UseForMedium(data->mPresContext)) {
++  if (bSheetApplicable &&
++      sheet->UseForPresentation(data->mPresContext, data->mCacheKey)) {
+     nsCSSStyleSheet* child = sheet->mFirstChild;
+     while (child) {
+       CascadeSheetRulesInto(child, data);
+@@ -2299,23 +2304,21 @@ nsCSSRuleProcessor::GetRuleCascade(nsPre
+   // (@-moz-document).)  Things will get a little more complicated if
+   // we implement media queries, though.
+ 
+-  // FIXME: per-medium caching is now invalid; fix using boundary
+-  // conditions per feature
+   RuleCascadeData **cascadep = &mRuleCascades;
+   RuleCascadeData *cascade;
+-  nsIAtom *medium = aPresContext->Medium();
+   while ((cascade = *cascadep)) {
+-    if (cascade->mMedium == medium)
++    if (cascade->mCacheKey.Matches(aPresContext))
+       return cascade;
+     cascadep = &cascade->mNext;
+   }
+ 
+   if (mSheets.Count() != 0) {
+     nsAutoPtr<RuleCascadeData> newCascade(
+-      new RuleCascadeData(medium,
++      new RuleCascadeData(aPresContext->Medium(),
+                           eCompatibility_NavQuirks == aPresContext->CompatibilityMode()));
+     if (newCascade) {
+-      CascadeEnumData data(aPresContext, newCascade->mRuleHash.Arena());
++      CascadeEnumData data(aPresContext, newCascade->mCacheKey,
++                           newCascade->mRuleHash.Arena());
+       if (!data.mRulesByWeight.ops)
+         return nsnull;
+       if (!mSheets.EnumerateForwards(CascadeSheetRulesInto, &data))
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -1036,10 +1036,11 @@ nsCSSMediaRule::DeleteRule(PRUint32 aInd
+ 
+ // nsICSSGroupRule interface
+ NS_IMETHODIMP_(PRBool)
+-nsCSSMediaRule::UseForPresentation(nsPresContext* aPresContext)
++nsCSSMediaRule::UseForPresentation(nsPresContext* aPresContext,
++                                   nsMediaQueryResultCacheKey& aKey)
+ {
+   if (mMedia) {
+-    return mMedia->Matches(aPresContext);
++    return mMedia->Matches(aPresContext, aKey);
+   }
+   return PR_TRUE;
+ }
+@@ -1196,7 +1197,8 @@ nsCSSDocumentRule::DeleteRule(PRUint32 a
+ 
+ // nsICSSGroupRule interface
+ NS_IMETHODIMP_(PRBool)
+-nsCSSDocumentRule::UseForPresentation(nsPresContext* aPresContext)
++nsCSSDocumentRule::UseForPresentation(nsPresContext* aPresContext,
++                                      nsMediaQueryResultCacheKey& aKey)
+ {
+   nsIURI *docURI = aPresContext->Document()->GetDocumentURI();
+   nsCAutoString docURISpec;
+diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
+--- a/layout/style/nsCSSRules.h
++++ b/layout/style/nsCSSRules.h
+@@ -135,7 +135,8 @@ public:
+   NS_DECL_NSIDOMCSSMEDIARULE
+ 
+   // rest of nsICSSGroupRule interface
+-  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext);
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                         nsMediaQueryResultCacheKey& aKey);
+ 
+   // @media rule methods
+   nsresult SetMedia(nsMediaList* aMedia);
+@@ -170,7 +171,8 @@ public:
+   NS_DECL_NSIDOMCSSMOZDOCUMENTRULE
+ 
+   // rest of nsICSSGroupRule interface
+-  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext);
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                         nsMediaQueryResultCacheKey& aKey);
+ 
+   enum Function {
+     eURL,
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -165,6 +165,16 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
+   return result;
+ }
+ 
++PRBool
++nsMediaQueryResultCacheKey::Matches(nsPresContext* aPresContext) const
++{
++  if (aPresContext->Medium() != mMedium) {
++    return PR_FALSE;
++  }
++
++  // XXX WRITE ME
++}
++
+ void
+ nsMediaQuery::AppendToString(nsAString& aString) const
+ {
+@@ -285,7 +295,8 @@ PRInt32 DoCompare(Numeric a, Numeric b)
+ }
+ 
+ PRBool
+-nsMediaQuery::Matches(nsPresContext* aPresContext) const
++nsMediaQuery::Matches(nsPresContext* aPresContext,
++                      nsMediaQueryResultCacheKey& aKey) const
+ {
+   if (mHadUnknownExpression)
+     return mNegated;
+@@ -472,10 +483,11 @@ nsMediaList::SetText(const nsAString& aM
+ }
+ 
+ PRBool
+-nsMediaList::Matches(nsPresContext* aPresContext)
++nsMediaList::Matches(nsPresContext* aPresContext,
++                     nsMediaQueryResultCacheKey& aKey)
+ {
+   for (PRInt32 i = 0, i_end = mArray.Length(); i < i_end; ++i) {
+-    if (mArray[i]->Matches(aPresContext)) {
++    if (mArray[i]->Matches(aPresContext, aKey)) {
+       return PR_TRUE;
+     }
+   }
+@@ -1103,10 +1115,11 @@ nsCSSStyleSheet::GetType(nsString& aType
+ }
+ 
+ NS_IMETHODIMP_(PRBool)
+-nsCSSStyleSheet::UseForMedium(nsPresContext* aPresContext) const
++nsCSSStyleSheet::UseForPresentation(nsPresContext* aPresContext,
++                                    nsMediaQueryResultCacheKey& aKey) const
+ {
+   if (mMedia) {
+-    return mMedia->Matches(aPresContext);
++    return mMedia->Matches(aPresContext, aKey);
+   }
+   return PR_TRUE;
+ }
+diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
+--- a/layout/style/nsCSSStyleSheet.h
++++ b/layout/style/nsCSSStyleSheet.h
+@@ -109,7 +109,8 @@ public:
+   NS_IMETHOD GetBaseURI(nsIURI** aBaseURI) const;
+   NS_IMETHOD GetTitle(nsString& aTitle) const;
+   NS_IMETHOD GetType(nsString& aType) const;
+-  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                       nsMediaQueryResultCacheKey& aKey) const;
+   NS_IMETHOD_(PRBool) HasRules() const;
+   NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
+   NS_IMETHOD SetEnabled(PRBool aEnabled);
+diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
+--- a/layout/style/nsHTMLCSSStyleSheet.cpp
++++ b/layout/style/nsHTMLCSSStyleSheet.cpp
+@@ -342,7 +342,8 @@ public:
+   NS_IMETHOD GetBaseURI(nsIURI** aBaseURL) const;
+   NS_IMETHOD GetTitle(nsString& aTitle) const;
+   NS_IMETHOD GetType(nsString& aType) const;
+-  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                       nsMediaQueryResultCacheKey& aKey) const;
+   NS_IMETHOD_(PRBool) HasRules() const;
+ 
+   NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
+@@ -538,7 +539,8 @@ HTMLCSSStyleSheetImpl::GetType(nsString&
+ }
+ 
+ NS_IMETHODIMP_(PRBool)
+-HTMLCSSStyleSheetImpl::UseForMedium(nsPresContext* aPresContext) const
++HTMLCSSStyleSheetImpl::UseForPresentation(nsPresContext* aPresContext,
++                                        nsMediaQueryResultCacheKey& aKey) const
+ {
+   return PR_TRUE; // works for all media
+ }
+diff --git a/layout/style/nsHTMLStyleSheet.cpp b/layout/style/nsHTMLStyleSheet.cpp
+--- a/layout/style/nsHTMLStyleSheet.cpp
++++ b/layout/style/nsHTMLStyleSheet.cpp
+@@ -609,7 +609,8 @@ nsHTMLStyleSheet::GetType(nsString& aTyp
+ }
+ 
+ NS_IMETHODIMP_(PRBool)
+-nsHTMLStyleSheet::UseForMedium(nsPresContext* aPresContext) const
++nsHTMLStyleSheet::UseForPresentation(nsPresContext* aPresContext,
++                                     nsMediaQueryResultCacheKey& aKey) const
+ {
+   return PR_TRUE; // works for all media
+ }
+diff --git a/layout/style/nsHTMLStyleSheet.h b/layout/style/nsHTMLStyleSheet.h
+--- a/layout/style/nsHTMLStyleSheet.h
++++ b/layout/style/nsHTMLStyleSheet.h
+@@ -64,7 +64,8 @@ public:
+   NS_IMETHOD GetBaseURI(nsIURI** aBaseURL) const;
+   NS_IMETHOD GetTitle(nsString& aTitle) const;
+   NS_IMETHOD GetType(nsString& aType) const;
+-  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const;
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                       nsMediaQueryResultCacheKey& aKey) const;
+   NS_IMETHOD_(PRBool) HasRules() const;
+   NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
+   NS_IMETHOD SetEnabled(PRBool aEnabled);
+diff --git a/layout/style/nsICSSGroupRule.h b/layout/style/nsICSSGroupRule.h
+--- a/layout/style/nsICSSGroupRule.h
++++ b/layout/style/nsICSSGroupRule.h
+@@ -48,6 +48,7 @@
+ 
+ class nsIAtom;
+ class nsPresContext;
++class nsMediaQueryResultCacheKey;
+ 
+ // IID for the nsICSSGroupRule interface {67b8492e-6d8d-43a5-8037-71eb269f24fe}
+ #define NS_ICSS_GROUP_RULE_IID     \
+@@ -75,7 +76,8 @@ public:
+                                  nsCOMArray<nsICSSRule>& aRules) = 0;
+   NS_IMETHOD  ReplaceStyleRule(nsICSSRule* aOld, nsICSSRule* aNew) = 0;
+ 
+-  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext) = 0;
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                         nsMediaQueryResultCacheKey& aKey) = 0;
+    
+ };
+ 
+diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
+--- a/layout/style/nsIMediaList.h
++++ b/layout/style/nsIMediaList.h
+@@ -64,6 +64,24 @@ struct nsMediaExpression {
+   nsCSSValue mValue;
+ };
+ 
++/**
++ * An nsMediaQueryResultCacheKey records what feature/value combinations
++ * a set of media query results are valid for.  This allows the caller
++ * to quickly learn whether a prior result of media query evaluation is
++ * still valid (e.g., due to a window size change) without rerunning all
++ * of the evaluation and rebuilding the list of rules.
++ */
++class nsMediaQueryResultCacheKey {
++public:
++  nsMediaQueryResultCacheKey(nsIAtom* aMedium)
++    : mMedium(aMedium)
++  {}
++
++  PRBool Matches(nsPresContext* aPresContext) const;
++private:
++  nsCOMPtr<nsIAtom> mMedium;
++};
++
+ class nsMediaQuery {
+ public:
+   nsMediaQuery()
+@@ -106,7 +124,8 @@ public:
+   nsMediaQuery* Clone() const;
+ 
+   // Does this query apply to the presentation?
+-  PRBool Matches(nsPresContext* aPresContext) const;
++  PRBool Matches(nsPresContext* aPresContext,
++                 nsMediaQueryResultCacheKey& aKey) const;
+ 
+ private:
+   PRPackedBool mNegated;
+@@ -127,7 +146,8 @@ public:
+ 
+   nsresult GetText(nsAString& aMediaText);
+   nsresult SetText(const nsAString& aMediaText);
+-  PRBool Matches(nsPresContext* aPresContext);
++  PRBool Matches(nsPresContext* aPresContext,
++                 nsMediaQueryResultCacheKey& aKey);
+   nsresult SetStyleSheet(nsICSSStyleSheet* aSheet);
+   nsresult AppendQuery(nsMediaQuery *aQuery) {
+     // Takes ownership of aQuery
+diff --git a/layout/style/nsIStyleSheet.h b/layout/style/nsIStyleSheet.h
+--- a/layout/style/nsIStyleSheet.h
++++ b/layout/style/nsIStyleSheet.h
+@@ -78,7 +78,8 @@ public:
+   NS_IMETHOD GetBaseURI(nsIURI** aBaseURI) const = 0;
+   NS_IMETHOD GetTitle(nsString& aTitle) const = 0;
+   NS_IMETHOD GetType(nsString& aType) const = 0;
+-  NS_IMETHOD_(PRBool) UseForMedium(nsPresContext* aPresContext) const = 0;
++  NS_IMETHOD_(PRBool) UseForPresentation(nsPresContext* aPresContext,
++                                   nsMediaQueryResultCacheKey& aKey) const = 0;
+   NS_IMETHOD_(PRBool) HasRules() const = 0;
+ 
+   /**
