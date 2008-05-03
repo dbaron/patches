@@ -1,0 +1,223 @@
+Compute widths for replaced block clearing past floats once we're at the correct vertical position.  b=430813
+
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1778,20 +1778,17 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+       line->MarkDirty();
+     }
+ 
+-    ReplacedElementWidthToClear replacedWidthStruct;
+-    ReplacedElementWidthToClear *replacedWidth = nsnull;
++    nsIFrame *replacedBlock = nsnull;
+     if (line->IsBlock() &&
+         !nsBlockFrame::BlockCanIntersectFloats(line->mFirstChild)) {
+-      replacedWidthStruct =
+-        nsBlockFrame::WidthToClearPastFloats(aState, line->mFirstChild);
+-      replacedWidth = &replacedWidthStruct;
++      replacedBlock = line->mFirstChild;
+     }
+ 
+     // We have to reflow the line if it's a block whose clearance
+     // might have changed, so detect that.
+     if (!line->IsDirty() &&
+         (line->GetBreakTypeBefore() != NS_STYLE_CLEAR_NONE ||
+-         replacedWidth)) {
++         replacedBlock)) {
+       nscoord curY = aState.mY;
+       // See where we would be after applying any clearance due to
+       // BRs.
+@@ -1800,7 +1797,7 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+       }
+ 
+       nscoord newY =
+-        aState.ClearFloats(curY, line->GetBreakTypeBefore(), replacedWidth);
++        aState.ClearFloats(curY, line->GetBreakTypeBefore(), replacedBlock);
+       
+       if (line->HasClearance()) {
+         // Reflow the line if it might not have clearance anymore.
+@@ -2804,12 +2801,10 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+   PRBool treatWithClearance = aLine->HasClearance();
+ 
+   PRBool mightClearFloats = breakType != NS_STYLE_CLEAR_NONE;
+-  ReplacedElementWidthToClear replacedWidthStruct;
+-  ReplacedElementWidthToClear *replacedWidth = nsnull;
++  nsIFrame *replacedBlock = nsnull;
+   if (!nsBlockFrame::BlockCanIntersectFloats(frame)) {
+     mightClearFloats = PR_TRUE;
+-    replacedWidthStruct = nsBlockFrame::WidthToClearPastFloats(aState, frame);
+-    replacedWidth = &replacedWidthStruct;
++    replacedBlock = frame;
+   }
+ 
+   // If our top margin was counted as part of some parents top-margin
+@@ -2819,7 +2814,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+   if (!treatWithClearance && !applyTopMargin && mightClearFloats &&
+       aState.mReflowState.mDiscoveredClearance) {
+     nscoord curY = aState.mY + aState.mPrevBottomMargin.get();
+-    nscoord clearY = aState.ClearFloats(curY, breakType, replacedWidth);
++    nscoord clearY = aState.ClearFloats(curY, breakType, replacedBlock);
+     if (clearY != curY) {
+       // Looks like that assumption was invalid, we do need
+       // clearance. Tell our ancestor so it can reflow again. It is
+@@ -2898,7 +2893,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+         // decision is only allowed to be made under the optimistic
+         // first pass.
+         nscoord curY = aState.mY + aState.mPrevBottomMargin.get();
+-        nscoord clearY = aState.ClearFloats(curY, breakType, replacedWidth);
++        nscoord clearY = aState.ClearFloats(curY, breakType, replacedBlock);
+         if (clearY != curY) {
+           // Looks like we need clearance and we didn't know about it already. So
+           // recompute collapsed margin
+@@ -2926,7 +2921,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+       if (treatWithClearance) {
+         nscoord currentY = aState.mY;
+         // advance mY to the clear position.
+-        aState.mY = aState.ClearFloats(aState.mY, breakType, replacedWidth);
++        aState.mY = aState.ClearFloats(aState.mY, breakType, replacedBlock);
+         
+         // Compute clearance. It's the amount we need to add to the top
+         // border-edge of the frame, after applying collapsed margins
+@@ -2957,7 +2952,7 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+     PRBool isImpacted = aState.IsImpactedByFloat() ? PR_TRUE : PR_FALSE;
+     aLine->SetLineIsImpactedByFloat(isImpacted);
+     nsRect availSpace;
+-    aState.ComputeBlockAvailSpace(frame, display, replacedWidth, availSpace);
++    aState.ComputeBlockAvailSpace(frame, display, replacedBlock, availSpace);
+     
+     // Now put the Y coordinate back to the top of the top-margin +
+     // clearance, and flow the block.
+@@ -6781,7 +6776,6 @@ nsBlockFrame::WidthToClearPastFloats(nsB
+ nsBlockFrame::WidthToClearPastFloats(nsBlockReflowState& aState,
+                                      nsIFrame* aFrame)
+ {
+-  aState.GetAvailableSpace();
+   nscoord leftOffset, rightOffset;
+   nsCSSOffsetState offsetState(aFrame, aState.mReflowState.rendContext,
+                                aState.mContentArea.width);
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -297,7 +297,9 @@ public:
+ 
+   /**
+    * Returns the width that needs to be cleared past floats for blocks
+-   * that cannot intersect floats.
++   * that cannot intersect floats.  aState must already have
++   * GetAvailableSpace called on it for the vertical position that we
++   * care about (which need not be its current mY)
+    */
+   struct ReplacedElementWidthToClear {
+     nscoord marginLeft, borderBoxWidth, marginRight;
+diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
+--- a/layout/generic/nsBlockReflowState.cpp
++++ b/layout/generic/nsBlockReflowState.cpp
+@@ -254,9 +254,7 @@ void
+ void
+ nsBlockReflowState::ComputeBlockAvailSpace(nsIFrame* aFrame,
+                                            const nsStyleDisplay* aDisplay,
+-                                           nsBlockFrame::
+-                                             ReplacedElementWidthToClear
+-                                                               *aReplacedWidth,
++                                           nsIFrame* aReplacedBlock,
+                                            nsRect& aResult)
+ {
+ #ifdef REALLY_NOISY_REFLOW
+@@ -285,7 +283,7 @@ nsBlockReflowState::ComputeBlockAvailSpa
+   // nsBlockFrame::WidthToClearPastFloats would need to use the
+   // shrink-wrap formula, max(MIN_WIDTH, min(avail width, PREF_WIDTH))
+   // rather than just using MIN_WIDTH.
+-  NS_ASSERTION(nsBlockFrame::BlockCanIntersectFloats(aFrame) == !aReplacedWidth,
++  NS_ASSERTION(nsBlockFrame::BlockCanIntersectFloats(aFrame) == !aReplacedBlock,
+                "unexpected replaced width");
+   if (!aReplacedWidth) {
+     if (mBand.GetFloatCount()) {
+@@ -319,9 +317,16 @@ nsBlockReflowState::ComputeBlockAvailSpa
+     }
+   }
+   else {
++    nsBlockFrame::ReplacedElementWidthToClear replacedWidthStruct;
++    nsBlockFrame::ReplacedElementWidthToClear *replacedWidth = nsnull;
++    if (aFrame->GetType() == nsGkAtoms::tableOuterFrame) {
++      replacedWidth = &replacedWidthStruct;
++      replacedWidthStruct = nsBlockFrame::WidthToClearPastFloats(this, aFrame);
++    }
++
+     nscoord leftOffset, rightOffset;
+     ComputeReplacedBlockOffsetsForFloats(aFrame, leftOffset, rightOffset,
+-                                         aReplacedWidth);
++                                         replacedWidth);
+     aResult.x = borderPadding.left + leftOffset;
+     aResult.width = mContentArea.width - leftOffset - rightOffset;
+   }
+@@ -1063,7 +1068,7 @@ nsBlockReflowState::PlaceBelowCurrentLin
+ 
+ nscoord
+ nsBlockReflowState::ClearFloats(nscoord aY, PRUint8 aBreakType,
+-                     nsBlockFrame::ReplacedElementWidthToClear *aReplacedWidth)
++                                nsIFrame *aReplacedBlock)
+ {
+ #ifdef DEBUG
+   if (nsBlockFrame::gNoisyReflow) {
+@@ -1086,15 +1091,17 @@ nsBlockReflowState::ClearFloats(nscoord 
+     newY = bp.top + mSpaceManager->ClearFloats(newY - bp.top, aBreakType);
+   }
+ 
+-  if (aReplacedWidth) {
++  if (aReplacedBlock) {
+     for (;;) {
+       GetAvailableSpace(newY, PR_FALSE);
++      nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
++        nsBlockFrame::WidthToClearPastFloats(this, aReplacedBlock);
+       if (mBand.GetFloatCount() == 0 ||
+-          PR_MAX(mAvailSpaceRect.x, aReplacedWidth->marginLeft) +
+-            aReplacedWidth->borderBoxWidth +
++          PR_MAX(mAvailSpaceRect.x, replacedWidth.marginLeft) +
++            replacedWidth.borderBoxWidth +
+             PR_MAX(mContentArea.width -
+                      PR_MIN(mContentArea.width, mAvailSpaceRect.XMost()),
+-                   aReplacedWidth->marginRight) <=
++                   replacedWidth.marginRight) <=
+           mContentArea.width) {
+         break;
+       }
+diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
+--- a/layout/generic/nsBlockReflowState.h
++++ b/layout/generic/nsBlockReflowState.h
+@@ -108,9 +108,9 @@ public:
+ 
+   // Returns the first coordinate >= aY that clears the
+   // floats indicated by aBreakType and has enough width between floats
+-  // (or no floats remaining) to accomodate aReplacedWidth.
++  // (or no floats remaining) to accomodate aReplacedBlock.
+   nscoord ClearFloats(nscoord aY, PRUint8 aBreakType,
+-    nsBlockFrame::ReplacedElementWidthToClear *aReplacedWidth = nsnull);
++                      nsIFrame *aReplacedBlock = nsnull);
+ 
+   PRBool IsAdjacentWithTop() const {
+     return mY ==
+@@ -140,18 +140,19 @@ public:
+   // Reconstruct the previous bottom margin that goes above |aLine|.
+   void ReconstructMarginAbove(nsLineList::iterator aLine);
+ 
+-  // Caller must have called GetAvailableSpace for the current mY
++  // Caller must have called GetAvailableSpace for the correct position
++  // (which need not be the current mY).  Callers need only pass
++  // aReplacedWidth for outer table frames.
+   void ComputeReplacedBlockOffsetsForFloats(nsIFrame* aFrame,
+                                             nscoord& aLeftResult,
+                                             nscoord& aRightResult,
+-                                        nsBlockFrame::ReplacedElementWidthToClear
+-                                                       *aReplacedWidth = nsnull);
++                                       nsBlockFrame::ReplacedElementWidthToClear
++                                                      *aReplacedWidth = nsnull);
+ 
+   // Caller must have called GetAvailableSpace for the current mY
+   void ComputeBlockAvailSpace(nsIFrame* aFrame,
+                               const nsStyleDisplay* aDisplay,
+-                              nsBlockFrame::ReplacedElementWidthToClear
+-                                                               *aReplacedWidth,
++                              nsIFrame* aReplacedBlock,
+                               nsRect& aResult);
+ 
+ protected:
