@@ -1,0 +1,1739 @@
+From: Andrew Smith <asmith15@littlesvr.ca>
+
+Implement css3 border-image property.  b=378217
+
+diff --git a/content/html/content/src/nsGenericHTMLElement.cpp b/content/html/content/src/nsGenericHTMLElement.cpp
+--- a/content/html/content/src/nsGenericHTMLElement.cpp
++++ b/content/html/content/src/nsGenericHTMLElement.cpp
+@@ -583,8 +583,8 @@ nsGenericHTMLElement::GetOffsetRect(nsRe
+   if (parent &&
+       parent->GetStylePosition()->mBoxSizing != NS_STYLE_BOX_SIZING_BORDER) {
+     const nsStyleBorder* border = parent->GetStyleBorder();
+-    origin.x -= border->GetBorderWidth(NS_SIDE_LEFT);
+-    origin.y -= border->GetBorderWidth(NS_SIDE_TOP);
++    origin.x -= border->GetActualBorderWidth(NS_SIDE_LEFT);
++    origin.y -= border->GetActualBorderWidth(NS_SIDE_TOP);
+   }
+ 
+   // XXX We should really consider subtracting out padding for
+diff --git a/content/html/document/src/nsImageDocument.cpp b/content/html/document/src/nsImageDocument.cpp
+--- a/content/html/document/src/nsImageDocument.cpp
++++ b/content/html/document/src/nsImageDocument.cpp
+@@ -662,7 +662,7 @@ nsImageDocument::CheckOverflowing(PRBool
+     nsMargin m;
+     if (styleContext->GetStyleMargin()->GetMargin(m))
+       visibleArea.Deflate(m);
+-    m = styleContext->GetStyleBorder()->GetBorder();
++    m = styleContext->GetStyleBorder()->GetActualBorder();
+     visibleArea.Deflate(m);
+     if (styleContext->GetStylePadding()->GetPadding(m))
+       visibleArea.Deflate(m);
+diff --git a/dom/public/idl/css/nsIDOMCSS2Properties.idl b/dom/public/idl/css/nsIDOMCSS2Properties.idl
+--- a/dom/public/idl/css/nsIDOMCSS2Properties.idl
++++ b/dom/public/idl/css/nsIDOMCSS2Properties.idl
+@@ -406,7 +406,7 @@ interface nsIDOMCSS2Properties : nsISupp
+                                         // raises(DOMException) on setting
+ };
+ 
+-[scriptable, uuid(c9339b8c-9bdd-4d2a-a61a-55ca609b92bd)]
++[scriptable, uuid(b5659318-4db3-463f-931e-5baf4f9850f5)]
+ interface nsIDOMNSCSS2Properties : nsIDOMCSS2Properties
+ {
+            /* Non-DOM 2 extensions */
+@@ -591,4 +591,7 @@ interface nsIDOMNSCSS2Properties : nsIDO
+            attribute DOMString        MozBorderStartWidth;
+                                         // raises(DOMException) on setting
+ 
++           attribute DOMString        MozBorderImage;
++                                        // raises(DOMException) on setting
++
+ };
+diff --git a/gfx/public/nsIImage.h b/gfx/public/nsIImage.h
+--- a/gfx/public/nsIImage.h
++++ b/gfx/public/nsIImage.h
+@@ -193,7 +193,7 @@ public:
+    * @param aSubimageRect the subimage that we're extracting the contents from.
+    * It must contain aSourceRect. Pixels outside this rectangle must not
+    * be sampled.
+-   * @param aDestRect  destination rectangle, in device pixels
++   * @param aDestRect  destination rectangle, in device pixels XXX no it isn't, it's image pixels (andrew, 09 Jun)
+    */
+   NS_IMETHOD Draw(nsIRenderingContext &aContext,
+                   const gfxRect &aSourceRect,
+diff --git a/gfx/thebes/public/gfxContext.h b/gfx/thebes/public/gfxContext.h
+--- a/gfx/thebes/public/gfxContext.h
++++ b/gfx/thebes/public/gfxContext.h
+@@ -337,7 +337,8 @@ public:
+      * Uses a surface for drawing. This is a shorthand for creating a
+      * pattern and setting it.
+      *
+-     * @param offset ?
++     * @param offset from the source surface, to use only part of it.
++     *        May need to make it negative.
+      */
+     void SetSource(gfxASurface *surface, const gfxPoint& offset = gfxPoint(0.0, 0.0));
+ 
+diff --git a/gfx/thebes/public/gfxImageSurface.h b/gfx/thebes/public/gfxImageSurface.h
+--- a/gfx/thebes/public/gfxImageSurface.h
++++ b/gfx/thebes/public/gfxImageSurface.h
+@@ -52,13 +52,10 @@ public:
+ public:
+     /**
+      * Construct an image surface.
++     * @param size, in pixels
+      * @param format Format of the data
+-     * @param width Width of the surface in pixels
+-     * @param height Height in pixels
+      *
+      * @see gfxImageFormat
+-     *
+-     * XXX why not unsigned long for the dimensions? And, why not gfxSize?
+      */
+     gfxImageSurface(const gfxIntSize& size, gfxImageFormat format);
+     gfxImageSurface(cairo_surface_t *csurf);
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -70,6 +70,9 @@
+ #include "nsLayoutUtils.h"
+ #include "nsINameSpaceManager.h"
+ #include "nsBlockFrame.h"
++#include "nsIInterfaceRequestorUtils.h"
++#include "gfxPlatform.h"
++#include "gfxImageSurface.h"
+ 
+ #include "gfxContext.h"
+ 
+@@ -2694,6 +2697,12 @@ nsCSSRendering::PaintBorder(nsPresContex
+       return; // Let the theme handle it.
+   }
+ 
++  if (aBorderStyle.mBorderImage) {
++    DrawBorderImage(aPresContext, aRenderingContext, aForFrame,
++                    aBorderArea, aBorderStyle, aHardBorderSize);
++    return;
++  }
++  
+   // Get our style context's color struct.
+   const nsStyleColor* ourColor = aStyleContext->GetStyleColor();
+ 
+@@ -2705,7 +2714,7 @@ nsCSSRendering::PaintBorder(nsPresContex
+   if (aHardBorderSize > 0) {
+     border.SizeTo(aHardBorderSize, aHardBorderSize, aHardBorderSize, aHardBorderSize);
+   } else {
+-    border = aBorderStyle.GetBorder();
++    border = aBorderStyle.GetRoundedBorder();
+   }
+ 
+   if ((0 == border.left) && (0 == border.right) &&
+@@ -3602,20 +3611,13 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+   PRBool  needBackgroundColor = !(aColor.mBackgroundFlags &
+                                   NS_STYLE_BG_COLOR_TRANSPARENT);
+   PRIntn  repeat = aColor.mBackgroundRepeat;
+-  nscoord xDistance, yDistance;
+ 
+   switch (repeat) {
+     case NS_STYLE_BG_REPEAT_X:
+-      xDistance = dirtyRect.width;
+-      yDistance = tileHeight;
+       break;
+     case NS_STYLE_BG_REPEAT_Y:
+-      xDistance = tileWidth;
+-      yDistance = dirtyRect.height;
+       break;
+     case NS_STYLE_BG_REPEAT_XY:
+-      xDistance = dirtyRect.width;
+-      yDistance = dirtyRect.height;
+       if (needBackgroundColor) {
+         // If the image is completely opaque, we do not need to paint the
+         // background color
+@@ -3640,8 +3642,6 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+     case NS_STYLE_BG_REPEAT_OFF:
+     default:
+       NS_ASSERTION(repeat == NS_STYLE_BG_REPEAT_OFF, "unknown background-repeat value");
+-      xDistance = tileWidth;
+-      yDistance = tileHeight;
+       break;
+   }
+ 
+@@ -3719,7 +3719,7 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+ 
+         // Take the border out of the frame's rect
+         const nsStyleBorder* borderStyle = firstRootElementFrame->GetStyleBorder();
+-        firstRootElementFrameArea.Deflate(borderStyle->GetBorder());
++        firstRootElementFrameArea.Deflate(borderStyle->GetActualBorder());
+ 
+         // Get the anchor point
+         ComputeBackgroundAnchorPoint(aColor, firstRootElementFrameArea +
+@@ -3952,6 +3952,346 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+ }
+ 
+ void
++nsCSSRendering::DrawBorderImage(nsPresContext* aPresContext,
++                                nsIRenderingContext& aRenderingContext,
++                                nsIFrame* aForFrame,
++                                const nsRect& aBorderArea,
++                                const nsStyleBorder& aBorderStyle,
++                                nscoord aHardBorderSize)
++{
++    float percent;
++    nsStyleCoord borderImageSplit[4];
++    PRInt32 borderImageSplitInt[4];
++    nsMargin border;
++    
++    if (aHardBorderSize > 0) {
++      border.SizeTo(aHardBorderSize, aHardBorderSize, aHardBorderSize, aHardBorderSize);
++    } else {
++      border = aBorderStyle.GetActualBorder();
++    }
++    
++    if ((0 == border.left) && (0 == border.right) &&
++        (0 == border.top) && (0 == border.bottom)) {
++      // Empty border area
++      return;
++    }
++
++    aBorderStyle.mBorderImageSplit.GetTop(borderImageSplit[0]);
++    aBorderStyle.mBorderImageSplit.GetRight(borderImageSplit[1]);
++    aBorderStyle.mBorderImageSplit.GetBottom(borderImageSplit[2]);
++    aBorderStyle.mBorderImageSplit.GetLeft(borderImageSplit[3]);
++    
++    imgIRequest *req = aPresContext->LoadBorderImage(aBorderStyle.mBorderImage,
++                                                     aForFrame);
++    
++    PRUint32 status = imgIRequest::STATUS_ERROR;
++    if (req) {
++      req->GetImageStatus(&status);
++    }
++    
++    if (req && (status & imgIRequest::STATUS_FRAME_COMPLETE || 
++                status & imgIRequest::STATUS_SIZE_AVAILABLE)) {
++      nsCOMPtr<imgIContainer> image;
++      req->GetImage(getter_AddRefs(image));
++      
++      nsSize imageSize;
++      image->GetWidth(&imageSize.width);
++      image->GetHeight(&imageSize.height);
++      imageSize.width = nsPresContext::CSSPixelsToAppUnits(imageSize.width);
++      imageSize.height = nsPresContext::CSSPixelsToAppUnits(imageSize.height);
++      
++      // convert percentage values
++      NS_FOR_CSS_SIDES(side) {
++        borderImageSplitInt[side] = 0;
++        switch (borderImageSplit[side].GetUnit()) {
++          case eStyleUnit_Percent:
++            percent = borderImageSplit[side].GetPercentValue();
++            if (side == 0 || side == 2)
++              borderImageSplitInt[side] = (nscoord)(percent * imageSize.height);
++            else
++              borderImageSplitInt[side] = (nscoord)(percent * imageSize.width);
++            break;
++          case eStyleUnit_Integer:
++            borderImageSplitInt[side] = nsPresContext::CSSPixelsToAppUnits(borderImageSplit[side].
++                                            GetIntValue());
++            break;
++          default:
++            break;
++        }
++      }
++      
++      nsRect outerRect(aBorderArea);
++      nsRect rectToDraw;
++      nsRect rectToDrawSource;
++      
++      // draw top left corner
++      rectToDraw = outerRect;
++      rectToDraw.width = border.left;
++      rectToDraw.height = border.top;
++      rectToDrawSource.x = 0;
++      rectToDrawSource.y = 0;
++      rectToDrawSource.width = borderImageSplitInt[3];
++      rectToDrawSource.height = borderImageSplitInt[0];
++      nsLayoutUtils::DrawImage(&aRenderingContext, image, rectToDraw, rectToDraw, &rectToDrawSource);
++      
++      // draw top
++      rectToDraw = outerRect;
++      rectToDraw.x += border.left;
++      rectToDraw.width -= (border.left + border.right);
++      rectToDraw.height = border.top;
++      rectToDrawSource.x = borderImageSplitInt[3];
++      rectToDrawSource.y = 0;
++      rectToDrawSource.width = imageSize.width - borderImageSplitInt[3] - borderImageSplitInt[1];
++      rectToDrawSource.height = borderImageSplitInt[0];
++      DrawBorderImageSide(aPresContext, &aRenderingContext, image, rectToDraw,  &rectToDrawSource, 
++                          aBorderStyle.mBorderImageHFill, PR_TRUE);
++      
++      // draw top right corner
++      rectToDraw = outerRect;
++      rectToDraw.x += outerRect.width - border.right;
++      rectToDraw.width = border.right;
++      rectToDraw.height = border.top;
++      rectToDrawSource.x = imageSize.width - borderImageSplitInt[1];
++      rectToDrawSource.y = 0;
++      rectToDrawSource.width = borderImageSplitInt[1];
++      rectToDrawSource.height = borderImageSplitInt[0];
++      nsLayoutUtils::DrawImage(&aRenderingContext, image, rectToDraw, rectToDraw, &rectToDrawSource);
++      
++      // draw right
++      rectToDraw = outerRect;
++      rectToDraw.x += outerRect.width - border.right;
++      rectToDraw.y += border.top;
++      rectToDraw.width = border.right;
++      rectToDraw.height -= (border.top + border.bottom);
++      rectToDrawSource.x = imageSize.width - borderImageSplitInt[1];
++      rectToDrawSource.y = borderImageSplitInt[0];
++      rectToDrawSource.width = borderImageSplitInt[1];
++      rectToDrawSource.height = imageSize.height - borderImageSplitInt[0] - borderImageSplitInt[2];
++      DrawBorderImageSide(aPresContext, &aRenderingContext, image, rectToDraw, &rectToDrawSource, 
++                          aBorderStyle.mBorderImageVFill, PR_FALSE);
++      
++      // draw bottom right corner
++      rectToDraw = outerRect;
++      rectToDraw.x += outerRect.width - border.right;
++      rectToDraw.y += outerRect.height - border.bottom;
++      rectToDraw.width = border.right;
++      rectToDraw.height = border.bottom;
++      rectToDrawSource.x = imageSize.width - borderImageSplitInt[1];
++      rectToDrawSource.y = imageSize.height - borderImageSplitInt[2];
++      rectToDrawSource.width = borderImageSplitInt[1];
++      rectToDrawSource.height = borderImageSplitInt[2];
++      nsLayoutUtils::DrawImage(&aRenderingContext, image, rectToDraw, rectToDraw, &rectToDrawSource);
++      
++      // draw bottom
++      rectToDraw = outerRect;
++      rectToDraw.x += border.left;
++      rectToDraw.y += outerRect.height - border.bottom;
++      rectToDraw.width -= (border.left + border.right);
++      rectToDraw.height = border.bottom;
++      rectToDrawSource.x = borderImageSplitInt[3];
++      rectToDrawSource.y = imageSize.height - borderImageSplitInt[2];
++      rectToDrawSource.width = imageSize.width - borderImageSplitInt[3] - borderImageSplitInt[1];
++      rectToDrawSource.height = borderImageSplitInt[2];
++      DrawBorderImageSide(aPresContext, &aRenderingContext, image, rectToDraw, &rectToDrawSource, 
++                          aBorderStyle.mBorderImageHFill, PR_TRUE);
++      
++      // draw bottom left corner
++      rectToDraw = outerRect;
++      rectToDraw.y += outerRect.height - border.bottom;
++      rectToDraw.width = border.left;
++      rectToDraw.height = border.bottom;
++      rectToDrawSource.x = 0;
++      rectToDrawSource.y = imageSize.height - borderImageSplitInt[2];
++      rectToDrawSource.width = borderImageSplitInt[3];
++      rectToDrawSource.height = borderImageSplitInt[2];
++      nsLayoutUtils::DrawImage(&aRenderingContext, image, rectToDraw, rectToDraw, &rectToDrawSource);
++      
++      // draw left
++      rectToDraw = outerRect;
++      rectToDraw.y += border.top;
++      rectToDraw.width = border.left;
++      rectToDraw.height -= (border.top + border.bottom);
++      rectToDrawSource.x = 0;
++      rectToDrawSource.y = borderImageSplitInt[0];
++      rectToDrawSource.width = borderImageSplitInt[3];
++      rectToDrawSource.height = imageSize.height - borderImageSplitInt[0] - borderImageSplitInt[2];
++      DrawBorderImageSide(aPresContext, &aRenderingContext, image, rectToDraw, &rectToDrawSource, 
++                          aBorderStyle.mBorderImageVFill, PR_FALSE);
++    }
++    req = nsnull;
++}
++
++void
++nsCSSRendering::DrawBorderImageSide(nsPresContext* aPresContext,
++                                    nsIRenderingContext* aRenderingContext,
++                                    imgIContainer* aImage,
++                                    nsRect& aDestRect,
++                                    const nsRect* aSourceRect,
++                                    PRUint8 aFillType,
++                                    PRBool aHorizontal)
++{
++  nscoord tileSize; // width or height, depending on aHorizontal
++  nscoord origDestCoord; // x or y, depending on aHorizontal
++  nscoord origDestSize; // width or height, depending on aHorizontal
++  
++  if (aDestRect.width == 0 || aDestRect.height == 0 ||
++      aSourceRect->width == 0 || aSourceRect->height == 0) {
++    return;
++  }
++  
++  if (aFillType == NS_STYLE_BORDER_IMAGE_STRETCH) {
++    // XXX this resize doesn't look very smooth, needs to be replaced with something
++    nsLayoutUtils::DrawImage(aRenderingContext, aImage, aDestRect, aDestRect, aSourceRect);
++    return;
++  }
++  
++  if(aFillType == NS_STYLE_BORDER_IMAGE_REPEAT) {
++    nsresult rv;
++    
++    nsCOMPtr<gfxIImageFrame> frame;
++    rv = aImage->GetCurrentFrame(getter_AddRefs(frame));
++    if (NS_FAILED(rv))
++      return;
++    nsCOMPtr<nsIImage> image;
++    image = do_GetInterface(frame);
++    if (!image)
++      return;
++    
++    // surface for the whole image
++    nsRefPtr<gfxASurface> imageSurface;
++    rv = image->GetSurface(getter_AddRefs(imageSurface));
++    if (NS_FAILED(rv) || !imageSurface)
++      return;
++    
++    gfxIntSize gfxSourceSize(nsPresContext::AppUnitsToIntCSSPixels(aSourceRect->width),
++                             nsPresContext::AppUnitsToIntCSSPixels(aSourceRect->height));
++    
++    // surface for just the tile i'm interested in drawing
++    nsRefPtr<gfxASurface> tileSurface = gfxPlatform::GetPlatform()->CreateOffscreenSurface(
++                                           gfxSourceSize, gfxASurface::ImageFormatARGB32);
++    
++    nsRefPtr<gfxContext> tileCtx = new gfxContext(tileSurface);
++    tileCtx->SetSource(imageSurface, -gfxPoint(nsPresContext::AppUnitsToIntCSSPixels(aSourceRect->x),
++                                               nsPresContext::AppUnitsToIntCSSPixels(aSourceRect->y)));
++    tileCtx->SetOperator(gfxContext::OPERATOR_SOURCE);
++    tileCtx->Paint();
++    
++    // to resize the tile to fit in the border exactly
++    gfxFloat scaleRatio;
++    if (aHorizontal) {
++      scaleRatio = (gfxFloat)aSourceRect->height / aDestRect.height;
++    } else {
++      scaleRatio = (gfxFloat)aSourceRect->width / aDestRect.width;
++    }
++    
++    // width and height are proportional, so using the same ratio is ok
++    gfxMatrix scaleMatrix;
++    scaleMatrix.Scale(scaleRatio, scaleRatio);
++    
++    // pattern to scale and repeat the tile
++    nsRefPtr<gfxPattern> pattern = new gfxPattern(tileSurface);
++    pattern->SetExtend(gfxPattern::EXTEND_REPEAT);
++    pattern->SetMatrix(scaleMatrix);
++    
++    // where the actual border ends up being rendered
++    gfxRect gfxDestRect;
++    gfxDestRect.pos.x = nsPresContext::AppUnitsToFloatCSSPixels(aDestRect.x);
++    gfxDestRect.pos.y = nsPresContext::AppUnitsToFloatCSSPixels(aDestRect.y);
++    gfxDestRect.size.width = nsPresContext::AppUnitsToFloatCSSPixels(aDestRect.width);
++    gfxDestRect.size.height = nsPresContext::AppUnitsToFloatCSSPixels(aDestRect.height);
++    
++    // offset to make the middle tile centered in the middle of the border
++    gfxPoint renderOffset(0, 0);
++    gfxFloat actualTileSize;
++    int numWholeTiles;
++    gfxFloat edgeTileSize;
++    if (aHorizontal) {
++      actualTileSize = gfxSourceSize.width / scaleRatio;
++      
++      numWholeTiles = (int)(gfxDestRect.size.width / actualTileSize);
++      if (numWholeTiles % 2 == 0)
++        numWholeTiles--;
++      
++      edgeTileSize = (gfxDestRect.size.width - numWholeTiles * actualTileSize) / 2;
++      
++      gfxDestRect.pos.x -= (actualTileSize - edgeTileSize);
++      
++      renderOffset.x += (actualTileSize - edgeTileSize);
++    } else {
++      actualTileSize = gfxSourceSize.height / scaleRatio;
++      
++      numWholeTiles = (int)(gfxDestRect.size.height / actualTileSize);
++      if (numWholeTiles % 2 == 0)
++        numWholeTiles--;
++      
++      edgeTileSize = (gfxDestRect.size.height - numWholeTiles * actualTileSize) / 2;
++      
++      gfxDestRect.pos.y -= (actualTileSize - edgeTileSize);
++      
++      renderOffset.y += (actualTileSize - edgeTileSize);
++    }
++    
++    // render
++    nsRefPtr<gfxContext> thebesCtx = (gfxContext*)
++            aRenderingContext->GetNativeGraphicData(nsIRenderingContext::NATIVE_THEBES_CONTEXT);
++    thebesCtx->Save();
++    thebesCtx->Translate(gfxDestRect.pos);
++    thebesCtx->SetPattern(pattern);
++    thebesCtx->NewPath();
++    thebesCtx->Rectangle(gfxRect(renderOffset, gfxDestRect.size));
++    thebesCtx->Fill();
++    thebesCtx->Restore();
++    
++  } else if(aFillType == NS_STYLE_BORDER_IMAGE_ROUND) {
++    if (aHorizontal) {
++      int numNormalTiles; /* tiles that keep their proportions */
++      
++      tileSize = (aDestRect.height * aSourceRect->width) / aSourceRect->height;
++      tileSize = (nscoord)(aDestRect.width / ceil((float)aDestRect.width / tileSize));
++      
++      numNormalTiles = aDestRect.width / tileSize;
++      
++      origDestCoord = aDestRect.x;
++      
++      origDestSize = aDestRect.width;
++      aDestRect.width = tileSize;
++      
++      // draw the tiles
++      while(aDestRect.x <= origDestCoord + origDestSize - tileSize) {
++        nsLayoutUtils::DrawImage(aRenderingContext, aImage, aDestRect, aDestRect, aSourceRect);
++        aDestRect.x += tileSize;
++      }
++      
++      // restore original values
++      aDestRect.x = origDestCoord;
++      aDestRect.width = origDestSize;
++    } else {
++      int numNormalTiles; /* tiles that keep their proportions */
++      
++      tileSize = (aDestRect.width * aSourceRect->height) / aSourceRect->width;
++      tileSize = (nscoord)(aDestRect.height / ceil((float)aDestRect.height / tileSize));
++      
++      numNormalTiles = aDestRect.height / tileSize;
++      
++      origDestCoord = aDestRect.y;
++      
++      origDestSize = aDestRect.height;
++      aDestRect.height = tileSize;
++      
++      // draw the tiles
++      while(aDestRect.y <= origDestCoord + origDestSize - tileSize) {
++        nsLayoutUtils::DrawImage(aRenderingContext, aImage, aDestRect, aDestRect, aSourceRect);
++        aDestRect.y += tileSize;
++      }
++      
++      // restore original values
++      aDestRect.y = origDestCoord;
++      aDestRect.height = origDestSize;
++    }
++  }
++}
++
++void
+ nsCSSRendering::PaintBackgroundColor(nsPresContext* aPresContext,
+                                      nsIRenderingContext& aRenderingContext,
+                                      nsIFrame* aForFrame,
+@@ -4050,7 +4390,7 @@ nsCSSRendering::PaintRoundedBackground(n
+     // Get the radius to the outer edge of the padding.
+     // -moz-border-radius is the radius to the outer edge of the border.
+     NS_FOR_CSS_SIDES(side) {
+-      aTheRadius[side] -= aBorder.GetBorderWidth(side);
++      aTheRadius[side] -= aBorder.GetActualBorderWidth(side);
+       aTheRadius[side] = PR_MAX(aTheRadius[side], 0);
+     }
+   }
+@@ -4064,7 +4404,7 @@ nsCSSRendering::PaintRoundedBackground(n
+ 
+   // convert the radii
+   gfxFloat radii[4];
+-  nsMargin border = aBorder.GetBorder();
++  nsMargin border = aBorder.GetActualBorder();
+ 
+   ComputePixelRadii(aTheRadius, aBgClipArea, border,
+                     aForFrame ? aForFrame->GetSkipSides() : 0,
+diff --git a/layout/base/nsCSSRendering.h b/layout/base/nsCSSRendering.h
+--- a/layout/base/nsCSSRendering.h
++++ b/layout/base/nsCSSRendering.h
+@@ -267,6 +267,21 @@ public:
+ 
+ protected:
+ 
++  static void DrawBorderImage(nsPresContext* aPresContext,
++                              nsIRenderingContext& aRenderingContext,
++                              nsIFrame* aForFrame,
++                              const nsRect& aBorderArea,
++                              const nsStyleBorder& aBorderStyle,
++                              nscoord aHardBorderSize);
++
++  static void DrawBorderImageSide(nsPresContext* aPresContext,
++                                  nsIRenderingContext* aRenderingContext,
++                                  imgIContainer* aImage,
++                                  nsRect& aDestRect,
++                                  const nsRect* aSourceRect,
++                                  PRUint8 aFillType,
++                                  PRBool aHorizontal);
++
+   static void PaintBackgroundColor(nsPresContext* aPresContext,
+                                    nsIRenderingContext& aRenderingContext,
+                                    nsIFrame* aForFrame,
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -800,6 +800,9 @@ nsPresContext::Init(nsIDeviceContext* aD
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ 
+   if (!mImageLoaders.Init())
++    return NS_ERROR_OUT_OF_MEMORY;
++  
++  if (!mBorderImageLoaders.Init())
+     return NS_ERROR_OUT_OF_MEMORY;
+   
+   // Get the look and feel service here; default colors will be initialized
+@@ -1192,6 +1195,28 @@ nsPresContext::LoadImage(imgIRequest* aI
+   return request;
+ }
+ 
++imgIRequest*
++nsPresContext::LoadBorderImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
++{
++  // look and see if we have a loader for the target frame.
++  nsCOMPtr<nsImageLoader> loader;
++  mBorderImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
++
++  if (!loader) {
++    loader = new nsImageLoader();
++    if (!loader)
++      return nsnull;
++
++    loader->Init(aTargetFrame, this);
++    mBorderImageLoaders.Put(aTargetFrame, loader);
++  }
++
++  loader->Load(aImage);
++
++  imgIRequest *request = loader->GetRequest();
++
++  return request;
++}
+ 
+ void
+ nsPresContext::StopImagesFor(nsIFrame* aTargetFrame)
+@@ -1203,6 +1228,14 @@ nsPresContext::StopImagesFor(nsIFrame* a
+     loader->Destroy();
+ 
+     mImageLoaders.Remove(aTargetFrame);
++  }
++  
++  mBorderImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
++  
++  if (loader) {
++    loader->Destroy();
++
++    mBorderImageLoaders.Remove(aTargetFrame);
+   }
+ }
+ 
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -378,6 +378,11 @@ public:
+    */
+   NS_HIDDEN_(imgIRequest*) LoadImage(imgIRequest* aImage,
+                                      nsIFrame* aTargetFrame);
++  /**
++   * Same as LoadImage but for border images
++   */
++  NS_HIDDEN_(imgIRequest*) LoadBorderImage(imgIRequest* aImage,
++                                           nsIFrame* aTargetFrame);
+ 
+   /**
+    * This method is called when a frame is being destroyed to
+@@ -804,6 +809,7 @@ protected:
+   nsIAtom*              mLangGroup;     // [STRONG]
+ 
+   nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> mImageLoaders;
++  nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> mBorderImageLoaders;
+   nsWeakPtr             mContainer;
+ 
+   float                 mTextZoom;      // Text zoom, defaults to 1.0
+diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
+--- a/layout/base/nsStyleConsts.h
++++ b/layout/base/nsStyleConsts.h
+@@ -263,9 +263,15 @@
+ #define NS_STYLE_BORDER_STYLE_OUTSET            8
+ #define NS_STYLE_BORDER_STYLE_HIDDEN            9
+ #define NS_STYLE_BORDER_STYLE_AUTO              10 // for outline-style only
++#define NS_STYLE_BORDER_STYLE_IMAGE             11 // only used if there is no other border style set
+ // a bit ORed onto the style for table border collapsing indicating that the style was 
+ // derived from a table with its rules attribute set
+ #define NS_STYLE_BORDER_STYLE_RULES_MARKER      0x10  
++
++// See nsStyleBorder mBorderImage
++#define NS_STYLE_BORDER_IMAGE_STRETCH           0
++#define NS_STYLE_BORDER_IMAGE_REPEAT            1
++#define NS_STYLE_BORDER_IMAGE_ROUND             2
+ 
+ // See nsStyleDisplay
+ #define NS_STYLE_CLEAR_NONE                     0
+diff --git a/layout/forms/nsButtonFrameRenderer.cpp b/layout/forms/nsButtonFrameRenderer.cpp
+--- a/layout/forms/nsButtonFrameRenderer.cpp
++++ b/layout/forms/nsButtonFrameRenderer.cpp
+@@ -263,7 +263,7 @@ nsButtonFrameRenderer::GetButtonOuterFoc
+     if (!mOuterFocusStyle->GetStylePadding()->GetPadding(result)) {
+       NS_NOTYETIMPLEMENTED("percentage padding");
+     }
+-    result += mOuterFocusStyle->GetStyleBorder()->GetBorder();
++    result += mOuterFocusStyle->GetStyleBorder()->GetActualBorder();
+   }
+ 
+   return result;
+@@ -302,7 +302,7 @@ nsButtonFrameRenderer::GetButtonInnerFoc
+     if (!mInnerFocusStyle->GetStylePadding()->GetPadding(result)) {
+       NS_NOTYETIMPLEMENTED("percentage padding");
+     }
+-    result += mInnerFocusStyle->GetStyleBorder()->GetBorder();
++    result += mInnerFocusStyle->GetStyleBorder()->GetActualBorder();
+   }
+ 
+   return result;
+diff --git a/layout/forms/nsFieldSetFrame.cpp b/layout/forms/nsFieldSetFrame.cpp
+--- a/layout/forms/nsFieldSetFrame.cpp
++++ b/layout/forms/nsFieldSetFrame.cpp
+@@ -262,7 +262,7 @@ nsFieldSetFrame::PaintBorderBackground(n
+   const nsStyleBorder* borderStyle = GetStyleBorder();
+   const nsStylePadding* paddingStyle = GetStylePadding();
+        
+-  nscoord topBorder = borderStyle->GetBorderWidth(NS_SIDE_TOP);
++  nscoord topBorder = borderStyle->GetActualBorderWidth(NS_SIDE_TOP);
+   nscoord yoff = 0;
+   nsPresContext* presContext = PresContext();
+      
+diff --git a/layout/forms/nsHTMLButtonControlFrame.cpp b/layout/forms/nsHTMLButtonControlFrame.cpp
+--- a/layout/forms/nsHTMLButtonControlFrame.cpp
++++ b/layout/forms/nsHTMLButtonControlFrame.cpp
+@@ -226,7 +226,7 @@ nsHTMLButtonControlFrame::BuildDisplayLi
+   // but the real problem is the FirstChild (the AreaFrame)
+   // isn't being constrained properly
+   // Bug #17474
+-  nsMargin border = GetStyleBorder()->GetBorder();
++  nsMargin border = GetStyleBorder()->GetActualBorder();
+   nsRect rect(aBuilder->ToReferenceFrame(this), GetSize());
+   rect.Deflate(border);
+   
+diff --git a/layout/generic/nsAbsoluteContainingBlock.cpp b/layout/generic/nsAbsoluteContainingBlock.cpp
+--- a/layout/generic/nsAbsoluteContainingBlock.cpp
++++ b/layout/generic/nsAbsoluteContainingBlock.cpp
+@@ -397,7 +397,7 @@ nsAbsoluteContainingBlock::ReflowAbsolut
+ 
+   nsresult  rv;
+   // Get the border values
+-  const nsMargin& border = aReflowState.mStyleBorder->GetBorder();
++  const nsMargin& border = aReflowState.mStyleBorder->GetActualBorder();
+ 
+   nscoord availWidth = aContainingBlockWidth;
+   if (availWidth == -1) {
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -796,7 +796,7 @@ CalculateContainingBlockSizeForAbsolutes
+ 
+   nsSize cbSize(aFrameSize);
+     // Containing block is relative to the padding edge
+-  const nsMargin& border = aReflowState.mStyleBorder->GetBorder();
++  const nsMargin& border = aReflowState.mStyleBorder->GetActualBorder();
+   cbSize.width -= border.left + border.right;
+   cbSize.height -= border.top + border.bottom;
+ 
+@@ -2641,8 +2641,8 @@ nsBlockFrame::IsSelfEmpty()
+ 
+   const nsStyleBorder* border = GetStyleBorder();
+   const nsStylePadding* padding = GetStylePadding();
+-  if (border->GetBorderWidth(NS_SIDE_TOP) != 0 ||
+-      border->GetBorderWidth(NS_SIDE_BOTTOM) != 0 ||
++  if (border->GetActualBorderWidth(NS_SIDE_TOP) != 0 ||
++      border->GetActualBorderWidth(NS_SIDE_BOTTOM) != 0 ||
+       !IsPaddingZero(padding->mPadding.GetTopUnit(),
+                      padding->mPadding.GetTop()) ||
+       !IsPaddingZero(padding->mPadding.GetBottomUnit(),
+diff --git a/layout/generic/nsContainerFrame.cpp b/layout/generic/nsContainerFrame.cpp
+--- a/layout/generic/nsContainerFrame.cpp
++++ b/layout/generic/nsContainerFrame.cpp
+@@ -666,7 +666,7 @@ nsContainerFrame::DoInlineIntrinsicWidth
+   if (!GetPrevContinuation()) {
+     aData->currentLine +=
+       GetCoord(stylePadding->mPadding.Get(startSide), 0) +
+-      styleBorder->GetBorderWidth(startSide) +
++      styleBorder->GetActualBorderWidth(startSide) +
+       GetCoord(styleMargin->mMargin.Get(startSide), 0);
+   }
+ 
+@@ -703,7 +703,7 @@ nsContainerFrame::DoInlineIntrinsicWidth
+   if (!lastInFlow->GetNextContinuation()) {
+     aData->currentLine +=
+       GetCoord(stylePadding->mPadding.Get(endSide), 0) +
+-      styleBorder->GetBorderWidth(endSide) +
++      styleBorder->GetActualBorderWidth(endSide) +
+       GetCoord(styleMargin->mMargin.Get(endSide), 0);
+   }
+ }
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -576,7 +576,7 @@ nsIFrame::GetUsedBorder() const
+     return result;
+   }
+ 
+-  return GetStyleBorder()->GetBorder();
++  return GetStyleBorder()->GetActualBorder();
+ }
+ 
+ /* virtual */ nsMargin
+@@ -2980,8 +2980,8 @@ nsFrame::IntrinsicWidthOffsets(nsIRender
+            &result.hPadding, &result.hPctPadding);
+ 
+   const nsStyleBorder *styleBorder = GetStyleBorder();
+-  result.hBorder += styleBorder->GetBorderWidth(NS_SIDE_LEFT);
+-  result.hBorder += styleBorder->GetBorderWidth(NS_SIDE_RIGHT);
++  result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_LEFT);
++  result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_RIGHT);
+ 
+   const nsStyleDisplay *disp = GetStyleDisplay();
+   if (IsThemed(disp)) {
+@@ -3759,7 +3759,7 @@ nsFrame::CheckInvalidateSizeChange(nsPre
+   // may be moving.
+   const nsStyleBorder* border = GetStyleBorder();
+   NS_FOR_CSS_SIDES(side) {
+-    if (border->GetBorderWidth(side) != 0) {
++    if (border->GetActualBorderWidth(side) != 0) {
+       Invalidate(nsRect(0, 0, mRect.width, mRect.height));
+       return;
+     }
+diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
+--- a/layout/generic/nsHTMLReflowState.cpp
++++ b/layout/generic/nsHTMLReflowState.cpp
+@@ -799,7 +799,7 @@ nsHTMLReflowState::CalculateHorizBorderP
+                        nscoord* aInsideBoxSizing,
+                        nscoord* aOutsideBoxSizing)
+ {
+-  const nsMargin& border = mStyleBorder->GetBorder();
++  const nsMargin& border = mStyleBorder->GetActualBorder();
+   nsMargin padding, margin;
+ 
+   // See if the style system can provide us the padding directly
+@@ -1892,7 +1892,7 @@ nsCSSOffsetState::InitOffsets(nscoord aC
+     mComputedBorderPadding = *aBorder;
+   }
+   else {
+-    mComputedBorderPadding = frame->GetStyleBorder()->GetBorder();
++    mComputedBorderPadding = frame->GetStyleBorder()->GetActualBorder();
+   }
+   mComputedBorderPadding += mComputedPadding;
+ 
+diff --git a/layout/generic/nsInlineFrame.cpp b/layout/generic/nsInlineFrame.cpp
+--- a/layout/generic/nsInlineFrame.cpp
++++ b/layout/generic/nsInlineFrame.cpp
+@@ -133,8 +133,8 @@ nsInlineFrame::IsSelfEmpty()
+   // XXX Top and bottom removed, since they shouldn't affect things, but this
+   // doesn't really match with nsLineLayout.cpp's setting of
+   // ZeroEffectiveSpanBox, anymore, so what should this really be?
+-  if (border->GetBorderWidth(NS_SIDE_RIGHT) != 0 ||
+-      border->GetBorderWidth(NS_SIDE_LEFT) != 0 ||
++  if (border->GetActualBorderWidth(NS_SIDE_RIGHT) != 0 ||
++      border->GetActualBorderWidth(NS_SIDE_LEFT) != 0 ||
+       !IsPaddingZero(padding->mPadding.GetRightUnit(),
+                      padding->mPadding.GetRight()) ||
+       !IsPaddingZero(padding->mPadding.GetLeftUnit(),
+diff --git a/layout/generic/nsPageContentFrame.cpp b/layout/generic/nsPageContentFrame.cpp
+--- a/layout/generic/nsPageContentFrame.cpp
++++ b/layout/generic/nsPageContentFrame.cpp
+@@ -206,7 +206,7 @@ nsPageContentFrame::Reflow(nsPresContext
+       if (aDesiredSize.mOverflowArea.XMost() > aDesiredSize.width) {
+         mPD->mPageContentXMost =
+           aDesiredSize.mOverflowArea.XMost() +
+-          kidReflowState.mStyleBorder->GetBorderWidth(NS_SIDE_RIGHT) +
++          kidReflowState.mStyleBorder->GetActualBorderWidth(NS_SIDE_RIGHT) +
+           padding.right;
+       }
+     }
+diff --git a/layout/reftests/border-image/3x3green-1DD813.png b/layout/reftests/border-image/3x3green-1DD813.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb7a3cf21f5a2298a16cb7ce0e132bb4fa4ebf4e
+GIT binary patch
+literal 89
+zc%17D@N?(olHy`uVBq!ia0vp^%plCc1|-8Yw(bW~3Z5>GAsp9}r|ebyGoO)bh6E7E
+iW$#H%NdN+uX^af5@oYR+=B!>owG5uFelF{r5}E)hoD_)w
+
+diff --git a/layout/reftests/border-image/3x3transparent.png b/layout/reftests/border-image/3x3transparent.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..6528a9f036834a59300848246ca8442de86e1a21
+GIT binary patch
+literal 69
+zc%17D@N?(olHy`uVBq!ia0vp^%plCc1|-8Yw(bW~Jf1F&Asp9}6BIzo)EOA1Q~16D
+OSqz@8elF{r5}E*Z`3!mh
+
+diff --git a/layout/reftests/border-image/reftest.list b/layout/reftests/border-image/reftest.list
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/border-image/reftest.list
+@@ -0,0 +1,2 @@
++== solid-image-1.html solid-image-1-ref.html
++== transparent-image-1.html transparent-image-1-ref.html
+diff --git a/layout/reftests/border-image/solid-image-1-ref.html b/layout/reftests/border-image/solid-image-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/border-image/solid-image-1-ref.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html lang="en-US">
++<head>
++  <title>test of -moz-border-image</title>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
++  <meta http-equiv="Content-Style-Type" content="text/css">
++</head>
++<body>
++<div style="border: solid #1DD813 1em;">border.png<br />second longer longer longer longer longer longer line<br />third longer longer longer longer longer longer line</div>
++</body>
++</html>
+diff --git a/layout/reftests/border-image/solid-image-1.html b/layout/reftests/border-image/solid-image-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/border-image/solid-image-1.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html lang="en-US">
++<head>
++  <title>test of -moz-border-image</title>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
++  <meta http-equiv="Content-Style-Type" content="text/css">
++</head>
++<body>
++<div style="-moz-border-image: url('3x3green-1DD813.png') 1 1 1 1 / 1em;">border.png<br />second longer longer longer longer longer longer line<br />third longer longer longer longer longer longer line</div>
++</body>
++</html>
+diff --git a/layout/reftests/border-image/transparent-image-1-ref.html b/layout/reftests/border-image/transparent-image-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/border-image/transparent-image-1-ref.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html lang="en-US">
++<head>
++  <title>test of -moz-border-image</title>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
++  <meta http-equiv="Content-Style-Type" content="text/css">
++</head>
++<body>
++<div style="border: double orange 1em;">border.png<br />second longer longer longer longer longer longer line<br />third longer longer longer longer longer longer line</div>
++</body>
++</html>
+diff --git a/layout/reftests/border-image/transparent-image-1.html b/layout/reftests/border-image/transparent-image-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/border-image/transparent-image-1.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html lang="en-US">
++<head>
++  <title>test of -moz-border-image</title>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
++  <meta http-equiv="Content-Style-Type" content="text/css">
++</head>
++<body>
++<div style="-moz-border-image: url('3x3transparent.png') 1 1 1 1; border: double orange 1em;">border.png<br />second longer longer longer longer longer longer line<br />third longer longer longer longer longer longer line</div>
++</body>
++</html>
+diff --git a/layout/reftests/reftest.list b/layout/reftests/reftest.list
+--- a/layout/reftests/reftest.list
++++ b/layout/reftests/reftest.list
+@@ -66,6 +66,9 @@ include native-theme/reftest.list
+ # bidi
+ include bidi/reftest.list
+ 
++# border-image
++include border-image/reftest.list
++
+ # z-index/
+ include z-index/reftest.list
+  
+diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
+--- a/layout/style/nsCSSDataBlock.cpp
++++ b/layout/style/nsCSSDataBlock.cpp
+@@ -210,6 +210,12 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+                              iProp == eCSSProperty_list_style_image) &&
+                             val->GetUnit() == eCSSUnit_URL) {
+                             val->StartImageLoad(aRuleData->mPresContext->Document());
++                        } else if (iProp == eCSSProperty_border_image &&
++                                   val->GetUnit() == eCSSUnit_Array) {
++                            nsCSSValue::Array *array = val->GetArrayValue();
++                            if (array->Item(0).GetUnit() == eCSSUnit_URL) {
++                                array->Item(0).StartImageLoad(aRuleData->mPresContext->Document());
++                            }
+                         }
+                         *target = *val;
+                         if (iProp == eCSSProperty_font_family) {
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -328,6 +328,14 @@ nsCSSDeclaration::AppendCSSValueToString
+     nsCSSValue::Array *array = aValue.GetArrayValue();
+     PRBool mark = PR_FALSE;
+     for (PRUint16 i = 0, i_end = array->Count(); i < i_end; ++i) {
++      if (aProperty == eCSSProperty_border_image && i >= 5) {
++        if (array->Item(i).GetUnit() == eCSSUnit_Null) {
++          continue;
++        }
++        if (i == 5) {
++          aResult.AppendLiteral(" /");
++        }
++      }
+       if (mark && array->Item(i).GetUnit() != eCSSUnit_Null) {
+         if (unit == eCSSUnit_Array)
+           aResult.AppendLiteral(" ");
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -389,6 +389,7 @@ protected:
+   PRBool ParseBorderColors(nsresult& aErrorCode,
+                            nsCSSValueList** aResult,
+                            nsCSSProperty aProperty);
++  PRBool ParseBorderImage(nsresult& aErrorCode);
+   PRBool ParseBorderSpacing(nsresult& aErrorCode);
+   PRBool ParseBorderSide(nsresult& aErrorCode,
+                          const nsCSSProperty aPropIDs[],
+@@ -3699,27 +3700,27 @@ CSSParserImpl::ParseDeclaration(nsresult
+   }
+ 
+   if (eCSSToken_Symbol == tk->mType && '!' == tk->mSymbol) {
+-    // Look for important ident
+-    if (!GetToken(aErrorCode, PR_TRUE)) {
+-      // Premature eof is not ok
+-      REPORT_UNEXPECTED_EOF(PEImportantEOF);
+-      ClearTempData(propID);
+-      return PR_FALSE;
+-    }
+-    if ((eCSSToken_Ident != tk->mType) ||
+-        !tk->mIdent.LowerCaseEqualsLiteral("important")) {
+-      REPORT_UNEXPECTED_TOKEN(PEExpectedImportant);
+-      OUTPUT_ERROR();
+-      UngetToken();
+-      ClearTempData(propID);
+-      return PR_FALSE;
+-    }
+-    isImportant = PR_TRUE;
+-  }
+-  else {
+-    // Not a !important declaration
+-    UngetToken();
+-  }
++        // Look for important ident
++        if (!GetToken(aErrorCode, PR_TRUE)) {
++          // Premature eof is not ok
++          REPORT_UNEXPECTED_EOF(PEImportantEOF);
++          ClearTempData(propID);
++          return PR_FALSE;
++        }
++        if ((eCSSToken_Ident != tk->mType) ||
++            !tk->mIdent.LowerCaseEqualsLiteral("important")) {
++          REPORT_UNEXPECTED_TOKEN(PEExpectedImportant);
++          OUTPUT_ERROR();
++          UngetToken();
++          ClearTempData(propID);
++          return PR_FALSE;
++        }
++        isImportant = PR_TRUE;
++      }
++      else {
++        // Not a !important declaration
++        UngetToken();
++      }
+ 
+   // Make sure valid property declaration is terminated with either a
+   // semicolon, EOF or a right-curly-brace (this last only when
+@@ -4610,6 +4611,8 @@ PRBool CSSParserImpl::ParseProperty(nsre
+     return ParseBorderColors(aErrorCode,
+                              &mTempData.mMargin.mBorderColors.mTop,
+                              aPropID);
++  case eCSSProperty_border_image:
++    return ParseBorderImage(aErrorCode);
+   case eCSSProperty_border_width:
+     return ParseBorderWidth(aErrorCode);
+   case eCSSProperty_border_end_color:
+@@ -4821,6 +4824,7 @@ PRBool CSSParserImpl::ParseSingleValuePr
+   case eCSSProperty_border:
+   case eCSSProperty_border_color:
+   case eCSSProperty_border_bottom_colors:
++  case eCSSProperty_border_image:
+   case eCSSProperty_border_left_colors:
+   case eCSSProperty_border_right_colors:
+   case eCSSProperty_border_end_color:
+@@ -5654,6 +5658,84 @@ PRBool CSSParserImpl::ParseBorderColor(n
+                             kBorderColorIDs);
+ }
+ 
++PRBool CSSParserImpl::ParseBorderImage(nsresult& aErrorCode)
++{
++  if (ParseVariant(aErrorCode, mTempData.mMargin.mBorderImage, 
++                   VARIANT_INHERIT | VARIANT_NONE, nsnull)) {
++    mTempData.SetPropertyBit(eCSSProperty_border_image);
++    return PR_TRUE;
++  }
++  
++  // <uri> [<number> | <percentage>]{4} [ / <border-width>{1,4} ]? [stretch | repeat | round]{0,2}
++  nsRefPtr<nsCSSValue::Array> arr = nsCSSValue::Array::Create(11);
++  if (!arr) {
++    aErrorCode = NS_ERROR_OUT_OF_MEMORY;
++    return PR_FALSE;
++  }
++  
++  nsCSSValue& url = arr->Item(0);
++  nsCSSValue& splitTop = arr->Item(1);
++  nsCSSValue& splitRight = arr->Item(2);
++  nsCSSValue& splitBottom = arr->Item(3);
++  nsCSSValue& splitLeft = arr->Item(4);
++  nsCSSValue& borderWidthTop = arr->Item(5);
++  nsCSSValue& borderWidthRight = arr->Item(6);
++  nsCSSValue& borderWidthBottom = arr->Item(7);
++  nsCSSValue& borderWidthLeft = arr->Item(8);
++  nsCSSValue& horizontalKeyword = arr->Item(9);
++  nsCSSValue& verticalKeyword = arr->Item(10);
++  
++  // <uri>
++  if (!ParseVariant(aErrorCode, url, VARIANT_URL, nsnull)) {
++    return PR_FALSE;
++  }
++  
++  // [<number> | <percentage>]{4}
++  if (!ParsePositiveVariant(aErrorCode, splitTop, VARIANT_INTEGER | VARIANT_PERCENT, nsnull) ||
++      !ParsePositiveVariant(aErrorCode, splitRight, VARIANT_INTEGER | VARIANT_PERCENT, nsnull) ||
++      !ParsePositiveVariant(aErrorCode, splitBottom, VARIANT_INTEGER | VARIANT_PERCENT, nsnull) ||
++      !ParsePositiveVariant(aErrorCode, splitLeft, VARIANT_INTEGER | VARIANT_PERCENT, nsnull)) {
++    return PR_FALSE;
++  }
++  
++  // [ / <border-width>{1,4} ]?
++  if (ExpectSymbol(aErrorCode, '/', PR_TRUE)) {
++    // if have '/', at least one value is required
++    if (!ParsePositiveVariant(aErrorCode, borderWidthTop, VARIANT_LENGTH, nsnull)) {
++      return PR_FALSE;
++    }
++    
++    if (ParsePositiveVariant(aErrorCode, borderWidthRight, VARIANT_LENGTH, nsnull)) {
++      if (ParsePositiveVariant(aErrorCode, borderWidthBottom, VARIANT_LENGTH, nsnull)) {
++        if (ParsePositiveVariant(aErrorCode, borderWidthLeft, VARIANT_LENGTH, nsnull)) {
++          ; // got all four widths
++        } else { // only have top, right and bottom
++          borderWidthLeft = borderWidthRight;
++        }
++      } else { // only have top and right
++        borderWidthBottom = borderWidthTop;
++        borderWidthLeft = borderWidthRight;
++      }
++    } else { // only have top
++      borderWidthLeft = borderWidthBottom = borderWidthRight = borderWidthTop;
++    }
++  }
++  
++  // [stretch | repeat | round]{0,2}
++  // missing keywords are handled in nsRuleNode::ComputeBorderData()
++  if (ParseEnum(aErrorCode, horizontalKeyword, nsCSSProps::kBorderImageKTable)) {
++    ParseEnum(aErrorCode, verticalKeyword, nsCSSProps::kBorderImageKTable);
++  }
++  
++  if(!ExpectEndProperty(aErrorCode, PR_TRUE))
++    return PR_FALSE;
++  
++  mTempData.mMargin.mBorderImage.SetArrayValue(arr, eCSSUnit_Array);
++  mTempData.SetPropertyBit(eCSSProperty_border_image);
++  
++  return PR_TRUE;
++}
++
+ PRBool CSSParserImpl::ParseBorderSpacing(nsresult& aErrorCode)
+ {
+   nsCSSValue  xValue;
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -304,6 +304,7 @@ CSS_PROP_SHORTHAND(-moz-border-end-width
+ #ifndef CSS_PROP_LIST_EXCLUDE_INTERNAL
+ CSS_PROP_BORDER(border-end-width-value, border_end_width_value, X, Margin, mBorderEndWidth, eCSSType_Value, kBorderWidthKTable)
+ #endif
++CSS_PROP_BORDER(-moz-border-image, border_image, MozBorderImage, Margin, mBorderImage, eCSSType_Value, kBorderImageKTable)
+ CSS_PROP_SHORTHAND(border-left, border_left, BorderLeft)
+ CSS_PROP_SHORTHAND(border-left-color, border_left_color, BorderLeftColor)
+ #ifndef CSS_PROP_LIST_EXCLUDE_INTERNAL
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -349,6 +349,13 @@ const PRInt32 nsCSSProps::kBorderColorKT
+ const PRInt32 nsCSSProps::kBorderColorKTable[] = {
+   eCSSKeyword_transparent, NS_STYLE_COLOR_TRANSPARENT,
+   eCSSKeyword__moz_use_text_color, NS_STYLE_COLOR_MOZ_USE_TEXT_COLOR,
++  eCSSKeyword_UNKNOWN,-1
++};
++
++const PRInt32 nsCSSProps::kBorderImageKTable[] = {
++  eCSSKeyword_stretch, NS_STYLE_BORDER_IMAGE_STRETCH,
++  eCSSKeyword_repeat, NS_STYLE_BORDER_IMAGE_REPEAT,
++  eCSSKeyword_round, NS_STYLE_BORDER_IMAGE_ROUND,
+   eCSSKeyword_UNKNOWN,-1
+ };
+ 
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -122,6 +122,7 @@ public:
+   static const PRInt32 kBackgroundRepeatKTable[];
+   static const PRInt32 kBorderCollapseKTable[];
+   static const PRInt32 kBorderColorKTable[];
++  static const PRInt32 kBorderImageKTable[];
+   static const PRInt32 kBorderStyleKTable[];
+   static const PRInt32 kBorderWidthKTable[];
+   static const PRInt32 kBoxAlignKTable[];
+diff --git a/layout/style/nsCSSStruct.h b/layout/style/nsCSSStruct.h
+--- a/layout/style/nsCSSStruct.h
++++ b/layout/style/nsCSSStruct.h
+@@ -354,6 +354,7 @@ struct nsCSSMargin : public nsCSSStruct 
+   nsCSSValue  mOutlineOffset;
+   nsCSSRect   mOutlineRadius; // (extension)
+   nsCSSValue  mFloatEdge; // NEW
++  nsCSSValue  mBorderImage;
+ private:
+   nsCSSMargin(const nsCSSMargin& aOther); // NOT IMPLEMENTED
+ };
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -2099,6 +2099,94 @@ nsComputedDOMStyle::GetBoxSizing(nsIDOMC
+ }
+ 
+ nsresult
++nsComputedDOMStyle::GetBorderImage(nsIDOMCSSValue** aValue)
++{
++  const nsStyleBorder* border = GetStyleBorder();
++  
++  // none
++  if (!border->mBorderImage) {
++    nsROCSSPrimitiveValue *valNone = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(valNone, NS_ERROR_OUT_OF_MEMORY);
++    valNone->SetIdent(nsGkAtoms::none);
++    return CallQueryInterface(valNone, aValue);
++  }
++  
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_FALSE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++  
++  // uri
++  nsROCSSPrimitiveValue *valURI = GetROCSSPrimitiveValue();
++  if (!valURI || !valueList->AppendCSSValue(valURI)) {
++    delete valURI;
++    delete valueList;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++  nsCOMPtr<nsIURI> uri;
++  border->mBorderImage->GetURI(getter_AddRefs(uri));
++  valURI->SetURI(uri);
++  
++  // four split numbers
++  nsStyleCoord splitCoord;
++  NS_FOR_CSS_SIDES(side) {
++    nsROCSSPrimitiveValue *valSplit = GetROCSSPrimitiveValue();
++    if (!valSplit || !valueList->AppendCSSValue(valSplit)) {
++      delete valSplit;
++      delete valueList;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++    border->mBorderImageSplit.Get(side, splitCoord);
++    SetValueToCoord(valSplit, splitCoord, nsnull, nsnull);
++  }
++  
++  // copy of border-width
++  if (border->mHaveBorderImageWidth) {
++    nsROCSSPrimitiveValue *slash = GetROCSSPrimitiveValue();
++    if (!slash || !valueList->AppendCSSValue(slash)) {
++      delete slash;
++      delete valueList;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++    slash->SetString(NS_LITERAL_STRING("/"));
++    NS_FOR_CSS_SIDES(side) {
++      nsROCSSPrimitiveValue *borderWidth = GetROCSSPrimitiveValue();
++      if (!borderWidth || !valueList->AppendCSSValue(borderWidth)) {
++        delete borderWidth;
++        delete valueList;
++        return NS_ERROR_OUT_OF_MEMORY;
++      }
++      nscoord width = GetStyleBorder()->mBorderImageWidth.side(side);
++      borderWidth->SetAppUnits(width);
++    }
++  }
++  
++  // first keyword
++  nsROCSSPrimitiveValue *keyword = GetROCSSPrimitiveValue();
++  if (!keyword || !valueList->AppendCSSValue(keyword)) {
++    delete keyword;
++    delete valueList;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++  const nsAFlatCString& borderImageIdent =
++            nsCSSProps::ValueToKeyword(GetStyleBorder()->mBorderImageHFill,
++                                       nsCSSProps::kBorderImageKTable);
++  keyword->SetIdent(borderImageIdent);
++  
++  // second keyword
++  nsROCSSPrimitiveValue *keyword2 = GetROCSSPrimitiveValue();
++  if (!keyword2 || !valueList->AppendCSSValue(keyword2)) {
++    delete keyword2;
++    delete valueList;
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++  const nsAFlatCString& borderImageIdent2 =
++            nsCSSProps::ValueToKeyword(GetStyleBorder()->mBorderImageVFill,
++                                       nsCSSProps::kBorderImageKTable);
++  keyword2->SetIdent(borderImageIdent2);
++  
++  return CallQueryInterface(valueList, aValue);
++}
++
++nsresult
+ nsComputedDOMStyle::GetFloatEdge(nsIDOMCSSValue** aValue)
+ {
+   nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+@@ -3813,6 +3901,7 @@ nsComputedDOMStyle::GetQueryableProperty
+     COMPUTED_STYLE_MAP_ENTRY(_moz_background_origin,        BackgroundOrigin),
+     COMPUTED_STYLE_MAP_ENTRY(binding,                       Binding),
+     COMPUTED_STYLE_MAP_ENTRY(border_bottom_colors,          BorderBottomColors),
++    COMPUTED_STYLE_MAP_ENTRY(border_image,                  BorderImage),
+     COMPUTED_STYLE_MAP_ENTRY(border_left_colors,            BorderLeftColors),
+     COMPUTED_STYLE_MAP_ENTRY(border_right_colors,           BorderRightColors),
+     COMPUTED_STYLE_MAP_ENTRY(border_top_colors,             BorderTopColors),
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -193,6 +193,7 @@ private:
+   nsresult GetBorderRadiusTopLeft(nsIDOMCSSValue** aValue);
+   nsresult GetBorderRadiusTopRight(nsIDOMCSSValue** aValue);
+   nsresult GetFloatEdge(nsIDOMCSSValue** aValue);
++  nsresult GetBorderImage(nsIDOMCSSValue** aValue);
+ 
+   /* Margin Properties */
+   nsresult GetMarginWidth(nsIDOMCSSValue** aValue);
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -3275,9 +3275,6 @@ nsRuleNode::ComputeDisplayData(void* aSt
+     // XXX These restrictions are no longer present in CSS2.1.  We
+     // should ensure that we support removing them before doing so,
+     // though.
+-    // XXXbz For example, the calls to WipeContainingBlock in the
+-    // frame constructor will need to be changedif we allow
+-    // block-level generated content inside inlines.
+ 
+     if (display->mPosition != NS_STYLE_POSITION_STATIC)
+       display->mPosition = NS_STYLE_POSITION_STATIC;
+@@ -3710,9 +3707,23 @@ nsRuleNode::ComputeBorderData(void* aSta
+         border->SetBorderWidth(side,
+                                (mPresContext->GetBorderWidthTable())[value.GetIntValue()]);
+       }
++      else if (eCSSUnit_Inherit == value.GetUnit()) {
++        inherited = PR_TRUE;
++        border->SetBorderWidth(side,
++                               parentBorder->GetComputedBorderWidth(side));
++      }
++      else if (eCSSUnit_Initial == value.GetUnit()) {
++        border->SetBorderWidth(side,
++          (mPresContext->GetBorderWidthTable())[NS_STYLE_BORDER_WIDTH_MEDIUM]);
++      }
+       // OK to pass bad aParentCoord since we're not passing SETCOORD_INHERIT
+-      else if (SetCoord(value, coord, nsStyleCoord(), SETCOORD_LENGTH,
+-                        aContext, mPresContext, inherited)) {
++      else {
++#ifdef DEBUG
++        PRBool ok =
++#endif
++          SetCoord(value, coord, nsStyleCoord(), SETCOORD_LENGTH,
++                   aContext, mPresContext, inherited);
++        NS_ASSERTION(ok, "missing case handling border width");
+         if (coord.GetUnit() == eStyleUnit_Coord) {
+           border->SetBorderWidth(side, coord.GetCoordValue());
+         }
+@@ -3722,14 +3733,6 @@ nsRuleNode::ComputeBorderData(void* aSta
+           NS_WARNING("Border set in chars; we don't handle that");
+         }
+ #endif        
+-      }
+-      else if (eCSSUnit_Inherit == value.GetUnit()) {
+-        inherited = PR_TRUE;
+-        border->SetBorderWidth(side, parentBorder->GetBorderWidth(side));
+-      }
+-      else if (eCSSUnit_Initial == value.GetUnit()) {
+-        border->SetBorderWidth(side,
+-          (mPresContext->GetBorderWidthTable())[NS_STYLE_BORDER_WIDTH_MEDIUM]);
+       }
+     }
+   }
+@@ -3866,6 +3869,76 @@ nsRuleNode::ComputeBorderData(void* aSta
+   }
+   else if (eCSSUnit_Initial == marginData.mFloatEdge.GetUnit()) {
+     border->mFloatEdge = NS_STYLE_FLOAT_EDGE_CONTENT;
++  }
++  
++  // border-image
++  if (eCSSUnit_Array == marginData.mBorderImage.GetUnit()) {
++    nsCSSValue::Array *arr = marginData.mBorderImage.GetArrayValue();
++    
++    // the image
++    if (eCSSUnit_Image == arr->Item(0).GetUnit()) {
++      border->mBorderImage = arr->Item(0).GetImageValue();
++    }
++    
++    // the numbers saying where to split the image
++    NS_FOR_CSS_SIDES(side) {
++      // an uninitialized parentCoord is ok because I'm not passing SETCOORD_INHERIT
++      if (SetCoord(arr->Item(1 + side), coord, parentCoord, SETCOORD_INTEGER | SETCOORD_PERCENT, 
++                   aContext, mPresContext, inherited)) {
++        border->mBorderImageSplit.Set(side, coord);
++      }
++    }
++    
++    // possible replacement for border-width
++    // if have one - have all four (see CSSParserImpl::ParseBorderImage())
++    if (eCSSUnit_Null != arr->Item(5).GetUnit()) {
++      NS_FOR_CSS_SIDES(side) {
++        // an uninitialized parentCoord is ok because I'm not passing SETCOORD_INHERIT
++        NS_ASSERTION(SetCoord(arr->Item(5 + side), coord, parentCoord, SETCOORD_LENGTH, 
++                              aContext, mPresContext, inherited),
++                     "SetCoord for border-width replacement from border-image failed");
++        if (coord.GetUnit() == eStyleUnit_Coord) {
++          border->mBorderImageWidth.side(side) = coord.GetCoordValue();
++        } else {
++          NS_WARNING("a border-width replacement from border-image "
++                     "has a unit that's not eStyleUnit_Coord");
++          border->mBorderImageWidth.side(side) = 0;
++        }
++      }
++      border->mHaveBorderImageWidth = PR_TRUE;
++    } else {
++      border->mHaveBorderImageWidth = PR_FALSE;
++    }
++    
++    // stretch/round/repeat keywords
++    if (eCSSUnit_Null == arr->Item(9).GetUnit()) {
++      // default, both horizontal and vertical are stretch
++      border->mBorderImageHFill = NS_STYLE_BORDER_IMAGE_STRETCH;
++      border->mBorderImageVFill = NS_STYLE_BORDER_IMAGE_STRETCH;
++    } else {
++      // have horizontal value
++      border->mBorderImageHFill = arr->Item(9).GetIntValue();
++      if (eCSSUnit_Null == arr->Item(10).GetUnit()) {
++        // vertical same as horizontal
++        border->mBorderImageVFill = border->mBorderImageHFill;
++      } else {
++        // have vertical value
++        border->mBorderImageVFill = arr->Item(10).GetIntValue();
++      }
++    }
++  } else if (eCSSUnit_None == marginData.mBorderImage.GetUnit() ||
++             eCSSUnit_Initial == marginData.mBorderImage.GetUnit()) {
++    border->mHaveBorderImageWidth = PR_FALSE;
++    border->mBorderImage = nsnull;
++  } else if (eCSSUnit_Inherit == marginData.mBorderImage.GetUnit()) {
++    NS_FOR_CSS_SIDES(side) {
++      border->mBorderImageWidth.side(side) = parentBorder->mBorderImageWidth.side(side);
++    }
++    border->mBorderImageSplit = parentBorder->mBorderImageSplit;
++    border->mBorderImageHFill = parentBorder->mBorderImageHFill;
++    border->mBorderImageVFill = parentBorder->mBorderImageVFill;
++    border->mHaveBorderImageWidth = parentBorder->mHaveBorderImageWidth;
++    border->mBorderImage = parentBorder->mBorderImage;
+   }
+ 
+   COMPUTE_END_RESET(Border, border)
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -644,10 +644,10 @@ void nsStyleContext::DumpRegressionData(
+   const char format [] = "top: %dtw right: %dtw bottom: %dtw left: %dtw";
+ #endif
+   nsPrintfCString output(format,
+-                         border->GetBorderWidth(NS_SIDE_TOP),
+-                         border->GetBorderWidth(NS_SIDE_RIGHT),
+-                         border->GetBorderWidth(NS_SIDE_BOTTOM),
+-                         border->GetBorderWidth(NS_SIDE_LEFT));
++                         border->GetActualBorderWidth(NS_SIDE_TOP),
++                         border->GetActualBorderWidth(NS_SIDE_RIGHT),
++                         border->GetActualBorderWidth(NS_SIDE_BOTTOM),
++                         border->GetActualBorderWidth(NS_SIDE_LEFT));
+   fprintf(out, "%s ", output.get());
+   border->mBorderRadius.ToString(str);
+   fprintf(out, "%s ", NS_ConvertUTF16toUTF8(str).get());
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -353,8 +353,9 @@ nsChangeHint nsStylePadding::MaxDifferen
+ }
+ #endif
+ 
+-nsStyleBorder::nsStyleBorder(nsPresContext* aPresContext)
+-  : mActualBorder(0, 0, 0, 0)
++nsStyleBorder::nsStyleBorder(nsPresContext* aPresContext) :
++  mHaveBorderImageWidth(PR_FALSE),
++  mActualBorder(0, 0, 0, 0)
+ {
+   nscoord medium =
+     (aPresContext->GetBorderWidthTable())[NS_STYLE_BORDER_WIDTH_MEDIUM];
+@@ -372,9 +373,22 @@ nsStyleBorder::nsStyleBorder(nsPresConte
+   mTwipsPerPixel = aPresContext->DevPixelsToAppUnits(1);
+ }
+ 
+-nsStyleBorder::nsStyleBorder(const nsStyleBorder& aSrc)
++nsStyleBorder::nsStyleBorder(const nsStyleBorder& aSrc) :
++  mBorderRadius(aSrc.mBorderRadius),
++  mBorderImageSplit(aSrc.mBorderImageSplit),
++  mFloatEdge(aSrc.mFloatEdge),
++  mBorderImageHFill(aSrc.mBorderImageHFill),
++  mBorderImageVFill(aSrc.mBorderImageVFill),
++  mHaveBorderImageWidth(aSrc.mHaveBorderImageWidth),
++  mBorderImage(aSrc.mBorderImage),
++  mBorderImageWidth(aSrc.mBorderImageWidth),
++  mActualBorder(aSrc.mActualBorder),
++  mBorder(aSrc.mBorder),
++  mTwipsPerPixel(aSrc.mTwipsPerPixel)
+ {
+-  memcpy((nsStyleBorder*)this, &aSrc, sizeof(nsStyleBorder));
++  memcpy(mBorderStyle, aSrc.mBorderStyle, sizeof(mBorderStyle));
++  memcpy(mBorderColor, aSrc.mBorderColor, sizeof(mBorderColor));
++  
+   mBorderColors = nsnull;
+   if (aSrc.mBorderColors) {
+     EnsureBorderColors();
+@@ -383,6 +397,15 @@ nsStyleBorder::nsStyleBorder(const nsSty
+         mBorderColors[i] = aSrc.mBorderColors[i]->CopyColors();
+       else
+         mBorderColors[i] = nsnull;
++  }
++}
++
++nsStyleBorder::~nsStyleBorder()
++{
++  if (mBorderColors) {
++    for (PRInt32 i = 0; i < 4; i++)
++      delete mBorderColors[i];
++    delete []mBorderColors;
+   }
+ }
+ 
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -322,13 +322,7 @@ struct nsStyleBorder {
+ struct nsStyleBorder {
+   nsStyleBorder(nsPresContext* aContext);
+   nsStyleBorder(const nsStyleBorder& aBorder);
+-  ~nsStyleBorder(void) {
+-    if (mBorderColors) {
+-      for (PRInt32 i = 0; i < 4; i++)
+-        delete mBorderColors[i];
+-      delete []mBorderColors;
+-    }
+-  }
++  ~nsStyleBorder();
+ 
+   void* operator new(size_t sz, nsPresContext* aContext) CPP_THROW_NEW;
+   void Destroy(nsPresContext* aContext);
+@@ -339,9 +333,15 @@ struct nsStyleBorder {
+ #endif
+  
+   nsStyleSides  mBorderRadius;    // [reset] length, percent
++  nsStyleSides  mBorderImageSplit; // [reset] integer, percent
+   PRUint8       mFloatEdge;       // [reset] see nsStyleConsts.h
++  PRUint8       mBorderImageHFill; // [reset]
++  PRUint8       mBorderImageVFill; // [reset]
+   nsBorderColors** mBorderColors; // [reset] multiple levels of color for a border.
+-
++  PRBool        mHaveBorderImageWidth; // [reset]
++  nsCOMPtr<imgIRequest> mBorderImage; // [reset]
++  nsMargin      mBorderImageWidth; // [reset]
++  
+   void EnsureBorderColors() {
+     if (!mBorderColors) {
+       mBorderColors = new nsBorderColors*[4];
+@@ -375,8 +375,19 @@ struct nsStyleBorder {
+     }
+   }
+ 
++  // Regarding GetRoundedBorder() and GetActualBorder():
++  // The process is computed ==[rounding]==> rounded == [including border-image]==> actual
++  
+   // Get the actual border, in twips.
+-  const nsMargin& GetBorder() const
++  const nsMargin& GetActualBorder() const
++  {
++    if (mHaveBorderImageWidth)
++      return mBorderImageWidth;
++    else
++      return mActualBorder;
++  }
++  
++  const nsMargin& GetRoundedBorder() const
+   {
+     return mActualBorder;
+   }
+@@ -385,9 +396,12 @@ struct nsStyleBorder {
+   // this is zero if and only if there is no border to be painted for this
+   // side.  That is, this value takes into account the border style and the
+   // value is rounded to the nearest device pixel by NS_ROUND_BORDER_TO_PIXELS.
+-  nscoord GetBorderWidth(PRUint8 aSide) const
++  nscoord GetActualBorderWidth(PRUint8 aSide) const
+   {
+-    return mActualBorder.side(aSide);
++    if (mHaveBorderImageWidth)
++      return mBorderImageWidth.side(aSide);
++    else
++      return mActualBorder.side(aSide);
+   }
+ 
+   PRUint8 GetBorderStyle(PRUint8 aSide) const
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -148,6 +148,23 @@ var gCSSProperties = {
+ 		initial_values: [ "medium", "3px" ],
+ 		other_values: [ "thin", "thick", "1px", "2em" ],
+ 		invalid_values: [ "5%" ]
++	},
++	"-moz-border-image": {
++		domProp: "MozBorderImage",
++		inherited: false,
++		type: CSS_TYPE_LONGHAND,
++		initial_values: [ "none" ],
++		other_values: [ "url('border.png') 27 27 27 27",
++                                "url('border.png') 27 27 27 27 repeat",
++                                "url('border.png') 27 27 27 27 / 1em",
++                                "url('border.png') 27 27 27 27 / 1em 1em 1em 1em repeat",
++                                "url('border.png') 27 27 27 27 / 1em 1em 1em 1em stretch round" ],
++		invalid_values: [ "url('border.png')",
++                                  "url('border.png') 27",
++                                  "url('border.png') 27 27 27 27 27",
++                                  "url('border.png') 27 27 27 27 / 1em 1em 1em 1em 1em",
++                                  "url('border.png') / repeat",
++                                  "url('border.png') 27 27 27 27 /" ]
+ 	},
+ 	"-moz-border-left-colors": {
+ 		domProp: "MozBorderLeftColors",
+diff --git a/layout/style/test/test_value_storage.html b/layout/style/test/test_value_storage.html
+--- a/layout/style/test/test_value_storage.html
++++ b/layout/style/test/test_value_storage.html
+@@ -199,14 +199,14 @@ function test_property(property)
+         step1comps.push(gComputedStyle.getPropertyValue(info.subproperties[idx]));
+ 
+     func = xfail_accepted(property, value) ? todo_isnot : isnot;
+-    func(step1val, "", "setting '" + value + "' on '" + property);
++    func(step1val, "", "setting '" + value + "' on '" + property + "'");
+     if ("subproperties" in info)
+       for (idx in info.subproperties) {
+         var subprop = info.subproperties[idx];
+         func = xfail_accepted_split(property, subprop, value)
+                  ? todo_isnot : isnot;
+         func(gDeclaration.getPropertyValue(subprop), "",
+-             "setting '" + value + "' on '" + property);
++             "setting '" + value + "' on '" + property + "'");
+       }
+ 
+     // We don't care particularly about the whitespace or the placement of
+diff --git a/layout/tables/nsTableCellFrame.cpp b/layout/tables/nsTableCellFrame.cpp
+--- a/layout/tables/nsTableCellFrame.cpp
++++ b/layout/tables/nsTableCellFrame.cpp
+@@ -1041,7 +1041,7 @@ nsMargin*
+ nsMargin* 
+ nsTableCellFrame::GetBorderWidth(nsMargin&  aBorder) const
+ {
+-  aBorder = GetStyleBorder()->GetBorder();
++  aBorder = GetStyleBorder()->GetActualBorder();
+   return &aBorder;
+ }
+ 
+diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp
++++ b/layout/tables/nsTableFrame.cpp
+@@ -2550,7 +2550,7 @@ void GetSeparateModelBorderPadding(const
+   // mComputedBorderPadding or we don't and then we get the padding
+   // wrong!
+   const nsStyleBorder* border = aStyleContext.GetStyleBorder();
+-  aBorderPadding = border->GetBorder();
++  aBorderPadding = border->GetActualBorder();
+   if (aReflowState) {
+     aBorderPadding += aReflowState->mComputedPadding;
+   }
+@@ -4652,7 +4652,7 @@ GetColorAndStyle(const nsIFrame*  aFrame
+       aSide = NS_SIDE_RIGHT;
+     }
+   }
+-  width = styleData->GetBorderWidth(aSide);
++  width = styleData->GetActualBorderWidth(aSide);
+   aWidth = nsPresContext::AppUnitsToIntCSSPixels(width);
+ }
+  
+diff --git a/layout/tools/reftest/README.txt b/layout/tools/reftest/README.txt
+--- a/layout/tools/reftest/README.txt
++++ b/layout/tools/reftest/README.txt
+@@ -161,6 +161,11 @@ Running Tests
+ Running Tests
+ =============
+ 
++(If you're not using a DEBUG build, first set browser.dom.window.dump.enabled
++to true (in about:config, in the profile you'll be using to run the tests).
++Create the option as a new boolean if it doesn't exist already. If you skip
++this step you won't get any output in the terminal.)
++
+ At some point in the future there will hopefully be a cleaner way to do
+ this.  For now, go to your object directory, and run (perhaps using
+ MOZ_NO_REMOTE=1 or the -profile <directory> option)
+diff --git a/layout/xul/base/src/nsBox.cpp b/layout/xul/base/src/nsBox.cpp
+--- a/layout/xul/base/src/nsBox.cpp
++++ b/layout/xul/base/src/nsBox.cpp
+@@ -355,7 +355,7 @@ nsBox::GetBorder(nsMargin& aMargin)
+     }
+   }
+ 
+-  aMargin = GetStyleBorder()->GetBorder();
++  aMargin = GetStyleBorder()->GetActualBorder();
+ 
+   return NS_OK;
+ }
+diff --git a/layout/xul/base/src/nsBoxObject.cpp b/layout/xul/base/src/nsBoxObject.cpp
+--- a/layout/xul/base/src/nsBoxObject.cpp
++++ b/layout/xul/base/src/nsBoxObject.cpp
+@@ -197,13 +197,13 @@ nsBoxObject::GetOffsetRect(nsRect& aRect
+   
+     // For the origin, add in the border for the frame
+     const nsStyleBorder* border = frame->GetStyleBorder();
+-    origin.x += border->GetBorderWidth(NS_SIDE_LEFT);
+-    origin.y += border->GetBorderWidth(NS_SIDE_TOP);
++    origin.x += border->GetActualBorderWidth(NS_SIDE_LEFT);
++    origin.y += border->GetActualBorderWidth(NS_SIDE_TOP);
+ 
+     // And subtract out the border for the parent
+     const nsStyleBorder* parentBorder = parent->GetStyleBorder();
+-    origin.x -= parentBorder->GetBorderWidth(NS_SIDE_LEFT);
+-    origin.y -= parentBorder->GetBorderWidth(NS_SIDE_TOP);
++    origin.x -= parentBorder->GetActualBorderWidth(NS_SIDE_LEFT);
++    origin.y -= parentBorder->GetActualBorderWidth(NS_SIDE_TOP);
+ 
+     aRect.x = nsPresContext::AppUnitsToIntCSSPixels(origin.x);
+     aRect.y = nsPresContext::AppUnitsToIntCSSPixels(origin.y);
+diff --git a/layout/xul/base/src/nsGroupBoxFrame.cpp b/layout/xul/base/src/nsGroupBoxFrame.cpp
+--- a/layout/xul/base/src/nsGroupBoxFrame.cpp
++++ b/layout/xul/base/src/nsGroupBoxFrame.cpp
+@@ -151,7 +151,7 @@ nsGroupBoxFrame::PaintBorderBackground(n
+   PRIntn skipSides = 0;
+   const nsStyleBorder* borderStyleData = GetStyleBorder();
+   const nsStylePadding* paddingStyleData = GetStylePadding();
+-  const nsMargin& border = borderStyleData->GetBorder();
++  const nsMargin& border = borderStyleData->GetActualBorder();
+   nscoord yoff = 0;
+   nsPresContext* presContext = PresContext();
+ 
+diff --git a/layout/xul/base/src/nsListBoxBodyFrame.cpp b/layout/xul/base/src/nsListBoxBodyFrame.cpp
+--- a/layout/xul/base/src/nsListBoxBodyFrame.cpp
++++ b/layout/xul/base/src/nsListBoxBodyFrame.cpp
+@@ -773,7 +773,7 @@ nsListBoxBodyFrame::ComputeIntrinsicWidt
+ 
+     if (styleContext->GetStylePadding()->GetPadding(margin))
+       width += margin.LeftRight();
+-    width += styleContext->GetStyleBorder()->GetBorder().LeftRight();
++    width += styleContext->GetStyleBorder()->GetActualBorder().LeftRight();
+     if (styleContext->GetStyleMargin()->GetMargin(margin))
+       width += margin.LeftRight();
+ 
+diff --git a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+--- a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
++++ b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+@@ -195,7 +195,7 @@ GetBorderPadding(nsStyleContext* aContex
+   if (!aContext->GetStylePadding()->GetPadding(aMargin)) {
+     NS_NOTYETIMPLEMENTED("percentage padding");
+   }
+-  aMargin += aContext->GetStyleBorder()->GetBorder();
++  aMargin += aContext->GetStyleBorder()->GetActualBorder();
+ }
+ 
+ static void
