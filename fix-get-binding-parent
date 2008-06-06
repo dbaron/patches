@@ -1,0 +1,508 @@
+Change the binding parent for native anonymous content to work like the binding parent for XBL anonymous content, and be the parent of the anonymous content subtree rather than the root of the anonymous content subtree.
+
+diff --git a/accessible/src/base/nsAccessNode.cpp b/accessible/src/base/nsAccessNode.cpp
+--- a/accessible/src/base/nsAccessNode.cpp
++++ b/accessible/src/base/nsAccessNode.cpp
+@@ -186,16 +186,17 @@ NS_IMETHODIMP nsAccessNode::Init()
+     do_QueryInterface(docAccessible);
+   NS_ASSERTION(privateDocAccessible, "No private docaccessible for docaccessible");
+   privateDocAccessible->CacheAccessNode(uniqueID, this);
+ 
+   // Make sure an ancestor in real content is cached
+   // so that nsDocAccessible::RefreshNodes() can find the anonymous subtree to release when
+   // the root node goes away
+   nsCOMPtr<nsIContent> content = do_QueryInterface(mDOMNode);
++  // FIXME: This should check IsInAnonymousSubtree
+   if (content && (content->IsNativeAnonymous() ||
+                   content->GetBindingParent())) {
+     // Specific examples of where this is used: <input type="file"> and <xul:findbar>
+     nsCOMPtr<nsIAccessible> parentAccessible;
+     docAccessible->GetAccessibleInParentChain(mDOMNode, PR_TRUE, getter_AddRefs(parentAccessible));
+     if (parentAccessible) {
+       PRInt32 childCountUnused;
+       parentAccessible->GetChildCount(&childCountUnused);
+diff --git a/accessible/src/base/nsAccessibilityUtils.cpp b/accessible/src/base/nsAccessibilityUtils.cpp
+--- a/accessible/src/base/nsAccessibilityUtils.cpp
++++ b/accessible/src/base/nsAccessibilityUtils.cpp
+@@ -748,18 +748,17 @@ nsAccUtils::FindNeighbourPointingToNode(
+                                         PRUint32 aAttrNum,
+                                         nsIAtom *aTagName,
+                                         PRUint32 aAncestorLevelsToSearch)
+ {
+   nsCOMPtr<nsIContent> binding;
+   nsAutoString controlID;
+   if (!nsAccUtils::GetID(aForNode, controlID)) {
+     binding = aForNode->GetBindingParent();
+-    if (binding == aForNode)
+-      return nsnull;
++    // FIXME: Why was this returning null?
+ 
+     aForNode->GetAttr(kNameSpaceID_None, nsAccessibilityAtoms::anonid, controlID);
+     if (controlID.IsEmpty())
+       return nsnull;
+   }
+ 
+   // Look for label in subtrees of nearby ancestors
+   PRUint32 count = 0;
+diff --git a/accessible/src/base/nsAccessible.cpp b/accessible/src/base/nsAccessible.cpp
+--- a/accessible/src/base/nsAccessible.cpp
++++ b/accessible/src/base/nsAccessible.cpp
+@@ -1918,16 +1918,17 @@ nsresult nsAccessible::GetXULName(nsAStr
+   label.CompressWhitespace();
+   if (!label.IsEmpty()) {
+     aLabel = label;
+     return NS_OK;
+   }
+ 
+   // Can get text from title of <toolbaritem> if we're a child of a <toolbaritem>
+   nsIContent *bindingParent = content->GetBindingParent();
++  // FIXME: Why do we skip to bindingParent's parent?
+   nsIContent *parent = bindingParent? bindingParent->GetParent() :
+                                       content->GetParent();
+   while (parent) {
+     if (parent->Tag() == nsAccessibilityAtoms::toolbaritem &&
+         parent->GetAttr(kNameSpaceID_None, nsAccessibilityAtoms::title, label)) {
+       label.CompressWhitespace();
+       aLabel = label;
+       return NS_OK;
+diff --git a/accessible/src/base/nsDocAccessible.cpp b/accessible/src/base/nsDocAccessible.cpp
+--- a/accessible/src/base/nsDocAccessible.cpp
++++ b/accessible/src/base/nsDocAccessible.cpp
+@@ -1743,16 +1743,17 @@ void nsDocAccessible::RefreshNodes(nsIDO
+         children->GetLength(&childCount);
+       nsCOMPtr<nsIDOMNode> possibleAnonNode;
+       for (PRUint32 index = 0; index < childCount; index++) {
+         nsCOMPtr<nsIAccessNode> childAccessNode;
+         children->QueryElementAt(index, NS_GET_IID(nsIAccessNode),
+                                  getter_AddRefs(childAccessNode));
+         childAccessNode->GetDOMNode(getter_AddRefs(possibleAnonNode));
+         nsCOMPtr<nsIContent> iterContent = do_QueryInterface(possibleAnonNode);
++        // FIXME: This should check IsInAnonymousSubtree.
+         if (iterContent && (iterContent->IsNativeAnonymous() ||
+                             iterContent->GetBindingParent())) {
+           // GetBindingParent() check is a perf win -- make sure we don't
+           // shut down the same subtree twice since we'll reach non-anon content via
+           // DOM traversal later in this method
+           RefreshNodes(possibleAnonNode);
+         }
+       }
+diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUtils.cpp
+--- a/content/base/src/nsContentUtils.cpp
++++ b/content/base/src/nsContentUtils.cpp
+@@ -1803,16 +1803,17 @@ nsContentUtils::GenerateStateKey(nsICont
+     KeyAppendInt(aID, aKey);
+     return NS_OK;
+   }
+ 
+   // We must have content if we're not using a special state id
+   NS_ENSURE_TRUE(aContent, NS_ERROR_FAILURE);
+ 
+   // Don't capture state for anonymous content
++  // FIXME: Should be IsInAnonymousSubtree
+   if (aContent->IsNativeAnonymous() || aContent->GetBindingParent()) {
+     return NS_OK;
+   }
+ 
+   nsCOMPtr<nsIDOMElement> element(do_QueryInterface(aContent));
+   if (element && IsAutocompleteOff(element)) {
+     return NS_OK;
+   }
+diff --git a/content/base/src/nsDocument.cpp b/content/base/src/nsDocument.cpp
+--- a/content/base/src/nsDocument.cpp
++++ b/content/base/src/nsDocument.cpp
+@@ -1727,18 +1727,20 @@ nsDocument::ElementFromPoint(PRInt32 aX,
+     return NS_OK;
+   }
+ 
+   // If we have an anonymous element (such as an internal div from a textbox),
+   // or a node that isn't an element (such as a text frame node),
+   // replace it with the first non-anonymous parent node of type element.
+   while (ptContent &&
+          !ptContent->IsNodeOfType(nsINode::eELEMENT) ||
++         // FIXME: Should just check IsInAnonymousSubtree.
+          ptContent->GetBindingParent() ||
+          ptContent->IsNativeAnonymous()) {
++    // FIXME: jump to GetBindingParent if present?
+     ptContent = ptContent->GetParent();
+   }
+  
+   if (ptContent)
+     CallQueryInterface(ptContent, aReturn);
+   return NS_OK;
+ }
+ 
+diff --git a/content/base/src/nsGenericDOMDataNode.cpp b/content/base/src/nsGenericDOMDataNode.cpp
+--- a/content/base/src/nsGenericDOMDataNode.cpp
++++ b/content/base/src/nsGenericDOMDataNode.cpp
+@@ -587,36 +587,38 @@ nsGenericDOMDataNode::BindToTree(nsIDocu
+   // only assert if our parent is _changing_ while we have a parent.
+   NS_PRECONDITION(!GetParent() || aParent == GetParent(),
+                   "Already have a parent.  Unbind first!");
+   NS_PRECONDITION(!GetBindingParent() ||
+                   aBindingParent == GetBindingParent() ||
+                   (!aBindingParent && aParent &&
+                    aParent->GetBindingParent() == GetBindingParent()),
+                   "Already have a binding parent.  Unbind first!");
+-  NS_PRECONDITION(aBindingParent != this || IsNativeAnonymous(),
+-                  "Only native anonymous content should have itself as its "
++  NS_PRECONDITION(aBindingParent != this,
++                  "Content must not be its own binding parent");
++  NS_PRECONDITION(!IsNativeAnonymous() || aBindingParent == aParent,
++                  "Native anonymous content must have its parent as its "
+                   "own binding parent");
+ 
+   if (!aBindingParent && aParent) {
+     aBindingParent = aParent->GetBindingParent();
+   }
+ 
+   // First set the binding parent
+   if (aBindingParent) {
+     nsDataSlots *slots = GetDataSlots();
+     NS_ENSURE_TRUE(slots, NS_ERROR_OUT_OF_MEMORY);
+ 
+     NS_ASSERTION(IsNativeAnonymous() || !HasFlag(NODE_IS_IN_ANONYMOUS_SUBTREE) ||
++                 // FIXME: Is this check still right?
+                  aBindingParent->IsInNativeAnonymousSubtree(),
+                  "Trying to re-bind content from native anonymous subtree to"
+                  "non-native anonymous parent!");
+     slots->mBindingParent = aBindingParent; // Weak, so no addref happens.
+-    if (IsNativeAnonymous() ||
+-        aBindingParent->IsInNativeAnonymousSubtree()) {
++    if (IsNativeAnonymous() || aParent->IsInNativeAnonymousSubtree()) {
+       SetFlags(NODE_IS_IN_ANONYMOUS_SUBTREE);
+     }
+   }
+ 
+   // Set parent
+   if (aParent) {
+     mParentPtrBits =
+       reinterpret_cast<PtrBits>(aParent) | PARENT_BIT_PARENT_IS_CONTENT;
+diff --git a/content/base/src/nsGenericElement.cpp b/content/base/src/nsGenericElement.cpp
+--- a/content/base/src/nsGenericElement.cpp
++++ b/content/base/src/nsGenericElement.cpp
+@@ -426,16 +426,17 @@ nsIContent::UpdateEditableState()
+   nsIContent *parent = GetParent();
+ 
+   SetEditableFlag(parent && parent->HasFlag(NODE_IS_EDITABLE));
+ }
+ 
+ nsIContent*
+ nsIContent::FindFirstNonNativeAnonymous() const
+ {
++  // FIXME: Needs complete rewrite!
+   // This handles also nested native anonymous content.
+   nsIContent* content = GetBindingParent();
+   nsIContent* possibleResult = 
+     !IsNativeAnonymous() ? const_cast<nsIContent*>(this) : nsnull;
+   while (content) {
+     if (content->IsNativeAnonymous()) {
+       content = possibleResult = content->GetParent();
+     } else {
+@@ -2021,21 +2022,20 @@ nsGenericElement::BindToTree(nsIDocument
+   NS_PRECONDITION(!GetBindingParent() ||
+                   aBindingParent == GetBindingParent() ||
+                   (!aBindingParent && aParent &&
+                    aParent->GetBindingParent() == GetBindingParent()),
+                   "Already have a binding parent.  Unbind first!");
+   NS_PRECONDITION(!aParent || !aDocument ||
+                   !aParent->HasFlag(NODE_FORCE_XBL_BINDINGS),
+                   "Parent in document but flagged as forcing XBL");
+-  NS_PRECONDITION(aBindingParent != this || IsNativeAnonymous(),
+-                  "Only native anonymous content should have itself as its "
+-                  "own binding parent");
+-  NS_PRECONDITION(!IsNativeAnonymous() || aBindingParent == this,
+-                  "Native anonymous content must have itself as its "
++  NS_PRECONDITION(aBindingParent != this,
++                  "Content must not be its own binding parent");
++  NS_PRECONDITION(!IsNativeAnonymous() || aBindingParent == aParent,
++                  "Native anonymous content must have its parent as its "
+                   "own binding parent");
+ 
+   if (!aBindingParent && aParent) {
+     aBindingParent = aParent->GetBindingParent();
+   }
+ 
+ #ifdef MOZ_XUL
+   // First set the binding parent
+@@ -2053,21 +2053,22 @@ nsGenericElement::BindToTree(nsIDocument
+         return NS_ERROR_OUT_OF_MEMORY;
+       }
+ 
+       slots->mBindingParent = aBindingParent; // Weak, so no addref happens.
+     }
+   }
+   NS_ASSERTION(!aBindingParent || IsNativeAnonymous() ||
+                !HasFlag(NODE_IS_IN_ANONYMOUS_SUBTREE) ||
++               // IS this check still OK?
+                aBindingParent->IsInNativeAnonymousSubtree(),
+                "Trying to re-bind content from native anonymous subtree to"
+                "non-native anonymous parent!");
+   if (IsNativeAnonymous() ||
+-      aBindingParent && aBindingParent->IsInNativeAnonymousSubtree()) {
++      aParent && aParent->IsInNativeAnonymousSubtree()) {
+     SetFlags(NODE_IS_IN_ANONYMOUS_SUBTREE);
+   }
+ 
+   PRBool hadForceXBL = HasFlag(NODE_FORCE_XBL_BINDINGS);
+ 
+   // Now set the parent and set the "Force attach xbl" flag if needed.
+   if (aParent) {
+     mParentPtrBits = reinterpret_cast<PtrBits>(aParent) | PARENT_BIT_PARENT_IS_CONTENT;
+diff --git a/content/events/src/nsDOMEvent.cpp b/content/events/src/nsDOMEvent.cpp
+--- a/content/events/src/nsDOMEvent.cpp
++++ b/content/events/src/nsDOMEvent.cpp
+@@ -122,16 +122,17 @@ nsDOMEvent::nsDOMEvent(nsPresContext* aP
+   }
+ 
+   // Get the explicit original target (if it's anonymous make it null)
+   {
+     mExplicitOriginalTarget = GetTargetFromFrame();
+     mTmpRealOriginalTarget = mExplicitOriginalTarget;
+     nsCOMPtr<nsIContent> content = do_QueryInterface(mExplicitOriginalTarget);
+     if (content) {
++      // FIXME: Use IsInAnonymousSubtree
+       if (content->IsNativeAnonymous() || content->GetBindingParent()) {
+         mExplicitOriginalTarget = nsnull;
+       }
+     }
+   }
+ }
+ 
+ nsDOMEvent::~nsDOMEvent() 
+diff --git a/content/xbl/src/nsBindingManager.cpp b/content/xbl/src/nsBindingManager.cpp
+--- a/content/xbl/src/nsBindingManager.cpp
++++ b/content/xbl/src/nsBindingManager.cpp
+@@ -1258,25 +1258,19 @@ nsBindingManager::WalkRules(nsStyleSet* 
+       if (content != aData->mContent) {
+         if (!binding->InheritsStyle()) {
+           // Go no further; we're not inheriting style from anything above here
+           break;
+         }
+       }
+     }
+ 
+-    nsIContent* parent = content->GetBindingParent();
+-    if (parent == content) {
+-      NS_ASSERTION(content->IsNativeAnonymous(), "Unexpected binding parent");
+-                             
++    if (content->IsNativeAnonymous()) {
+       break; // The anonymous content case is often deliberately hacked to
+              // return itself to cut off style inheritance here.  Do that.
+-             // XXXldb Could we use nsIContent::IsNativeAnonymous instead of
+-             // this hack?  bz says we can't because IsNativeAnonymous is
+-             // broken for XUL.
+     }
+ 
+     content = parent;
+   } while (content);
+ 
+   // If "content" is non-null that means we cut off inheritance at some point
+   // in the loop.
+   *aCutOffInheritance = (content != nsnull);
+diff --git a/content/xbl/src/nsXBLService.cpp b/content/xbl/src/nsXBLService.cpp
+--- a/content/xbl/src/nsXBLService.cpp
++++ b/content/xbl/src/nsXBLService.cpp
+@@ -105,20 +105,19 @@ IsAncestorBinding(nsIDocument* aDocument
+                   nsIURI* aChildBindingURI,
+                   nsIContent* aChild)
+ {
+   NS_ASSERTION(aDocument, "expected a document");
+   NS_ASSERTION(aChildBindingURI, "expected a binding URI");
+   NS_ASSERTION(aChild, "expected a child content");
+ 
+   PRUint32 bindingRecursion = 0;
+-  nsIContent* bindingParent = aChild->GetBindingParent();
+   nsBindingManager* bindingManager = aDocument->BindingManager();
+-  for (nsIContent* prev = aChild;
+-       bindingParent && prev != bindingParent;
++  for (nsIContent *prev = aChild, *bindingParent = aChild->GetBindingParent();
++       bindingParent;
+        prev = bindingParent, bindingParent = bindingParent->GetBindingParent()) {
+     nsXBLBinding* binding = bindingManager->GetBinding(bindingParent);
+     if (!binding) {
+       continue;
+     }
+     PRBool equal;
+     nsresult rv =
+       binding->PrototypeBinding()->BindingURI()->Equals(aChildBindingURI,
+diff --git a/content/xul/content/src/nsXULElement.cpp b/content/xul/content/src/nsXULElement.cpp
+--- a/content/xul/content/src/nsXULElement.cpp
++++ b/content/xul/content/src/nsXULElement.cpp
+@@ -1071,16 +1071,17 @@ nsXULElement::UnregisterAccessKey(const 
+ 
+         if (shell) {
+             nsIContent *content = this;
+ 
+             // find out what type of content node this is
+             if (mNodeInfo->Equals(nsGkAtoms::label)) {
+                 // For anonymous labels the unregistering must
+                 // occur on the binding parent control.
++                // FIXME: And what if the binding parent is null?
+                 content = GetBindingParent();
+             }
+ 
+             if (content) {
+                 shell->GetPresContext()->EventStateManager()->
+                     UnregisterAccessKey(content, aOldValue.First());
+             }
+         }
+diff --git a/embedding/components/find/src/nsWebBrowserFind.cpp b/embedding/components/find/src/nsWebBrowserFind.cpp
+--- a/embedding/components/find/src/nsWebBrowserFind.cpp
++++ b/embedding/components/find/src/nsWebBrowserFind.cpp
+@@ -406,31 +406,16 @@ FocusElementButNotDocument(nsIDocument* 
+   aDocument->EndUpdate(UPDATE_CONTENT_STATE);
+ 
+   // Reset esm::mCurrentFocus = nsnull for this doc, so when this document
+   // does get focus next time via preHandleEvent() NS_GOTFOCUS,
+   // the old document gets blurred
+   esm->SetFocusedContent(nsnull);
+ }
+ 
+-static PRBool
+-IsInNativeAnonymousSubtree(nsIContent* aContent)
+-{
+-    while (aContent) {
+-        nsIContent* bindingParent = aContent->GetBindingParent();
+-        if (bindingParent == aContent) {
+-            return PR_TRUE;
+-        }
+-
+-        aContent = bindingParent;
+-    }
+-
+-    return PR_FALSE;
+-}
+-
+ void nsWebBrowserFind::SetSelectionAndScroll(nsIDOMWindow* aWindow,
+                                              nsIDOMRange*  aRange)
+ {
+   nsCOMPtr<nsIDOMDocument> domDoc;    
+   aWindow->GetDocument(getter_AddRefs(domDoc));
+   if (!domDoc) return;
+ 
+   nsCOMPtr<nsIDocument> doc(do_QueryInterface(domDoc));
+@@ -446,17 +431,17 @@ void nsWebBrowserFind::SetSelectionAndSc
+   nsCOMPtr<nsISelectionController> selCon;
+   frame->GetSelectionController(presShell->GetPresContext(),
+                                 getter_AddRefs(selCon));
+   
+   // since the match could be an anonymous textnode inside a
+   // <textarea> or text <input>, we need to get the outer frame
+   nsITextControlFrame *tcFrame = nsnull;
+   for ( ; content; content = content->GetParent()) {
+-    if (!IsInNativeAnonymousSubtree(content)) {
++    if (!content->IsInNativeAnonymousSubtree()) {
+       nsIFrame* f = presShell->GetPrimaryFrameFor(content);
+       if (!f)
+         return;
+       CallQueryInterface(f, &tcFrame);
+       break;
+     }
+   }
+ 
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -10765,18 +10765,18 @@ IsBindingAncestor(nsIContent* aContent, 
+ IsBindingAncestor(nsIContent* aContent, nsIContent* aBindingRoot)
+ {
+   while (PR_TRUE) {
+     nsIContent* bindingParent = aContent->GetBindingParent();
+     if (!bindingParent)
+       return PR_FALSE;
+     if (bindingParent == aBindingRoot)
+       return PR_TRUE;
+-    if (bindingParent == aContent)
+-      return PR_FALSE;
++    // FOR REVIEW: Old code here seems broken, actually; should have
++    // stepped to GetParent.
+     aContent = bindingParent;
+   }
+ }
+ 
+ // Helper function that searches the immediate child frames 
+ // (and their children if the frames are "special")
+ // for a frame that maps the specified content object
+ nsIFrame*
+@@ -11852,17 +11852,18 @@ nsCSSFrameConstructor::CreateFloatingLet
+   nsIFrame* letterFrame;
+   nsStyleSet *styleSet = mPresShell->StyleSet();
+ 
+   letterFrame = NS_NewFirstLetterFrame(mPresShell, aStyleContext);
+   // We don't want to use a text content for a non-text frame (because we want
+   // its primary frame to be a text frame).  So use its parent for the
+   // first-letter.
+   nsIContent* letterContent = aTextContent->GetParent();
+-  NS_ASSERTION(letterContent->GetBindingParent() != letterContent,
++  // FIXME: Should we really assert this?
++  NS_ASSERTION(!letterContent->IsNativeAnonymous(),
+                "Reframes of this letter frame will mess with the root of a "
+                "native anonymous content subtree!");
+   InitAndRestoreFrame(aState, letterContent,
+                       aState.GetGeometricParent(aStyleContext->GetStyleDisplay(),
+                                                 aParentFrame),
+                       nsnull, letterFrame);
+ 
+   // Init the text frame to refer to the letter frame. Make sure we
+@@ -11985,17 +11986,18 @@ nsCSSFrameConstructor::CreateLetterFrame
+       // Make an inflow first-letter frame
+       nsIFrame* letterFrame = NS_NewFirstLetterFrame(mPresShell, sc);
+ 
+       if (letterFrame) {
+         // Initialize the first-letter-frame.  We don't want to use a text
+         // content for a non-text frame (because we want its primary frame to
+         // be a text frame).  So use its parent for the first-letter.
+         nsIContent* letterContent = aTextContent->GetParent();
+-        NS_ASSERTION(letterContent->GetBindingParent() != letterContent,
++        // FIXME: Should we really assert this?
++        NS_ASSERTION(!letterContent->IsNativeAnonymous(),
+                      "Reframes of this letter frame will mess with the root "
+                      "of a native anonymous content subtree!");
+         letterFrame->Init(letterContent, aParentFrame, nsnull);
+ 
+         InitAndRestoreFrame(aState, aTextContent, letterFrame, nsnull,
+                             textFrame);
+ 
+         letterFrame->SetInitialChildList(nsnull, textFrame);
+diff --git a/layout/generic/nsBRFrame.cpp b/layout/generic/nsBRFrame.cpp
+--- a/layout/generic/nsBRFrame.cpp
++++ b/layout/generic/nsBRFrame.cpp
+@@ -271,16 +271,17 @@ BRFrame::PeekOffsetWord(PRBool aForward,
+ }
+ 
+ #ifdef ACCESSIBILITY
+ NS_IMETHODIMP BRFrame::GetAccessible(nsIAccessible** aAccessible)
+ {
+   NS_ENSURE_TRUE(mContent, NS_ERROR_FAILURE);
+   nsCOMPtr<nsIAccessibilityService> accService = do_GetService("@mozilla.org/accessibilityService;1");
+   NS_ENSURE_TRUE(accService, NS_ERROR_FAILURE);
++  // FIXME: Needs rewrite.
+   nsCOMPtr<nsIContent> parent = mContent->GetBindingParent();
+   if (parent && parent->IsNativeAnonymous() && parent->GetChildCount() == 1) {
+     // This <br> is the only node in a text control, therefore it is the hacky
+     // "bogus node" used when there is no text in the control
+     return NS_ERROR_FAILURE;
+   }
+   return accService->CreateHTMLBRAccessible(static_cast<nsIFrame*>(this), aAccessible);
+ }
+diff --git a/layout/inspector/src/inDOMView.cpp b/layout/inspector/src/inDOMView.cpp
+--- a/layout/inspector/src/inDOMView.cpp
++++ b/layout/inspector/src/inDOMView.cpp
+@@ -344,16 +344,17 @@ NS_IMETHODIMP
+ NS_IMETHODIMP
+ inDOMView::GetCellProperties(PRInt32 row, nsITreeColumn* col, nsISupportsArray *properties)
+ {
+   inDOMViewNode* node = nsnull;
+   RowToNode(row, &node);
+   if (!node) return NS_ERROR_FAILURE;
+ 
+   nsCOMPtr<nsIContent> content = do_QueryInterface(node->node);
++  // FIXME: Use IsInAnonymousSubtree.
+   if (content && content->GetBindingParent()) {
+     properties->AppendElement(kAnonymousAtom);
+   }
+ 
+   PRUint16 nodeType;
+   node->node->GetNodeType(&nodeType);
+   switch (nodeType) {
+     case nsIDOMNode::ELEMENT_NODE:
