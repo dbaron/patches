@@ -1,0 +1,105 @@
+Make rule node children destruction happen in a queue from the root rule node (or root of the subtree being destroyed) rather than using recursion.  (Bug 439184.)
+
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -408,18 +408,46 @@ nsRuleNode::operator new(size_t sz, nsPr
+ {
+   // Check the recycle list first.
+   return aPresContext->AllocateFromShell(sz);
+ }
+ 
+ // Overridden to prevent the global delete from being called, since the memory
+ // came out of an nsIArena instead of the global delete operator's heap.
+ void 
+-nsRuleNode::Destroy()
+-{
++nsRuleNode::Destroy(nsRuleNode ***aDestroyQueueTail)
++{
++  nsRuleNode *destroyQueue, *destroyQueueTail;
++  if (aDestroyQueueTail) {
++    destroyQueueTail = *aDestroyQueueTail;
++  } else {
++    destroyQueueTail = &destroyQueue;
++  }
++
++  if (ChildrenAreHashed()) {
++    PLDHashTable *children = ChildrenHash();
++    // XXX LINK THEM INSTEAD!
++    PL_DHashTableEnumerate(children, DeleteRuleNodeChildren, nsnull);
++    PL_DHashTableDestroy(children);
++  } else if (HaveChildren()) {
++    *destroyQueueTail = ChildrenList();
++    do {
++      destroyQueueTail = &(*destroyQueueTail)->mNextSibling;
++    } while (*destroyQueueTail);
++  }
++  mChildrenTaggedPtr = nsnull;
++
++  if (aDestroyQueueTail) {
++    // Our caller destroys the queue.
++    *aDestroyQueueTail = destroyQueueTail;
++  } else {
++    // We have to do destroy the queue.
++    // XXX WRITE ME
++  }
++
+   // Destroy ourselves.
+   this->~nsRuleNode();
+   
+   // Don't let the memory be freed, since it will be recycled
+   // instead. Don't call the global operator delete.
+   mPresContext->FreeToShell(sizeof(nsRuleNode), this);
+ }
+ 
+@@ -458,28 +486,16 @@ DeleteRuleNodeChildren(PLDHashTable *tab
+   return PL_DHASH_NEXT;
+ }
+ 
+ nsRuleNode::~nsRuleNode()
+ {
+   MOZ_COUNT_DTOR(nsRuleNode);
+   if (mStyleData.mResetData || mStyleData.mInheritedData)
+     mStyleData.Destroy(0, mPresContext);
+-  if (ChildrenAreHashed()) {
+-    PLDHashTable *children = ChildrenHash();
+-    PL_DHashTableEnumerate(children, DeleteRuleNodeChildren, nsnull);
+-    PL_DHashTableDestroy(children);
+-  } else if (HaveChildren()) {
+-    nsRuleNode *node = ChildrenList();
+-    do {
+-      nsRuleNode *next = node->mNextSibling;
+-      node->Destroy();
+-      node = next;
+-    } while (node);
+-  }
+   NS_IF_RELEASE(mRule);
+ }
+ 
+ nsRuleNode*
+ nsRuleNode::Transition(nsIStyleRule* aRule, PRUint8 aLevel,
+                        PRPackedBool aIsImportantRule)
+ {
+   nsRuleNode* next = nsnull;
+diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
+--- a/layout/style/nsRuleNode.h
++++ b/layout/style/nsRuleNode.h
+@@ -441,17 +441,17 @@ private:
+                       // never used for reset structs since their
+                       // Compute*Data functions don't initialize from
+                       // inherited data.
+ 
+ public:
+   // Overloaded new operator. Initializes the memory to 0 and relies on an arena
+   // (which comes from the presShell) to perform the allocation.
+   NS_HIDDEN_(void*) operator new(size_t sz, nsPresContext* aContext) CPP_THROW_NEW;
+-  NS_HIDDEN_(void) Destroy();
++  NS_HIDDEN_(void) Destroy(nsRuleNode ***aDestroyQueueTail = nsnull);
+   static NS_HIDDEN_(nsILanguageAtomService*) gLangService;
+ 
+ protected:
+   NS_HIDDEN_(void) PropagateDependentBit(PRUint32 aBit,
+                                          nsRuleNode* aHighestNode);
+   NS_HIDDEN_(void) PropagateNoneBit(PRUint32 aBit, nsRuleNode* aHighestNode);
+   
+   NS_HIDDEN_(const void*) SetDefaultOnRoot(const nsStyleStructID aSID,
