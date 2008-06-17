@@ -1,0 +1,503 @@
+From: Eric Butler <ebutler@mozilla.com>
+
+Fix crashes when using text API on a canvas context whose element doesn't have a frame, and update handling of that case to match the spec.  (Bug 438695)  r+sr=dbaron
+
+diff --git a/content/canvas/src/Makefile.in b/content/canvas/src/Makefile.in
+--- a/content/canvas/src/Makefile.in
++++ b/content/canvas/src/Makefile.in
+@@ -81,9 +81,13 @@ endif
+ 
+ # we don't want the shared lib, but we want to force the creation of a static lib.
+ FORCE_STATIC_LIB = 1
+ 
+ include $(topsrcdir)/config/rules.mk
+ 
+ CXXFLAGS	+= $(MOZ_CAIRO_CFLAGS) $(TK_CFLAGS)
+ 
++INCLUDES	+= \
++		-I$(srcdir)/../../../layout/style \
++		$(NULL)
++
+ DEFINES += -D_IMPL_NS_LAYOUT
+diff --git a/content/canvas/src/nsCanvasRenderingContext2D.cpp b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+--- a/content/canvas/src/nsCanvasRenderingContext2D.cpp
++++ b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+@@ -64,16 +64,17 @@
+ #include "nsIInterfaceRequestorUtils.h"
+ #include "nsIImage.h"
+ #include "nsIFrame.h"
+ #include "nsDOMError.h"
+ #include "nsIScriptError.h"
+ 
+ #include "nsICSSParser.h"
+ #include "nsICSSStyleRule.h"
++#include "nsInspectorCSSUtils.h"
+ #include "nsStyleSet.h"
+ 
+ #include "nsPrintfCString.h"
+ 
+ #include "nsReadableUtils.h"
+ 
+ #include "nsColor.h"
+ #include "nsIRenderingContext.h"
+@@ -1565,78 +1566,143 @@ nsCanvasRenderingContext2D::Rect(float x
+     cairo_rectangle (mCairo, x, y, w, h);
+     return NS_OK;
+ }
+ 
+ //
+ // text
+ //
+ 
++/**
++ * Helper function for SetFont that creates a style rule for the given font.
++ * @param aFont The CSS font string
++ * @param aCssParser The CSS parser of the canvas rendering context
++ * @param aNode The canvas element
++ * @param aResult Pointer in which to place the new style rule.
++ * @remark Assumes all pointer arguments are non-null.
++ */
++static nsresult
++CreateFontStyleRule(const nsAString& aFont,
++                    nsICSSParser* aCssParser,
++                    nsINode* aNode,
++                    nsICSSStyleRule** aResult)
++{
++    nsresult rv;
++
++    nsCOMPtr<nsICSSStyleRule> rule;
++    PRBool changed;
++
++    nsIPrincipal* principal = aNode->NodePrincipal();
++    nsIDocument* document = aNode->GetOwnerDoc();
++
++    nsIURI* docURL = document->GetDocumentURI();
++    nsIURI* baseURL = document->GetBaseURI();
++
++    rv = aCssParser->ParseStyleAttribute(
++            EmptyString(),
++            docURL,
++            baseURL,
++            principal,
++            getter_AddRefs(rule));
++    if (NS_FAILED(rv))
++        return rv;
++
++    rv = aCssParser->ParseProperty(eCSSProperty_font,
++                                  aFont,
++                                  docURL,
++                                  baseURL,
++                                  principal,
++                                  rule->GetDeclaration(),
++                                  &changed);
++    if (NS_FAILED(rv))
++        return rv;
++
++    // set line height to normal, as per spec
++    rv = aCssParser->ParseProperty(eCSSProperty_line_height,
++                                 NS_LITERAL_STRING("normal"),
++                                 docURL,
++                                 baseURL,
++                                 principal,
++                                 rule->GetDeclaration(),
++                                 &changed);
++    if (NS_FAILED(rv))
++        return rv;
++
++    NS_ADDREF(*aResult = rule.get());
++    return NS_OK;
++}
++
+ NS_IMETHODIMP
+ nsCanvasRenderingContext2D::SetFont(const nsAString& font)
+ {
+-    if(CurrentState().font.Equals(font)) return NS_OK;
++    nsresult rv;
+ 
+-    nsCOMPtr<nsINode> elem = do_QueryInterface(mCanvasElement);
+-    if (!elem) {
+-        NS_WARNING("Canvas element must be an nsINode and non-null");
++    /*
++     * If font is defined with relative units (e.g. ems) and the parent
++     * style context changes in between calls, setting the font to the
++     * same value as previous could result in a different computed value,
++     * so we cannot have the optimization where we check if the new font
++     * string is equal to the old one.
++     */
++
++    nsCOMPtr<nsIContent> content = do_QueryInterface(mCanvasElement);
++    if (!content) {
++        NS_WARNING("Canvas element must be an nsIContent and non-null");
+         return NS_ERROR_FAILURE;
+     }
+ 
+-    nsIPrincipal* elemPrincipal = elem->NodePrincipal();
+-    nsIDocument* elemDocument = elem->GetOwnerDoc();
++    nsIDocument* document = content->GetOwnerDoc();
+ 
+-    if (!elemDocument || !elemPrincipal) {
+-        NS_WARNING("Element is missing document or principal");
+-        return NS_ERROR_FAILURE;
+-    }
+-
+-    nsIPresShell* presShell = elemDocument->GetPrimaryShell();
++    nsIPresShell* presShell = document->GetPrimaryShell();
+     if (!presShell)
+         return NS_ERROR_FAILURE;
+-
+-    nsIURI *docURL = elemDocument->GetDocumentURI();
+-    nsIURI *baseURL = elemDocument->GetBaseURI();
+ 
+     nsCString langGroup;
+     presShell->GetPresContext()->GetLangGroup()->ToUTF8String(langGroup);
+ 
+     nsCOMArray<nsIStyleRule> rules;
+-    PRBool changed;
+ 
+     nsCOMPtr<nsICSSStyleRule> rule;
+-    mCSSParser->ParseStyleAttribute(
+-            EmptyString(),
+-            docURL,
+-            baseURL,
+-            elemPrincipal,
+-            getter_AddRefs(rule));
+-
+-    mCSSParser->ParseProperty(eCSSProperty_font,
+-                              font,
+-                              docURL,
+-                              baseURL,
+-                              elemPrincipal,
+-                              rule->GetDeclaration(),
+-                              &changed);
++    rv = CreateFontStyleRule(font, mCSSParser.get(), content.get(), getter_AddRefs(rule));
++    if (NS_FAILED(rv))
++        return rv;
+ 
+     rules.AppendObject(rule);
+ 
+-    nsStyleSet *styleSet = presShell->StyleSet();
++    nsStyleSet* styleSet = presShell->StyleSet();
+ 
+-    // get the frame's style context to use as the parent
+-    if (!mCanvasElement) {
+-        return NS_ERROR_FAILURE;
+-    }
+-    nsIFrame* frame;
+-    if (mCanvasElement->GetPrimaryCanvasFrame(&frame)!=NS_OK) {
+-        return NS_ERROR_FAILURE;
++    // have to get a parent style context
++    nsRefPtr<nsStyleContext> parentContext;
++
++    if (content->IsInDoc()) {
++        // try to find the closest context
++        parentContext = nsInspectorCSSUtils::GetStyleContextForContent(
++                content,
++                nsnull,
++                presShell);
++    } else {
++        // otherwise inherit from default (10px sans-serif)
++        nsCOMPtr<nsICSSStyleRule> parentRule;
++        rv = CreateFontStyleRule(NS_LITERAL_STRING("10px sans-serif"),
++                                 mCSSParser.get(),
++                                 content.get(),
++                                 getter_AddRefs(parentRule));
++        if (NS_FAILED(rv))
++            return rv;
++        nsCOMArray<nsIStyleRule> parentRules;
++        parentRules.AppendObject(parentRule);
++        parentContext = styleSet->ResolveStyleForRules(nsnull, parentRules);
+     }
+ 
+-    nsRefPtr<nsStyleContext> sc = styleSet->ResolveStyleForRules(frame->GetStyleContext(), rules);
++    if (!parentContext)
++        return NS_ERROR_FAILURE;
++
++    nsRefPtr<nsStyleContext> sc = styleSet->ResolveStyleForRules(parentContext, rules);
++    if (!sc)
++        return NS_ERROR_FAILURE;
+     const nsStyleFont *fontStyle = sc->GetStyleFont();
+ 
+     NS_ASSERTION(fontStyle, "Could not obtain font style");
+ 
+     PRUint32 aupdp = presShell->GetPresContext()->AppUnitsPerDevPixel();
+ 
+     gfxFontStyle style(fontStyle->mFont.style,
+                        fontStyle->mFont.weight,
+@@ -1765,17 +1831,18 @@ nsCanvasRenderingContext2D::GetTextBasel
+ 
+ /*
+  * Helper function that replaces the whitespace characters in a string
+  * with U+0020 SPACE. The whitespace characters are defined as U+0020 SPACE,
+  * U+0009 CHARACTER TABULATION (tab), U+000A LINE FEED (LF), U+000B LINE
+  * TABULATION, U+000C FORM FEED (FF), and U+000D CARRIAGE RETURN (CR).
+  * @param str The string whose whitespace characters to replace.
+  */
+-static inline void TextReplaceWhitespaceCharacters(nsAutoString& str)
++static inline void
++TextReplaceWhitespaceCharacters(nsAutoString& str)
+ {
+     str.ReplaceChar("\x09\x0A\x0B\x0C\x0D", PRUnichar(' '));
+ }
+ 
+ NS_IMETHODIMP
+ nsCanvasRenderingContext2D::FillText(const nsAString& text, float x, float y, float maxWidth)
+ {
+     return drawText(text, x, y, maxWidth, TEXT_DRAW_OPERATION_FILL);
+@@ -1792,44 +1859,60 @@ nsCanvasRenderingContext2D::drawText(con
+                                      float x,
+                                      float y,
+                                      float maxWidth,
+                                      TextDrawOperation op)
+ {
+     if (!FloatValidate(x, y, maxWidth))
+         return NS_ERROR_DOM_SYNTAX_ERR;
+ 
+-    // get js context to parse extra arg
+-    nsresult rv;
+-
+     // spec isn't clear on what should happen if maxWidth <= 0, so
+     // treat it as an invalid argument
+     // technically, 0 should be an invalid value as well, but 0 is the default
+     // arg, and there is no way to tell if the default was used
+     if (maxWidth < 0)
+         return NS_ERROR_INVALID_ARG;
+ 
+     gfxFontGroup* fontgrp = GetCurrentFontStyle();
+     NS_ASSERTION(fontgrp, "font group is null");
+ 
++    nsCOMPtr<nsIContent> content = do_QueryInterface(mCanvasElement);
++    if (!content) {
++        NS_WARNING("Canvas element must be an nsIContent and non-null");
++        return NS_ERROR_FAILURE;
++    }
++
++    nsIDocument* document = content->GetOwnerDoc();
++
++    nsIPresShell* presShell = document->GetPrimaryShell();
++    if (!presShell)
++        return NS_ERROR_FAILURE;
++
+     // replace all the whitespace characters with U+0020 SPACE
+     nsAutoString textToDraw(rawText);
+     TextReplaceWhitespaceCharacters(textToDraw);
+ 
+     const PRUnichar* textData;
+     textToDraw.GetData(&textData);
+-
+-    // get direction property from the frame
+-    nsIFrame* frame;
+-    rv = mCanvasElement->GetPrimaryCanvasFrame(&frame);
+-    if (NS_FAILED(rv))
+-        return rv;
+   
+-    PRBool isRTL = frame->GetStyleVisibility()->mDirection ==
+-        NS_STYLE_DIRECTION_RTL;
++    // for now, default to ltr if not in doc
++    PRBool isRTL = PR_FALSE;
++    
++    if (content->IsInDoc()) {
++        // try to find the closest context
++        nsRefPtr<nsStyleContext> parentContext =
++            nsInspectorCSSUtils::GetStyleContextForContent(content,
++                                                           nsnull,
++                                                           presShell);
++        if (parentContext)
++            isRTL = parentContext->GetStyleVisibility()->mDirection ==
++                NS_STYLE_DIRECTION_RTL;
++        else
++            return NS_ERROR_FAILURE;
++    }
+ 
+     PRUint32 textrunflags = isRTL ? gfxTextRunFactory::TEXT_IS_RTL : 0;
+ 
+     // app units conversion factor
+     PRUint32 aupdp;
+     GetAppUnitsValues(&aupdp, NULL);
+ 
+     gfxTextRunCache::AutoTextRun textRun;
+@@ -2005,19 +2088,17 @@ nsCanvasRenderingContext2D::GetMozTextSt
+     // font and mozTextStyle are the same value
+     return GetFont(textStyle);
+ }
+ 
+ gfxFontGroup *nsCanvasRenderingContext2D::GetCurrentFontStyle()
+ {
+     // use lazy initilization for the font group since it's rather expensive
+     if(!CurrentState().fontGroup) {
+-        nsAutoString style;
+-        style.AssignLiteral("10px sans-serif");
+-        nsresult res = SetMozTextStyle(style);
++        nsresult res = SetMozTextStyle(NS_LITERAL_STRING("10px sans-serif"));
+         NS_ASSERTION(res == NS_OK, "Default canvas font is invalid");
+     }
+ 
+     return CurrentState().fontGroup;
+ }
+ 
+ NS_IMETHODIMP
+ nsCanvasRenderingContext2D::MozDrawText(const nsAString& textToDraw)
+diff --git a/layout/reftests/canvas/reftest.list b/layout/reftests/canvas/reftest.list
+--- a/layout/reftests/canvas/reftest.list
++++ b/layout/reftests/canvas/reftest.list
+@@ -20,8 +20,12 @@
+ 
+ != text-big-stroke.html text-blank.html
+ != text-big-stroke.html text-big-fill.html
+ 
+ == text-context-state-test.html text-context-state-ref.html
+ == text-font-inherit.html text-big-fill.html
+ == text-space-replace-test.html text-space-replace-ref.html
+ 
++== text-no-frame-test.html text-no-frame-ref.html
++== text-no-frame-2-test.html text-not-in-doc-ref.html
++== text-not-in-doc-test.html text-not-in-doc-ref.html
++
+diff --git a/layout/reftests/canvas/text-no-frame-2-test.html b/layout/reftests/canvas/text-no-frame-2-test.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/canvas/text-no-frame-2-test.html
+@@ -0,0 +1,29 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++<title>Test to ensure non-framed canvas inherits properties</title>
++</head>
++<body>
++<div style="font: 20px sans-serif;">
++<div style="display: none;">		
++<canvas id="c" width="512" height="256"></canvas>
++</div>
++<canvas id="d" width="512" height="256"></canvas>
++</div>
++<script type="text/javascript">
++  var canvas = document.getElementById('c');
++  var ctx = canvas.getContext('2d');
++
++  var str = 'BLEARGH!';
++  ctx.font = '1em sans-serif';
++  ctx.fillStyle = 'black';
++  ctx.textAlign = 'center';
++  ctx.fillText(str, 256, 128);
++
++  var canvas2 = document.getElementById('d');
++  var ctx = canvas2.getContext('2d');
++
++  ctx.drawImage(canvas, 0, 0);
++</script>
++</body>
++</html>
+diff --git a/layout/reftests/canvas/text-no-frame-ref.html b/layout/reftests/canvas/text-no-frame-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/canvas/text-no-frame-ref.html
+@@ -0,0 +1,21 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++<title>Test to ensure non-framed canvas inherits properties</title>
++</head>
++<body>
++<div style="font: 40px sans-serif">
++<canvas id="c" width="512" height="256" style="direction: rtl;"></canvas>
++</div>
++<script type="text/javascript">
++  var canvas = document.getElementById('c');
++  var ctx = canvas.getContext('2d');
++
++  var str = 'BLEARGH!';
++  ctx.font = '1em sans-serif';
++  ctx.fillStyle = 'black';
++  ctx.textAlign = 'center';
++  ctx.fillText(str, 256, 128);
++</script>
++</body>
++</html>
+diff --git a/layout/reftests/canvas/text-no-frame-test.html b/layout/reftests/canvas/text-no-frame-test.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/canvas/text-no-frame-test.html
+@@ -0,0 +1,27 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++<title>Test to ensure non-framed canvas inherits properties</title>
++</head>
++<body>
++<div style="font: 40px sans-serif; direction: rtl;">
++<canvas id="c" width="512" height="256" style="display: none;"></canvas>
++</div>
++<canvas id="d" width="512" height="256"></canvas>
++<script type="text/javascript">
++  var canvas = document.getElementById('c');
++  var ctx = canvas.getContext('2d');
++
++  var str = 'BLEARGH!';
++  ctx.font = '1em sans-serif';
++  ctx.fillStyle = 'black';
++  ctx.textAlign = 'center';
++  ctx.fillText(str, 256, 128);
++
++  var canvas2 = document.getElementById('d');
++  var ctx = canvas2.getContext('2d');
++
++  ctx.drawImage(canvas, 0, 0);
++</script>
++</body>
++</html>
+diff --git a/layout/reftests/canvas/text-not-in-doc-ref.html b/layout/reftests/canvas/text-not-in-doc-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/canvas/text-not-in-doc-ref.html
+@@ -0,0 +1,21 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++<title>Test to ensure canvas not in doc gets default properties</title>
++</head>
++<body>
++<div style="font: 10px sans-serif; direction: ltr">
++<canvas id="c" width="512" height="256"></canvas>
++</div>
++<script type="text/javascript">
++  var canvas = document.getElementById('c');
++  var ctx = canvas.getContext('2d');
++
++  var str = 'BLEARGH!';
++  ctx.font = '2em sans-serif';
++  ctx.fillStyle = 'black';
++  ctx.textAlign = 'center';
++  ctx.fillText(str, 256, 128);
++</script>
++</body>
++</html>
+diff --git a/layout/reftests/canvas/text-not-in-doc-test.html b/layout/reftests/canvas/text-not-in-doc-test.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/canvas/text-not-in-doc-test.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++<title>Test to ensure canvas not in doc gets default properties</title>
++</head>
++<body>
++<canvas id="d" width="512" height="256"></canvas>
++<script type="text/javascript">
++  var canvas = document.createElement('canvas');
++  canvas.width = 512;
++  canvas.height = 526;
++  var ctx = canvas.getContext('2d');
++
++  var str = 'BLEARGH!';
++  ctx.font = '2em sans-serif';
++  ctx.fillStyle = 'black';
++  ctx.textAlign = 'center';
++  ctx.fillText(str, 256, 128);
++
++  var canvas2 = document.getElementById('d');
++  var ctx = canvas2.getContext('2d');
++
++  ctx.drawImage(canvas, 0, 0);
++</script>
++</body>
++</html>
