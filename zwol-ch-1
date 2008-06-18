@@ -1,0 +1,215 @@
+# HG changeset patch
+# User Zack Weinberg <zweinberg@mozilla.com>
+# Date 1213738676 25200
+# Node ID f6b609b0af6e9d5df2c5cafeabbb63884968a673
+# Parent  5951d3fe2a66bc6cdaf9de858cb7149a2ffbf3c2
+Add .zeroOrAveCharWidth field to gfxFont::Metrics.  Initialize it in all font backends.  Use it when computing CSS 'ch' units.  (Bug 363706)  r=roc  sr=dbaron
+
+diff --git a/gfx/thebes/public/gfxFont.h b/gfx/thebes/public/gfxFont.h
+--- a/gfx/thebes/public/gfxFont.h
++++ b/gfx/thebes/public/gfxFont.h
+@@ -410,16 +410,19 @@ public:
+         gfxFloat emDescent;
+         gfxFloat maxHeight;
+         gfxFloat maxAscent;
+         gfxFloat maxDescent;
+         gfxFloat maxAdvance;
+ 
+         gfxFloat aveCharWidth;
+         gfxFloat spaceWidth;
++        // Width of U+0030 DIGIT ZERO, or if this font does not contain that
++        // character, the average character width (same as .aveCharWidth).
++        gfxFloat zeroOrAveCharWidth;
+     };
+     virtual const gfxFont::Metrics& GetMetrics() = 0;
+ 
+     /**
+      * We let layout specify spacing on either side of any
+      * character. We need to specify both before and after
+      * spacing so that substring measurement can do the right things.
+      * These values are in appunits. They're always an integral number of
+diff --git a/gfx/thebes/src/gfxAtsuiFonts.cpp b/gfx/thebes/src/gfxAtsuiFonts.cpp
+--- a/gfx/thebes/src/gfxAtsuiFonts.cpp
++++ b/gfx/thebes/src/gfxAtsuiFonts.cpp
+@@ -267,16 +267,20 @@ gfxAtsuiFont::InitMetrics(ATSUFontID aFo
+     mMetrics.superscriptOffset = mMetrics.xHeight;
+ 
+     mMetrics.strikeoutOffset = mMetrics.xHeight / 2.0;
+     mMetrics.strikeoutSize = mMetrics.underlineSize;
+ 
+     PRUint32 glyphID;
+     mMetrics.spaceWidth = GetCharWidth(' ', &glyphID);
+     mSpaceGlyph = glyphID;
++
++    mMetrics.zeroOrAveCharWidth = GetCharWidth('0', &glyphID);
++    if (glyphID == 0) // no zero in this font
++        mMetrics.zeroOrAveCharWidth = mMetrics.aveCharWidth;
+ 
+     SanitizeMetrics(&mMetrics, mFontEntry->FamilyEntry()->IsBadUnderlineFontFamily());
+ 
+ #if 0
+     fprintf (stderr, "Font: %p size: %f (fixed: %d)", this, size, gfxQuartzFontCache::SharedFontCache()->IsFixedPitch(aFontID));
+     fprintf (stderr, "    emHeight: %f emAscent: %f emDescent: %f\n", mMetrics.emHeight, mMetrics.emAscent, mMetrics.emDescent);
+     fprintf (stderr, "    maxAscent: %f maxDescent: %f maxAdvance: %f\n", mMetrics.maxAscent, mMetrics.maxDescent, mMetrics.maxAdvance);
+     fprintf (stderr, "    internalLeading: %f externalLeading: %f\n", mMetrics.externalLeading, mMetrics.internalLeading);
+diff --git a/gfx/thebes/src/gfxOS2Fonts.cpp b/gfx/thebes/src/gfxOS2Fonts.cpp
+--- a/gfx/thebes/src/gfxOS2Fonts.cpp
++++ b/gfx/thebes/src/gfxOS2Fonts.cpp
+@@ -149,16 +149,26 @@ const gfxFont::Metrics& gfxOS2Font::GetM
+             mMetrics->xHeight = face->glyph->metrics.height * yScale;
+             mMetrics->aveCharWidth = face->glyph->metrics.width * xScale;
+         } else {
+             // this font doesn't have an 'x'...
+             // fake these metrics using a fraction of the font size
+             mMetrics->xHeight = mMetrics->emHeight * 0.5;
+             mMetrics->aveCharWidth = mMetrics->emHeight * 0.5;
+         }
++
++	// properties of '0', for 'ch' units
++	gid = FT_Get_Char_Index(face, '0');
++	if (gid) {
++            FT_Load_Glyph(face, gid, FT_LOAD_NO_SCALE);
++            mMetrics->zeroOrAveCharWidth = face->glyph->metrics.width * xScale;
++	} else {
++	     // this font doesn't have a '0'
++	     mMetrics->zeroOrAveCharWidth = mMetrics->aveCharWidth;
++	}
+ 
+         // compute an adjusted size if we need to
+         if (mAdjustedSize == 0 && GetStyle()->sizeAdjust != 0) {
+             gfxFloat aspect = mMetrics->xHeight / GetStyle()->size;
+             mAdjustedSize = GetStyle()->GetAdjustedSize(aspect);
+             mMetrics->emHeight = mAdjustedSize;
+         }
+ 
+diff --git a/gfx/thebes/src/gfxPangoFonts.cpp b/gfx/thebes/src/gfxPangoFonts.cpp
+--- a/gfx/thebes/src/gfxPangoFonts.cpp
++++ b/gfx/thebes/src/gfxPangoFonts.cpp
+@@ -958,20 +958,26 @@ gfxPangoFont::GetMetrics()
+ 
+     mMetrics.maxHeight = lineHeight;
+ 
+     mMetrics.emAscent = lineHeight > 0.0 ?
+         mMetrics.maxAscent * mMetrics.emHeight / lineHeight : 0.0;
+     mMetrics.emDescent = mMetrics.emHeight - mMetrics.emAscent;
+ 
+     gfxSize isz, lsz;
++    PRUint32 zeroGlyph;
+     GetCharSize(' ', isz, lsz, &mSpaceGlyph);
+     mMetrics.spaceWidth = lsz.width;
+     GetCharSize('x', isz, lsz);
+     mMetrics.xHeight = isz.height;
++    GetCharSize('0', isz, lsz, &zeroGlyph);
++    if (zeroGlyph)
++        mMetrics.zeroOrAveCharWidth = lsz.width;
++    else
++        mMetrics.zeroOrAveCharWidth = mMetrics.aveCharWidth;
+ 
+     FT_Face face = NULL;
+     if (pfm && PANGO_IS_FC_FONT(font))
+         face = pango_fc_font_lock_face(PANGO_FC_FONT(font));
+ 
+     if (face) {
+         mMetrics.maxAdvance = face->size->metrics.max_advance / 64.0; // 26.6
+ 
+diff --git a/gfx/thebes/src/gfxWindowsFonts.cpp b/gfx/thebes/src/gfxWindowsFonts.cpp
+--- a/gfx/thebes/src/gfxWindowsFonts.cpp
++++ b/gfx/thebes/src/gfxWindowsFonts.cpp
+@@ -625,16 +625,25 @@ gfxWindowsFont::ComputeMetrics()
+     if (!(metrics.tmPitchAndFamily & TMPF_FIXED_PITCH)) {
+       mMetrics->maxAdvance = mMetrics->aveCharWidth;
+     }
+ 
+     // Cache the width of a single space.
+     SIZE size;
+     GetTextExtentPoint32(dc, " ", 1, &size);
+     mMetrics->spaceWidth = ROUND(size.cx);
++
++    // Cache the width of digit zero.
++    // XXX MSDN (http://msdn.microsoft.com/en-us/library/ms534223.aspx)
++    // does not say what the failure modes for GetExtentPoint32 are -
++    // is it safe to assume it will fail iff the font has no '0'?
++    if (GetExtentPoint32(dc, "0", 1, &size))
++        mMetrics->zeroOrAveCharWidth = ROUND(size.cx);
++    else
++        mMetrics->zeroOrAveCharWidth = mMetrics->aveCharWidth;
+ 
+     mSpaceGlyph = 0;
+     if (metrics.tmPitchAndFamily & TMPF_TRUETYPE) {
+         WORD glyph;
+         DWORD ret = GetGlyphIndicesA(dc, " ", 1, &glyph,
+                                      GGI_MARK_NONEXISTING_GLYPHS);
+         if (ret != GDI_ERROR && glyph != 0xFFFF) {
+             mSpaceGlyph = glyph;
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -2654,21 +2654,26 @@ nscoord
+ nscoord
+ nsLayoutUtils::CharsToCoord(const nsStyleCoord& aStyle,
+                             nsIRenderingContext* aRenderingContext,
+                             nsStyleContext* aStyleContext)
+ {
+   NS_ASSERTION(aStyle.GetUnit() == eStyleUnit_Chars,
+                "Shouldn't have called this");
+ 
+-  SetFontFromStyle(aRenderingContext, aStyleContext);
+-  nscoord fontWidth;
+-  aRenderingContext->SetTextRunRTL(PR_FALSE);
+-  aRenderingContext->GetWidth('M', fontWidth);
+-  return aStyle.GetIntValue() * fontWidth;
++  nsCOMPtr<nsIFontMetrics> metrics;
++  aRenderingContext->GetMetricsFor(aStyleContext->GetStyleFont()->mFont,
++                                   *getter_AddRefs(metrics));
++  nsCOMPtr<nsIThebesFontMetrics> tfm(do_QueryInterface(metrics));
++  gfxFloat zeroWidth =
++    tfm->GetThebesFontGroup()->GetFontAt(0)->GetMetrics().zeroOrAveCharWidth;
++
++  return NSToCoordRound(aValue.GetFloatValue() *
++                        NS_ceil(aPresContext->AppUnitsPerDevPixel() *
++                                zeroWidth));
+ }
+ 
+ static PRBool NonZeroStyleCoord(const nsStyleCoord& aCoord)
+ {
+   switch (aCoord.GetUnit()) {
+   case eStyleUnit_Percent:
+     return aCoord.GetPercentValue() > 0;
+   case eStyleUnit_Coord:
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -48,30 +48,32 @@
+  */
+ 
+ #include "nsRuleNode.h"
+ #include "nscore.h"
+ #include "nsIServiceManager.h"
+ #include "nsIDeviceContext.h"
+ #include "nsILookAndFeel.h"
+ #include "nsIPresShell.h"
+-#include "nsIFontMetrics.h"
++#include "nsIThebesFontMetrics.h"
++#include "gfxFont.h"
+ #include "nsStyleUtil.h"
+ #include "nsCSSPseudoElements.h"
+ #include "nsThemeConstants.h"
+ #include "nsITheme.h"
+ #include "pldhash.h"
+ #include "nsStyleContext.h"
+ #include "nsStyleSet.h"
+ #include "nsSize.h"
+ #include "imgIRequest.h"
+ #include "nsRuleData.h"
+ #include "nsILanguageAtomService.h"
+ #include "nsIStyleRule.h"
+ #include "nsBidiUtils.h"
++
+ 
+ /*
+  * For storage of an |nsRuleNode|'s children in a linked list.
+  */
+ struct nsRuleList {
+   nsRuleNode* mRuleNode;
+   nsRuleList* mNext;
+   
