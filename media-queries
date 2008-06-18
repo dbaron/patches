@@ -769,7 +769,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  {
  public:
    CSSRuleListImpl(nsCSSStyleSheet *aStyleSheet);
-@@ -158,47 +160,293 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
+@@ -158,47 +160,298 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
          result = NS_OK; // per spec: "Return Value ... null if ... not a valid index."
        }
      }
@@ -778,6 +778,126 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
    return result;
  }
  
++template <class Numeric>
++PRInt32 DoCompare(Numeric a, Numeric b)
++{
++  if (a == b)
++    return 0;
++  if (a < b)
++    return -1;
++  return 1;
++}
++
++PRBool
++nsMediaExpression::Matches(nsPresContext *aPresContext,
++                           const nsCSSValue& aActualValue) const
++{
++  const nsCSSValue& actual = aActualValue;
++  const nsCSSValue& required = mValue;
++
++  // If we don't have the feature, the match fails.
++  if (actual.GetUnit() == eCSSUnit_Null) {
++    return PR_FALSE;
++  }
++
++  // If the expression had no value to match, the match succeeds,
++  // unless the value is an integer 0.
++  if (required.GetUnit() == eCSSUnit_Null) {
++    return actual.GetUnit() != eCSSUnit_Integer ||
++           actual.GetIntValue() != 0;
++  }
++
++  NS_ASSERTION(mFeature->mRangeType == nsMediaFeature::eMinMaxAllowed ||
++               mRange == nsMediaExpression::eEqual, "yikes");
++  PRInt32 cmp; // -1 (actual < required)
++               //  0 (actual == required)
++               //  1 (actual > required)
++  switch (mFeature->mValueType) {
++    case nsMediaFeature::eLength:
++      {
++        NS_ASSERTION(actual.IsLengthUnit(), "bad actual value");
++        NS_ASSERTION(required.IsLengthUnit(), "bad required value");
++        nscoord actualCoord = nsRuleNode::CalcLengthWithInitialFont(
++                                aPresContext, actual);
++        nscoord requiredCoord = nsRuleNode::CalcLengthWithInitialFont(
++                                  aPresContext, required);
++        cmp = DoCompare(actualCoord, requiredCoord);
++      }
++      break;
++    case nsMediaFeature::eInteger:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Integer,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Integer,
++                     "bad required value");
++        cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
++      }
++      break;
++    case nsMediaFeature::eIntRatio:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Array &&
++                     actual.GetArrayValue()->Item(0).GetUnit() ==
++                       eCSSUnit_Integer &&
++                     actual.GetArrayValue()->Item(1).GetUnit() ==
++                       eCSSUnit_Integer,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Array &&
++                     required.GetArrayValue()->Item(0).GetUnit() ==
++                       eCSSUnit_Integer &&
++                     required.GetArrayValue()->Item(1).GetUnit() ==
++                       eCSSUnit_Integer,
++                     "bad required value");
++        // Convert to PRInt64 so we can multiply without worry
++        PRInt64 actualNum = actual.GetArrayValue()->Item(0).GetIntValue(),
++                actualDen = actual.GetArrayValue()->Item(1).GetIntValue(),
++                requiredNum = required.GetArrayValue()->Item(0).GetIntValue(),
++                requiredDen = required.GetArrayValue()->Item(1).GetIntValue();
++        cmp = DoCompare(actualNum * requiredDen, requiredNum * actualDen);
++      }
++      break;
++    case nsMediaFeature::eResolution:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Inch ||
++                     actual.GetUnit() == eCSSUnit_Centimeter,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Inch ||
++                     required.GetUnit() == eCSSUnit_Centimeter,
++                     "bad required value");
++        float actualDPI = actual.GetFloatValue();
++        if (actual.GetUnit() == eCSSUnit_Centimeter)
++          actualDPI = actualDPI / 2.54f;
++        float requiredDPI = required.GetFloatValue();
++        if (required.GetUnit() == eCSSUnit_Centimeter)
++          requiredDPI = requiredDPI / 2.54f;
++        cmp = DoCompare(actualDPI, requiredDPI);
++      }
++      break;
++    case nsMediaFeature::eEnumerated:
++      {
++        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Enumerated,
++                     "bad actual value");
++        NS_ASSERTION(required.GetUnit() == eCSSUnit_Enumerated,
++                     "bad required value");
++        NS_ASSERTION(mFeature->mRangeType == nsMediaFeature::eMinMaxNotAllowed,
++                     "bad range"); // we asserted above about mRange
++        // We don't really need DoCompare, but it doesn't hurt (and
++        // maybe the compiler will condense this case with eInteger).
++        cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
++      }
++      break;
++  }
++  switch (mRange) {
++    case nsMediaExpression::eMin:
++      return cmp != -1;
++    case nsMediaExpression::eMax:
++      return cmp != 1;
++    case nsMediaExpression::eEqual:
++      return cmp == 0;
++  }
++  NS_NOTREACHED("unexpected mRange");
++  return PR_FALSE;
++}
++
 +void
 +nsMediaQuery::AppendToString(nsAString& aString) const
 +{
@@ -889,16 +1009,6 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +  return result.forget();
 +}
 +
-+template <class Numeric>
-+PRInt32 DoCompare(Numeric a, Numeric b)
-+{
-+  if (a == b)
-+    return 0;
-+  if (a < b)
-+    return -1;
-+  return 1;
-+}
-+
 +PRBool
 +nsMediaQuery::Matches(nsPresContext* aPresContext) const
 +{
@@ -910,115 +1020,10 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +    mMediaType == aPresContext->Medium() || mMediaType == nsGkAtoms::all;
 +  for (PRUint32 i = 0, i_end = mExpressions.Length(); match && i < i_end; ++i) {
 +    const nsMediaExpression &expr = mExpressions[i];
-+    const nsMediaFeature *feature = expr.mFeature;
 +    nsCSSValue actual;
-+    nsresult rv = (feature->mGetter)(aPresContext, actual);
++    nsresult rv = (expr.mFeature->mGetter)(aPresContext, actual);
 +    NS_ENSURE_SUCCESS(rv, PR_FALSE); // any better ideas?
-+    // If we don't have the feature, the match fails.
-+    if (actual.GetUnit() == eCSSUnit_Null) {
-+      match = PR_FALSE;
-+      continue;
-+    }
-+
-+    // If the expression had no value to match, the match succeeds,
-+    // unless the value is an integer 0.
-+    const nsCSSValue required = expr.mValue;
-+    if (required.GetUnit() == eCSSUnit_Null) {
-+      match = actual.GetUnit() != eCSSUnit_Integer ||
-+              actual.GetIntValue() != 0;
-+      continue;
-+    }
-+
-+    NS_ASSERTION(feature->mRangeType == nsMediaFeature::eMinMaxAllowed ||
-+                 expr.mRange == nsMediaExpression::eEqual, "yikes");
-+    PRInt32 cmp; // -1 (actual < required)
-+                 //  0 (actual == required)
-+                 //  1 (actual > required)
-+    switch (feature->mValueType) {
-+      case nsMediaFeature::eLength:
-+        {
-+          NS_ASSERTION(actual.IsLengthUnit(), "bad actual value");
-+          NS_ASSERTION(required.IsLengthUnit(), "bad required value");
-+          nscoord actualCoord = nsRuleNode::CalcLengthWithInitialFont(
-+                                  aPresContext, actual);
-+          nscoord requiredCoord = nsRuleNode::CalcLengthWithInitialFont(
-+                                    aPresContext, required);
-+          cmp = DoCompare(actualCoord, requiredCoord);
-+        }
-+        break;
-+      case nsMediaFeature::eInteger:
-+        {
-+          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Integer,
-+                       "bad actual value");
-+          NS_ASSERTION(required.GetUnit() == eCSSUnit_Integer,
-+                       "bad required value");
-+          cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
-+        }
-+        break;
-+      case nsMediaFeature::eIntRatio:
-+        {
-+          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Array &&
-+                       actual.GetArrayValue()->Item(0).GetUnit() ==
-+                         eCSSUnit_Integer &&
-+                       actual.GetArrayValue()->Item(1).GetUnit() ==
-+                         eCSSUnit_Integer,
-+                       "bad actual value");
-+          NS_ASSERTION(required.GetUnit() == eCSSUnit_Array &&
-+                       required.GetArrayValue()->Item(0).GetUnit() ==
-+                         eCSSUnit_Integer &&
-+                       required.GetArrayValue()->Item(1).GetUnit() ==
-+                         eCSSUnit_Integer,
-+                       "bad required value");
-+          // Convert to PRInt64 so we can multiply without worry
-+          PRInt64 actualNum = actual.GetArrayValue()->Item(0).GetIntValue(),
-+                  actualDen = actual.GetArrayValue()->Item(1).GetIntValue(),
-+                  requiredNum = required.GetArrayValue()->Item(0).GetIntValue(),
-+                  requiredDen = required.GetArrayValue()->Item(1).GetIntValue();
-+          cmp = DoCompare(actualNum * requiredDen, requiredNum * actualDen);
-+        }
-+        break;
-+      case nsMediaFeature::eResolution:
-+        {
-+          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Inch ||
-+                       actual.GetUnit() == eCSSUnit_Centimeter,
-+                       "bad actual value");
-+          NS_ASSERTION(required.GetUnit() == eCSSUnit_Inch ||
-+                       required.GetUnit() == eCSSUnit_Centimeter,
-+                       "bad required value");
-+          float actualDPI = actual.GetFloatValue();
-+          if (actual.GetUnit() == eCSSUnit_Centimeter)
-+            actualDPI = actualDPI / 2.54f;
-+          float requiredDPI = required.GetFloatValue();
-+          if (required.GetUnit() == eCSSUnit_Centimeter)
-+            requiredDPI = requiredDPI / 2.54f;
-+          cmp = DoCompare(actualDPI, requiredDPI);
-+        }
-+        break;
-+      case nsMediaFeature::eEnumerated:
-+        {
-+          NS_ASSERTION(actual.GetUnit() == eCSSUnit_Enumerated,
-+                       "bad actual value");
-+          NS_ASSERTION(required.GetUnit() == eCSSUnit_Enumerated,
-+                       "bad required value");
-+          NS_ASSERTION(feature->mRangeType == nsMediaFeature::eMinMaxNotAllowed,
-+                       "bad range"); // we asserted above about expr.mRange
-+          // We don't really need DoCompare, but it doesn't hurt (and
-+          // maybe the compiler will condense this case with eInteger).
-+          cmp = DoCompare(actual.GetIntValue(), required.GetIntValue());
-+        }
-+        break;
-+    }
-+    switch (expr.mRange) {
-+      case nsMediaExpression::eMin:
-+        match = cmp != -1;
-+        break;
-+      case nsMediaExpression::eMax:
-+        match = cmp != 1;
-+        break;
-+      case nsMediaExpression::eEqual:
-+        match = cmp == 0;
-+        break;
-+    }
++    match = expr.Matches(aPresContext, actual);
 +  }
 +
 +  return match == !mNegated;
@@ -1070,7 +1075,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
    return NS_OK;
  }
  
-@@ -219,47 +467,50 @@ nsMediaList::SetText(const nsAString& aM
+@@ -219,47 +472,50 @@ nsMediaList::SetText(const nsAString& aM
      domSheet->GetOwnerNode(getter_AddRefs(node));
      htmlMode = !!node;
    }
@@ -1133,7 +1138,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  nsMediaList::GetMediaText(nsAString& aMediaText)
  {
    return GetText(aMediaText);
-@@ -305,26 +556,30 @@ nsMediaList::SetMediaText(const nsAStrin
+@@ -305,26 +561,30 @@ nsMediaList::SetMediaText(const nsAStrin
    return rv;
  }
                                 
@@ -1166,7 +1171,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  }
  
  NS_IMETHODIMP
-@@ -362,48 +617,62 @@ nsMediaList::AppendMedium(const nsAStrin
+@@ -362,48 +622,62 @@ nsMediaList::AppendMedium(const nsAStrin
  }
  
  nsresult
@@ -1269,7 +1274,7 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
   * of those above. If you wish to allow use of your version of this file only
   * under the terms of either the GPL or the LGPL, and not to allow others to
   * use your version of this file under the terms of the MPL, indicate your
-@@ -41,49 +42,119 @@
+@@ -41,49 +42,123 @@
   * @media rules
   */
  
@@ -1294,6 +1299,10 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
 +  const nsMediaFeature *mFeature;
 +  Range mRange;
 +  nsCSSValue mValue;
++
++  // aActualValue must be obtained from mFeature->mGetter
++  PRBool Matches(nsPresContext* aPresContext,
++                 const nsCSSValue& aActualValue) const;
 +};
 +
 +class nsMediaQuery {
@@ -1732,7 +1741,7 @@ diff --git a/layout/style/nsMediaFeatures.h b/layout/style/nsMediaFeatures.h
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsMediaFeatures.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,88 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1797,6 +1806,11 @@ new file mode 100644
 +        eResolution, // values are in eCSSUnit_Inch (for dpi) or
 +                     //   eCSSUnit_Centimeter (for dpcm)
 +        eEnumerated  // values are eCSSUnit_Enumerated (uses keyword table)
++
++        // Note that a number of pieces of code (both for parsing and
++        // for matching of valueless expressions) assume that all numeric
++        // value types cannot be negative.  The parsing code also does
++        // not allow zeros in eIntRatio types.
 +    };
 +    ValueType mValueType;
 +
