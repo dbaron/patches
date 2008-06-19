@@ -337,13 +337,16 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    CSSParserImpl();
    virtual ~CSSParserImpl();
  
-@@ -220,16 +276,17 @@ protected:
+@@ -218,18 +274,20 @@ protected:
+   PRBool PushGroup(nsICSSGroupRule* aRule);
+   void PopGroup(void);
  
    PRBool ParseRuleSet(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseAtRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseCharsetRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseImportRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool GatherURL(nsresult& aErrorCode, nsString& aURL);
++  // Callers must clear or throw out aMedia if GatherMedia returns false.
    PRBool GatherMedia(nsresult& aErrorCode, nsMediaList* aMedia,
                       PRUnichar aStopSymbol);
 +  PRBool ParseMediaQueryExpression(nsresult& aErrorCode, nsMediaQuery* aQuery);
@@ -355,29 +358,37 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    PRBool ParseGroupRule(nsresult& aErrorCode, nsICSSGroupRule* aRule, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseMediaRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseMozDocumentRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
-@@ -1011,16 +1068,17 @@ NS_IMETHODIMP
- NS_IMETHODIMP
- CSSParserImpl::ParseMediaList(const nsSubstring& aBuffer,
-                               nsIURI* aURL, // for error reporting
-                               PRUint32 aLineNumber, // for error reporting
-                               nsMediaList* aMediaList,
-                               PRBool aHTMLMode)
+@@ -1053,16 +1111,20 @@ CSSParserImpl::DoParseMediaList(const ns
  {
-   aMediaList->Clear();
-+  aMediaList->SetNonEmpty();
- 
-   if (aHTMLMode) {
-     mHTMLMediaMode = PR_TRUE;
+   // fake base URL since media lists don't have URLs in them
+   nsresult rv = InitScanner(aBuffer, aURL, aLineNumber, aURL, nsnull);
+   if (NS_FAILED(rv)) {
+     return rv;
    }
  
-     // XXXldb We need to make the scanner not skip CSS comments!  (Or
-     // should we?)
+   if (!GatherMedia(rv, aMediaList, PRUnichar(0)) && !mHTMLMediaMode) {
++    // XXX Instead of clearing here, should we have been parsing into a
++    // fresh media list in the first place?
++    aMediaList->Clear();
++    aMediaList->SetNonEmpty(); // don't match anything
+     OUTPUT_ERROR();
+   }
+   CLEAR_ERROR();
+   ReleaseScanner();
+   return rv;
+ }
  
-@@ -1355,56 +1413,238 @@ PRBool CSSParserImpl::GatherURL(nsresult
+ NS_IMETHODIMP
+@@ -1351,60 +1413,264 @@ PRBool CSSParserImpl::GatherURL(nsresult
+   else if (eCSSToken_Function == mToken.mType && 
+            mToken.mIdent.LowerCaseEqualsLiteral("url") &&
+            GetURLInParens(aErrorCode, aURL)) {
+     return PR_TRUE;
    }
    return PR_FALSE;
  }
  
++// Callers must clear or throw out aMedia if GatherMedia returns false.
  PRBool CSSParserImpl::GatherMedia(nsresult& aErrorCode,
                                    nsMediaList* aMedia,
                                    PRUnichar aStopSymbol)
@@ -422,8 +433,29 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 -    }
 -  }
 -  return PR_FALSE;
-+  // XXX NEED TO LOOK AT WHEN THIS SHOULD REALLY RETURN FALSE AND WHAT THAT
-+  // MEANS TO ALL CALLERS.  (should DoParseMediaList look at the result?)
++  // "If the comma-separated list is the empty list it is assumed to
++  // specify the media query ‘all’."  (css3-mediaqueries, section
++  // "Media Queries")
++  if (!GetToken(aErrorCode, PR_TRUE)) {
++    // expected termination by EOF
++    if (aStopSymbol == PRUnichar(0))
++      return PR_TRUE;
++
++    // unexpected termination by EOF; if we were looking for a
++    // semicolon, return true anyway, for the same reason this is
++    // done by ExpectSymbol().
++    REPORT_UNEXPECTED_EOF(PEGatherMediaEOF);
++    return aStopSymbol == PRUnichar(';');
++  }
++
++  if (eCSSToken_Symbol == mToken.mType &&
++      mToken.mSymbol == aStopSymbol) {
++    UngetToken();
++    return PR_TRUE;
++  }
++  UngetToken();
++  aMedia->SetNonEmpty();
++
 +  for (;;) {
 +    nsAutoPtr<nsMediaQuery> queryHolder(new nsMediaQuery);
 +    if (!queryHolder) {
@@ -469,7 +501,9 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +      query->SetType(mediaType);
 +    }
 +
-+    // XXX WHEN DO WE WANT TO APPEND THIS?
++    // In terms of error handling, it doesn't really matter when we
++    // append this, since aMedia's contents get dropped entirely
++    // whenever there is an error.
 +    nsresult rv = aMedia->AppendQuery(query);
 +    if (NS_FAILED(rv)) {
 +      aErrorCode = rv;
@@ -487,9 +521,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +        // semicolon, return true anyway, for the same reason this is
 +        // done by ExpectSymbol().
 +        REPORT_UNEXPECTED_EOF(PEGatherMediaEOF);
-+        if (aStopSymbol == PRUnichar(';'))
-+          return PR_TRUE;
-+        return PR_FALSE;
++        return aStopSymbol == PRUnichar(';');
 +      }
 +
 +      if (eCSSToken_Symbol == mToken.mType &&
@@ -652,7 +684,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    nsCOMPtr<nsMediaList> media = new nsMediaList();
    if (!media) {
      aErrorCode = NS_ERROR_OUT_OF_MEMORY;
-@@ -3647,72 +3887,16 @@ CSSParserImpl::DoTransferTempData(nsCSSD
+@@ -3647,72 +3913,16 @@ CSSParserImpl::DoTransferTempData(nsCSSD
        if (!nsCSSQuotes::Equal(*source, *dest))
          *aChanged = PR_TRUE;
        delete *dest;
@@ -1075,7 +1107,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
    return NS_OK;
  }
  
-@@ -219,47 +472,50 @@ nsMediaList::SetText(const nsAString& aM
+@@ -219,47 +472,47 @@ nsMediaList::SetText(const nsAString& aM
      domSheet->GetOwnerNode(getter_AddRefs(node));
      htmlMode = !!node;
    }
@@ -1101,10 +1133,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +      return PR_TRUE;
 +    }
 +  }
-+  // FIXME: This should just be:
-+  //   return mIsEmpty;
-+  // but we're not setting mIsEmpty correctly yet.
-+  return mArray.Length() == 0;
++  return mIsEmpty;
  }
  
  nsresult
@@ -1138,7 +1167,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  nsMediaList::GetMediaText(nsAString& aMediaText)
  {
    return GetText(aMediaText);
-@@ -305,26 +561,30 @@ nsMediaList::SetMediaText(const nsAStrin
+@@ -305,26 +558,30 @@ nsMediaList::SetMediaText(const nsAStrin
    return rv;
  }
                                 
@@ -1171,7 +1200,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  }
  
  NS_IMETHODIMP
-@@ -362,48 +622,62 @@ nsMediaList::AppendMedium(const nsAStrin
+@@ -362,48 +619,62 @@ nsMediaList::AppendMedium(const nsAStrin
  }
  
  nsresult
