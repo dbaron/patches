@@ -1,6 +1,6 @@
 From: Zack Weinberg <zweinberg@mozilla.com>
 
-Add .zeroOrAveCharWidth field to gfxFont::Metrics.  Initialize it in all font backends.  Use it when computing CSS 'ch' units.  (Bug 363706)  r=roc  sr=dbaron
+Add .zeroOrAveCharWidth field to gfxFont::Metrics.  Initialize it in all font backends.  Use it when computing CSS 'ch' units, and make eStyleUnit_Chars and nsLayoutUtils::CharsToCoord unused.  (Bug 363706)  r=roc  sr=dbaron
 
 diff --git a/gfx/thebes/public/gfxFont.h b/gfx/thebes/public/gfxFont.h
 --- a/gfx/thebes/public/gfxFont.h
@@ -14,9 +14,9 @@ diff --git a/gfx/thebes/public/gfxFont.h b/gfx/thebes/public/gfxFont.h
  
          gfxFloat aveCharWidth;
          gfxFloat spaceWidth;
-+        // Width of U+0030 DIGIT ZERO, or if this font does not contain that
-+        // character, the average character width (same as .aveCharWidth).
-+        gfxFloat zeroOrAveCharWidth;
++        gfxFloat zeroOrAveCharWidth;  // width of '0', or if there is
++                                      // no '0' glyph in this font,
++                                      // equal to .aveCharWidth
      };
      virtual const gfxFont::Metrics& GetMetrics() = 0;
  
@@ -138,45 +138,46 @@ diff --git a/gfx/thebes/src/gfxWindowsFonts.cpp b/gfx/thebes/src/gfxWindowsFonts
                                       GGI_MARK_NONEXISTING_GLYPHS);
          if (ret != GDI_ERROR && glyph != 0xFFFF) {
              mSpaceGlyph = glyph;
-diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
---- a/layout/base/nsLayoutUtils.cpp
-+++ b/layout/base/nsLayoutUtils.cpp
-@@ -2654,21 +2654,26 @@ nscoord
- nscoord
- nsLayoutUtils::CharsToCoord(const nsStyleCoord& aStyle,
-                             nsIRenderingContext* aRenderingContext,
-                             nsStyleContext* aStyleContext)
- {
-   NS_ASSERTION(aStyle.GetUnit() == eStyleUnit_Chars,
-                "Shouldn't have called this");
- 
--  SetFontFromStyle(aRenderingContext, aStyleContext);
--  nscoord fontWidth;
--  aRenderingContext->SetTextRunRTL(PR_FALSE);
--  aRenderingContext->GetWidth('M', fontWidth);
--  return aStyle.GetIntValue() * fontWidth;
-+  nsCOMPtr<nsIFontMetrics> metrics;
-+  aRenderingContext->GetMetricsFor(aStyleContext->GetStyleFont()->mFont,
-+                                   *getter_AddRefs(metrics));
-+  nsCOMPtr<nsIThebesFontMetrics> tfm(do_QueryInterface(metrics));
-+  gfxFloat zeroWidth =
-+    tfm->GetThebesFontGroup()->GetFontAt(0)->GetMetrics().zeroOrAveCharWidth;
-+
-+  return NSToCoordRound(aValue.GetFloatValue() *
-+                        NS_ceil(aPresContext->AppUnitsPerDevPixel() *
-+                                zeroWidth));
- }
- 
- static PRBool NonZeroStyleCoord(const nsStyleCoord& aCoord)
- {
-   switch (aCoord.GetUnit()) {
-   case eStyleUnit_Percent:
-     return aCoord.GetPercentValue() > 0;
-   case eStyleUnit_Coord:
+diff --git a/layout/reftests/bugs/371043-1-ref.html b/layout/reftests/bugs/371043-1-ref.html
+--- a/layout/reftests/bugs/371043-1-ref.html
++++ b/layout/reftests/bugs/371043-1-ref.html
+@@ -1,9 +1,9 @@
+ <!DOCTYPE html>
+ <body>
+   <div id="source" style="font-size: 10px; -moz-column-gap: 2ch">
+     <span id="test"
+           style="background: green; color: green; display: inline-block;
+-                 height: 30px; padding: 0 2px">MM
++                 height: 30px; padding: 0 2px">00
+     </span>
+   </div>
+ </body>
+diff --git a/layout/reftests/bugs/reftest.list b/layout/reftests/bugs/reftest.list
+--- a/layout/reftests/bugs/reftest.list
++++ b/layout/reftests/bugs/reftest.list
+@@ -388,17 +388,17 @@ skip-if(MOZ_WIDGET_TOOLKIT=="windows") =
+ == 362594-2b.html 362594-2-standards-ref.html
+ == 362594-2c.html 362594-2-standards-ref.html
+ == 362901-1.html 362901-1-ref.html
+ == 363329-1.html 363329-1-ref.html
+ == 363329-2.html 363329-2-ref.html
+ == 363370-1.html 363370-1-ref.html
+ == 363402-1.html 363402-1-ref.html
+ == 363637-1.html 363637-1-ref.html
+-fails == 363706-1.html 363706-1-ref.html
++== 363706-1.html 363706-1-ref.html
+ != 363706-1.html about:blank
+ == 363858-1.html 363858-1-ref.html
+ == 363858-2.html 363858-2-ref.html
+ == 363858-3.html 363858-3-ref.html
+ == 363858-4.html 363858-4-ref.html
+ == 363858-5a.html 363858-5-ref.html
+ == 363858-5b.html 363858-5-ref.html
+ == 363858-6a.html 363858-6-ref.html
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
-@@ -48,30 +48,32 @@
+@@ -48,17 +48,18 @@
   */
  
  #include "nsRuleNode.h"
@@ -196,17 +197,52 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
  #include "nsStyleContext.h"
  #include "nsStyleSet.h"
  #include "nsSize.h"
- #include "imgIRequest.h"
- #include "nsRuleData.h"
- #include "nsILanguageAtomService.h"
- #include "nsIStyleRule.h"
- #include "nsBidiUtils.h"
+@@ -226,18 +227,17 @@ static nscoord CalcLengthWith(const nsCS
+     aStyleFont = aStyleContext->GetStyleFont();
+   }
+   if (aFontSize == -1) {
+     // XXX Should this be aStyleFont->mSize instead to avoid taking minfontsize
+     // prefs into account?
+     aFontSize = aStyleFont->mFont.size;
+   }
+   switch (unit) {
+-    case eCSSUnit_EM:
+-    case eCSSUnit_Char: {
++    case eCSSUnit_EM: {
+       return NSToCoordRound(aValue.GetFloatValue() * float(aFontSize));
+       // XXX scale against font metrics height instead?
+     }
+     case eCSSUnit_EN: {
+       return NSToCoordRound((aValue.GetFloatValue() * float(aFontSize)) / 2.0f);
+     }
+     case eCSSUnit_XHeight: {
+       nsFont font = aStyleFont->mFont;
+@@ -246,16 +246,28 @@ static nscoord CalcLengthWith(const nsCS
+       nscoord xHeight;
+       fm->GetXHeight(xHeight);
+       return NSToCoordRound(aValue.GetFloatValue() * float(xHeight));
+     }
+     case eCSSUnit_CapHeight: {
+       NS_NOTYETIMPLEMENTED("cap height unit");
+       nscoord capHeight = ((aFontSize / 3) * 2); // XXX HACK!
+       return NSToCoordRound(aValue.GetFloatValue() * float(capHeight));
++    }
++    case eCSSUnit_Char: {
++      nsFont font = aStyleFont->mFont;
++      font.size = aFontSize;
++      nsCOMPtr<nsIFontMetrics> fm = aPresContext->GetMetricsFor(font);
++      nsCOMPtr<nsIThebesFontMetrics> tfm(do_QueryInterface(fm));
++      gfxFloat zeroWidth = (tfm->GetThebesFontGroup()->GetFontAt(0)
++                            ->GetMetrics().zeroOrAveCharWidth);
 +
++      return NSToCoordRound(aValue.GetFloatValue() *
++                            NS_ceil(aPresContext->AppUnitsPerDevPixel() *
++                                    zeroWidth));
+     }
+     default:
+       NS_NOTREACHED("unexpected unit");
+       break;
+   }
+   return 0;
+ }
  
- /*
-  * For storage of an |nsRuleNode|'s children in a linked list.
-  */
- struct nsRuleList {
-   nsRuleNode* mRuleNode;
-   nsRuleList* mNext;
-   
