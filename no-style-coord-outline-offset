@@ -1,0 +1,157 @@
+Convert outline offset storage from nsStyleCoord to nscoord.  b=443057
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -2893,18 +2893,17 @@ nsCSSRendering::PaintOutline(nsPresConte
+         twipsRadii[i] = bordStyleRadius[i].GetCoordValue();
+         break;
+ 
+       default:
+         break;
+     }
+   }
+ 
+-  nscoord offset;
+-  aOutlineStyle.GetOutlineOffset(offset);
++  nscoord offset = aOutlineStyle.mOutlineOffset;
+ 
+   // When the outline property is set on :-moz-anonymous-block or
+   // :-moz-anonyomus-positioned-block pseudo-elements, it inherited that
+   // outline from the inline that was broken because it contained a
+   // block.  In that case, we don't want a really wide outline if the
+   // block inside the inline is narrow, so union the actual contents of
+   // the anonymous blocks.
+   nsIFrame *frameForArea = aForFrame;
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -575,19 +575,17 @@ nsDisplayOutline::OptimizeVisibility(nsD
+                                      nsRegion* aVisibleRegion) {
+   if (!nsDisplayItem::OptimizeVisibility(aBuilder, aVisibleRegion))
+     return PR_FALSE;
+ 
+   const nsStyleOutline* outline = mFrame->GetStyleOutline();
+   nsPoint origin = aBuilder->ToReferenceFrame(mFrame);
+   if (nsRect(origin, mFrame->GetSize()).Contains(aVisibleRegion->GetBounds()) &&
+       !nsLayoutUtils::HasNonZeroSide(outline->mOutlineRadius)) {
+-    nscoord outlineOffset;
+-    outline->GetOutlineOffset(outlineOffset);
+-    if (outlineOffset >= 0) {
++    if (outline->mOutlineOffset >= 0) {
+       // the visible region is entirely inside the border-rect, and the outline
+       // isn't rendered inside the border-rect, so the outline is not visible
+       return PR_FALSE;
+     }
+   }
+ 
+   return PR_TRUE;
+ }
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3701,18 +3701,17 @@ static nsRect ComputeOutlineRect(const n
+   if (outlineStyle != NS_STYLE_BORDER_STYLE_NONE) {
+     nscoord width;
+ #ifdef DEBUG
+     PRBool result = 
+ #endif
+       outline->GetOutlineWidth(width);
+     NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
+     if (width > 0) {
+-      nscoord offset;
+-      outline->GetOutlineOffset(offset);
++      nscoord offset = outline->mOutlineOffset;
+       nscoord inflateBy = PR_MAX(width + offset, 0);
+       r.Inflate(inflateBy, inflateBy);
+       *aAnyOutline = PR_TRUE;
+     }
+   }
+   return r;
+ }
+ 
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -1531,17 +1531,17 @@ nsComputedDOMStyle::GetOutlineStyle(nsID
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetOutlineOffset(nsIDOMCSSValue** aValue)
+ {
+   nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
+   NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+ 
+-  SetValueToCoord(val, GetStyleOutline()->mOutlineOffset);
++  val->SetAppUnits(GetStyleOutline()->mOutlineOffset);
+ 
+   return CallQueryInterface(val, aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetOutlineRadiusBottomLeft(nsIDOMCSSValue** aValue)
+ {
+   return GetOutlineRadiusFor(NS_SIDE_LEFT, aValue);
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -3964,19 +3964,22 @@ nsRuleNode::ComputeOutlineData(void* aSt
+   }
+   else {
+     SetCoord(marginData.mOutlineWidth, outline->mOutlineWidth,
+              parentOutline->mOutlineWidth, SETCOORD_LEH, aContext,
+              mPresContext, inherited);
+   }
+ 
+   // outline-offset: length, inherit
+-  SetCoord(marginData.mOutlineOffset, outline->mOutlineOffset, parentOutline->mOutlineOffset,
++  nsStyleCoord outlineOffset;
++  SetCoord(marginData.mOutlineOffset, outlineOffset,
++           parentOutline->mOutlineOffset,
+            SETCOORD_LH | SETCOORD_INITIAL_ZERO, aContext, mPresContext,
+            inherited);
++  outline->mOutlineOffset = outlineOffset.GetCoordValue();
+   
+ 
+   // outline-color: color, string, enum, inherit
+   nscolor outlineColor;
+   nscolor unused = NS_RGB(0,0,0);
+   if (eCSSUnit_Inherit == marginData.mOutlineColor.GetUnit()) {
+     if (parentContext) {
+       inherited = PR_TRUE;
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -511,31 +511,18 @@ struct nsStyleOutline {
+ #endif
+  
+   nsStyleSides  mOutlineRadius;    // [reset] length, percent
+   																// (top=topLeft, right=topRight, bottom=bottomRight, left=bottomLeft)
+ 
+   // Note that these are specified values.  You can get the actual values with
+   // GetOutlineWidth and GetOutlineOffset.  You cannot get the computed values
+   // directly.
+-  nsStyleCoord  mOutlineOffset;   // [reset] length XXX Why nsStyleCoord?
+   nsStyleCoord  mOutlineWidth;    // [reset] length, enum (see nsStyleConsts.h)
+-
+-  PRBool GetOutlineOffset(nscoord& aOffset) const
+-  {
+-    if (mOutlineOffset.GetUnit() == eStyleUnit_Coord) {
+-      nscoord offset = mOutlineOffset.GetCoordValue();
+-      aOffset = NS_ROUND_OFFSET_TO_PIXELS(offset, mTwipsPerPixel);
+-      return PR_TRUE;
+-    } else {
+-      NS_ERROR("GetOutlineOffset: bad unit type");
+-      aOffset = 0;
+-      return PR_FALSE;
+-    }
+-  }
++  nscoord       mOutlineOffset;   // [reset]
+ 
+   PRBool GetOutlineWidth(nscoord& aWidth) const
+   {
+     if (mHasCachedOutline) {
+       aWidth = mCachedOutlineWidth;
+       return PR_TRUE;
+     }
+     return PR_FALSE;
