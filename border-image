@@ -808,7 +808,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 +  const nsStyleBorder *styleBorder;
    if (paddingRect.Contains(aVisibleRegion->GetBounds()) &&
 -      !nsLayoutUtils::HasNonZeroSide(mFrame->GetStyleBorder()->mBorderRadius)) {
-+      !(styleBorder = mFrame->GetStyleBorder())->GetBorderImage() &&
++      !(styleBorder = mFrame->GetStyleBorder())->IsBorderImageLoaded() &&
 +      !nsLayoutUtils::HasNonZeroSide(styleBorder->mBorderRadius)) {
      // the visible region is entirely inside the content rect, and no part
      // of the border is rendered inside the content rect, so we are not
@@ -827,7 +827,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
 --- a/layout/base/nsImageLoader.cpp
 +++ b/layout/base/nsImageLoader.cpp
-@@ -75,20 +75,21 @@ nsImageLoader::~nsImageLoader()
+@@ -75,20 +75,22 @@ nsImageLoader::~nsImageLoader()
  
    if (mRequest) {
      mRequest->Cancel(NS_ERROR_FAILURE);
@@ -837,7 +837,8 @@ diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
  
  void
 -nsImageLoader::Init(nsIFrame *aFrame, nsPresContext *aPresContext)
-+nsImageLoader::Init(nsIFrame *aFrame, nsPresContext *aPresContext, PRBool aReflowOnLoad)
++nsImageLoader::Init(nsIFrame *aFrame, nsPresContext *aPresContext,
++                    PRBool aReflowOnLoad)
  {
    mFrame = aFrame;
    mPresContext = aPresContext;
@@ -850,7 +851,7 @@ diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
    mFrame = nsnull;
    mPresContext = nsnull;
  
-@@ -203,16 +204,22 @@ NS_IMETHODIMP nsImageLoader::FrameChange
+@@ -203,16 +205,26 @@ NS_IMETHODIMP nsImageLoader::FrameChange
  
    return NS_OK;
  }
@@ -863,6 +864,10 @@ diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
 +    nsIPresShell *shell = mPresContext->GetPresShell();
 +    nsresult rv = shell->FrameNeedsReflow(mFrame, nsIPresShell::eStyleChange, NS_FRAME_IS_DIRTY);
 +    NS_WARN_IF_FALSE(NS_SUCCEEDED(rv), "Could not reflow after loading border-image");
++    // Note that we're assuming that the resulting reflow will
++    // invalidate the entire frame.  Given that we only set
++    // mReflowOnLoad if the actual border width will change when we do
++    // this reflow, this invalidate should happen.
 +    return;
 +  }
    // NOTE: It is not sufficient to invalidate only the size of the image:
@@ -876,7 +881,7 @@ diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
 diff --git a/layout/base/nsImageLoader.h b/layout/base/nsImageLoader.h
 --- a/layout/base/nsImageLoader.h
 +++ b/layout/base/nsImageLoader.h
-@@ -64,24 +64,25 @@ public:
+@@ -64,24 +64,26 @@ public:
    // has been loaded.
    // Note: Images referenced by the <img> element are displayed
    // incrementally in nsImageFrame.cpp.
@@ -886,7 +891,8 @@ diff --git a/layout/base/nsImageLoader.h b/layout/base/nsImageLoader.h
                            nsRect * dirtyRect);
  
 -  void Init(nsIFrame *aFrame, nsPresContext *aPresContext);
-+  void Init(nsIFrame *aFrame, nsPresContext *aPresContext, PRBool aReflowOnLoad=PR_FALSE);
++  void Init(nsIFrame *aFrame, nsPresContext *aPresContext,
++            PRBool aReflowOnLoad);
    nsresult Load(imgIRequest *aImage);
  
    void Destroy();
@@ -926,7 +932,35 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
    if (NS_FAILED(rv)) {
      NS_ERROR("LookAndFeel service must be implemented for this toolkit");
      return rv;
-@@ -1185,27 +1188,57 @@ nsPresContext::LoadImage(imgIRequest* aI
+@@ -1163,49 +1166,72 @@ nsPresContext::SetFullZoom(float aZoom)
+   RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
+ 
+   mSupressResizeReflow = PR_FALSE;
+ 
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ }
+ 
+ imgIRequest*
+-nsPresContext::LoadImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
++nsPresContext::DoLoadImage(nsPresContext::ImageLoaderTable& aTable,
++                           imgIRequest* aImage,
++                           nsIFrame* aTargetFrame,
++                           PRBool aReflowOnLoad)
+ {
+   // look and see if we have a loader for the target frame.
+   nsCOMPtr<nsImageLoader> loader;
+-  mImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
++  aTable.Get(aTargetFrame, getter_AddRefs(loader));
+ 
+   if (!loader) {
+     loader = new nsImageLoader();
+     if (!loader)
+       return nsnull;
+ 
+-    loader->Init(aTargetFrame, this);
++    loader->Init(aTargetFrame, this, aReflowOnLoad);
+     mImageLoaders.Put(aTargetFrame, loader);
+   }
  
    loader->Load(aImage);
  
@@ -936,26 +970,16 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  }
  
 +imgIRequest*
++nsPresContext::LoadImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
++{
++  return DoLoadImage(mImageLoaders, aImage, aTargetFrame, PR_FALSE);
++}
++
++imgIRequest*
 +nsPresContext::LoadBorderImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
 +{
-+  // look and see if we have a loader for the target frame.
-+  nsCOMPtr<nsImageLoader> loader;
-+  mBorderImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
-+
-+  if (!loader) {
-+    loader = new nsImageLoader();
-+    if (!loader)
-+      return nsnull;
-+
-+    loader->Init(aTargetFrame, this, aTargetFrame->GetStyleBorder()->ImageBorderDiffers());
-+    mBorderImageLoaders.Put(aTargetFrame, loader);
-+  }
-+
-+  loader->Load(aImage);
-+
-+  imgIRequest *request = loader->GetRequest();
-+
-+  return request;
++  return DoLoadImage(mBorderImageLoaders, aImage, aTargetFrame,
++                     aTargetFrame->GetStyleBorder()->ImageBorderDiffers());
 +}
  
  void
@@ -987,20 +1011,42 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
-@@ -367,16 +367,21 @@ public:
-    * Load an image for the target frame. This call can be made
-    * repeated with only a single image ever being loaded. When the
-    * image's data is ready for rendering the target frame's Paint()
-    * method will be invoked (via the ViewManager) so that the
-    * appropriate damage repair is done.
+@@ -359,24 +359,38 @@ public:
+   const nscolor FocusTextColor() const { return mFocusTextColor; }
+ 
+   PRBool GetUseFocusColors() const { return mUseFocusColors; }
+   PRUint8 FocusRingWidth() const { return mFocusRingWidth; }
+   PRBool GetFocusRingOnAnything() const { return mFocusRingOnAnything; }
+  
+ 
+   /**
+-   * Load an image for the target frame. This call can be made
+-   * repeated with only a single image ever being loaded. When the
+-   * image's data is ready for rendering the target frame's Paint()
+-   * method will be invoked (via the ViewManager) so that the
+-   * appropriate damage repair is done.
++   * Set up observers so that aTargetFrame will be invalidated when
++   * aImage loads, where aImage is its background image.  Only a single
++   * image will be tracked per frame.
     */
    NS_HIDDEN_(imgIRequest*) LoadImage(imgIRequest* aImage,
                                       nsIFrame* aTargetFrame);
 +  /**
-+   * Same as LoadImage but for border images
++   * Set up observers so that aTargetFrame will be invalidated or
++   * reflowed (as appropriate) when aImage loads, where aImage is its
++   * *border* image.  Only a single image will be tracked per frame.
 +   */
 +  NS_HIDDEN_(imgIRequest*) LoadBorderImage(imgIRequest* aImage,
 +                                           nsIFrame* aTargetFrame);
++
++private:
++  typedef nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> ImageLoaderTable;
++
++  NS_HIDDEN_(imgIRequest*) DoLoadImage(ImageLoaderTable& aTable,
++                                       imgIRequest* aImage,
++                                       nsIFrame* aTargetFrame,
++                                       PRBool aReflowOnLoad);
++public:
  
    /**
     * This method is called when a frame is being destroyed to
@@ -1009,7 +1055,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    NS_HIDDEN_(void) StopImagesFor(nsIFrame* aTargetFrame);
  
    NS_HIDDEN_(void) SetContainer(nsISupports* aContainer);
-@@ -796,16 +801,17 @@ protected:
+@@ -795,17 +809,18 @@ protected:
+   nsIEventStateManager* mEventManager;  // [STRONG]
    nsILookAndFeel*       mLookAndFeel;   // [STRONG]
    nsIAtom*              mMedium;        // initialized by subclass ctors;
                                          // weak pointer to static atom
@@ -1017,8 +1064,9 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    nsILinkHandler*       mLinkHandler;   // [WEAK]
    nsIAtom*              mLangGroup;     // [STRONG]
  
-   nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> mImageLoaders;
-+  nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> mBorderImageLoaders;
+-  nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> mImageLoaders;
++  ImageLoaderTable      mImageLoaders;
++  ImageLoaderTable      mBorderImageLoaders;
    nsWeakPtr             mContainer;
  
    float                 mTextZoom;      // Text zoom, defaults to 1.0
@@ -1030,16 +1078,12 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
 --- a/layout/base/nsStyleConsts.h
 +++ b/layout/base/nsStyleConsts.h
-@@ -262,19 +262,25 @@
- #define NS_STYLE_BORDER_STYLE_DOTTED            3
- #define NS_STYLE_BORDER_STYLE_DASHED            4
- #define NS_STYLE_BORDER_STYLE_SOLID             5
+@@ -265,16 +265,21 @@
  #define NS_STYLE_BORDER_STYLE_DOUBLE            6
  #define NS_STYLE_BORDER_STYLE_INSET             7
  #define NS_STYLE_BORDER_STYLE_OUTSET            8
  #define NS_STYLE_BORDER_STYLE_HIDDEN            9
  #define NS_STYLE_BORDER_STYLE_AUTO              10 // for outline-style only
-+#define NS_STYLE_BORDER_STYLE_IMAGE             11 // only used if there is no other border style set
  // a bit ORed onto the style for table border collapsing indicating that the style was 
  // derived from a table with its rules attribute set
  #define NS_STYLE_BORDER_STYLE_RULES_MARKER      0x10  
@@ -2538,20 +2582,32 @@ diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
 diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
 --- a/layout/style/nsCSSDataBlock.cpp
 +++ b/layout/style/nsCSSDataBlock.cpp
-@@ -205,16 +205,22 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+@@ -201,20 +201,30 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+             void *prop =
+                 nsCSSExpandedDataBlock::RuleDataPropertyAt(aRuleData, iProp);
+             switch (nsCSSProps::kTypeTable[iProp]) {
+                 case eCSSType_Value: {
                      nsCSSValue* target = static_cast<nsCSSValue*>(prop);
                      if (target->GetUnit() == eCSSUnit_Null) {
                          const nsCSSValue *val = ValueAtCursor(cursor);
                          NS_ASSERTION(val->GetUnit() != eCSSUnit_Null, "oops");
-                         if ((iProp == eCSSProperty_background_image ||
-                              iProp == eCSSProperty_list_style_image) &&
-                             val->GetUnit() == eCSSUnit_URL) {
-                             val->StartImageLoad(aRuleData->mPresContext->Document());
-+                        } else if (iProp == eCSSProperty_border_image &&
-+                                   val->GetUnit() == eCSSUnit_Array) {
-+                            nsCSSValue::Array *array = val->GetArrayValue();
-+                            if (array->Item(0).GetUnit() == eCSSUnit_URL) {
-+                                array->Item(0).StartImageLoad(aRuleData->mPresContext->Document());
+-                        if ((iProp == eCSSProperty_background_image ||
+-                             iProp == eCSSProperty_list_style_image) &&
+-                            val->GetUnit() == eCSSUnit_URL) {
+-                            val->StartImageLoad(aRuleData->mPresContext->Document());
++                        if (iProp == eCSSProperty_background_image ||
++                            iProp == eCSSProperty_list_style_image) {
++                            if (val->GetUnit() == eCSSUnit_URL) {
++                                val->StartImageLoad(
++                                    aRuleData->mPresContext->Document());
++                            }
++                        } else if (iProp == eCSSProperty_border_image) {
++                            if (val->GetUnit() == eCSSUnit_Array) {
++                                nsCSSValue::Array *array = val->GetArrayValue();
++                                if (array->Item(0).GetUnit() == eCSSUnit_URL) {
++                                    array->Item(0).StartImageLoad(
++                                        aRuleData->mPresContext->Document());
++                                }
 +                            }
                          }
                          *target = *val;
@@ -3211,8 +3267,7 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
  #include "nsIStyleRule.h"
  #include "nsCRT.h"
  
-@@ -347,18 +348,20 @@ nsChangeHint nsStylePadding::CalcDiffere
- #ifdef DEBUG
+@@ -348,17 +349,19 @@ nsChangeHint nsStylePadding::CalcDiffere
  /* static */
  nsChangeHint nsStylePadding::MaxDifference()
  {
@@ -3220,12 +3275,11 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
  }
  #endif
  
--nsStyleBorder::nsStyleBorder(nsPresContext* aPresContext)
+ nsStyleBorder::nsStyleBorder(nsPresContext* aPresContext)
 -  : mActualBorder(0, 0, 0, 0)
-+nsStyleBorder::nsStyleBorder(nsPresContext* aPresContext) :
-+  mHaveBorderImageWidth(PR_FALSE),
-+  mComputedBorder(0, 0, 0, 0),
-+  mBorderImage(nsnull)
++  : mHaveBorderImageWidth(PR_FALSE),
++    mComputedBorder(0, 0, 0, 0),
++    mBorderImage(nsnull)
  {
    nscoord medium =
      (aPresContext->GetBorderWidthTable())[NS_STYLE_BORDER_WIDTH_MEDIUM];
@@ -3282,7 +3336,7 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 +  if (mBorderColors) {
 +    for (PRInt32 i = 0; i < 4; i++)
 +      delete mBorderColors[i];
-+    delete []mBorderColors;
++    delete [] mBorderColors;
 +  }
 +}
 +
