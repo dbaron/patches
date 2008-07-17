@@ -1,5 +1,73 @@
 Do the invalidation as well when we're doing a reflow, since the reflow might not invalidate.  (Bug 445810)
 
+diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
+--- a/layout/base/nsFrameManager.cpp
++++ b/layout/base/nsFrameManager.cpp
+@@ -86,16 +86,17 @@
+ #include "nsContentUtils.h"
+ #include "nsReadableUtils.h"
+ #include "nsUnicharUtils.h"
+ #include "nsPrintfCString.h"
+ #include "nsLayoutErrors.h"
+ #include "nsLayoutUtils.h"
+ #include "nsAutoPtr.h"
+ #include "imgIRequest.h"
++#include "nsStyleStructInlines.h"
+ 
+ #include "nsFrameManager.h"
+ #ifdef ACCESSIBILITY
+ #include "nsIAccessibilityService.h"
+ #include "nsIAccessibleEvent.h"
+ #endif
+ 
+   #ifdef DEBUG
+@@ -1210,18 +1211,45 @@ nsFrameManager::ReResolveStyleContext(ns
+             oldColor->mBackgroundImage->GetURI(getter_AddRefs(oldURI));
+             newColor->mBackgroundImage->GetURI(getter_AddRefs(newURI));
+             PRBool equal;
+             stopImages =
+               NS_FAILED(oldURI->Equals(newURI, &equal)) || !equal;
+           }
+           if (stopImages) {
+             // stop the image loading for the frame, the image has changed
+-            aPresContext->StopImagesFor(aFrame);
++            aPresContext->StopBackgroundImageFor(aFrame);
+           }
++        }
++
++        const nsStyleBorder* oldBorder = oldContext->GetStyleBorder();
++        const nsStyleBorder* newBorder = newContext->GetStyleBorder();
++        if (oldBorder->GetBorderImage()) {
++          PRBool stopImages = !newColor->GetBorderImage();
++          if (!stopImages) {
++            nsCOMPtr<nsIURI> oldURI, newURI;
++            oldColor->GetBorderImage()->GetURI(getter_AddRefs(oldURI));
++            newColor->GetBorderImage()->GetURI(getter_AddRefs(newURI));
++            PRBool equal;
++            stopImages =
++              NS_FAILED(oldURI->Equals(newURI, &equal)) || !equal;
++          }
++          if (stopImages) {
++            // stop the image loading for the frame, the image has changed
++            aPresContext->StopBorderImageFor(aFrame);
++          }
++        }
++
++        // Since the CalcDifference call checked whether the new border
++        // image was loaded in order to determine whether to do a
++        // reflow, we need to call LoadBorderImage now so that the frame
++        // gets notified if the image loads.
++        imgIRequest *borderImage = newBorder->GetBorderImage();
++        if (borderImage) {
++          aPresContext->LoadBorderImage(borderImage, aFrame);
+         }
+       }
+       oldContext->Release();
+     }
+     else {
+       NS_ERROR("resolve style context failed");
+       newContext = oldContext;  // new context failed, recover... (take ref)
+       oldContext = nsnull;
 diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
 --- a/layout/base/nsImageLoader.cpp
 +++ b/layout/base/nsImageLoader.cpp
@@ -26,6 +94,78 @@ diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
    //       we have to at least invalidate the frame's bounds, hence
    //       as long as we have a frame we'll use its size.
    //
+ 
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1210,34 +1210,45 @@ nsPresContext::LoadBorderImage(imgIReque
+ {
+   return DoLoadImage(mBorderImageLoaders, aImage, aTargetFrame,
+                      aTargetFrame->GetStyleBorder()->ImageBorderDiffers());
+ }
+ 
+ void
+ nsPresContext::StopImagesFor(nsIFrame* aTargetFrame)
+ {
++  StopBackgroundImageFor(aTargetFrame);
++  StopBorderImageFor(aTargetFrame);
++}
++
++void
++nsPresContext::StopBackgroundImageFor(nsIFrame* aTargetFrame)
++{
+   nsCOMPtr<nsImageLoader> loader;
+   mImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
+ 
+   if (loader) {
+     loader->Destroy();
+ 
+     mImageLoaders.Remove(aTargetFrame);
+   }
++}
+   
++void
++nsPresContext::StopBorderImageFor(nsIFrame* aTargetFrame)
++{
++  nsCOMPtr<nsImageLoader> loader;
+   mBorderImageLoaders.Get(aTargetFrame, getter_AddRefs(loader));
+   
+   if (loader) {
+     loader->Destroy();
+ 
+     mBorderImageLoaders.Remove(aTargetFrame);
+   }
+ }
+-
+ 
+ void
+ nsPresContext::SetContainer(nsISupports* aHandler)
+ {
+   mContainer = do_GetWeakReference(aHandler);
+   if (mContainer) {
+     GetDocumentColorPreferences();
+   }
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -389,16 +389,18 @@ private:
+   typedef nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> ImageLoaderTable;
+ 
+   NS_HIDDEN_(imgIRequest*) DoLoadImage(ImageLoaderTable& aTable,
+                                        imgIRequest* aImage,
+                                        nsIFrame* aTargetFrame,
+                                        PRBool aReflowOnLoad);
+ public:
+ 
++  NS_HIDDEN_(void) StopBackgroundImageFor(nsIFrame* aTargetFrame);
++  NS_HIDDEN_(void) StopBorderImageFor(nsIFrame* aTargetFrame);
+   /**
+    * This method is called when a frame is being destroyed to
+    * ensure that the image load gets disassociated from the prescontext
+    */
+   NS_HIDDEN_(void) StopImagesFor(nsIFrame* aTargetFrame);
+ 
+   NS_HIDDEN_(void) SetContainer(nsISupports* aContainer);
  
 diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 --- a/layout/style/nsStyleStruct.cpp
