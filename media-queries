@@ -354,7 +354,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    CSSParserImpl();
    virtual ~CSSParserImpl();
  
-@@ -224,18 +280,20 @@ protected:
+@@ -230,18 +286,20 @@ protected:
    PRBool PushGroup(nsICSSGroupRule* aRule);
    void PopGroup(void);
  
@@ -375,7 +375,27 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    PRBool ParseGroupRule(nsresult& aErrorCode, nsICSSGroupRule* aRule, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseMediaRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
    PRBool ParseMozDocumentRule(nsresult& aErrorCode, RuleAppendFunc aAppendFunc, void* aProcessData);
-@@ -1086,16 +1144,20 @@ CSSParserImpl::DoParseMediaList(const ns
+@@ -1054,16 +1112,18 @@ CSSParserImpl::ParseProperty(const nsCSS
+ 
+ NS_IMETHODIMP
+ CSSParserImpl::ParseMediaList(const nsSubstring& aBuffer,
+                               nsIURI* aURL, // for error reporting
+                               PRUint32 aLineNumber, // for error reporting
+                               nsMediaList* aMediaList,
+                               PRBool aHTMLMode)
+ {
++  // XXX Are there cases where the caller wants to keep what it already
++  // has in case of parser error?
+   aMediaList->Clear();
+ 
+   AssertInitialState();
+   NS_ASSERTION(aHTMLMode == PR_TRUE || aHTMLMode == PR_FALSE,
+                "invalid PRBool");
+   mHTMLMediaMode = aHTMLMode;
+ 
+     // XXXldb We need to make the scanner not skip CSS comments!  (Or
+@@ -1097,18 +1157,22 @@ CSSParserImpl::DoParseMediaList(const ns
+                                 nsMediaList* aMediaList)
  {
    // fake base URL since media lists don't have URLs in them
    nsresult rv = InitScanner(aBuffer, aURL, aLineNumber, aURL, nsnull);
@@ -383,12 +403,14 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      return rv;
    }
  
-   if (!GatherMedia(rv, aMediaList, PRUnichar(0)) && !mHTMLMediaMode) {
-+    // XXX Instead of clearing here, should we have been parsing into a
-+    // fresh media list in the first place?
+-  if (!GatherMedia(rv, aMediaList, PRUnichar(0)) && !mHTMLMediaMode) {
+-    OUTPUT_ERROR();
++  if (!GatherMedia(rv, aMediaList, PRUnichar(0))) {
 +    aMediaList->Clear();
 +    aMediaList->SetNonEmpty(); // don't match anything
-     OUTPUT_ERROR();
++    if (!mHTMLMediaMode) {
++      OUTPUT_ERROR();
++    }
    }
    CLEAR_ERROR();
    ReleaseScanner();
@@ -396,7 +418,8 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
  }
  
  NS_IMETHODIMP
-@@ -1417,60 +1479,266 @@ PRBool CSSParserImpl::GatherURL(nsresult
+ CSSParserImpl::ParseColorString(const nsSubstring& aBuffer,
+@@ -1429,60 +1493,271 @@ PRBool CSSParserImpl::GatherURL(nsresult
    else if (eCSSToken_Function == mToken.mType && 
             mToken.mIdent.LowerCaseEqualsLiteral("url") &&
             GetURLInParens(aErrorCode, aURL)) {
@@ -451,7 +474,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 -  }
 -  return PR_FALSE;
 +  // "If the comma-separated list is the empty list it is assumed to
-+  // specify the media query ‘all’."  (css3-mediaqueries, section
++  // specify the media query 'all'."  (css3-mediaqueries, section
 +  // "Media Queries")
 +  if (!GetToken(aErrorCode, PR_TRUE)) {
 +    // expected termination by EOF
@@ -474,12 +497,27 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +  aMedia->SetNonEmpty();
 +
 +  for (;;) {
-+    nsAutoPtr<nsMediaQuery> queryHolder(new nsMediaQuery);
-+    if (!queryHolder) {
-+      aErrorCode = NS_ERROR_OUT_OF_MEMORY;
-+      return PR_FALSE;
++    // We want to still have |query| after we transfer ownership from
++    // |queryHolder| to |aMedia|.
++    nsMediaQuery *query;
++    {
++      nsAutoPtr<nsMediaQuery> queryHolder(new nsMediaQuery);
++      if (!queryHolder) {
++        aErrorCode = NS_ERROR_OUT_OF_MEMORY;
++        return PR_FALSE;
++      }
++      query = queryHolder;
++
++      // In terms of error handling, it doesn't really matter when we
++      // append this, since aMedia's contents get dropped entirely
++      // whenever there is an error.
++      nsresult rv = aMedia->AppendQuery(queryHolder);
++      if (NS_FAILED(rv)) {
++        aErrorCode = rv;
++        return PR_FALSE;
++      }
++      NS_ASSERTION(!queryHolder, "ownership should have been transferred");
 +    }
-+    nsMediaQuery *query = queryHolder;
 +
 +    if (ExpectSymbol(aErrorCode, '(', PR_TRUE)) {
 +      // we got an expression without a media type
@@ -518,16 +556,6 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +      }
 +      query->SetType(mediaType);
 +    }
-+
-+    // In terms of error handling, it doesn't really matter when we
-+    // append this, since aMedia's contents get dropped entirely
-+    // whenever there is an error.
-+    nsresult rv = aMedia->AppendQuery(query);
-+    if (NS_FAILED(rv)) {
-+      aErrorCode = rv;
-+      return PR_FALSE;
-+    }
-+    queryHolder.forget(); // aMedia now owns query
 +
 +    for (;;) {
 +      if (!GetToken(aErrorCode, PR_TRUE)) {
@@ -649,8 +677,8 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +      break;
 +    case nsMediaFeature::eIntRatio:
 +      {
-+        // XXX This allows whitespace around the '/'.  The spec isn't
-+        // clear on whether we should.
++        // Two integers separated by '/', with optional whitespace on
++        // either side of the '/'.
 +        nsRefPtr<nsCSSValue::Array> a = nsCSSValue::Array::Create(2);
 +        if (!a) {
 +          aErrorCode = NS_ERROR_OUT_OF_MEMORY;
@@ -703,7 +731,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    nsCOMPtr<nsMediaList> media = new nsMediaList();
    if (!media) {
      aErrorCode = NS_ERROR_OUT_OF_MEMORY;
-@@ -3682,72 +3950,16 @@ CSSParserImpl::DoTransferTempData(nsCSSD
+@@ -3694,72 +3969,16 @@ CSSParserImpl::DoTransferTempData(nsCSSD
        if (!nsCSSQuotes::Equal(*source, *dest))
          *aChanged = PR_TRUE;
        delete *dest;
@@ -798,7 +826,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  {
  public:
    CSSRuleListImpl(nsCSSStyleSheet *aStyleSheet);
-@@ -158,47 +160,298 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
+@@ -158,47 +160,309 @@ CSSRuleListImpl::Item(PRUint32 aIndex, n
          result = NS_OK; // per spec: "Return Value ... null if ... not a valid index."
        }
      }
@@ -865,18 +893,24 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +    case nsMediaFeature::eIntRatio:
 +      {
 +        NS_ASSERTION(actual.GetUnit() == eCSSUnit_Array &&
++                     actual.GetArrayValue()->Count() == 2 &&
 +                     actual.GetArrayValue()->Item(0).GetUnit() ==
 +                       eCSSUnit_Integer &&
 +                     actual.GetArrayValue()->Item(1).GetUnit() ==
 +                       eCSSUnit_Integer,
 +                     "bad actual value");
 +        NS_ASSERTION(required.GetUnit() == eCSSUnit_Array &&
++                     required.GetArrayValue()->Count() == 2 &&
 +                     required.GetArrayValue()->Item(0).GetUnit() ==
 +                       eCSSUnit_Integer &&
 +                     required.GetArrayValue()->Item(1).GetUnit() ==
 +                       eCSSUnit_Integer,
 +                     "bad required value");
-+        // Convert to PRInt64 so we can multiply without worry
++        // Convert to PRInt64 so we can multiply without worry.  Note
++        // that while the spec requires that both halves of |required|
++        // be positive, the numerator or denominator of |actual| might
++        // be zero (e.g., when testing 'aspect-ratio' on a 0-width or
++        // 0-height iframe).
 +        PRInt64 actualNum = actual.GetArrayValue()->Item(0).GetIntValue(),
 +                actualDen = actual.GetArrayValue()->Item(1).GetIntValue(),
 +                requiredNum = required.GetArrayValue()->Item(0).GetIntValue(),
@@ -975,12 +1009,16 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +        switch (feature->mValueType) {
 +          case nsMediaFeature::eLength:
 +            NS_ASSERTION(expr.mValue.IsLengthUnit(), "bad unit");
++            // Use 'width' as a property that takes length values
++            // written in the normal way.
 +            nsCSSDeclaration::AppendCSSValueToString(eCSSProperty_width,
 +                                                     expr.mValue, aString);
 +            break;
 +          case nsMediaFeature::eInteger:
 +            NS_ASSERTION(expr.mValue.GetUnit() == eCSSUnit_Integer,
 +                         "bad unit");
++            // Use 'z-index' as a property that takes integer values
++            // written without anything extra.
 +            nsCSSDeclaration::AppendCSSValueToString(eCSSProperty_z_index,
 +                                                     expr.mValue, aString);
 +            break;
@@ -989,6 +1027,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 +              NS_ASSERTION(expr.mValue.GetUnit() == eCSSUnit_Array,
 +                           "bad unit");
 +              nsCSSValue::Array *array = expr.mValue.GetArrayValue();
++              NS_ASSERTION(array->Count() == 2, "unexpected length");
 +              NS_ASSERTION(array->Item(0).GetUnit() == eCSSUnit_Integer,
 +                           "bad unit");
 +              NS_ASSERTION(array->Item(1).GetUnit() == eCSSUnit_Integer,
@@ -1104,7 +1143,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
    return NS_OK;
  }
  
-@@ -219,47 +472,47 @@ nsMediaList::SetText(const nsAString& aM
+@@ -219,47 +483,47 @@ nsMediaList::SetText(const nsAString& aM
      domSheet->GetOwnerNode(getter_AddRefs(node));
      htmlMode = !!node;
    }
@@ -1164,7 +1203,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  nsMediaList::GetMediaText(nsAString& aMediaText)
  {
    return GetText(aMediaText);
-@@ -305,26 +558,30 @@ nsMediaList::SetMediaText(const nsAStrin
+@@ -305,26 +569,30 @@ nsMediaList::SetMediaText(const nsAStrin
    return rv;
  }
                                 
@@ -1197,7 +1236,7 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  }
  
  NS_IMETHODIMP
-@@ -362,48 +619,62 @@ nsMediaList::AppendMedium(const nsAStrin
+@@ -362,48 +630,62 @@ nsMediaList::AppendMedium(const nsAStrin
  }
  
  nsresult
@@ -1300,7 +1339,7 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
   * of those above. If you wish to allow use of your version of this file only
   * under the terms of either the GPL or the LGPL, and not to allow others to
   * use your version of this file under the terms of the MPL, indicate your
-@@ -41,49 +42,123 @@
+@@ -41,49 +42,127 @@
   * @media rules
   */
  
@@ -1360,7 +1399,11 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
 +  void SetHasOnly()                     { mHasOnly = PR_TRUE; }
 +  void SetTypeOmitted()                 { mTypeOmitted = PR_TRUE; }
 +  void SetHadUnknownExpression()        { mHadUnknownExpression = PR_TRUE; }
-+  void SetType(nsIAtom* aMediaType)     { mMediaType = aMediaType; }
++  void SetType(nsIAtom* aMediaType)     { 
++                                          NS_ASSERTION(aMediaType,
++                                                       "expected non-null");
++                                          mMediaType = aMediaType;
++                                        }
 +
 +  // Return a new nsMediaExpression in the array for the caller to fill
 +  // in.  The caller must either fill it in completely, or call
@@ -1398,7 +1441,7 @@ diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
    nsresult SetStyleSheet(nsICSSStyleSheet* aSheet);
 -  nsresult AppendAtom(nsIAtom* aMediumAtom) {
 -    return mArray.AppendObject(aMediumAtom) ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
-+  nsresult AppendQuery(nsMediaQuery *aQuery) {
++  nsresult AppendQuery(nsAutoPtr<nsMediaQuery>& aQuery) {
 +    // Takes ownership of aQuery
 +    return mArray.AppendElement(aQuery) ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
    }
@@ -1435,7 +1478,7 @@ diff --git a/layout/style/nsMediaFeatures.cpp b/layout/style/nsMediaFeatures.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsMediaFeatures.cpp
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,326 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1616,8 +1659,8 @@ new file mode 100644
 +    // table.  Stuart says that our handling of displays with 8-bit
 +    // color is bad enough that we never change the lookup table to
 +    // match what we're trying to display, so perhaps we should always
-+    // return zero.  Given that we there isn't any better information
-+    // exposed, 
++    // return zero.  Given that there isn't any better information
++    // exposed, we don't have much other choice.
 +    aResult.SetIntValue(0, eCSSUnit_Integer);
 +    return NS_OK;
 +}
@@ -1635,8 +1678,7 @@ new file mode 100644
 +PR_STATIC_CALLBACK(nsresult)
 +GetResolution(nsPresContext* aPresContext, nsCSSValue& aResult)
 +{
-+    // XXX: The spec isn't clear whether this is CSS pixels or device
-+    // pixels.  For now, do device pixels.
++    // Resolution values are in device pixels, not CSS pixels.
 +    nsIDeviceContext *dx = aPresContext->DeviceContext();
 +    float dpi = float(dx->AppUnitsPerInch()) / float(dx->AppUnitsPerDevPixel());
 +    aResult.SetFloatValue(dpi, eCSSUnit_Inch);
