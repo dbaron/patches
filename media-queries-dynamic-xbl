@@ -1,0 +1,201 @@
+Handle effects of medium feature changes on XBL style sheets.  (Bug 156716)
+
+diff --git a/content/xbl/src/nsBindingManager.cpp b/content/xbl/src/nsBindingManager.cpp
+--- a/content/xbl/src/nsBindingManager.cpp
++++ b/content/xbl/src/nsBindingManager.cpp
+@@ -1229,18 +1229,17 @@ nsBindingManager::GetBindingImplementati
+     }
+   }
+   
+   *aResult = nsnull;
+   return NS_NOINTERFACE;
+ }
+ 
+ nsresult
+-nsBindingManager::WalkRules(nsStyleSet* aStyleSet,
+-                            nsIStyleRuleProcessor::EnumFunc aFunc,
++nsBindingManager::WalkRules(nsIStyleRuleProcessor::EnumFunc aFunc,
+                             RuleProcessorData* aData,
+                             PRBool* aCutOffInheritance)
+ {
+   *aCutOffInheritance = PR_FALSE;
+   
+   if (!aData->mContent)
+     return NS_OK;
+ 
+@@ -1272,16 +1271,74 @@ nsBindingManager::WalkRules(nsStyleSet* 
+ 
+   // If "content" is non-null that means we cut off inheritance at some point
+   // in the loop.
+   *aCutOffInheritance = (content != nsnull);
+ 
+   // Null out the scoped root that we set repeatedly
+   aData->mScopedRoot = nsnull;
+ 
++  return NS_OK;
++}
++
++typedef nsTHashTable<nsVoidPtrHashKey> RuleProcessorSet;
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++EnumRuleProcessors(nsISupports *aKey, nsXBLBinding *aBinding, void* aClosure)
++{
++  RuleProcessorSet *set = static_cast<RuleProcessorSet*>(aClosure);
++  for (nsXBLBinding *binding = aBinding; binding;
++       binding = binding->GetBaseBinding()) {
++    nsIStyleRuleProcessor *ruleProc =
++      binding->PrototypeBinding->GetRuleProcessor();
++    if (ruleProc) {
++      if (!set.IsInitialized() && !set->Init(16))
++        return PL_DHASH_STOP;
++      set.PutEntry(ruleProc);
++    }
++  }
++  return PL_DHASH_NEXT;
++}
++
++struct MediumFeaturesChangedData {
++  nsPresContext *mPresContext;
++  PRBool *mRulesChanged;
++};
++
++PR_STATIC_CALLBACK(PLDHashOperator)
++EnumMediumFeaturesChanged(nsISupports *aKey, void *aRuleProcessor,
++                          void* aClosure)
++{
++  nsIStyleRuleProcessor *ruleProcessor =
++    static_cast<nsIStyleRuleProcessor*>(aRuleProcessor);
++  MediumFeaturesChangedData *data =
++    static_cast<MediumFeaturesChangedData*>(aClosure);
++
++  PRBool thisChanged = PR_FALSE;
++  aRuleProcessor->MediumFeaturesChanged(data->mPresContext, &thisChanged);
++  data->mRulesChanged = data->mRulesChanged || thisChanged;
++
++  return PL_DHASH_NEXT;
++}
++
++nsresult
++nsBindingManager::MediumFeaturesChanged(nsPresContext* aPresContext,
++                                        PRBool* aRulesChanged)
++{
++  *aRulesChanged = PR_FALSE;
++  if (!mBindingTable.IsInitialized())
++    return NS_OK;
++
++  RuleProcessorSet set;
++  mBindingTable.EnumerateRead(EnumRuleProcessors, &set);
++  if (!set.IsInitialized())
++    return NS_OK;
++
++  MediumFeaturesChangedData data = { aPresContext, aRulesChanged };
++  set.EnumerateEntries(EnumMediumFeaturesChanged, &data);
+   return NS_OK;
+ }
+ 
+ PRBool
+ nsBindingManager::ShouldBuildChildFrames(nsIContent* aContent)
+ {
+   nsXBLBinding *binding = GetBinding(aContent);
+ 
+diff --git a/content/xbl/src/nsBindingManager.h b/content/xbl/src/nsBindingManager.h
+--- a/content/xbl/src/nsBindingManager.h
++++ b/content/xbl/src/nsBindingManager.h
+@@ -179,20 +179,26 @@ public:
+ 
+   void FlushSkinBindings();
+ 
+   nsresult GetBindingImplementation(nsIContent* aContent, REFNSIID aIID, void** aResult);
+ 
+   PRBool ShouldBuildChildFrames(nsIContent* aContent);
+ 
+   // Style rule methods
+-  nsresult WalkRules(nsStyleSet* aStyleSet, 
+-                     nsIStyleRuleProcessor::EnumFunc aFunc,
++  nsresult WalkRules(nsIStyleRuleProcessor::EnumFunc aFunc,
+                      RuleProcessorData* aData,
+                      PRBool* aCutOffInheritance);
++  /**
++   * Do any processing that needs to happen as a result of a change in
++   * the characteristics of the medium, and return whether this rule
++   * processor's rules have changed (e.g., because of media queries).
++   */
++  nsresult MediumFeaturesChanged(nsPresContext* aPresContext,
++                                 PRBool* aRulesChanged);
+ 
+   NS_HIDDEN_(void) Traverse(nsIContent *aContent,
+                             nsCycleCollectionTraversalCallback &cb);
+ 
+   NS_DECL_CYCLE_COLLECTION_CLASS(nsBindingManager)
+ 
+   // Notify the binding manager when an outermost update begins and
+   // ends.  The end method can execute script.
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -528,18 +528,17 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   if (mRuleProcessors[eHTMLPresHintSheet])
+     (*aCollectorFunc)(mRuleProcessors[eHTMLPresHintSheet], aData);
+   nsRuleNode* lastHTMLPresHintRN = mRuleWalker->GetCurrentNode();
+   
+   mRuleWalker->SetLevel(eDocSheet, PR_FALSE);
+   PRBool cutOffInheritance = PR_FALSE;
+   if (mBindingManager) {
+     // We can supply additional document-level sheets that should be walked.
+-    mBindingManager->WalkRules(this, aCollectorFunc, aData,
+-                               &cutOffInheritance);
++    mBindingManager->WalkRules(aCollectorFunc, aData, &cutOffInheritance);
+   }
+   if (!skipUserStyles && !cutOffInheritance &&
+       mRuleProcessors[eDocSheet]) // NOTE: different
+     (*aCollectorFunc)(mRuleProcessors[eDocSheet], aData);
+   mRuleWalker->SetLevel(eStyleAttrSheet, PR_FALSE);
+   if (mRuleProcessors[eStyleAttrSheet])
+     (*aCollectorFunc)(mRuleProcessors[eStyleAttrSheet], aData);
+   nsRuleNode* lastDocRN = mRuleWalker->GetCurrentNode();
+@@ -589,17 +588,17 @@ nsStyleSet::WalkRuleProcessors(nsIStyleR
+     (*aFunc)(mRuleProcessors[eUserSheet], aData);
+ 
+   if (mRuleProcessors[eHTMLPresHintSheet])
+     (*aFunc)(mRuleProcessors[eHTMLPresHintSheet], aData);
+   
+   PRBool cutOffInheritance = PR_FALSE;
+   if (mBindingManager) {
+     // We can supply additional document-level sheets that should be walked.
+-    mBindingManager->WalkRules(this, aFunc, aData, &cutOffInheritance);
++    mBindingManager->WalkRules(aFunc, aData, &cutOffInheritance);
+   }
+   if (!skipUserStyles && !cutOffInheritance &&
+       mRuleProcessors[eDocSheet]) // NOTE: different
+     (*aFunc)(mRuleProcessors[eDocSheet], aData);
+   if (mRuleProcessors[eStyleAttrSheet])
+     (*aFunc)(mRuleProcessors[eStyleAttrSheet], aData);
+   if (mRuleProcessors[eOverrideSheet])
+     (*aFunc)(mRuleProcessors[eOverrideSheet], aData);
+@@ -963,22 +962,25 @@ nsStyleSet::HasAttributeDependentStyle(n
+ 
+   return result;
+ }
+ 
+ PRBool
+ nsStyleSet::MediumFeaturesChanged(nsPresContext* aPresContext)
+ {
+   // We can't use WalkRuleProcessors without a content node.
+-  // XXX We don't notify mBindingManager.  Should we?
+   PRBool stylesChanged = PR_FALSE;
+   for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(mRuleProcessors); ++i) {
+     nsIStyleRuleProcessor *processor = mRuleProcessors[i];
+     if (!processor) {
+       continue;
+     }
+     PRBool thisChanged = PR_FALSE;
+     processor->MediumFeaturesChanged(aPresContext, &thisChanged);
+     stylesChanged = stylesChanged || thisChanged;
+   }
+ 
++  PRBool thisChanged = PR_FALSE;
++  mBindingManager->MediumFeaturesChanged(aPresContext, &thisChanged);
++  stylesChanged = stylesChanged || thisChanged;
++
+   return stylesChanged;
+ }
