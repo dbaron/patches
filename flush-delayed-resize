@@ -1,0 +1,120 @@
+Flush view manager's delayed resize when flushing layout.  (Bug 448132)
+
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -4578,16 +4578,17 @@ PresShell::DoFlushPendingNotifications(m
+     }
+ 
+     // There might be more pending constructors now, but we're not going to
+     // worry about them.  They can't be triggered during reflow, so we should
+     // be good.
+     
+     if (aType >= Flush_Layout && !mIsDestroying) {
+       mFrameConstructor->RecalcQuotesAndCounters();
++      mViewManager->FlushDelayedResize();
+       ProcessReflowCommands(aInterruptibleReflow);
+     }
+ 
+     PRUint32 updateFlags = NS_VMREFRESH_NO_SYNC;
+     if (aType >= Flush_Display) {
+       // Flushing paints, so perform the invalidates and drawing
+       // immediately
+       updateFlags = NS_VMREFRESH_IMMEDIATE;
+diff --git a/view/public/nsIViewManager.h b/view/public/nsIViewManager.h
+--- a/view/public/nsIViewManager.h
++++ b/view/public/nsIViewManager.h
+@@ -132,16 +132,21 @@ public:
+   /**
+    * Set the dimensions of the root window.
+    * Called if the root window is resized. The dimensions are in
+    * twips
+    * @param aWidth of window in twips
+    * @param aHeight of window in twips
+    */
+   NS_IMETHOD  SetWindowDimensions(nscoord aWidth, nscoord aHeight) = 0;
++
++  /**
++   * Do any resizes that are pending.
++   */
++  NS_IMETHOD  FlushDelayedResize() = 0;
+ 
+   /**
+    * Called to force a redrawing of any dirty areas.
+    */
+   // XXXbz why is this exposed?  Shouldn't update view batches handle this?
+   // It's not like Composite() does what's expected inside a view update batch
+   // anyway, since dirty areas may not have been invalidated on the widget yet
+   // and widget changes may not have been propagated yet.  Maybe this should
+diff --git a/view/src/nsViewManager.cpp b/view/src/nsViewManager.cpp
+--- a/view/src/nsViewManager.cpp
++++ b/view/src/nsViewManager.cpp
+@@ -370,16 +370,26 @@ NS_IMETHODIMP nsViewManager::SetWindowDi
+     if (IsViewVisible(mRootView)) {
+       mDelayedResize.SizeTo(NSCOORD_NONE, NSCOORD_NONE);
+       DoSetWindowDimensions(aWidth, aHeight);
+     } else {
+       mDelayedResize.SizeTo(aWidth, aHeight);
+     }
+   }
+ 
++  return NS_OK;
++}
++
++NS_IMETHODIMP nsViewManager::FlushDelayedResize()
++{
++  if (vm->mDelayedResize != nsSize(NSCOORD_NONE, NSCOORD_NONE)) {
++    vm->DoSetWindowDimensions(vm->mDelayedResize.width,
++                              vm->mDelayedResize.height);
++    vm->mDelayedResize.SizeTo(NSCOORD_NONE, NSCOORD_NONE);
++  }
+   return NS_OK;
+ }
+ 
+ static void ConvertNativeRegionToAppRegion(nsIRegion* aIn, nsRegion* aOut,
+                                            nsIDeviceContext* context)
+ {
+   nsRegionRectSet* rects = nsnull;
+   aIn->GetRects(&rects);
+@@ -1068,19 +1078,17 @@ NS_IMETHODIMP nsViewManager::DispatchEve
+           // have a delayed resize to handle.
+           PRBool didResize = PR_FALSE;
+           for (nsViewManager *vm = this; vm;
+                vm = vm->mRootView->GetParent()
+                       ? vm->mRootView->GetParent()->GetViewManager()
+                       : nsnull) {
+             if (vm->mDelayedResize != nsSize(NSCOORD_NONE, NSCOORD_NONE) &&
+                 IsViewVisible(vm->mRootView)) {
+-              vm->DoSetWindowDimensions(vm->mDelayedResize.width,
+-                                        vm->mDelayedResize.height);
+-              vm->mDelayedResize.SizeTo(NSCOORD_NONE, NSCOORD_NONE);
++              FlushDelayedResize();
+ 
+               // Paint later.
+               vm->UpdateView(vm->mRootView, NS_VMREFRESH_NO_SYNC);
+               didResize = PR_TRUE;
+ 
+               // not sure if it's valid for us to claim that we
+               // ignored this, but we're going to do so anyway, since
+               // we didn't actually paint anything
+diff --git a/view/src/nsViewManager.h b/view/src/nsViewManager.h
+--- a/view/src/nsViewManager.h
++++ b/view/src/nsViewManager.h
+@@ -118,16 +118,17 @@ public:
+   NS_IMETHOD_(nsIScrollableView*) CreateScrollableView(const nsRect& aBounds,
+                                                        const nsIView* aParent);
+ 
+   NS_IMETHOD  GetRootView(nsIView *&aView);
+   NS_IMETHOD  SetRootView(nsIView *aView);
+ 
+   NS_IMETHOD  GetWindowDimensions(nscoord *width, nscoord *height);
+   NS_IMETHOD  SetWindowDimensions(nscoord width, nscoord height);
++  NS_IMETHOD  FlushDelayedResize();
+ 
+   NS_IMETHOD  Composite(void);
+ 
+   NS_IMETHOD  UpdateView(nsIView *aView, PRUint32 aUpdateFlags);
+   NS_IMETHOD  UpdateView(nsIView *aView, const nsRect &aRect, PRUint32 aUpdateFlags);
+   NS_IMETHOD  UpdateAllViews(PRUint32 aUpdateFlags);
+ 
+   NS_IMETHOD  DispatchEvent(nsGUIEvent *aEvent, nsEventStatus* aStatus);
