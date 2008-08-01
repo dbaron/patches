@@ -1,0 +1,147 @@
+Make scrollbars be reflow roots only some of the time.
+
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -363,26 +363,34 @@ public:
+                                     nsIFrame** aPlaceholderFrame) const = 0;
+ 
+   /**
+    * Tell the pres shell that a frame needs to be marked dirty and needs
+    * Reflow.  It's OK if this is an ancestor of the frame needing reflow as
+    * long as the ancestor chain between them doesn't cross a reflow root.  The
+    * bit to add should be either NS_FRAME_IS_DIRTY or
+    * NS_FRAME_HAS_DIRTY_CHILDREN (but not both!).
++   *
++   * If |aReflowRoot| is non-null, it is treated as the reflow root for
++   * the resulting reflow.  In other words, the caller must ensure that
++   * the reflow in question will result in no change to aReflowRoot or
++   * anything outside of it.  (Frames that contain changes all of the
++   * time should be marked with NS_FRAME_REFLOW_ROOT; this is for frames
++   * that contain changes only some of the time.)
+    */
+   enum IntrinsicDirty {
+     // XXXldb eResize should be renamed
+     eResize,     // don't mark any intrinsic widths dirty
+     eTreeChange, // mark intrinsic widths dirty on aFrame and its ancestors
+     eStyleChange // Do eTreeChange, plus all of aFrame's descendants
+   };
+   NS_IMETHOD FrameNeedsReflow(nsIFrame *aFrame,
+                               IntrinsicDirty aIntrinsicDirty,
+-                              nsFrameState aBitToAdd) = 0;
++                              nsFrameState aBitToAdd,
++                              nsIFrame *aReflowRoot = nsnull) = 0;
+ 
+   NS_IMETHOD CancelAllPendingReflows() = 0;
+ 
+   /**
+    * Recreates the frames for a node
+    */
+   NS_IMETHOD RecreateFramesFor(nsIContent* aContent) = 0;
+ 
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -3192,17 +3192,17 @@ PresShell::VerifyHasDirtyRootAncestor(ns
+   }
+   NS_NOTREACHED("Frame has dirty bits set but isn't scheduled to be "
+                 "reflowed?");
+ }
+ #endif
+ 
+ NS_IMETHODIMP
+ PresShell::FrameNeedsReflow(nsIFrame *aFrame, IntrinsicDirty aIntrinsicDirty,
+-                            nsFrameState aBitToAdd)
++                            nsFrameState aBitToAdd, nsIFrame *aReflowRoot)
+ {
+   NS_PRECONDITION(aBitToAdd == NS_FRAME_IS_DIRTY ||
+                   aBitToAdd == NS_FRAME_HAS_DIRTY_CHILDREN,
+                   "Unexpected bits being added");
+ 
+   NS_ASSERTION(!mIsReflowing, "can't mark frame dirty during reflow");
+ 
+   // If we've not yet done the initial reflow, then don't bother
+@@ -3235,19 +3235,19 @@ PresShell::FrameNeedsReflow(nsIFrame *aF
+   // Grab |wasDirty| now so we can go ahead and update the bits on aFrame.
+   PRBool wasDirty = NS_SUBTREE_DIRTY(aFrame);
+   aFrame->AddStateBits(aBitToAdd);
+ 
+   // Now if aFrame is a reflow root we can cut off this reflow at it if the bit
+   // being added is NS_FRAME_HAS_DIRTY_CHILDREN.
+   PRBool targetFrameDirty = (aBitToAdd == NS_FRAME_IS_DIRTY);
+ 
+-#define FRAME_IS_REFLOW_ROOT(_f)                   \
+-  ((_f->GetStateBits() & NS_FRAME_REFLOW_ROOT) &&  \
+-   (_f != aFrame || !targetFrameDirty))
++#define FRAME_IS_REFLOW_ROOT(_f)                                              \
++  ((((_f)->GetStateBits() & NS_FRAME_REFLOW_ROOT) || (_f) == aReflowRoot) &&  \
++   ((_f) != aFrame || !targetFrameDirty))
+ 
+ 
+   // Mark the intrinsic widths as dirty on the frame, all of its ancestors,
+   // and all of its descendants, if needed:
+ 
+   if (aIntrinsicDirty != eResize) {
+     // Mark argument and all ancestors dirty. (Unless we hit a reflow root that
+     // should contain the reflow.  That root could be aFrame itself if it's not
+diff --git a/layout/xul/base/src/nsScrollbarFrame.cpp b/layout/xul/base/src/nsScrollbarFrame.cpp
+--- a/layout/xul/base/src/nsScrollbarFrame.cpp
++++ b/layout/xul/base/src/nsScrollbarFrame.cpp
+@@ -60,33 +60,16 @@ NS_NewScrollbarFrame (nsIPresShell* aPre
+ } // NS_NewScrollbarFrame
+ 
+ //
+ // QueryInterface
+ //
+ NS_INTERFACE_MAP_BEGIN(nsScrollbarFrame)
+   NS_INTERFACE_MAP_ENTRY(nsIScrollbarFrame)
+ NS_INTERFACE_MAP_END_INHERITING(nsBoxFrame)
+-
+-
+-NS_IMETHODIMP
+-nsScrollbarFrame::Init(nsIContent* aContent,
+-                       nsIFrame*   aParent,
+-                       nsIFrame*   aPrevInFlow)
+-{
+-  nsresult  rv = nsBoxFrame::Init(aContent, aParent, aPrevInFlow);
+-
+-  // We want to be a reflow root since we use reflows to move the
+-  // slider.  Any reflow inside the scrollbar frame will be a reflow to
+-  // move the slider and will thus not change anything outside of the
+-  // scrollbar or change the size of the scrollbar frame.
+-  mState |= NS_FRAME_REFLOW_ROOT;
+-
+-  return rv;
+-}
+ 
+ NS_IMETHODIMP
+ nsScrollbarFrame::Reflow(nsPresContext*          aPresContext,
+                          nsHTMLReflowMetrics&     aDesiredSize,
+                          const nsHTMLReflowState& aReflowState,
+                          nsReflowStatus&          aStatus)
+ {
+   nsresult rv = nsBoxFrame::Reflow(aPresContext, aDesiredSize, aReflowState, aStatus);
+diff --git a/layout/xul/base/src/nsScrollbarFrame.h b/layout/xul/base/src/nsScrollbarFrame.h
+--- a/layout/xul/base/src/nsScrollbarFrame.h
++++ b/layout/xul/base/src/nsScrollbarFrame.h
+@@ -83,20 +83,16 @@ public:
+   NS_IMETHOD HandleDrag(nsPresContext* aPresContext,
+                         nsGUIEvent *    aEvent,
+                         nsEventStatus*  aEventStatus);
+ 
+   NS_IMETHOD HandleRelease(nsPresContext* aPresContext,
+                            nsGUIEvent *    aEvent,
+                            nsEventStatus*  aEventStatus);
+ 
+-  NS_IMETHOD Init(nsIContent*      aContent,
+-                  nsIFrame*        aParent,
+-                  nsIFrame*        aPrevInFlow);
+-
+   NS_IMETHOD Reflow(nsPresContext*          aPresContext,
+                     nsHTMLReflowMetrics&     aDesiredSize,
+                     const nsHTMLReflowState& aReflowState,
+                     nsReflowStatus&          aStatus);
+ 
+   virtual PRBool IsContainingBlock() const;
+ 
+   virtual nsIAtom* GetType() const;  
