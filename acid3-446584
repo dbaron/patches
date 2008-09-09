@@ -1,0 +1,374 @@
+From: Ben Newman <bnewman@mozilla.com>
+
+WIP from attachment 334385 on bug 446584
+
+diff --git a/js/src/xpconnect/src/xpcconvert.cpp b/js/src/xpconnect/src/xpcconvert.cpp
+--- a/js/src/xpconnect/src/xpcconvert.cpp
++++ b/js/src/xpconnect/src/xpcconvert.cpp
+@@ -1382,16 +1382,29 @@ XPCConvert::ConstructException(nsresult 
+ 
+     nsresult res = nsXPCException::NewException(msg, rv, nsnull, data, exceptn);
+ 
+     if(sz)
+         JS_smprintf_free(sz);
+     return res;
+ }
+ 
++// static
++nsresult
++XPCConvert::ConstructException(CONSTRUCT_EXCEPTION_FORMALS,
++                               jsval jsException)
++{
++    nsCOMPtr<nsXPCException> xpcEx;
++    rv = ConstructException(rv, message, ifaceName, methodName, data, exception);
++    if (NS_SUCCEEDED(rv) && *exception && (xpcEx = do_QueryInterface(*exception))) {
++        xpcEx->SetThrownJSVal(jsException);
++    }
++    return rv;
++}
++
+ /********************************/
+ 
+ // static
+ nsresult
+ XPCConvert::JSValToXPCException(XPCCallContext& ccx,
+                                 jsval s,
+                                 const char* ifaceName,
+                                 const char* methodName,
+@@ -1487,25 +1500,25 @@ XPCConvert::JSValToXPCException(XPCCallC
+ 
+             JSString* str = JS_ValueToString(cx, s);
+             if(!str)
+                 return NS_ERROR_FAILURE;
+ 
+             return ConstructException(NS_ERROR_XPC_JS_THREW_JS_OBJECT,
+                                       JS_GetStringBytes(str),
+                                       ifaceName, methodName, nsnull,
+-                                      exceptn);
++                                      exceptn, s);
+         }
+     }
+ 
+     if(JSVAL_IS_VOID(s) || JSVAL_IS_NULL(s))
+     {
+         return ConstructException(NS_ERROR_XPC_JS_THREW_NULL,
+                                   nsnull, ifaceName, methodName, nsnull,
+-                                  exceptn);
++                                  exceptn, s);
+     }
+ 
+     if(JSVAL_IS_NUMBER(s))
+     {
+         // lets see if it looks like an nsresult
+         nsresult rv;
+         double number;
+         JSBool isResult = JS_FALSE;
+@@ -1528,44 +1541,47 @@ XPCConvert::JSValToXPCException(XPCCallC
+                 rv = (nsresult) number;
+                 if(NS_FAILED(rv))
+                     isResult = JS_TRUE;
+             }
+         }
+ 
+         if(isResult)
+             return ConstructException(rv, nsnull, ifaceName, methodName,
+-                                      nsnull, exceptn);
++                                      nsnull, exceptn, s);
+         else
+         {
++            // XXX all this nsISupportsDouble code seems a little redundant
++            // now that we're storing the jsval in the exception...
+             nsISupportsDouble* data;
+             nsCOMPtr<nsIComponentManager> cm;
+             if(NS_FAILED(NS_GetComponentManager(getter_AddRefs(cm))) || !cm ||
+                NS_FAILED(cm->CreateInstanceByContractID(
+                                 NS_SUPPORTS_DOUBLE_CONTRACTID,
+                                 nsnull,
+                                 NS_GET_IID(nsISupportsDouble),
+                                 (void**)&data)))
+                 return NS_ERROR_FAILURE;
+             data->SetData(number);
+             rv = ConstructException(NS_ERROR_XPC_JS_THREW_NUMBER, nsnull,
+-                                    ifaceName, methodName, data, exceptn);
++                                    ifaceName, methodName, data, exceptn, s);
+             NS_RELEASE(data);
+             return rv;
+         }
+     }
+ 
+     // otherwise we'll just try to convert it to a string
++    // Note: e.g., JSBools get converted to JSStrings by this code.
+ 
+     JSString* str = JS_ValueToString(cx, s);
+     if(str)
+         return ConstructException(NS_ERROR_XPC_JS_THREW_STRING,
+                                   JS_GetStringBytes(str),
+                                   ifaceName, methodName, nsnull,
+-                                  exceptn);
++                                  exceptn, s);
+     return NS_ERROR_FAILURE;
+ }
+ 
+ /********************************/
+ 
+ // static
+ nsresult
+ XPCConvert::JSErrorToXPCException(XPCCallContext& ccx,
+diff --git a/js/src/xpconnect/src/xpcexception.cpp b/js/src/xpconnect/src/xpcexception.cpp
+--- a/js/src/xpconnect/src/xpcexception.cpp
++++ b/js/src/xpconnect/src/xpcexception.cpp
+@@ -144,16 +144,33 @@ nsXPCException::nsXPCException()
+ {
+     MOZ_COUNT_CTOR(nsXPCException);
+ }
+ 
+ nsXPCException::~nsXPCException()
+ {
+     MOZ_COUNT_DTOR(nsXPCException);
+     Reset();
++}
++
++PRBool
++nsXPCException::GetThrownJSVal(jsval *vp) const
++{
++    if (mThrownJSVal) {
++        if (vp) *vp = mThrownJSVal->GetJSVal();
++        return PR_TRUE;
++    } else return PR_FALSE;
++}
++
++void
++nsXPCException::SetThrownJSVal(jsval v)
++{
++    mThrownJSVal = JSVAL_IS_TRACEABLE(v)
++        ? new XPCTraceableVariant(nsXPConnect::GetRuntime(), v)
++        : new XPCVariant(v);
+ }
+ 
+ void
+ nsXPCException::Reset()
+ {
+     if(mMessage)
+     {
+         nsMemory::Free(mMessage);
+diff --git a/js/src/xpconnect/src/xpcprivate.h b/js/src/xpconnect/src/xpcprivate.h
+--- a/js/src/xpconnect/src/xpcprivate.h
++++ b/js/src/xpconnect/src/xpcprivate.h
+@@ -2764,21 +2764,26 @@ public:
+ 
+     static nsresult JSErrorToXPCException(XPCCallContext& ccx,
+                                           const char* message,
+                                           const char* ifaceName,
+                                           const char* methodName,
+                                           const JSErrorReport* report,
+                                           nsIException** exception);
+ 
+-    static nsresult ConstructException(nsresult rv, const char* message,
+-                                       const char* ifaceName,
+-                                       const char* methodName,
+-                                       nsISupports* data,                                       
+-                                       nsIException** exception);
++#define CONSTRUCT_EXCEPTION_FORMALS   \
++    nsresult rv, const char* message, \
++    const char* ifaceName,            \
++    const char* methodName,           \
++    nsISupports* data,                \
++    nsIException** exception
++
++    static nsresult ConstructException(CONSTRUCT_EXCEPTION_FORMALS);
++    static nsresult ConstructException(CONSTRUCT_EXCEPTION_FORMALS,
++                                       jsval jsException);
+ 
+     static void RemoveXPCOMUCStringFinalizer();
+ 
+ private:
+     XPCConvert(); // not implemented
+ 
+ };
+ 
+@@ -2854,16 +2859,18 @@ public:
+                              nsIStackFrame* aCaller,
+                              nsIStackFrame** stack);
+ private:
+     XPCJSStack();   // not implemented
+ };
+ 
+ /***************************************************************************/
+ 
++class XPCVariant;
++
+ class nsXPCException :
+             public nsIXPCException
+ {
+ public:
+     NS_DEFINE_STATIC_CID_ACCESSOR(NS_XPCEXCEPTION_CID)
+ 
+     NS_DECL_ISUPPORTS
+     NS_DECL_NSIEXCEPTION
+@@ -2885,29 +2892,34 @@ public:
+                                   void** iterp);
+ 
+     static PRUint32 GetNSResultCount();
+ 
+     nsXPCException();
+     virtual ~nsXPCException();
+ 
+     static void InitStatics() { sEverMadeOneFromFactory = JS_FALSE; }
++    
++    PRBool GetThrownJSVal(jsval *vp) const;
++    void   SetThrownJSVal(jsval v);
+ 
+ protected:
+     void Reset();
+ private:
+     char*           mMessage;
+     nsresult        mResult;
+     char*           mName;
+     nsIStackFrame*  mLocation;
+     nsISupports*    mData;
+     char*           mFilename;
+     int             mLineNumber;
+     nsIException*   mInner;
+     PRBool          mInitialized;
++    
++    nsCOMPtr<XPCVariant> mThrownJSVal;
+ 
+     static JSBool sEverMadeOneFromFactory;
+ };
+ 
+ /***************************************************************************/
+ /*
+ * nsJSID implements nsIJSID. It is also used by nsJSIID and nsJSCID as a
+ * member (as a hidden implementaion detail) to which they delegate many calls.
+diff --git a/js/src/xpconnect/src/xpcwrappednative.cpp b/js/src/xpconnect/src/xpcwrappednative.cpp
+--- a/js/src/xpconnect/src/xpcwrappednative.cpp
++++ b/js/src/xpconnect/src/xpcwrappednative.cpp
+@@ -1883,16 +1883,26 @@ GetInterfaceTypeFromParam(XPCCallContext
+             return ThrowBadParam(NS_ERROR_XPC_CANT_GET_PARAM_IFACE_INFO, paramIndex, ccx);
+         *result = *p;
+     }
+     return JS_TRUE;
+ }
+ 
+ /***************************************************************************/
+ 
++static PRBool
++IsCallerChrome() // TODO unify with nsContentUtils::IsCallerChrome?
++{
++    PRBool isChrome = PR_FALSE;
++    nsCOMPtr<nsIScriptSecurityManager> securityManager =
++        do_GetService(NS_SCRIPTSECURITYMANAGER_CONTRACTID);
++    nsresult rv = securityManager->SubjectPrincipalIsSystem(&isChrome);
++    return NS_SUCCEEDED(rv) && isChrome;
++}
++
+ // static
+ NS_SUPPRESS_STACK_CHECK JSBool
+ XPCWrappedNative::CallMethod(XPCCallContext& ccx,
+                              CallMode mode /*= CALL_METHOD */)
+ {
+     NS_ASSERTION(ccx.GetXPCContext()->CallerTypeIsJavaScript(),
+                  "Native caller for XPCWrappedNative::CallMethod?");
+     
+@@ -2392,17 +2402,29 @@ XPCWrappedNative::CallMethod(XPCCallCont
+         invokeResult = NS_InvokeByIndex(callee, vtblIndex, paramCount,
+                                         dispatchParams);
+     }
+ 
+     xpcc->SetLastResult(invokeResult);
+ 
+     if(NS_FAILED(invokeResult))
+     {
+-        ThrowBadResult(invokeResult, ccx);
++        nsIException *nsiEx;
++        nsCOMPtr<nsXPCException> xpcEx;
++        jsval thrown;
++
++        if (!IsCallerChrome() && // throw jsval only in web context
++            NS_SUCCEEDED(ccx.GetThreadData()->GetException(&nsiEx)) &&
++            nsiEx && (xpcEx = do_QueryInterface(nsiEx)) &&
++            xpcEx->GetThrownJSVal(&thrown))
++        {
++            JS_SetPendingException(ccx.GetJSContext(), thrown);
++        }
++        else ThrowBadResult(invokeResult, ccx);
++
+         goto done;
+     }
+     else if(JS_IsExceptionPending(ccx))
+     {
+         goto done;
+     }
+ 
+     // now we iterate through the native params to gather and convert results
+diff --git a/js/src/xpconnect/tests/mochitest/Makefile.in b/js/src/xpconnect/tests/mochitest/Makefile.in
+--- a/js/src/xpconnect/tests/mochitest/Makefile.in
++++ b/js/src/xpconnect/tests/mochitest/Makefile.in
+@@ -45,12 +45,13 @@ include $(topsrcdir)/config/rules.mk
+ include $(topsrcdir)/config/rules.mk
+ 
+ _TEST_FILES =	test_bug361111.xul \
+ 		test_bug390488.html \
+ 		test_bug393269.html \
+ 		test_bug428021.html \
+ 		test_bug448587.html \
+ 		test_wrappers.html \
++		test_bug446584.html \
+ 		$(NULL)
+ 
+ libs:: $(_TEST_FILES)
+ 	$(INSTALL) $^ $(DEPTH)/_tests/testing/mochitest/tests/$(relativesrcdir)
+diff --git a/js/src/xpconnect/tests/mochitest/test_bug446584.html b/js/src/xpconnect/tests/mochitest/test_bug446584.html
+new file mode 100644
+--- /dev/null
++++ b/js/src/xpconnect/tests/mochitest/test_bug446584.html
+@@ -0,0 +1,49 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++https://bugzilla.mozilla.org/show_bug.cgi?id=446584
++-->
++<head>
++  <title>Test for Bug 446584</title>
++  <script type="text/javascript" src="/MochiKit/MochiKit.js"></script>
++  <script type="text/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
++</head>
++<body>
++<a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=446584">Mozilla Bug 446584</a>
++<p id="display"></p>
++<div id="content" style="display: none">
++  
++</div>
++<pre id="test">
++<script class="testbody" type="text/javascript">
++
++/** Test for Bug 446584 **/
++
++function test(val) {
++  try {
++    document.createNodeIterator(document.body,
++                                NodeFilter.SHOW_ALL,
++                                function() { throw val },
++                                true).nextNode();
++    ok(false, "NodeIterator::nextNode() should have thrown an exception.");
++  } catch (ex) {
++    ok(val === ex, "NodeIterator did not properly forward exception " +
++       val + " of type " + typeof val + ".  Thrown value was " + ex + ".");
++  }
++}
++
++test(0);
++test(1);
++test(3.14);
++test('roses');
++test({});
++test(false);
++test(true);
++test([1,2,3]);
++test(function(){});
++
++</script>
++</pre>
++</body>
++</html>
