@@ -1,0 +1,302 @@
+Convert text-shadow and box-shadow storage from nsStyleCoord to nscoord.  (Bug 443057)
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -1185,19 +1185,18 @@ nsCSSRendering::PaintBoxShadow(nsPresCon
+ 
+   gfxCornerSizes borderRadii;
+   ComputePixelRadii(twipsRadii, frameRect, borderValues, sidesToSkip, twipsPerPixel, &borderRadii);
+ 
+   gfxRect frameGfxRect = RectToGfxRect(frameRect, twipsPerPixel);
+   for (PRUint32 i = styleBorder->mBoxShadow->Length(); i > 0; --i) {
+     nsCSSShadowItem* shadowItem = styleBorder->mBoxShadow->ShadowAt(i - 1);
+     gfxRect shadowRect(frameRect.x, frameRect.y, frameRect.width, frameRect.height);
+-    shadowRect.MoveBy(gfxPoint(shadowItem->mXOffset.GetCoordValue(),
+-                               shadowItem->mYOffset.GetCoordValue()));
+-    shadowRect.Outset(shadowItem->mSpread.GetCoordValue());
++    shadowRect.MoveBy(gfxPoint(shadowItem->mXOffset, shadowItem->mYOffset));
++    shadowRect.Outset(shadowItem->mSpread);
+ 
+     gfxRect shadowRectPlusBlur = shadowRect;
+     shadowRect.ScaleInverse(twipsPerPixel);
+     shadowRect.RoundOut();
+ 
+     // shadowRect won't include the blur, so make an extra rect here that includes the blur
+     // for use in the even-odd rule below.
+     nscoord blurRadius = shadowItem->mRadius.GetCoordValue();
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -1344,22 +1344,19 @@ nsLayoutUtils::GetTextShadowRectsUnion(c
+   const nsStyleText* textStyle = aFrame->GetStyleText();
+   if (!textStyle->mTextShadow)
+     return aTextAndDecorationsRect;
+ 
+   nsRect resultRect = aTextAndDecorationsRect;
+   for (PRUint32 i = 0; i < textStyle->mTextShadow->Length(); ++i) {
+     nsRect tmpRect(aTextAndDecorationsRect);
+     nsCSSShadowItem* shadow = textStyle->mTextShadow->ShadowAt(i);
+-    nscoord xOffset = shadow->mXOffset.GetCoordValue();
+-    nscoord yOffset = shadow->mYOffset.GetCoordValue();
+-    nscoord blurRadius = shadow->mRadius.GetCoordValue();
+ 
+-    tmpRect.MoveBy(nsPoint(xOffset, yOffset));
+-    tmpRect.Inflate(blurRadius, blurRadius);
++    tmpRect.MoveBy(nsPoint(shadow->mXOffset, shadow->mYOffset));
++    tmpRect.Inflate(shadow->mRadius, shadow->mRadius);
+ 
+     resultRect.UnionRect(resultRect, tmpRect);
+   }
+   return resultRect;
+ }
+ 
+ nsresult
+ nsLayoutUtils::GetFontMetricsForFrame(nsIFrame* aFrame,
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3677,22 +3677,19 @@ ComputeOutlineAndEffectsRect(nsIFrame* a
+ 
+   // box-shadow
+   nsCSSShadowArray* boxShadows = aFrame->GetStyleBorder()->mBoxShadow;
+   if (boxShadows) {
+     nsRect shadows;
+     for (PRUint32 i = 0; i < boxShadows->Length(); ++i) {
+       nsRect tmpRect = r;
+       nsCSSShadowItem* shadow = boxShadows->ShadowAt(i);
+-      nscoord xOffset = shadow->mXOffset.GetCoordValue();
+-      nscoord yOffset = shadow->mYOffset.GetCoordValue();
+-      nscoord outsetRadius = shadow->mRadius.GetCoordValue() +
+-                             shadow->mSpread.GetCoordValue();
+-
+-      tmpRect.MoveBy(nsPoint(xOffset, yOffset));
++      nscoord outsetRadius = shadow->mRadius + shadow->mSpread;
++
++      tmpRect.MoveBy(nsPoint(shadow->mXOffset, shadow->mYOffset));
+       tmpRect.Inflate(outsetRadius, outsetRadius);
+ 
+       shadows.UnionRect(shadows, tmpRect);
+     }
+     r.UnionRect(r, shadows);
+   }
+ 
+   const nsStyleOutline* outline = aFrame->GetStyleOutline();
+diff --git a/layout/generic/nsHTMLContainerFrame.cpp b/layout/generic/nsHTMLContainerFrame.cpp
+--- a/layout/generic/nsHTMLContainerFrame.cpp
++++ b/layout/generic/nsHTMLContainerFrame.cpp
+@@ -265,26 +265,25 @@ nsHTMLContainerFrame::DisplayTextDecorat
+ 
+   // The text-shadow spec says that any text decorations must also have a shadow applied to
+   // it. So draw the shadows as part of the display list.
+   const nsStyleText* textStyle = GetStyleText();
+ 
+   if (textStyle->mTextShadow) {
+     for (PRUint32 i = textStyle->mTextShadow->Length(); i > 0; --i) {
+       nsCSSShadowItem* shadow = textStyle->mTextShadow->ShadowAt(i - 1);
+-      nscoord blurRadius = shadow->mRadius.GetCoordValue();
++      nscoord blurRadius = shadow->mRadius;
+       nscolor shadowColor;
+ 
+       if (shadow->mHasColor)
+         shadowColor = shadow->mColor;
+       else
+         shadowColor = GetStyleColor()->mColor;
+ 
+-      gfxPoint offset = gfxPoint(shadow->mXOffset.GetCoordValue(),
+-                                 shadow->mYOffset.GetCoordValue());
++      gfxPoint offset = gfxPoint(shadow->mXOffset, shadow->mYOffset);
+ 
+       // Add it to the display list so it is painted underneath the text and all decorations
+       nsresult rv = aBelowTextDecorations->AppendNewToTop(new (aBuilder)
+         nsDisplayTextShadow(this, decorations, shadowColor, aLine, blurRadius, offset));
+       NS_ENSURE_SUCCESS(rv, rv);
+     }
+   }
+ 
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4098,19 +4098,18 @@ AddHyphenToMetrics(nsTextFrame* aTextFra
+ 
+ void
+ nsTextFrame::PaintOneShadow(PRUint32 aOffset, PRUint32 aLength,
+                             nsCSSShadowItem* aShadowDetails,
+                             PropertyProvider* aProvider, const gfxRect& aDirtyRect,
+                             const gfxPoint& aFramePt, const gfxPoint& aTextBaselinePt,
+                             gfxContext* aCtx, const nscolor& aForegroundColor)
+ {
+-  gfxPoint shadowOffset(aShadowDetails->mXOffset.GetCoordValue(),
+-                        aShadowDetails->mYOffset.GetCoordValue());
+-  nscoord blurRadius = PR_MAX(aShadowDetails->mRadius.GetCoordValue(), 0);
++  gfxPoint shadowOffset(aShadowDetails->mXOffset, aShadowDetails->mYOffset);
++  nscoord blurRadius = PR_MAX(aShadowDetails->mRadius, 0);
+ 
+   gfxTextRun::Metrics shadowMetrics =
+     mTextRun->MeasureText(aOffset, aLength, PR_FALSE,
+                           nsnull, aProvider);
+   if (GetStateBits() & TEXT_HYPHEN_BREAK) {
+     AddHyphenToMetrics(this, mTextRun, &shadowMetrics, PR_FALSE, aCtx);
+   }
+ 
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -1649,30 +1649,30 @@ nsComputedDOMStyle::GetCSSShadowArray(ns
+                                       nsIDOMCSSValue** aValue)
+ {
+   if (!aArray) {
+     nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+     val->SetIdent(nsGkAtoms::none);
+     return CallQueryInterface(val, aValue);
+   }
+ 
+-  static nsStyleCoord nsCSSShadowItem::* const shadowValuesNoSpread[] = {
++  static nscoord nsCSSShadowItem::* const shadowValuesNoSpread[] = {
+     &nsCSSShadowItem::mXOffset,
+     &nsCSSShadowItem::mYOffset,
+     &nsCSSShadowItem::mRadius
+   };
+ 
+-  static nsStyleCoord nsCSSShadowItem::* const shadowValuesWithSpread[] = {
++  static nscoord nsCSSShadowItem::* const shadowValuesWithSpread[] = {
+     &nsCSSShadowItem::mXOffset,
+     &nsCSSShadowItem::mYOffset,
+     &nsCSSShadowItem::mRadius,
+     &nsCSSShadowItem::mSpread
+   };
+ 
+-  nsStyleCoord nsCSSShadowItem::* const * shadowValues;
++  nscoord nsCSSShadowItem::* const * shadowValues;
+   PRUint32 shadowValuesLength;
+   if (aUsesSpread) {
+     shadowValues = shadowValuesWithSpread;
+     shadowValuesLength = NS_ARRAY_LENGTH(shadowValuesWithSpread);
+   } else {
+     shadowValues = shadowValuesNoSpread;
+     shadowValuesLength = NS_ARRAY_LENGTH(shadowValuesNoSpread);
+   }
+@@ -1708,17 +1708,17 @@ nsComputedDOMStyle::GetCSSShadowArray(ns
+     // Set the offsets, blur radius, and spread if available
+     for (PRUint32 i = 0; i < shadowValuesLength; ++i) {
+       val = GetROCSSPrimitiveValue();
+       if (!val || !itemList->AppendCSSValue(val)) {
+         delete val;
+         delete valueList;
+         return NS_ERROR_OUT_OF_MEMORY;
+       }
+-      SetValueToCoord(val, item->*(shadowValues[i]));
++      val->SetAppUnits(item->*(shadowValues[i]));
+     }
+   }
+ 
+   return CallQueryInterface(valueList, aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBoxShadow(nsIDOMCSSValue** aValue)
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -2756,47 +2756,59 @@ nsRuleNode::GetShadowData(nsCSSValueList
+     ++arrayLength;
+ 
+   NS_ASSERTION(arrayLength > 0, "Non-null text-shadow list, yet we counted 0 items.");
+   nsCSSShadowArray* shadowList = new(arrayLength) nsCSSShadowArray(arrayLength);
+ 
+   if (!shadowList)
+     return nsnull;
+ 
++  nsStyleCoord tempCoord;
++  PRBool unitOK;
+   for (nsCSSShadowItem* item = shadowList->ShadowAt(0);
+        aList;
+        aList = aList->mNext, ++item) {
+     nsCSSValue::Array *arr = aList->mValue.GetArrayValue();
+     // OK to pass bad aParentCoord since we're not passing SETCOORD_INHERIT
+-    SetCoord(arr->Item(0), item->mXOffset, nsStyleCoord(),
+-             SETCOORD_LENGTH, aContext, mPresContext, inherited);
+-    SetCoord(arr->Item(1), item->mYOffset, nsStyleCoord(),
+-             SETCOORD_LENGTH, aContext, mPresContext, inherited);
++    unitOK = SetCoord(arr->Item(0), tempCoord, nsStyleCoord(),
++                      SETCOORD_LENGTH, aContext, mPresContext, inherited);
++    NS_ASSERTION(unitOK, "unexpected unit");
++    item->mXOffset = tempCoord.GetCoordValue();
++
++    unitOK = SetCoord(arr->Item(1), tempCoord, nsStyleCoord(),
++                      SETCOORD_LENGTH, aContext, mPresContext, inherited);
++    NS_ASSERTION(unitOK, "unexpected unit");
++    item->mYOffset = tempCoord.GetCoordValue();
+ 
+     // Blur radius is optional in the current box-shadow spec
+     if (arr->Item(2).GetUnit() != eCSSUnit_Null) {
+-      SetCoord(arr->Item(2), item->mRadius, nsStyleCoord(),
+-               SETCOORD_LENGTH, aContext, mPresContext, inherited);
+-    } else {
+-      item->mRadius.SetCoordValue(0);
++      unitOK = SetCoord(arr->Item(2), tempCoord, nsStyleCoord(),
++                        SETCOORD_LENGTH, aContext, mPresContext, inherited);
++      NS_ASSERTION(unitOK, "unexpected unit");
++      item->mRadius = tempCoord.GetCoordValue();
++    } else {
++      item->mRadius = 0;
+     }
+ 
+     // Find the spread radius
+     if (aUsesSpread && arr->Item(3).GetUnit() != eCSSUnit_Null) {
+-      SetCoord(arr->Item(3), item->mSpread, nsStyleCoord(),
+-               SETCOORD_LENGTH, aContext, mPresContext, inherited);
+-    } else {
+-      item->mSpread.SetCoordValue(0);
++      unitOK = SetCoord(arr->Item(3), tempCoord, nsStyleCoord(),
++                        SETCOORD_LENGTH, aContext, mPresContext, inherited);
++      NS_ASSERTION(unitOK, "unexpected unit");
++      item->mSpread = tempCoord.GetCoordValue();
++    } else {
++      item->mSpread = 0;
+     }
+ 
+     if (arr->Item(4).GetUnit() != eCSSUnit_Null) {
+       item->mHasColor = PR_TRUE;
+       // 2nd argument can be bogus since inherit is not a valid color
+-      SetColor(arr->Item(4), 0, mPresContext, aContext, item->mColor,
+-               inherited);
++      unitOK = SetColor(arr->Item(4), 0, mPresContext, aContext, item->mColor,
++                        inherited);
++      NS_ASSERTION(unitOK, "unexpected unit");
+     }
+   }
+ 
+   NS_ADDREF(shadowList);
+   return shadowList;
+ }
+ 
+ const void*
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -299,20 +299,20 @@ struct nsBorderColors {
+     }
+     // both should be NULL if these are equal, otherwise one
+     // has more colors than another
+     return !c1 && !c2;
+   }
+ };
+ 
+ struct nsCSSShadowItem {
+-  nsStyleCoord mXOffset;    // length (coord, chars)
+-  nsStyleCoord mYOffset;    // length (coord, chars)
+-  nsStyleCoord mRadius;     // length (coord, chars)
+-  nsStyleCoord mSpread;     // length (coord, chars)
++  nscoord mXOffset;
++  nscoord mYOffset;
++  nscoord mRadius;
++  nscoord mSpread;
+ 
+   nscolor      mColor;
+   PRPackedBool mHasColor; // Whether mColor should be used
+ 
+   nsCSSShadowItem() : mHasColor(PR_FALSE) {
+     MOZ_COUNT_CTOR(nsCSSShadowItem);
+   }
+   ~nsCSSShadowItem() {
