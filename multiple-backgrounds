@@ -48,8 +48,8 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +    nsCSSValue mRepeat;
 +    nsCSSValue mAttachment;
 +    nsCSSValuePair mPosition;
-+    nsCSSValue mClip; // NEW
-+    nsCSSValue mOrigin; // NEW
++    nsCSSValue mClip;
++    nsCSSValue mOrigin;
 +    // The background-color is set as a side-effect, and if so, mLastItem
 +    // is set to true.
 +    PRBool mLastItem;
@@ -148,36 +148,108 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      return ParseVariant(aValue, VARIANT_HK,
                          nsCSSProps::kBorderCollapseKTable);
    case eCSSProperty_border_bottom_color:
-@@ -5621,194 +5647,299 @@ BoxPositionMaskToCSSValue(PRInt32 aMask,
+@@ -5617,198 +5643,371 @@ BoxPositionMaskToCSSValue(PRInt32 aMask,
+     else if (aMask & BG_BOTTOM) {
+       val = NS_STYLE_BG_POSITION_BOTTOM;
+     }
+   }
  
    return nsCSSValue(val, eCSSUnit_Enumerated);
  }
  
++struct SimpleValueInfo {
++  nsCSSValue nsCSSParser::BackgroundItem::*member;
++  nsCSSProperty propID;
++};
++
  PRBool
  CSSParserImpl::ParseBackground()
  {
    nsAutoParseCompoundProperty compound(this);
--
+ 
++  // These two are set through side-effects of ParseBackgroundItem.
 +  mTempData.mColor.mBackColor.mXValue.SetColorValue(NS_RGBA(0, 0, 0, 0));
 +  mTempData.mColor.mBackColor.mYValue.SetColorValue(NS_RGBA(0, 0, 0, 0));
 +
-+  // call ParseBackgroundItem...
-+  //
-+  // check mLastItem
++  BackgroundItem bgitem;
++  nsCSSValuePairList *positionHead = nsnull, **positionTail = &positionHead;
++  static const SimpleValueInfo simpleValues[] = {
++    { &BackgroundItem::mImage,      eCSSProperty_background_image },
++    { &BackgroundItem::mRepeat,     eCSSProperty_background_repeat },
++    { &BackgroundItem::mAttachment, eCSSProperty_background_attachment },
++    { &BackgroundItem::mClip,       eCSSProperty__moz_background_clip },
++    { &BackgroundItem::mOrigin,     eCSSProperty__moz_background_origin }
++  };
++  nsCSSValueList *simpleHeads[NS_ARRAY_LENGTH(simpleValues)];
++  nsCSSValueList **simpleTails[NS_ARRAY_LENGTH(simpleValues)];
++  for (PRInt32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++    simpleHeads[i] = nsnull;
++    simpleTails[i] = &simpleHeads[i];
++  }
++  do {
++    if (!ParseBackgroundItem(bgitem, !head)) {
++      break;
++    }
++    nsCSSValuePairList *positionItem = new nsCSSValuePairList;
++    if (!positionItem) {
++      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      break;
++    }
++    positionItem->mXValue = bgitem.mPosition.mXValue;
++    positionItem->mYValue = bgitem.mPosition.mYValue;
++    *positionTail = positionItem;
++    positionTail = &positionItem->mNext;
 +
-+  // check ExpectEndProperty
-+  mTempData.SetPropertyBit(eCSSProperty_background_color);
-+  mTempData.SetPropertyBit(eCSSProperty_background_image);
-+  mTempData.SetPropertyBit(eCSSProperty_background_repeat);
-+  mTempData.SetPropertyBit(eCSSProperty_background_attachment);
-+  mTempData.SetPropertyBit(eCSSProperty_background_position);
-+  mTempData.SetPropertyBit(eCSSProperty__moz_background_clip);
-+  mTempData.SetPropertyBit(eCSSProperty__moz_background_origin);
++    PRBool fail = PR_FALSE;
++    for (PRInt32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++      nsCSSValueList *item = new nsCSSValueList;
++      if (!item) {
++        mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++        fail = PR_TRUE;
++        break;
++      }
++      item->mValue = bgitem.*(simpleValues[i].member);
++      *simpleTails[i] = item;
++      simpleTails[i] = &item->mNext;
++    }
++    if (fail) {
++      break;
++    }
++
++    if (!item.mLastItem && ExpectSymbol(',', PR_TRUE)) {
++      continue;
++    }
++    if (!ExpectEndProperty()) {
++      break;
++    }
++
++    mTempData.mColor.mBackPosition = positionHead;
++    for (PRInt32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++      nsCSSValueList **source = static_cast<nsCSSValueList**>(
++        mTempData.PropertyAt(simpleValues[i].propID));
++      *source = simpleHeads[i];
++    }
++
++    mTempData.SetPropertyBit(eCSSProperty_background_color);
++    mTempData.SetPropertyBit(eCSSProperty_background_image);
++    mTempData.SetPropertyBit(eCSSProperty_background_repeat);
++    mTempData.SetPropertyBit(eCSSProperty_background_attachment);
++    mTempData.SetPropertyBit(eCSSProperty_background_position);
++    mTempData.SetPropertyBit(eCSSProperty__moz_background_clip);
++    mTempData.SetPropertyBit(eCSSProperty__moz_background_origin);
++    return PR_TRUE;
++  }
++  delete positionHead;
++  for (PRInt32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++    delete simpleHeads[i];
++  }
++  return PR_FALSE;
 +}
 +
 +// Parse one item of the background shorthand property.
 +PRBool
-+CSSParserImpl::ParseBackgroundItem(CSSParserImpl::BackgroundItem& aItem)
++CSSParserImpl::ParseBackgroundItem(CSSParserImpl::BackgroundItem& aItem,
++                                   PRBool aFirstItem)
 +{
    // Fill in the values that the shorthand will set if we don't find
    // other values.
@@ -217,8 +289,9 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +  aItem.mLastItem = PR_FALSE;
 +
 +  // NOTE:  When we support 'background-size', we'll need to modify
-+  // both ParseBackgroundColor and the background-size parsing to be less
-+  // greedy about '/'s if the thing after them fails to parse.
++  // ParseBackgroundColor and the background-size parsing to be less
++  // greedy about '/'s if the thing after them fails to parse.  (Or,
++  // hopefully, the spec will change so we don't have to.)
    PRBool haveColor = PR_FALSE,
           haveImage = PR_FALSE,
           haveRepeat = PR_FALSE,
@@ -488,9 +561,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +    if (!ExpectEndProperty()) {
 +      break;
 +    }
-+    nsCSSValuePairList **source =
-+      static_cast<nsCSSValuePairList**>(mTempData.PropertyAt(aPropID));
-+    *source = head;
++    mTempData.mColor.mBackPosition = head;
 +    mTempData.SetPropertyBit(eCSSProperty_background_position);
 +    return PR_TRUE;
 +  }
@@ -520,7 +591,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    if (ParseVariant(xValue, VARIANT_HLP, nsnull)) {
      if (eCSSUnit_Inherit == xValue.GetUnit() ||
          eCSSUnit_Initial == xValue.GetUnit()) {  // both are inherited or both are set to initial
-@@ -7020,17 +7151,18 @@ PRBool CSSParserImpl::ParseMozTransform(
+@@ -7020,17 +7219,18 @@ PRBool CSSParserImpl::ParseMozTransform(
    mTempData.mDisplay.mTransform = transformList;
  
    return PR_TRUE;
