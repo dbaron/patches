@@ -1,0 +1,338 @@
+For fixed-layout tables, leave room for the cell spacing for all columns, whether they have cells originating in them or not, since we don't know if cells for those columns will arrive as the table loads incrementally.  (Bug 444928)
+
+diff --git a/layout/tables/BasicTableLayoutStrategy.cpp b/layout/tables/BasicTableLayoutStrategy.cpp
+--- a/layout/tables/BasicTableLayoutStrategy.cpp
++++ b/layout/tables/BasicTableLayoutStrategy.cpp
+@@ -46,17 +46,18 @@
+ #include "nsTableCellFrame.h"
+ #include "nsLayoutUtils.h"
+ #include "nsGkAtoms.h"
+ #include "SpanningCellSorter.h"
+ 
+ #undef  DEBUG_TABLE_STRATEGY 
+ 
+ BasicTableLayoutStrategy::BasicTableLayoutStrategy(nsTableFrame *aTableFrame)
+-  : mTableFrame(aTableFrame)
++  : nsITableLayoutStrategy(nsITableLayoutStrategy::Auto)
++  , mTableFrame(aTableFrame)
+ {
+     MarkIntrinsicWidthsDirty();
+ }
+ 
+ /* virtual */
+ BasicTableLayoutStrategy::~BasicTableLayoutStrategy()
+ {
+ }
+@@ -413,17 +414,17 @@ BasicTableLayoutStrategy::ComputeIntrins
+                            // where a cell originates
+ 
+     for (PRInt32 col = 0; col < colCount; ++col) {
+         nsTableColFrame *colFrame = mTableFrame->GetColFrame(col);
+         if (!colFrame) {
+             NS_ERROR("column frames out of sync with cell map");
+             continue;
+         }
+-        if (mTableFrame->GetNumCellsOriginatingInCol(col)) {
++        if (mTableFrame->ColumnHasCellSpacingBefore(col)) {
+             add += spacing;
+         }
+         min += colFrame->GetMinCoord();
+         pref = NSCoordSaturatingAdd(pref, colFrame->GetPrefCoord());
+ 
+         // Percentages are of the table, so we have to reverse them for
+         // intrinsic widths.
+         float p = colFrame->GetPrefPercent();
+@@ -622,17 +623,17 @@ BasicTableLayoutStrategy::DistributeWidt
+ 
+     // border-spacing isn't part of the basis for percentages.
+     nscoord spacing = mTableFrame->GetCellSpacingX();
+     nscoord subtract = 0;    
+     // aWidth initially includes border-spacing for the boundaries in between
+     // each of the columns. We start at aFirstCol + 1 because the first
+     // in-between boundary would be at the left edge of column aFirstCol + 1
+     for (PRInt32 col = aFirstCol + 1; col < aFirstCol + aColCount; ++col) {
+-        if (mTableFrame->GetNumCellsOriginatingInCol(col)) {
++        if (mTableFrame->ColumnHasCellSpacingBefore(col)) {
+             subtract += spacing;
+         }
+     }
+     if (aWidthType == BTLS_FINAL_WIDTH) {
+         // If we're computing final col-width, then aWidth initially includes
+         // border spacing on the table's far left + far right edge, too.  Need
+         // to subtract those out, too.
+         subtract += spacing * 2;
+@@ -731,17 +732,17 @@ BasicTableLayoutStrategy::DistributeWidt
+                 // loop
+                 nscoord delta = NSCoordSaturatingSubtract(pref_width, 
+                                                           min_width, 0);
+                 guess_min_spec = NSCoordSaturatingAdd(guess_min_spec, delta);
+                 total_fixed_pref = NSCoordSaturatingAdd(total_fixed_pref, 
+                                                         pref_width);
+             } else if (pref_width == 0) {
+                 if (aWidthType == BTLS_FINAL_WIDTH &&
+-                    mTableFrame->GetNumCellsOriginatingInCol(col)) {
++                    mTableFrame->ColumnHasCellSpacingBefore(col)) {
+                     ++numNonSpecZeroWidthCols;
+                 }
+             } else {
+                 total_flex_pref = NSCoordSaturatingAdd(total_flex_pref,
+                                                        pref_width);
+             }
+         }
+     }
+@@ -929,17 +930,17 @@ BasicTableLayoutStrategy::DistributeWidt
+                 }
+                 break;
+             case FLEX_FLEX_LARGE_ZERO:
+                 NS_ASSERTION(aWidthType == BTLS_FINAL_WIDTH,
+                              "FLEX_FLEX_LARGE_ZERO only should be hit "
+                              "when we're setting final width.");
+                 if (pct == 0.0f &&
+                     !colFrame->GetHasSpecifiedCoord() &&
+-                    mTableFrame->GetNumCellsOriginatingInCol(col)) {
++                    mTableFrame->ColumnHasCellSpacingBefore(col)) {
+ 
+                     NS_ASSERTION(col_width == 0 &&
+                                  colFrame->GetPrefCoord() == 0,
+                                  "Since we're in FLEX_FLEX_LARGE_ZERO case, "
+                                  "all auto-width cols should have zero pref "
+                                  "width.");
+                     float c = float(space) / float(basis.c);
+                     col_width += NSToCoordRound(c);
+diff --git a/layout/tables/FixedTableLayoutStrategy.cpp b/layout/tables/FixedTableLayoutStrategy.cpp
+--- a/layout/tables/FixedTableLayoutStrategy.cpp
++++ b/layout/tables/FixedTableLayoutStrategy.cpp
+@@ -42,17 +42,18 @@
+  */
+ 
+ #include "FixedTableLayoutStrategy.h"
+ #include "nsTableFrame.h"
+ #include "nsTableColFrame.h"
+ #include "nsTableCellFrame.h"
+ 
+ FixedTableLayoutStrategy::FixedTableLayoutStrategy(nsTableFrame *aTableFrame)
+-  : mTableFrame(aTableFrame)
++  : nsITableLayoutStrategy(nsITableLayoutStrategy::Fixed)
++  , mTableFrame(aTableFrame)
+ {
+     MarkIntrinsicWidthsDirty();
+ }
+ 
+ /* virtual */
+ FixedTableLayoutStrategy::~FixedTableLayoutStrategy()
+ {
+ }
+diff --git a/layout/tables/nsITableLayoutStrategy.h b/layout/tables/nsITableLayoutStrategy.h
+--- a/layout/tables/nsITableLayoutStrategy.h
++++ b/layout/tables/nsITableLayoutStrategy.h
+@@ -65,11 +65,23 @@ public:
+     /** Implement nsIFrame::MarkIntrinsicWidthsDirty for the table */
+     virtual void MarkIntrinsicWidthsDirty() = 0;
+ 
+     /**
+      * Compute final column widths based on the intrinsic width data and
+      * the available width.
+      */
+     virtual void ComputeColumnWidths(const nsHTMLReflowState& aReflowState) = 0;
++
++    /**
++     * Return the type of table layout strategy, without the cost of
++     * a virtual function call
++     */
++    enum Type { Auto, Fixed };
++    Type GetType() const { return mType; }
++
++protected:
++    nsITableLayoutStrategy(Type aType) : mType(aType) {}
++private:
++    Type mType;
+ };
+ 
+ #endif /* !defined(nsITableLayoutStrategy_h_) */
+diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp
++++ b/layout/tables/nsTableFrame.cpp
+@@ -426,16 +426,17 @@ void nsTableFrame::AttributeChangedFor(n
+ 
+ 
+ /* ****** CellMap methods ******* */
+ 
+ /* return the effective col count */
+ PRInt32 nsTableFrame::GetEffectiveColCount() const
+ {
+   PRInt32 colCount = GetColCount();
++  // XXX CHAGNE FOR FIXED LAYOUT
+   // don't count cols at the end that don't have originating cells
+   for (PRInt32 colX = colCount - 1; colX >= 0; colX--) {
+     if (GetNumCellsOriginatingInCol(colX) <= 0) { 
+       colCount--;
+     }
+     else break;
+   }
+   return colCount;
+@@ -2208,17 +2209,17 @@ nsTableFrame::GetCollapsedWidth(nsMargin
+       const nsStyleDisplay* colDisplay = colFrame->GetStyleDisplay();
+       PRInt32 colX = colFrame->GetColIndex();
+       if (NS_STYLE_DISPLAY_TABLE_COLUMN == colDisplay->mDisplay) {
+         const nsStyleVisibility* colVis = colFrame->GetStyleVisibility();
+         PRBool collapseCol = (NS_STYLE_VISIBILITY_COLLAPSE == colVis->mVisible);
+         PRInt32 colWidth = GetColumnWidth(colX);
+         if (!collapseGroup && !collapseCol) {
+           width += colWidth;
+-          if (GetNumCellsOriginatingInCol(colX) > 0)
++          if (ColumnHasCellSpacingBefore(colX) > 0)
+             width += cellSpacingX;
+         }
+       }
+     }
+   }
+   return width;
+ }
+ 
+@@ -4013,32 +4014,27 @@ nsTableFrame::GetRowAndColumnByIndex(PRI
+     return NS_ERROR_NOT_INITIALIZED;
+ 
+   cellMap->GetRowAndColumnByIndex(aIndex, aRow, aColumn);
+   return NS_OK;
+ }
+ 
+ /*---------------- end of nsITableLayout implementation ------------------*/
+ 
+-PRInt32 nsTableFrame::GetNumCellsOriginatingInCol(PRInt32 aColIndex) const
+-{
+-  nsTableCellMap* cellMap = GetCellMap();
+-  if (cellMap) 
+-    return cellMap->GetNumCellsOriginatingInCol(aColIndex);
+-  else
+-    return 0;
+-}
+-
+-PRInt32 nsTableFrame::GetNumCellsOriginatingInRow(PRInt32 aRowIndex) const
+-{
+-  nsTableCellMap* cellMap = GetCellMap();
+-  if (cellMap) 
+-    return cellMap->GetNumCellsOriginatingInRow(aRowIndex);
+-  else
+-    return 0;
++PRBool
++nsTableFrame::ColumnHasCellSpacingBefore(PRInt32 aColIndex) const
++{
++  // Since fixed-layout tables should not have their column sizes change
++  // as they load, we assume that all columns are significant.
++  if (mTableLayoutStrategy->GetType() == nsITableLayoutStrategy::Fixed)
++    return PR_TRUE;
++  nsTableCellMap* cellMap = GetCellMap();
++  if (!cellMap) 
++    return PR_FALSE;
++  return cellMap->GetNumCellsOriginatingInCol(aColIndex) > 0;
+ }
+ 
+ static void
+ CheckFixDamageArea(PRInt32 aNumRows,
+                    PRInt32 aNumCols,
+                    nsRect& aDamageArea)
+ {
+   if (((aDamageArea.XMost() > aNumCols) && (aDamageArea.width  != 1) && (aNumCols != 0)) || 
+diff --git a/layout/tables/nsTableFrame.h b/layout/tables/nsTableFrame.h
+--- a/layout/tables/nsTableFrame.h
++++ b/layout/tables/nsTableFrame.h
+@@ -525,18 +525,18 @@ public:
+ 
+   virtual void RemoveCol(nsTableColGroupFrame* aColGroupFrame,
+                          PRInt32               aColIndex,
+                          PRBool                aRemoveFromCache,
+                          PRBool                aRemoveFromCellMap);
+ 
+   NS_IMETHOD GetIndexByRowAndColumn(PRInt32 aRow, PRInt32 aColumn, PRInt32 *aIndex);
+   NS_IMETHOD GetRowAndColumnByIndex(PRInt32 aIndex, PRInt32 *aRow, PRInt32 *aColumn);
+-  PRInt32 GetNumCellsOriginatingInCol(PRInt32 aColIndex) const;
+-  PRInt32 GetNumCellsOriginatingInRow(PRInt32 aRowIndex) const;
++
++  PRBool ColumnHasCellSpacingBefore(PRInt32 aColIndex) const;
+ 
+   PRBool HasPctCol() const;
+   void SetHasPctCol(PRBool aValue);
+ 
+   PRBool HasCellSpanningPctCol() const;
+   void SetHasCellSpanningPctCol(PRBool aValue);
+ 
+   /**
+diff --git a/layout/tables/nsTableRowFrame.cpp b/layout/tables/nsTableRowFrame.cpp
+--- a/layout/tables/nsTableRowFrame.cpp
++++ b/layout/tables/nsTableRowFrame.cpp
+@@ -683,17 +683,17 @@ CalcAvailWidth(nsTableFrame&     aTableF
+   for (PRInt32 spanX = 0; spanX < colspan; spanX++) {
+     nscoord colWidth = aTableFrame.GetColumnWidth(colIndex + spanX);
+     if (NS_UNCONSTRAINEDSIZE == aColAvailWidth) {
+       aColAvailWidth = colWidth; 
+     }
+     else {
+       aColAvailWidth += colWidth;
+     }
+-    if ((spanX > 0) && (aTableFrame.GetNumCellsOriginatingInCol(colIndex + spanX) > 0)) {
++    if ((spanX > 0) && (aTableFrame.ColumnHasCellSpacingBefore(colIndex + spanX) > 0)) {
+       cellSpacing += aCellSpacingX;
+     }
+   }
+   if (NS_UNCONSTRAINEDSIZE != aColAvailWidth) {
+     aColAvailWidth += cellSpacing;
+   } 
+   aCellAvailWidth = aColAvailWidth;
+ }
+@@ -722,17 +722,17 @@ GetSpaceBetween(PRInt32       aPrevColIn
+         nsIFrame* cgFrame = colFrame->GetParent();
+         const nsStyleVisibility* groupVis = cgFrame->GetStyleVisibility();
+         PRBool collapseGroup = (NS_STYLE_VISIBILITY_COLLAPSE ==
+                                 groupVis->mVisible);
+         isCollapsed = collapseCol || collapseGroup;
+         if (!isCollapsed)
+           space += aTableFrame.GetColumnWidth(colX);
+       }
+-      if (!isCollapsed && (aTableFrame.GetNumCellsOriginatingInCol(colX) > 0)) {
++      if (!isCollapsed && (aTableFrame.ColumnHasCellSpacingBefore(colX) > 0)) {
+         space += aCellSpacingX;
+       }
+     }
+   } 
+   else {
+     PRInt32 lastCol = aColIndex + aColSpan - 1;
+     for (colX = aPrevColIndex - 1; colX > lastCol; colX--) {
+       PRBool isCollapsed = PR_FALSE;
+@@ -746,17 +746,17 @@ GetSpaceBetween(PRInt32       aPrevColIn
+         nsIFrame* cgFrame = colFrame->GetParent();
+         const nsStyleVisibility* groupVis = cgFrame->GetStyleVisibility();
+         PRBool collapseGroup = (NS_STYLE_VISIBILITY_COLLAPSE ==
+                                 groupVis->mVisible);
+         isCollapsed = collapseCol || collapseGroup;
+         if (!isCollapsed)
+           space += aTableFrame.GetColumnWidth(colX);
+       }
+-      if (!isCollapsed && (aTableFrame.GetNumCellsOriginatingInCol(colX) > 0)) {
++      if (!isCollapsed && (aTableFrame.ColumnHasCellSpacingBefore(colX) > 0)) {
+         space += aCellSpacingX;
+       }
+     }
+   }
+   return space;
+ }
+ 
+ // subtract the heights of aRow's prev in flows from the unpaginated height
+@@ -1241,17 +1241,17 @@ nsTableRowFrame::CollapseRowIfNecessary(
+             isVisible = PR_TRUE;
+           }
+           if (!isCollapsed &&  (actualColSpan > 1)) {
+             nsTableColFrame* nextColFrame =
+               tableFrame->GetColFrame(colX + colIncrement);
+             const nsStyleVisibility* nextColVis =
+               nextColFrame->GetStyleVisibility();
+             if ( (NS_STYLE_VISIBILITY_COLLAPSE != nextColVis->mVisible) &&
+-                (tableFrame->GetNumCellsOriginatingInCol(colX + colIncrement) > 0)) {
++                (tableFrame->ColumnHasCellSpacingBefore(colX + colIncrement) > 0)) {
+               cRect.width += cellSpacingX;
+             }
+           }
+         }
+         x += cRect.width;
+         if (isVisible)
+           x += cellSpacingX;
+         PRInt32 actualRowSpan = tableFrame->GetEffectiveRowSpan(*cellFrame);
