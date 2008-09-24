@@ -3,7 +3,7 @@ Hook g_object_ref and g_object_unref into NS_LogAddRef and NS_LogRelease.
 diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
 --- a/toolkit/xre/nsAppRunner.cpp
 +++ b/toolkit/xre/nsAppRunner.cpp
-@@ -2420,16 +2420,80 @@ static void MOZ_gdk_display_close(GdkDis
+@@ -2420,16 +2420,104 @@ static void MOZ_gdk_display_close(GdkDis
        gdk_display_close(display);
  #if GTK_CHECK_VERSION(2,8,0) && \
    (defined(DEBUG) || defined(NS_BUILD_REFCNT_LOGGING) || defined(NS_TRACE_MALLOC))
@@ -20,15 +20,19 @@ diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
 +
 +typedef gpointer (*ns_g_object_ref_type)  (gpointer);
 +typedef void (*ns_g_object_unref_type)(gpointer);
-+typedef GTypeInstance* (*ns_g_type_create_instance_type)(GType);
++typedef GObject* (*ns_g_object_constructor_type)(GType, guint,
++                                                 GObjectConstructParam*);
 +
++/*
++ * Note that these overrides only hook calls from outside of gobject,
++ * since gobjectalias.h plays tricks with visibility and macros so that
++ * we can't override the ones inside gobject.
++ *
++ * That's why we have to hook g_object_constructor rather than
++ * g_type_create_instance (which it calls).
++ */
 +static ns_g_object_ref_type real_g_object_ref = 
 +  (ns_g_object_ref_type) dlsym(RTLD_NEXT, "g_object_ref");
-+static ns_g_object_unref_type real_g_object_unref = 
-+  (ns_g_object_unref_type) dlsym(RTLD_NEXT, "g_object_unref");
-+static ns_g_type_create_instance_type real_g_type_create_instance = 
-+  (ns_g_type_create_instance_type) dlsym(RTLD_NEXT, "g_type_create_instance");
-+
 +gpointer
 +g_object_ref (gpointer _object)
 +{
@@ -44,6 +48,8 @@ diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
 +  return result;
 +}
 +
++static ns_g_object_unref_type real_g_object_unref = 
++  (ns_g_object_unref_type) dlsym(RTLD_NEXT, "g_object_unref");
 +void
 +g_object_unref (gpointer _object)
 +{
@@ -53,26 +59,44 @@ diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
 +  real_g_object_unref(_object);
 +}
 +
-+GTypeInstance*
-+g_type_create_instance(GType type)
++static ns_g_object_constructor_type HookGObjectConstructor();
++
++static ns_g_object_constructor_type real_g_object_constructor = 
++  HookGObjectConstructor();
++
++static GObject*
++my_g_object_constructor(GType type,
++                        guint n_construct_properties,
++                        GObjectConstructParam *construct_params)
 +{
 +  // GObjects are initialized with a reference count of one.  We want to
 +  // hook into their construction path as early as possible to log that
-+  // reference count.  (We want to log it before any other reference
-+  // counting happens.)  Since G_OBJECT_TYPE_NAME() will return the
-+  // correct result after g_type_create_instance finishes, so we can
-+  // hook that (rather than g_object_constructor).
-+  GTypeInstance *result = real_g_type_create_instance(type);
++  // reference count, so that we log it before any other reference
++  // counting happens.  However, we need to do this late enough so that
++  // G_OBJECT_TYPE_NAME() will return the correct result, which means
++  // after g_type_create_instance (called from the real
++  // g_object_constructor) finishes.
++  GObject *object = real_g_object_constructor(type, n_construct_properties,
++                                              construct_params);
 +
-+  GObject *object = G_OBJECT(result);
 +  GTypeQuery q;
 +  q.instance_size = 0;
-+  g_type_query(G_TYPE_FROM_INSTANCE(object), &q);
-+  NS_LogAddRef(object, 1, G_OBJECT_TYPE_NAME(object),
-+               q.instance_size);
++  g_type_query(type, &q);
++  NS_LogAddRef(object, 1, g_type_name(type), q.instance_size);
 +
-+  return result;
++  return object;
 +}
++
++static ns_g_object_constructor_type
++HookGObjectConstructor()
++{
++  // Leak this reference.
++  GObjectClass *clazz = G_OBJECT_CLASS(g_type_class_ref(G_TYPE_OBJECT));
++  ns_g_object_constructor_type real_ctor = clazz->constructor;
++  clazz->constructor = my_g_object_constructor;
++  return real_ctor;
++}
++
 +
 +#endif // defined(NS_BUILD_REFCNT_LOGGING)
 +
