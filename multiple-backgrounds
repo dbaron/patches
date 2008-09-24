@@ -1106,7 +1106,7 @@ diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
-@@ -3582,139 +3582,164 @@ nsRuleNode::ComputeColorData(void* aStar
+@@ -3582,139 +3582,252 @@ nsRuleNode::ComputeColorData(void* aStar
    else {
      SetColor(colorData.mColor, parentColor->mColor, mPresContext, aContext, color->mColor, 
               inherited);
@@ -1115,27 +1115,104 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
    COMPUTE_END_INHERITED(Color, color)
  }
  
++// information about how to compute values for background-* properties
++template <class SpecifiedValueItem>
++struct InitialInheritLocationFor {
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct InitialInheritLocationFor<nsCSSValueList>
++  static nsCSSValueList::*nsCSSValue Location() const {
++    return &nsCSSValueList::mValue;
++  }
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct InitialInheritLocationFor<nsCSSValuePairList>
++  static nsCSSValuePairList::*nsCSSValue Location() const {
++    return &nsCSSValuePairList::mXValue;
++  }
++};
++
++template <class SpecifiedValueItem, class ResultValueItem>
++struct BackgroundItemComputer {
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct BackgroundItemComputer<nsCSSValueList, PRUint8>
++{
++  static void ComputeValue(nsCSSValueList* aSpecifiedValue,
++                           PRUint8& aComputedValue,
++                           PRBool& aInherited)
++  {
++    SetDiscrete(aSpecifiedValue->mValue, aComputedValue, aInherited,
++                SETDSC_ENUMERATED, PRUint8(0), 0, 0, 0, 0, 0);
++  }
++};
++
++
++template <class SpecifiedValueItem, class ResultValueItem>
 +static void
-+SetBackgroundList(nsCSSValueList* aValueList, nsTArray<PRUint8>& aResult,
-+                  PRBool& aInherited, const nsTArray<PRUint8>& aParentResult)
++SetBackgroundList(SpecifiedValueItem* aValueList,
++                  nsStyleBackground::Item *aTopLayer,
++                  nsStyleBackground::Item *aParentTopLayer,
++                  nsStyleBackground::Item::*ResultValueItem aResultLocation,
++                  ResultValueItem aInitialValue,
++                  PRUint32 aParentItemCount,
++                  PRUint32& aItemCount,
++                  PRUint32& aMaxItemCount,
++                  PRBool& aRebuild,
++                  PRBool& aInherited)
 +{
 +  if (aValueList) {
-+    aResult.Clear();
-+    if (eCSSUnit_Inherit == aValueList->mValue.GetUnit()) {
++    aItemCount = 0;
++    SpecifiedValueItem::*nsCSSValue initialInherit =
++      InitialInheritLocationFor<SpecifiedValueItem>::Location();
++    if (eCSSUnit_Inherit == aValueList->*initialInherit.GetUnit()) {
 +      aInherited = PR_TRUE;
-+      aResult.AppendElements(aParentResult);
-+    } else if (eCSSUnit_Initial != aValueList->mValue.GetUnit()) {
-+      for (nsCSSValueList *item = aValueList; item; item = item->mNext) {
-+        NS_ASSERTION(item->mValue.GetUnit() != eCSSUnit_Inherit &&
-+                     item->mValue.GetUnit() != eCSSUnit_Initial,
++      nsStyleBackground::Item *layer = aTopLayer,
++                        *parentLayer = aParentTopLayer;
++      for (;;) {
++        ++aItemCount;
++        layer->*aResultLocation = parentLayer->*aResultLocation;
++        if (--aParentItemCount == 0) {
++          break;
++        }
++        layer = layer->GetOrMakeNextLayer();
++        if (!layer) {
++          NS_NOTREACHED("out of memory");
++          break;
++        }
++        parentLayer = parentLayer->mNextLayer;
++      }
++    } else if (eCSSUnit_Initial == aValueList->*initialInherit.GetUnit()) {
++      aItemCount = 1;
++      aTopLayer->*aResultLocation = aInitialValue;
++    } else {
++      nsStyleBackground::Item *layer = aTopLayer;
++      SpecifiedValueItem *item = aValueList;
++      
++      for (;;) {
++        NS_ASSERTION(item->*initialInherit.GetUnit() != eCSSUnit_Inherit &&
++                     item->*initialInherit.GetUnit() != eCSSUnit_Initial,
 +                     "unexpected unit");
-+        PRUint8 result;
-+        SetDiscrete(item->mValue, result, aInherited, SETDSC_ENUMERATED,
-+                    PRUint8(0), 0, 0, 0, 0, 0);
-+        aResult.AppendElement(result);
++        BackgroundItemComputer<SpecifiedValueItem, ResultValueItem>
++          ::ComputeValue(item, layer->*aResultLocation, aInherited);
++        item = item->mNext;
++        if (!item) {
++          break;
++        }
++        layer = layer->GetOrMakeNextLayer();
++        if (!layer) {
++          NS_NOTREACHED("out of memory");
++          break;
++        }
 +      }
 +    }
 +  }
++
++  if (aItemCount > aMaxItemCount)
++    aMaxItemCount = aItemCount;
 +}
 +
 +struct BackgroundPositionAxis {
@@ -1241,17 +1318,26 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 +    }
 +  }
 +
++  PRUint32 maxItemCount = 0;
++  PRBool rebuild = PR_FALSE;
++
 +  // background-repeat: enum, inherit, initial [list]
-+  SetBackgroundList(colorData.mBackRepeat, bg->mBackgroundRepeat,
-+                    inherited, parentBG->mBackgroundRepeat);
++  SetBackgroundList(colorData.mBackRepeat, &bg->mTopLayer,
++                    &parentBG->mTopLayer, &nsStyleBackground::Item::mRepeat,
++                    NS_STYLE_BG_REPEAT_XY, parentBG->mRepeatCount,
++                    bg->mRepeatCount, maxItemCount, rebuild, inherited);
 +
 +  // background-attachment: enum, inherit, initial [list]
-+  SetBackgroundList(colorData.mBackAttachment, bg->mBackgroundAttachment,
-+                    inherited, parentBG->mBackgroundAttachment);
++  SetBackgroundList(colorData.mBackAttachment, &bg->mTopLayer,
++                    &parentBG->mTopLayer, &nsStyleBackground::Item::mAttachment,
++                    NS_STYLE_BG_ATTACHMENT_SCROLL, parentBG->mAttachmentCount,
++                    bg->mAttachmentCount, maxItemCount, rebuild, inherited);
 +
 +  // background-clip: enum, inherit, initial [list]
-+  SetBackgroundList(colorData.mBackClip, bg->mBackgroundClip,
-+                    inherited, parentBG->mBackgroundClip);
++  SetBackgroundList(colorData.mBackClip, &bg->mTopLayer,
++                    &parentBG->mTopLayer, &nsStyleBackground::Item::mClip,
++                    NS_STYLE_BG_CLIP_BORDER, parentBG->mClipCount,
++                    bg->mClipCount, maxItemCount, rebuild, inherited);
  
    // background-inline-policy: enum, inherit, initial
    SetDiscrete(colorData.mBackInlinePolicy, bg->mBackgroundInlinePolicy,
@@ -1320,8 +1406,10 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 -  else if (eCSSUnit_Initial == colorData.mBackPosition.mYValue.GetUnit()) {
 -    bg->mBackgroundFlags &= ~(NS_STYLE_BG_Y_POSITION_LENGTH | NS_STYLE_BG_Y_POSITION_PERCENT);
 +  // background-origin: enum, inherit, initial [list]
-+  SetBackgroundList(colorData.mBackOrigin, bg->mBackgroundOrigin,
-+                    inherited, parentBG->mBackgroundOrigin);
++  SetBackgroundList(colorData.mBackOrigin, &bg->mTopLayer,
++                    &parentBG->mTopLayer, &nsStyleBackground::Item::mOrigin,
++                    NS_STYLE_BG_ORIGIN_PADDING, parentBG->mOriginCount,
++                    bg->mOriginCount, maxItemCount, rebuild, inherited);
 +
 +  // background-position: enum, length, percent (flags), inherit [pair list]
 +  static const BackgroundPositionAxis bgPosAxes[] = {
@@ -1373,7 +1461,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
  const void*
  nsRuleNode::ComputeMarginData(void* aStartStruct,
                                const nsRuleDataStruct& aData, 
-@@ -5249,16 +5274,17 @@ nsRuleNode::Sweep()
+@@ -5249,16 +5362,17 @@ nsRuleNode::Sweep()
  }
  
  /* static */ PRBool
@@ -1391,7 +1479,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
  
    if (ruleTypeMask & NS_AUTHOR_SPECIFIED_BORDER)
      inheritBits |= NS_STYLE_INHERIT_BIT(Border);
-@@ -5268,18 +5294,19 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
+@@ -5268,18 +5382,19 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
  
    /* We're relying on the use of |aStyleContext| not mutating it! */
    nsRuleData ruleData(inheritBits,
@@ -1413,7 +1501,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
      &marginData.mBorderWidth.mTop,
      &marginData.mBorderColor.mRight,
      &marginData.mBorderStyle.mRight,
-@@ -5329,16 +5356,22 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
+@@ -5329,16 +5444,22 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
      if (rule) {
        ruleData.mLevel = ruleNode->GetLevel();
        ruleData.mIsImportantRule = ruleNode->IsImportantRule();
@@ -1472,7 +1560,7 @@ diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 --- a/layout/style/nsStyleStruct.cpp
 +++ b/layout/style/nsStyleStruct.cpp
-@@ -1149,78 +1149,113 @@ nsChangeHint nsStyleColor::MaxDifference
+@@ -1149,78 +1149,120 @@ nsChangeHint nsStyleColor::MaxDifference
  }
  #endif
  
@@ -1488,7 +1576,13 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 -    mBackgroundOrigin(NS_STYLE_BG_ORIGIN_PADDING),
 -    mBackgroundRepeat(NS_STYLE_BG_REPEAT_XY),
 -    mBackgroundColor(NS_RGBA(0, 0, 0, 0))
-+  : mTopLayer(nsStyleBackground::Item::INIT_WITH_INITIAL_VALUES)
++  : mAttachCount(1)
++  , mClipCount(1)
++  , mOriginCount(1)
++  , mRepeatCount(1)
++  , mPositionCount(1)
++  , mImageCount(1)
++  , mTopLayer(nsStyleBackground::Item::INIT_WITH_INITIAL_VALUES)
 +  , mBackgroundColor(NS_RGBA(0, 0, 0, 0))
 +  , mFallbackBackgroundColor(NS_RGBA(0, 0, 0, 0))
 +  , mBackgroundInlinePolicy(NS_STYLE_BG_INLINE_POLICY_CONTINUOUS)
@@ -1511,6 +1605,7 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 +    mBackgroundInlinePolicy(aSource.mBackgroundInlinePolicy),
      mBackgroundImage(aSource.mBackgroundImage)
  {
++  // XXX WRITE ME COPY LAYERS
  }
  
  nsStyleBackground::~nsStyleBackground()
@@ -1639,7 +1734,7 @@ diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
  class nsIFrame;
  class imgIRequest;
  
-@@ -157,40 +158,82 @@ struct nsStyleBackground {
+@@ -157,40 +158,83 @@ struct nsStyleBackground {
      aContext->FreeToShell(sizeof(nsStyleBackground), this);
    }
  
@@ -1712,8 +1807,9 @@ diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
 +    }
 +  };
 +
-+  // The number of values of each property that were actually specified.
-+  PRUint32 mAttachCount,
++  // The (positive) number of computed values of each property, since
++  // the lengths of the lists are independent.
++  PRUint32 mAttachmentCount,
 +           mClipCount,
 +           mOriginCount,
 +           mRepeatCount,
