@@ -83,6 +83,198 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
        y = -y;
        if (y < 0) {
          // Some joker gave us max-negative-integer.
+@@ -1497,33 +1491,35 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+   if (!dirtyRect.IntersectRect(bgClipArea, aDirtyRect)) {
+     // Nothing to paint
+     return;
+   }
+ 
+   // if there is no background image or background images are turned off, try a color.
+   if (!aColor.mBackgroundImage || !canDrawBackgroundImage) {
+     PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, aPadding, canDrawBackgroundColor);
++                         aColor, aBorder, aPadding, !!aColor.mBackgroundImage,
++                         canDrawBackgroundColor);
+     return;
+   }
+ 
+   // We have a background image
+ 
+   // Lookup the image
+   imgIRequest *req = aPresContext->LoadImage(aColor.mBackgroundImage,
+                                              aForFrame);
+ 
+   PRUint32 status = imgIRequest::STATUS_ERROR;
+   if (req)
+     req->GetImageStatus(&status);
+ 
+   if (!req || !(status & imgIRequest::STATUS_FRAME_COMPLETE) || !(status & imgIRequest::STATUS_SIZE_AVAILABLE)) {
+     PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, aPadding, canDrawBackgroundColor);
++                         aColor, aBorder, aPadding, PR_TRUE,
++                         canDrawBackgroundColor);
+     return;
+   }
+ 
+   nsCOMPtr<imgIContainer> image;
+   req->GetImage(getter_AddRefs(image));
+ 
+   nsSize imageSize;
+   image->GetWidth(&imageSize.width);
+@@ -1618,17 +1614,18 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+     default:
+       NS_ASSERTION(repeat == NS_STYLE_BG_REPEAT_OFF, "unknown background-repeat value");
+       break;
+   }
+ 
+   // The background color is rendered over the 'background-clip' area
+   if (needBackgroundColor) {
+     PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, aPadding, canDrawBackgroundColor);
++                         aColor, aBorder, aPadding, PR_FALSE,
++                         canDrawBackgroundColor);
+   }
+ 
+   if ((tileWidth == 0) || (tileHeight == 0) || dirtyRect.IsEmpty()) {
+     // Nothing left to paint
+     return;
+   }
+ 
+   nsPoint borderAreaOriginSnapped = aBorderArea.TopLeft();
+@@ -2313,27 +2310,35 @@ void
+ void
+ nsCSSRendering::PaintBackgroundColor(nsPresContext* aPresContext,
+                                      nsIRenderingContext& aRenderingContext,
+                                      nsIFrame* aForFrame,
+                                      const nsRect& aBgClipArea,
+                                      const nsStyleBackground& aColor,
+                                      const nsStyleBorder& aBorder,
+                                      const nsStylePadding& aPadding,
++                                     PRBool aUseFallbackColor,
+                                      PRBool aCanPaintNonWhite)
+ {
++  nscolor color = aUseFallbackColor ? aColor.mFallbackBackgroundColor
++                                    : aColor.mBackgroundColor;
+   // If we're only allowed to paint white, then don't bail out on transparent
+   // color if we're not completely transparent.  See the corresponding check
+   // for whether we're allowed to paint background images in
+   // PaintBackgroundWithSC before the first call to PaintBackgroundColor.
+-  if (NS_GET_A(aColor.mBackgroundColor) == 0 &&
+-      (aCanPaintNonWhite || aColor.IsTransparent())) {
++  if (!aCanPaintNonWhite && !aColor.IsTransparent()) {
++    color = NS_RGB(255, 255, 255);
++  }
++  
++  if (NS_GET_A(color) == 0) {
+     // nothing to paint
+     return;
+   }
++
++  aRenderingContext.SetColor(color);
+ 
+   nscoord borderRadii[4];
+   nsRect bgClipArea(aBgClipArea);
+ 
+   GetBorderRadiusTwips(aBorder.mBorderRadius, aForFrame->GetSize().width, borderRadii);
+ 
+   PRUint8 side = 0;
+   // Rounded version of the border
+@@ -2341,55 +2346,45 @@ nsCSSRendering::PaintBackgroundColor(nsP
+     if (borderRadii[side] > 0) {
+       PaintRoundedBackground(aPresContext, aRenderingContext, aForFrame,
+                              bgClipArea, aColor, aBorder, borderRadii,
+                              aCanPaintNonWhite);
+       return;
+     }
+   }
+ 
+-  nscolor color;
+-  if (!aCanPaintNonWhite) {
+-    color = NS_RGB(255, 255, 255);
+-  } else {
+-    color = aColor.mBackgroundColor;
+-  }
+-  
+-  aRenderingContext.SetColor(color);
+   aRenderingContext.FillRect(bgClipArea);
+ }
+ 
+ /** ---------------------------------------------------
+  *  See documentation in nsCSSRendering.h
+  *  @update 3/26/99 dwc
++ *
++ * Our caller must call SetColor on aRenderingContext with the
++ * appropriate color.
+  */
+ void
+ nsCSSRendering::PaintRoundedBackground(nsPresContext* aPresContext,
+                                        nsIRenderingContext& aRenderingContext,
+                                        nsIFrame* aForFrame,
+                                        const nsRect& aBgClipArea,
+                                        const nsStyleBackground& aColor,
+                                        const nsStyleBorder& aBorder,
+-                                       nscoord aTheRadius[4],
+-                                       PRBool aCanPaintNonWhite)
++                                       nscoord aTheRadius[4])
+ {
+   gfxContext *ctx = aRenderingContext.ThebesContext();
+ 
+   // needed for our border thickness
+   nscoord appUnitsPerPixel = aPresContext->AppUnitsPerDevPixel();
+ 
+-  nscolor color = aColor.mBackgroundColor;
+-  if (!aCanPaintNonWhite) {
+-    color = NS_RGB(255, 255, 255);
+-  }
+-  aRenderingContext.SetColor(color);
+-
+   // Adjust for background-clip, if necessary
+-  if (aColor.mBackgroundClip != NS_STYLE_BG_CLIP_BORDER) {
+-    NS_ASSERTION(aColor.mBackgroundClip == NS_STYLE_BG_CLIP_PADDING, "unknown background-clip value");
++  if (aColor.mBottomLayer->mBackgroundClip != NS_STYLE_BG_CLIP_BORDER) {
++    NS_ASSERTION(aColor.mBottomLayer->mBackgroundClip ==
++                   NS_STYLE_BG_CLIP_PADDING,
++                 "unknown background-clip value");
+ 
+     // Get the radius to the outer edge of the padding.
+     // -moz-border-radius is the radius to the outer edge of the border.
+     NS_FOR_CSS_SIDES(side) {
+       aTheRadius[side] -= aBorder.GetActualBorderWidth(side);
+       aTheRadius[side] = PR_MAX(aTheRadius[side], 0);
+     }
+   }
+diff --git a/layout/base/nsCSSRendering.h b/layout/base/nsCSSRendering.h
+--- a/layout/base/nsCSSRendering.h
++++ b/layout/base/nsCSSRendering.h
+@@ -272,26 +272,26 @@ protected:
+ 
+   static void PaintBackgroundColor(nsPresContext* aPresContext,
+                                    nsIRenderingContext& aRenderingContext,
+                                    nsIFrame* aForFrame,
+                                    const nsRect& aBgClipArea,
+                                    const nsStyleBackground& aColor,
+                                    const nsStyleBorder& aBorder,
+                                    const nsStylePadding& aPadding,
++                                   PRBool aUseFallbackColor,
+                                    PRBool aCanPaintNonWhite);
+ 
+   static void PaintRoundedBackground(nsPresContext* aPresContext,
+                                      nsIRenderingContext& aRenderingContext,
+                                      nsIFrame* aForFrame,
+                                      const nsRect& aBorderArea,
+                                      const nsStyleBackground& aColor,
+                                      const nsStyleBorder& aBorder,
+-                                     nscoord aTheRadius[4],
+-                                     PRBool aCanPaintNonWhite);
++                                     nscoord aTheRadius[4]);
+ 
+   static nscolor MakeBevelColor(PRIntn whichSide, PRUint8 style,
+                                 nscolor aBackgroundColor,
+                                 nscolor aBorderColor);
+ 
+   static void DrawLine (nsIRenderingContext& aContext, 
+                         nscoord aX1, nscoord aY1, nscoord aX2, nscoord aY2,
+                         nsRect* aGap);
 diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
 --- a/layout/base/nsStyleConsts.h
 +++ b/layout/base/nsStyleConsts.h
