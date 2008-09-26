@@ -1,36 +1,5 @@
 Hacks to get pango to shutdown more cleanly and thus allow us to shut down fontconfig.
 
-diff --git a/gfx/thebes/src/gfxPangoFonts.cpp b/gfx/thebes/src/gfxPangoFonts.cpp
---- a/gfx/thebes/src/gfxPangoFonts.cpp
-+++ b/gfx/thebes/src/gfxPangoFonts.cpp
-@@ -612,19 +612,27 @@ gfxPangoFont::Shutdown()
- gfxPangoFont::Shutdown()
- {
-     gfxPangoFontCache::Shutdown();
- 
-     // This just cleans up memory used by Pango's caches and may cause an
-     // assert and crash in cairo (Bug 399556), so only do this when we care
-     // about cleaning up memory on shutdown.
- #if defined(DEBUG) || defined(NS_BUILD_REFCNT_LOGGING) || defined(NS_TRACE_MALLOC)
-+    // Do some shutdown of the fontmap, which clears a bunch of circular
-+    // references from the fontmap to itself.  The shutdown that this
-+    // does is much less than what's done by the fontmap's finalize,
-+    // though.
-     PangoFontMap *fontmap = pango_cairo_font_map_get_default ();
-     if (PANGO_IS_FC_FONT_MAP (fontmap))
-         pango_fc_font_map_shutdown (PANGO_FC_FONT_MAP (fontmap));
-+
-+    // And then free the reference in the static (hope nobody else needs
-+    // it!)
-+    g_object_unref (fontmap);
- #endif
- }
- 
- static PangoStyle
- ThebesStyleToPangoStyle (const gfxFontStyle *fs)
- {
-     if (fs->style == FONT_STYLE_ITALIC)
-         return PANGO_STYLE_ITALIC;
 diff --git a/gfx/thebes/src/gfxPlatform.cpp b/gfx/thebes/src/gfxPlatform.cpp
 --- a/gfx/thebes/src/gfxPlatform.cpp
 +++ b/gfx/thebes/src/gfxPlatform.cpp
@@ -90,10 +59,10 @@ diff --git a/gfx/thebes/src/gfxPlatformGtk.cpp b/gfx/thebes/src/gfxPlatformGtk.c
 diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
 --- a/toolkit/xre/nsAppRunner.cpp
 +++ b/toolkit/xre/nsAppRunner.cpp
-@@ -273,16 +273,17 @@ static char **gRestartArgv;
- static char **gRestartArgv;
- 
- #if defined(MOZ_WIDGET_GTK2)
+@@ -279,16 +279,17 @@ static char **gRestartArgv;
+ #define PANGO_ENABLE_BACKEND
+ #include <pango/pangofc-fontmap.h>
+ #endif
  #include <gtk/gtk.h>
  #ifdef MOZ_X11
  #include <gdk/gdkx.h>
@@ -108,21 +77,30 @@ diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
  {
    char *expr = PR_smprintf("%s=%s", name, PromiseFlatCString(word).get());
    if (expr)
-@@ -2415,16 +2416,17 @@ static void MOZ_gdk_display_close(GdkDis
- #endif /* MOZ_X11 */
-   }
-   else {
-     if (!theme_is_qt)
-       gdk_display_close(display);
- #if GTK_CHECK_VERSION(2,8,0) && \
-   (defined(DEBUG) || defined(NS_BUILD_REFCNT_LOGGING) || defined(NS_TRACE_MALLOC))
+@@ -2451,24 +2452,26 @@ static void MOZ_gdk_display_close(GdkDis
+         pango_fc_font_map_shutdown(PANGO_FC_FONT_MAP(fontmap));
+     g_object_unref(pangoContext);
+     // PangoCairo still holds a reference to the fontmap.
+     // Now that we have finished with GTK and Pango, we could unref fontmap,
+     // which would allow us to call FcFini, but removing what is really
+     // Pango's ref feels a bit evil.  Pango-1.22 will have support for
+     // pango_cairo_font_map_set_default(NULL), which would release the
+     // reference on the old fontmap.
++    g_object_unref (fontmap);
+ 
+ #if GTK_CHECK_VERSION(2,8,0)
+     // cairo_debug_reset_static_data() is prototyped through cairo.h included
+     // by gtk.h.
+ #ifdef cairo_debug_reset_static_data
+ #error "Looks like we're including Mozilla's cairo instead of system cairo"
+ #endif
      cairo_debug_reset_static_data();
 +    FcFini();
- #endif
+ #endif // 2.8.0
+ #endif // CLEANUP_MEMORY
    }
  }
  #endif // MOZ_WIDGET_GTK2
  
  /** 
   * NSPR will search for the "nspr_use_zone_allocator" symbol throughout
-  * the process and use it to determine whether the application defines its own
