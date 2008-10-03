@@ -1,0 +1,117 @@
+Fix warnings about breaking strict aliasing rules by making mChildren a union.
+
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -633,17 +633,17 @@ nsRuleNode::DestroyInternal(nsRuleNode *
+     *destroyQueueTail = nsnull; // ensure null-termination
+     PL_DHashTableDestroy(children);
+   } else if (HaveChildren()) {
+     *destroyQueueTail = ChildrenList();
+     do {
+       destroyQueueTail = &(*destroyQueueTail)->mNextSibling;
+     } while (*destroyQueueTail);
+   }
+-  mChildrenTaggedPtr = nsnull;
++  mChildren.asVoid = nsnull;
+ 
+   if (aDestroyQueueTail) {
+     // Our caller destroys the queue.
+     *aDestroyQueueTail = destroyQueueTail;
+   } else {
+     // We have to do destroy the queue.  When we destroy each node, it
+     // will add its children to the queue.
+     while (destroyQueue) {
+@@ -674,21 +674,21 @@ nsILanguageAtomService* nsRuleNode::gLan
+ nsILanguageAtomService* nsRuleNode::gLangService = nsnull;
+ 
+ nsRuleNode::nsRuleNode(nsPresContext* aContext, nsRuleNode* aParent,
+                        nsIStyleRule* aRule, PRUint8 aLevel,
+                        PRBool aIsImportant)
+   : mPresContext(aContext),
+     mParent(aParent),
+     mRule(aRule),
+-    mChildrenTaggedPtr(nsnull),
+     mDependentBits((PRUint32(aLevel) << NS_RULE_NODE_LEVEL_SHIFT) |
+                    (aIsImportant ? NS_RULE_NODE_IS_IMPORTANT : 0)),
+     mNoneBits(0)
+ {
++  mChildren.asVoid = nsnull;
+   MOZ_COUNT_CTOR(nsRuleNode);
+   NS_IF_ADDREF(mRule);
+ 
+   NS_ASSERTION(IsRoot() || GetLevel() == aLevel, "not enough bits");
+   NS_ASSERTION(IsRoot() || IsImportantRule() == aIsImportant, "yikes");
+ }
+ 
+ nsRuleNode::~nsRuleNode()
+diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
+--- a/layout/style/nsRuleNode.h
++++ b/layout/style/nsRuleNode.h
+@@ -379,53 +379,58 @@ private:
+     return Key(mRule, GetLevel(), IsImportantRule());
+   }
+ 
+   // The children of this node are stored in either a hashtable or list
+   // that maps from rules to our nsRuleNode children.  When matching
+   // rules, we use this mapping to transition from node to node
+   // (constructing new nodes as needed to flesh out the tree).
+ 
+-  void *mChildrenTaggedPtr; // Accessed only through the methods below.
++  union {
++    void* asVoid;
++    nsRuleNode* asList;
++    PLDHashTable* asHash;
++  } mChildren; // Accessed only through the methods below.
+ 
+   enum {
+     kTypeMask = 0x1,
+     kListType = 0x0,
+     kHashType = 0x1
+   };
+   enum {
+     // Maximum to have in a list before converting to a hashtable.
+     // XXX Need to optimize this.
+     kMaxChildrenInList = 32
+   };
+ 
+   PRBool HaveChildren() {
+-    return mChildrenTaggedPtr != nsnull;
++    return mChildren.asVoid != nsnull;
+   }
+   PRBool ChildrenAreHashed() {
+-    return (PRWord(mChildrenTaggedPtr) & kTypeMask) == kHashType;
++    return (PRWord(mChildren.asVoid) & kTypeMask) == kHashType;
+   }
+   nsRuleNode* ChildrenList() {
+-    return reinterpret_cast<nsRuleNode*>(mChildrenTaggedPtr);
++    return mChildren.asList;
+   }
+   nsRuleNode** ChildrenListPtr() {
+-    return reinterpret_cast<nsRuleNode**>(&mChildrenTaggedPtr);
++    return &mChildren.asList;
+   }
+   PLDHashTable* ChildrenHash() {
+-    return (PLDHashTable*) (PRWord(mChildrenTaggedPtr) & ~PRWord(kTypeMask));
++    return (PLDHashTable*) (PRWord(mChildren.asHash) & ~PRWord(kTypeMask));
+   }
+   void SetChildrenList(nsRuleNode *aList) {
+     NS_ASSERTION(!(PRWord(aList) & kTypeMask),
+                  "pointer not 2-byte aligned");
+-    mChildrenTaggedPtr = aList;
++    mChildren.asList = aList;
+   }
+   void SetChildrenHash(PLDHashTable *aHashtable) {
+     NS_ASSERTION(!(PRWord(aHashtable) & kTypeMask),
+                  "pointer not 2-byte aligned");
+-    mChildrenTaggedPtr = (void*)(PRWord(aHashtable) | kHashType);
++    mChildren.asHash =
++      static_cast<PLDHashTable*>(PRWord(aHashtable) | kHashType);
+   }
+   void ConvertChildrenToHash();
+ 
+   nsCachedStyleData mStyleData;   // Any data we cached on the rule node.
+ 
+   PRUint32 mDependentBits; // Used to cache the fact that we can look up
+                            // cached data under a parent rule.
+ 
