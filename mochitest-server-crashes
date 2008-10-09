@@ -3,27 +3,79 @@ Work around fatal PR_ASSERTs in mochitest server when running with --trace-mallo
 diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
 --- a/tools/trace-malloc/lib/nsTraceMalloc.c
 +++ b/tools/trace-malloc/lib/nsTraceMalloc.c
-@@ -958,17 +958,23 @@ backtrace(tm_thread *t, int skip)
-             return NULL;
-         info->buffer = new_stack_buffer;
-         info->size = new_stack_buffer_size;
+@@ -231,17 +231,18 @@ static uint32 tracing_enabled = 0;
+ #define TM_CREATE_TLS_INDEX(i_)         pthread_key_create(&(i_), NULL)
+ #define TM_DESTROY_TLS_INDEX(i_)        pthread_key_delete((i_))
+ #define TM_GET_TLS_DATA(i_)             pthread_getspecific((i_))
+ #define TM_SET_TLS_DATA(i_, v_)         pthread_setspecific((i_), (v_))
  
-         /* and call NS_StackWalk again */
-         info->entries = 0;
-         NS_StackWalk(stack_callback, skip, info);
+ #endif
  
-+        /*
-+         * comment out assertion because it fires in the mochitest
-+         * server while getting stacks for nsAutoLock
-+         */
-+#if 0
-         PR_ASSERT(info->entries * 2 == new_stack_buffer_size); /* same stack */
-+#endif
+ static TM_TLS_INDEX_TYPE tls_index;
+-static tm_thread main_thread; /* 0-initialization is correct */
++static volatile PRBool tls_index_initialized = PR_FALSE;
++static PRInt32 tls_index_initializing = 0;
+ 
+ /* FIXME (maybe): This is currently unused; we leak the thread-local data. */
+ #if 0
+ PR_STATIC_CALLBACK(void)
+ free_tm_thread(void *priv)
+ {
+     tm_thread *t = (tm_thread*) priv;
+ 
+@@ -258,18 +259,24 @@ free_tm_thread(void *priv)
+ #endif
+ 
+ tm_thread *
+ tm_get_thread(void)
+ {
+     tm_thread *t;
+     tm_thread stack_tm_thread;
+ 
+-    if (!tmlock) {
+-        return &main_thread;
++    if (!tls_index_initialized) {
++        if (PR_AtomicIncrement(&tls_index_initializing) == 1) {
++            TM_CREATE_TLS_INDEX(tls_index);
++            tls_index_initialized = PR_TRUE;
++        } else {
++            while (!tls_index_initialized)
++                ;
++        }
      }
  
-     if (info->entries == 0) {
-         t->suppress_tracing--;
-         return NULL;
+     t = TM_GET_TLS_DATA(tls_index);
+ 
+     if (!t) {
+         /*
+          * First, store a tm_thread on the stack to suppress for the
+          * malloc below
+@@ -1335,27 +1342,18 @@ NS_TraceMallocStartup(int logfd)
+         logfile_list = &default_logfile;
+         logfp->prevp = &logfile_list;
+         logfile_tail = &logfp->next;
+         log_header(logfd);
      }
  
-     site = calltree(info->buffer, info->entries, t);
+     atexit(NS_TraceMallocShutdown);
+ 
+-    /*
+-     * We only allow one thread until NS_TraceMallocStartup is called.
+-     * When it is, we have to initialize tls_index before allocating tmlock
+-     * since get_tm_index uses NULL-tmlock to detect tls_index being
+-     * uninitialized.
+-     */
+-    main_thread.suppress_tracing++;
+-    TM_CREATE_TLS_INDEX(tls_index);
+-    TM_SET_TLS_DATA(tls_index, &main_thread);
+     tmlock = PR_NewLock();
+-    main_thread.suppress_tracing--;
++    (void) tm_get_thread(); /* ensure index initialization while it's easy */
+ 
+     if (tracing_enabled)
+         StartupHooker();
+ 
+ #ifdef linux
+     SetupDumpAllocationsHook();
+ #endif
+ }
