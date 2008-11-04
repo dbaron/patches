@@ -1,9 +1,48 @@
 Rebuild the user font set when style sheets are enabled/disabled/added/removed, rules are modified/added/removed, or media changes change which style sheets apply, and fix cascading bugs with @font-face rules, by accumulating the @font-face rules across rule processors through the style set.  (Bug 457821)
 
+diff --git a/layout/base/Makefile.in b/layout/base/Makefile.in
+--- a/layout/base/Makefile.in
++++ b/layout/base/Makefile.in
+@@ -168,16 +168,17 @@ endif
+ endif                
+ 
+ FORCE_STATIC_LIB = 1
+ 
+ include $(topsrcdir)/config/rules.mk
+ 
+ LOCAL_INCLUDES += \
+ 		-I$(srcdir) \
++		-I$(srcdir)/../style \
+ 		-I$(srcdir)/../generic \
+ 		-I$(srcdir)/../forms \
+ 		-I$(srcdir)/../tables \
+ 		-I$(srcdir)/../printing \
+ 		-I$(srcdir)/../xul/base/src \
+ 		-I$(srcdir)/../xul/base/src/tree/src \
+ 		-I$(srcdir)/../../content/base/src \
+ 		-I$(srcdir)/../../content/events/src \
 diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 --- a/layout/base/nsPresContext.cpp
 +++ b/layout/base/nsPresContext.cpp
-@@ -225,16 +225,17 @@ nsPresContext::nsPresContext(nsIDocument
+@@ -80,16 +80,17 @@
+ #include "nsLayoutUtils.h"
+ #include "nsIViewManager.h"
+ #include "nsCSSFrameConstructor.h"
+ #include "nsCSSRuleProcessor.h"
+ #include "nsStyleChangeList.h"
+ #include "nsRuleNode.h"
+ #include "nsEventDispatcher.h"
+ #include "gfxUserFontSet.h"
++#include "nsCSSRules.h"
+ #include "nsIEventListenerManager.h"
+ 
+ #ifdef IBMBIDI
+ #include "nsBidiPresUtils.h"
+ #endif // IBMBIDI
+ 
+ #include "nsContentUtils.h"
+ 
+@@ -225,16 +226,17 @@ nsPresContext::nsPresContext(nsIDocument
      mImageAnimationMode = imgIContainer::kDontAnimMode;
      mNeverAnimate = PR_TRUE;
    } else {
@@ -21,7 +60,7 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
    mBorderImageLoaders.Enumerate(destroy_loads, nsnull);
  
    NS_PRECONDITION(!mShell, "Presshell forgot to clear our mShell pointer");
-@@ -1602,18 +1603,167 @@ nsPresContext::IsChrome() const
+@@ -1602,18 +1604,167 @@ nsPresContext::IsChrome() const
  
  /* virtual */ PRBool
  nsPresContext::HasAuthorSpecifiedRules(nsIFrame *aFrame, PRUint32 ruleTypeMask) const
@@ -272,7 +311,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
 +  RuleCascadeData* cascade = GetRuleCascade(aPresContext);
 +
 +  if (cascade) {
-+    if (!aArray.AppendElements(cascade->mRuleHash.mFontFaceRules))
++    if (!aArray.AppendElements(cascade->mFontFaceRules))
 +      return PR_FALSE;
 +  }
 +  
@@ -287,7 +326,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
    while (data) {
      RuleCascadeData *next = data->mNext;
      delete data;
-@@ -2283,19 +2300,21 @@ static PLDHashTableOps gRulesByWeightOps
+@@ -2283,166 +2300,53 @@ static PLDHashTableOps gRulesByWeightOps
      PL_DHashMoveEntryStub,
      PL_DHashClearEntryStub,
      PL_DHashFinalizeStub,
@@ -309,8 +348,14 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
        mRulesByWeight.ops = nsnull;
    }
  
-@@ -2308,141 +2327,25 @@ struct CascadeEnumData {
+   ~CascadeEnumData()
+   {
+     if (mRulesByWeight.ops)
+       PL_DHashTableFinish(&mRulesByWeight);
+   }
+ 
    nsPresContext* mPresContext;
++  nsTArray< nsRefPtr<nsCSSFontFaceRule> >& mFontFaceRules;
    nsMediaQueryResultCacheKey& mCacheKey;
    // Hooray, a manual PLDHashTable since nsClassHashtable doesn't
    // provide a getter that gives me a *reference* to the value.
@@ -459,7 +504,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
    if (nsICSSRule::STYLE_RULE == type) {
      nsICSSStyleRule* styleRule = (nsICSSStyleRule*)aRule;
  
-@@ -2461,59 +2364,49 @@ InsertRuleByWeight(nsICSSRule* aRule, vo
+@@ -2461,59 +2365,49 @@ InsertRuleByWeight(nsICSSRule* aRule, vo
        info->mNext = entry->data.mRules;
        entry->data.mRules = info;
      }
@@ -530,7 +575,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
  static int CompareWeightData(const void* aArg1, const void* aArg2,
                               void* closure)
  {
-@@ -2585,21 +2478,22 @@ nsCSSRuleProcessor::RefreshRuleCascade(n
+@@ -2585,21 +2479,22 @@ nsCSSRuleProcessor::RefreshRuleCascade(n
      }
    }
  
@@ -558,7 +603,30 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
 diff --git a/layout/style/nsCSSRuleProcessor.h b/layout/style/nsCSSRuleProcessor.h
 --- a/layout/style/nsCSSRuleProcessor.h
 +++ b/layout/style/nsCSSRuleProcessor.h
-@@ -92,25 +92,30 @@ public:
+@@ -42,19 +42,22 @@
+  * matching and cascading
+  */
+ 
+ #ifndef nsCSSRuleProcessor_h_
+ #define nsCSSRuleProcessor_h_
+ 
+ #include "nsIStyleRuleProcessor.h"
+ #include "nsCSSStyleSheet.h"
++#include "nsTArray.h"
++#include "nsAutoPtr.h"
+ 
+ struct RuleCascadeData;
+ struct nsCSSSelectorList;
++class nsCSSFontFaceRule;
+ 
+ /**
+  * The CSS style rule processor provides a mechanism for sibling style
+  * sheets to combine their rule processing in order to allow proper
+  * cascading to happen.
+  *
+  * CSS style rule processors keep a live reference on all style sheets
+  * bound to them.  The CSS style sheets keep a weak reference to all the
+@@ -92,25 +95,30 @@ public:
                                      nsReStyleHint* aResult);
  
    NS_IMETHOD HasAttributeDependentStyle(AttributeRuleProcessorData* aData,
@@ -633,8 +701,8 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 +  NS_ENSURE_FALSE(mInShutdown, PR_FALSE);
 +
 +  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gCSSSheetTypes); ++i) {
-+    nsCSSRuleProcessor *ruleProc =
-+      static_cast<nsCSSRuleProcessor*>(mRuleProcessors[gCSSSheetTypes[i]]);
++    nsCSSRuleProcessor *ruleProc = static_cast<nsCSSRuleProcessor*>
++                                    (mRuleProcessors[gCSSSheetTypes[i]].get());
 +    if (!ruleProc->AppendFontFaceRules(aPresContext, aArray))
 +      return PR_FALSE;
 +  }
