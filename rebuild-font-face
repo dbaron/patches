@@ -23,10 +23,55 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  {
    if (!mShell) {
      // We must have been torn down. Nothing to do here.
+@@ -1763,16 +1766,44 @@ nsPresContext::GetUserFontSet()
+     }
+ 
+     mUserFontSetDirty = PR_FALSE;
+   }
+   return mUserFontSet;
+ }
+ 
+ void
++nsPresContext::UserFontSetNeedsRebuild()
++{
++  mUserFontSetDirty = PR_TRUE;
++
++  // Setting the user font set to be dirty isn't sufficient, since under
++  // normal conditions we only rebuild it lazily, and it is only the act
++  // of rebuilding it that will trigger the style change reflow that
++  // calls GetUserFontSet.
++  if (!mPendingRebuildUserFontSet) {
++    nsCOMPtr<nsIRunnable> ev =
++      new nsRunnableMethod<nsPresContext>(this,
++                               &nsPresContext::HandlePostedRebuildUserFontSet);
++    if (NS_SUCCEEDED(NS_DispatchToCurrentThread(ev))) {
++      mPendingRebuildUserFontSet = PR_TRUE;
++    }
++  }    
++}
++
++void
++nsPresContext::HandlePostedRebuildUserFontSet()
++{
++  mPendingRebuildUserFontSet = PR_FALSE;
++  // Get the user font set, which will update it and trigger a style
++  // change reflow if needed.
++  (void)GetUserFontSet();
++}
++
++void
+ nsPresContext::FireDOMPaintEvent()
+ {
+   nsCOMPtr<nsPIDOMWindow> ourWindow = mDocument->GetWindow();
+   if (!ourWindow)
+     return;
+ 
+   nsISupports* eventTarget = ourWindow;
+   if (mSameDocDirtyRegion.IsEmpty() && !IsChrome()) {
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
-@@ -750,16 +750,17 @@ public:
+@@ -750,24 +750,27 @@ public:
    // Is it OK to let the page specify colors and backgrounds?
    PRBool UseDocumentColors() const {
      return GetCachedBoolPref(kPresContext_UseDocumentColors) || IsChrome();
@@ -35,7 +80,7 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    PRBool           SupressingResizeReflow() const { return mSupressResizeReflow; }
    
    gfxUserFontSet* GetUserFontSet();
-+  void UserFontSetNeedsRebuild() { mUserFontSetDirty = PR_TRUE; }
++  void UserFontSetNeedsRebuild();
  
    void NotifyInvalidation(const nsRect& aRect, PRBool aIsCrossDoc);
    void FireDOMPaintEvent();
@@ -44,10 +89,47 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    friend class nsRunnableMethod<nsPresContext>;
    NS_HIDDEN_(void) ThemeChangedInternal();
    NS_HIDDEN_(void) SysColorChangedInternal();
++
++  NS_HIDDEN_(void) HandlePostedRebuildUserFontSet();
+   
+   NS_HIDDEN_(void) SetImgAnimations(nsIContent *aParent, PRUint16 aMode);
+   NS_HIDDEN_(void) GetDocumentColorPreferences();
+ 
+   NS_HIDDEN_(void) PreferenceChanged(const char* aPrefName);
+   static NS_HIDDEN_(int) PrefChangedCallback(const char*, void*);
+ 
+   NS_HIDDEN_(void) UpdateAfterPreferencesChanged();
 diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
 --- a/layout/base/nsPresShell.cpp
 +++ b/layout/base/nsPresShell.cpp
-@@ -4773,27 +4773,31 @@ PresShell::ReconstructFrames(void)
+@@ -4554,21 +4554,26 @@ PresShell::DoFlushPendingNotifications(m
+     // depends on style being completely up to date.  If it's not, then style
+     // context reparenting, which can happen during reflow, might suddenly pick
+     // up the new rules and we'll end up with frames whose style doesn't match
+     // the frame type.
+     if (!mIsDestroying) {
+       mFrameConstructor->ProcessPendingRestyles();
+     }
+ 
++
+     // There might be more pending constructors now, but we're not going to
+     // worry about them.  They can't be triggered during reflow, so we should
+     // be good.
+     
+     if (aType >= Flush_Layout && !mIsDestroying) {
++      // Flush any pending update of the user font set, since that could
++      // post a style change reflow.
++      (void) mPresContext->GetUserFontSet();
++
+       mFrameConstructor->RecalcQuotesAndCounters();
+       mViewManager->FlushDelayedResize();
+       ProcessReflowCommands(aInterruptibleReflow);
+     }
+ 
+     PRUint32 updateFlags = NS_VMREFRESH_NO_SYNC;
+     if (aType >= Flush_Display) {
+       // Flushing paints, so perform the invalidates and drawing
+@@ -4773,27 +4778,31 @@ PresShell::ReconstructFrames(void)
    return rv;
  }
  
