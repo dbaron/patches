@@ -23,21 +23,32 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  {
    if (!mShell) {
      // We must have been torn down. Nothing to do here.
-@@ -1730,46 +1733,106 @@ InsertFontFaceRule(nsCSSFontFaceRule *aR
+@@ -1726,50 +1729,108 @@ InsertFontFaceRule(nsCSSFontFaceRule *aR
+      }
+   }
+   
+   if (!fontfamily.IsEmpty() && srcArray.Length() > 0) {
      aFontSet->AddFontFace(fontfamily, srcArray, weight, stretch, italicStyle);
    }
  }
  
- gfxUserFontSet* 
- nsPresContext::GetUserFontSet()
+-gfxUserFontSet* 
+-nsPresContext::GetUserFontSet()
++void
++nsPresContext::FlushUserFontSet()
  {
++  NS_ASSERTION(!mUserFontSetNeedsRebuild || mUserFontSetDirty,
++               "if it needs rebuild, it better be dirty");
    if (mUserFontSetDirty) {
 -    NS_IF_RELEASE(mUserFontSet);
--
-     if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
++    if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
++      nsRefPtr<gfxUserFontSet> oldUserFontSet = mUserFontSet;
+ 
+-    if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
        nsTArray< nsRefPtr<nsCSSFontFaceRule> > rules;
        if (!mShell->StyleSet()->AppendFontFaceRules(this, rules))
-         return nsnull;
+-        return nsnull;
++        return;
  
 -      if (rules.Length() > 0) {
 -        nsFontFaceLoaderContext *loaderCtx =
@@ -68,28 +79,18 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 -          InsertFontFaceRule(rules[i], fs);
 +      // Only rebuild things if the set of @font-face rules is different.
 +      if (differ) {
-+        if (mUserFontSet) {
-+          NS_RELEASE(mUserFontSet);
-+
-+          // We need to enqueue a style change reflow (for later) to
-+          // reflect that we're dropping @font-face rules.  This is
-+          // the same thing nsFontFaceLoader does when new
-+          // downloadable fonts become available.
-+          if (mShell) {
-+            mShell->StyleChangeReflow();
-+          }
-+        }
++        NS_IF_RELEASE(mUserFontSet);
 +
 +        if (rules.Length() > 0) {
 +          nsFontFaceLoaderContext *loaderCtx =
 +            new nsFontFaceLoaderContext(this);
 +          if (!loaderCtx)
-+            return nsnull;
++            return;
 +          gfxUserFontSet *fs = new gfxUserFontSet(loaderCtx);
 +          // user font set owns loader context
 +          if (!fs) {
 +            delete loaderCtx;
-+            return nsnull;
++            return;
 +          }
 +          mUserFontSet = fs;
 +          NS_ADDREF(mUserFontSet);
@@ -97,19 +98,33 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 +          for (PRUint32 i = 0, i_end = rules.Length(); i < i_end; ++i) {
 +            InsertFontFaceRule(rules[i], fs);
 +          }
-         }
-       }
++        }
++      }
 +
 +#ifdef DEBUG
 +      PRBool success =
 +#endif
 +        rules.SwapElements(mFontFaceRules);
 +      NS_ASSERTION(success, "should never fail given both are heap arrays");
++
++      if (mUserFontSetNeedsRebuild && oldUserFontSet != mUserFontSet) {
++        // If we've changed, created, or destroyed a user font set, we
++        // need to trigger a style change reflow.
++        // We need to enqueue a style change reflow (for later) to
++        // reflect that we're dropping @font-face rules.  This is the
++        // same thing nsFontFaceLoader does when font downloads
++        // complete.  (However, without a reflow, nothing will happen
++        // to start any downloads that are needed.)
++        if (mShell) {
++          mShell->StyleChangeReflow();
+         }
+       }
      }
  
      mUserFontSetDirty = PR_FALSE;
++    mUserFontSetNeedsRebuild = PR_FALSE;
    }
-   return mUserFontSet;
+-  return mUserFontSet;
 +}
 +
 +void
@@ -124,20 +139,11 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 +  if (!mPendingRebuildUserFontSet) {
 +    nsCOMPtr<nsIRunnable> ev =
 +      new nsRunnableMethod<nsPresContext>(this,
-+                               &nsPresContext::HandlePostedRebuildUserFontSet);
++                                          &nsPresContext::FlushUserFontSet);
 +    if (NS_SUCCEEDED(NS_DispatchToCurrentThread(ev))) {
 +      mPendingRebuildUserFontSet = PR_TRUE;
 +    }
 +  }    
-+}
-+
-+void
-+nsPresContext::HandlePostedRebuildUserFontSet()
-+{
-+  mPendingRebuildUserFontSet = PR_FALSE;
-+  // Get the user font set, which will update it and trigger a style
-+  // change reflow if needed.
-+  (void)GetUserFontSet();
  }
  
  void
@@ -186,7 +192,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  enum nsWidgetType {
    eWidgetType_Button  	= 1,
    eWidgetType_Checkbox	= 2,
-@@ -750,24 +753,27 @@ public:
+@@ -749,26 +752,28 @@ public:
+ 
    // Is it OK to let the page specify colors and backgrounds?
    PRBool UseDocumentColors() const {
      return GetCachedBoolPref(kPresContext_UseDocumentColors) || IsChrome();
@@ -194,8 +201,10 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  
    PRBool           SupressingResizeReflow() const { return mSupressResizeReflow; }
    
-   gfxUserFontSet* GetUserFontSet();
+-  gfxUserFontSet* GetUserFontSet();
++  gfxUserFontSet* GetUserFontSet() { return mUserFontSet; }
 +  void UserFontSetNeedsRebuild();
++  void FlushUserFontSet();
  
    void NotifyInvalidation(const nsRect& aRect, PRBool aIsCrossDoc);
    void FireDOMPaintEvent();
@@ -204,9 +213,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    friend class nsRunnableMethod<nsPresContext>;
    NS_HIDDEN_(void) ThemeChangedInternal();
    NS_HIDDEN_(void) SysColorChangedInternal();
+-  
 +
-+  NS_HIDDEN_(void) HandlePostedRebuildUserFontSet();
-   
    NS_HIDDEN_(void) SetImgAnimations(nsIContent *aParent, PRUint16 aMode);
    NS_HIDDEN_(void) GetDocumentColorPreferences();
  
@@ -214,7 +222,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    static NS_HIDDEN_(int) PrefChangedCallback(const char*, void*);
  
    NS_HIDDEN_(void) UpdateAfterPreferencesChanged();
-@@ -822,16 +828,18 @@ protected:
+   static NS_HIDDEN_(void) PrefChangedUpdateTimerCallback(nsITimer *aTimer, void *aClosure);
+@@ -822,16 +827,18 @@ protected:
  
    nsPropertyTable       mPropertyTable;
  
@@ -233,7 +242,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    nsSize                mPageSize;
    float                 mPageScale;
    float                 mPPScale;
-@@ -881,16 +889,17 @@ protected:
+@@ -880,17 +887,24 @@ protected:
+   unsigned              mIsRootPaginatedDocument : 1;
    unsigned              mPrefBidiDirection : 1;
    unsigned              mPrefScrollbarSide : 2;
    unsigned              mPendingSysColorChanged : 1;
@@ -241,6 +251,12 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    unsigned              mPendingMediaFeatureValuesChanged : 1;
    unsigned              mPrefChangePendingNeedsReflow : 1;
    unsigned              mRenderedPositionVaryingContent : 1;
++  // The following two variables differ only from when the pres context
++  // is initialized to when we first request the user font set;
++  // otherwise they are the same.  The first indicates that we have to
++  // rebuild the user font set; the second indicates that there is an
++  // event posted to do so and that we need to do a style change reflow
++  // if it changes.
    unsigned              mUserFontSetDirty : 1;
 +  unsigned              mPendingRebuildUserFontSet : 1;
  
@@ -271,7 +287,7 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
      if (aType >= Flush_Layout && !mIsDestroying) {
 +      // Flush any pending update of the user font set, since that could
 +      // post a style change reflow.
-+      (void) mPresContext->GetUserFontSet();
++      mPresContext->FlushUserFontSet();
 +
        mFrameConstructor->RecalcQuotesAndCounters();
        mViewManager->FlushDelayedResize();
@@ -319,6 +335,25 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
    mFrameConstructor->PostRestyleEvent(root, eReStyle_Self, NS_STYLE_HINT_NONE);
  
  #ifdef ACCESSIBILITY
+@@ -6237,16 +6246,18 @@ PresShell::WillDoReflow()
+ PresShell::WillDoReflow()
+ {
+   // We just reflowed, tell the caret that its frame might have moved.
+   // XXXbz that comment makes no sense
+   if (mCaret) {
+     mCaret->InvalidateOutsideCaret();
+     mCaret->UpdateCaretPosition();
+   }
++
++  mPresContext->FlushUserFontSet();
+ 
+   mFrameConstructor->BeginUpdate();
+ }
+ 
+ void
+ PresShell::DidDoReflow()
+ {
+   mFrameConstructor->EndUpdate();
 diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
 --- a/layout/style/nsCSSRuleProcessor.cpp
 +++ b/layout/style/nsCSSRuleProcessor.cpp
@@ -346,7 +381,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
 diff --git a/layout/style/nsFontFaceLoader.cpp b/layout/style/nsFontFaceLoader.cpp
 --- a/layout/style/nsFontFaceLoader.cpp
 +++ b/layout/style/nsFontFaceLoader.cpp
-@@ -143,17 +143,20 @@ nsFontFaceLoader::OnStreamComplete(nsISt
+@@ -143,17 +143,22 @@ nsFontFaceLoader::OnStreamComplete(nsISt
  
    // when new font loaded, need to reflow
    if (fontUpdate) {
@@ -358,8 +393,10 @@ diff --git a/layout/style/nsFontFaceLoader.cpp b/layout/style/nsFontFaceLoader.c
 -      // reflow async so that reflows coalesce
 +      // Update layout for the presence of the new font.  Since this is
 +      // asynchronous, reflows will coalesce.
-+      // nsPresContext::GetUserFontSet does the same thing when we
-+      // remove a user font set, for fonts becoming unavailable.
++      // nsPresContext::FlushUserFontSet does the same thing when we
++      // remove a user font set, for fonts becoming unavailable, or when
++      // we add one, because if we change it dynamically we need to
++      // trigger reflow to cause gfx to request the fonts.
        ps->StyleChangeReflow();
        LOG(("fontdownloader (%p) reflow\n", this));
      }
