@@ -23,7 +23,7 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  {
    if (!mShell) {
      // We must have been torn down. Nothing to do here.
-@@ -1728,50 +1731,110 @@ InsertFontFaceRule(nsCSSFontFaceRule *aR
+@@ -1728,50 +1731,144 @@ InsertFontFaceRule(nsCSSFontFaceRule *aR
       }
    }
    
@@ -33,21 +33,41 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  }
  
 -gfxUserFontSet* 
--nsPresContext::GetUserFontSet()
++gfxUserFontSet*
+ nsPresContext::GetUserFontSet()
+ {
++  // We want to initialize the user font set lazily the first time the
++  // user asks for it, rather than building it too early and forcing
++  // rule cascade creation.  Thus we try to enforce the invariant that
++  // we *never* build the user font set until the first call to
++  // GetUserFontSet.  However, once it's been requested, we can't wait
++  // for somebody to call GetUserFontSet in order to rebuild it (see
++  // comments below in RebuildUserFontSet for why).
+   if (mUserFontSetDirty) {
+-    NS_IF_RELEASE(mUserFontSet);
++    // Reuse the FlushUserFontSet code by setting
++    // mUserFontSetNeedsRebuild.
++    mUserFontSetNeedsRebuild = PR_TRUE;
++    FlushUserFontSet();
++  }
+ 
++  return mUserFontSet;
++}
++
 +void
 +nsPresContext::FlushUserFontSet()
- {
++{
 +  if (!mShell)
 +    return; // we've been torn down
 +
++  // See above in GetUserFontSet for why we're testing
++  // mUserFontSetNeedsRebuild here.
 +  NS_ASSERTION(!mUserFontSetNeedsRebuild || mUserFontSetDirty,
 +               "if it needs rebuild, it better be dirty");
-   if (mUserFontSetDirty) {
--    NS_IF_RELEASE(mUserFontSet);
-+    if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
++  if (mUserFontSetNeedsRebuild) {
+     if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
 +      nsRefPtr<gfxUserFontSet> oldUserFontSet = mUserFontSet;
- 
--    if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
++
        nsTArray< nsRefPtr<nsCSSFontFaceRule> > rules;
        if (!mShell->StyleSet()->AppendFontFaceRules(this, rules))
 -        return nsnull;
@@ -131,13 +151,25 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 +void
 +nsPresContext::RebuildUserFontSet()
 +{
++  if (mUserFontSetDirty) {
++    // mUserFontSetDirty will be true in two cases:
++    //   (1) mUserFontSetNeedsRebuild is true, and we've already posted
++    //       the event we need (or something in the code below failed,
++    //       e.g., due to out-of-memory)
++    //   (2) GetUserFontSet has not yet been called on this pres
++    //       context, and thus we can build it lazily at first call
++    return;
++  }
++
 +  mUserFontSetDirty = PR_TRUE;
 +
-+  // Setting the user font set to be dirty and lazily rebuilding it
-+  // isn't sufficient, since it is only the act of rebuilding it that
-+  // will trigger the style change reflow that calls GetUserFontSet.
-+  // (This reflow causes rebuilding of text runs, which starts font
-+  // loads, whose completion causes another style change reflow).
++  // Somebody has already asked for the user font set, so we need to
++  // post an event to rebuild it.  Setting the user font set to be dirty
++  // and lazily rebuilding it isn't sufficient, since it is only the act
++  // of rebuilding it that will trigger the style change reflow that
++  // calls GetUserFontSet.  (This reflow causes rebuilding of text runs,
++  // which starts font loads, whose completion causes another style
++  // change reflow).
 +  if (!mUserFontSetNeedsRebuild) {
 +    nsCOMPtr<nsIRunnable> ev =
 +      new nsRunnableMethod<nsPresContext>(this,
@@ -194,8 +226,7 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  enum nsWidgetType {
    eWidgetType_Button  	= 1,
    eWidgetType_Checkbox	= 2,
-@@ -749,26 +752,28 @@ public:
- 
+@@ -750,25 +753,27 @@ public:
    // Is it OK to let the page specify colors and backgrounds?
    PRBool UseDocumentColors() const {
      return GetCachedBoolPref(kPresContext_UseDocumentColors) || IsChrome();
@@ -203,10 +234,9 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  
    PRBool           SupressingResizeReflow() const { return mSupressResizeReflow; }
    
--  gfxUserFontSet* GetUserFontSet();
-+  gfxUserFontSet* GetUserFontSet() { return mUserFontSet; }
-+  void RebuildUserFontSet(); // asynchronously
+   gfxUserFontSet* GetUserFontSet();
 +  void FlushUserFontSet();
++  void RebuildUserFontSet(); // asynchronously
  
    void NotifyInvalidation(const nsRect& aRect, PRBool aIsCrossDoc);
    void FireDOMPaintEvent();
