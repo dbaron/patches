@@ -1,0 +1,193 @@
+Fix assertion about being too late to set quirks style sheet.  (Bug 450191)
+
+diff --git a/layout/style/nsCSSRuleProcessor.h b/layout/style/nsCSSRuleProcessor.h
+--- a/layout/style/nsCSSRuleProcessor.h
++++ b/layout/style/nsCSSRuleProcessor.h
+@@ -102,17 +102,18 @@ public:
+ 
+   // Append all the currently-active font face rules to aArray.  Return
+   // true for success and false for failure.
+   PRBool AppendFontFaceRules(nsPresContext* aPresContext,
+                              nsTArray< nsRefPtr<nsCSSFontFaceRule> >& aArray);
+ 
+ #ifdef DEBUG
+   void AssertQuirksChangeOK() {
+-    NS_ASSERTION(!mRuleCascades, "too late to set quirks style sheet");
++    NS_ASSERTION(!mRuleCascades, 
++                 "can't quirks style sheet without clearing rule cascades");
+   }
+ #endif
+ 
+ private:
+   static PRBool CascadeSheetEnumFunc(nsICSSStyleSheet* aSheet, void* aData);
+ 
+   RuleCascadeData* GetRuleCascade(nsPresContext* aPresContext);
+   void RefreshRuleCascade(nsPresContext* aPresContext);
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -1191,20 +1191,22 @@ nsCSSStyleSheet::GetApplicable(PRBool& a
+ 
+ NS_IMETHODIMP
+ nsCSSStyleSheet::SetEnabled(PRBool aEnabled)
+ {
+   // Internal method, so callers must handle BeginUpdate/EndUpdate
+   PRBool oldDisabled = mDisabled;
+   mDisabled = !aEnabled;
+ 
+-  if (mDocument && mInner->mComplete && oldDisabled != mDisabled) {
++  if (mInner->mComplete && oldDisabled != mDisabled) {
+     ClearRuleCascades();
+ 
+-    mDocument->SetStyleSheetApplicableState(this, !mDisabled);
++    if (mDocument) {
++      mDocument->SetStyleSheetApplicableState(this, !mDisabled);
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSStyleSheet::GetComplete(PRBool& aComplete) const
+ {
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -346,30 +346,35 @@ nsStyleSet::EndUpdate()
+   mDirty = 0;
+   return NS_OK;
+ }
+ 
+ void
+ nsStyleSet::EnableQuirkStyleSheet(PRBool aEnable)
+ {
+ #ifdef DEBUG
+-  if (mRuleProcessors[eAgentSheet]) {
++  PRBool oldEnabled;
++  {
++    nsCOMPtr<nsIDOMCSSStyleSheet> domSheet =
++      do_QueryInterface(mQuirkStyleSheet);
++    domSheet->GetDisabled(&oldEnabled);
++    oldEnabled = !oldEnabled;
++  }
++#endif
++  mQuirkStyleSheet->SetEnabled(aEnable);
++#ifdef DEBUG
++  // This should always be OK, since SetEnabled should call
++  // ClearRuleCascades.
++  // Note that we can hit this codepath multiple times when document.open()
++  // (potentially implied) happens multiple times.
++  if (mRuleProcessors[eAgentSheet] && aEnable != oldEnabled) {
+     static_cast<nsCSSRuleProcessor*>(static_cast<nsIStyleRuleProcessor*>(
+       mRuleProcessors[eAgentSheet]))->AssertQuirksChangeOK();
+   }
+ #endif
+-#ifdef DEBUG_dbaron_off // XXX Make this |DEBUG| once it stops firing.
+-  PRBool applicableNow;
+-  mQuirkStyleSheet->GetApplicable(applicableNow);
+-  NS_ASSERTION(!mRuleProcessors[eAgentSheet] || aEnable == applicableNow,
+-               "enabling/disabling quirk stylesheet too late or incomplete quirk stylesheet");
+-  if (mRuleProcessors[eAgentSheet] && aEnable == applicableNow)
+-    printf("WARNING: We set the quirks mode too many times.\n"); // we do!
+-#endif
+-  mQuirkStyleSheet->SetEnabled(aEnable);
+ }
+ 
+ static PRBool
+ EnumRulesMatching(nsIStyleRuleProcessor* aProcessor, void* aData)
+ {
+   ElementRuleProcessorData* data =
+     static_cast<ElementRuleProcessorData*>(aData);
+ 
+diff --git a/layout/style/test/Makefile.in b/layout/style/test/Makefile.in
+--- a/layout/style/test/Makefile.in
++++ b/layout/style/test/Makefile.in
+@@ -91,16 +91,17 @@ _TEST_FILES =	test_acid3_test46.html \
+ 		test_bug389464.html \
+ 		test_bug391034.html \
+ 		test_bug391221.html \
+ 		test_bug397427.html \
+ 		test_bug401046.html \
+ 		test_bug405818.html \
+ 		test_bug412901.html \
+ 		test_bug437915.html \
++		test_bug450191.html \
+ 		test_bug453896_deck.html \
+ 		test_cascade.html \
+ 		test_compute_data_with_start_struct.html \
+ 		test_css_eof_handling.html \
+ 		test_dont_use_document_colors.html \
+ 		test_font_face_parser.html \
+ 		test_for_expect_end_property.html \
+ 		test_inherit_computation.html \
+diff --git a/layout/style/test/test_bug450191.html b/layout/style/test/test_bug450191.html
+new file mode 100644
+--- /dev/null
++++ b/layout/style/test/test_bug450191.html
+@@ -0,0 +1,65 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++https://bugzilla.mozilla.org/show_bug.cgi?id=450191
++-->
++<head>
++  <title>Test for Bug 450191</title>
++  <script type="application/javascript" src="/MochiKit/MochiKit.js"></script>
++  <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
++</head>
++<body onload="run()">
++<a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=450191">Mozilla Bug 450191</a>
++<iframe id="display" src="about:blank"></iframe>
++<pre id="test">
++<script type="application/javascript">
++
++/** Test for Bug 450191 **/
++
++SimpleTest.waitForExplicitFinish();
++
++function run() {
++  var iframe = document.getElementById("display");
++  var subdoc = iframe.contentDocument;
++  var subwin = iframe.contentWindow;
++
++  var doctext = "<div style='font-size: 2em'>div text <table><tr><td id='t'>table text</td></tr></table></div>";
++
++  function subdoc_body_font() {
++    return subwin.getComputedStyle(subdoc.body, "").fontSize;
++  }
++
++  function subdoc_cell_font() {
++    return subwin.getComputedStyle(subdoc.getElementById("t"), "").fontSize;
++  }
++
++  subdoc.open();
++  subdoc.write(doctext);
++  subdoc.close();
++
++  is(subdoc_cell_font(), subdoc_body_font(),
++        "Quirks style sheet should be applied.");
++  
++  subdoc.open();
++  subdoc.write("<!DOCTYPE HTML>" + doctext);
++  subdoc.close();
++
++  isnot(subdoc_cell_font(), subdoc_body_font(),
++        "Quirks style sheet should NOT be applied.");
++  
++  subdoc.open();
++  subdoc.write(doctext);
++  subdoc.close();
++
++  is(subdoc_cell_font(), subdoc_body_font(),
++     "Quirks style sheet should be applied.");
++
++  SimpleTest.finish();
++}
++
++
++</script>
++</pre>
++</body>
++</html>
