@@ -1,0 +1,192 @@
+Make the code to suppress infinite synthesized mouse move loops work again with asynchronous style changes.  (Bug 302561)
+
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -1848,16 +1848,17 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+   , mGfxScrollFrame(nsnull)
+   , mPageSequenceFrame(nsnull)
+   , mUpdateCount(0)
+   , mQuotesDirty(PR_FALSE)
+   , mCountersDirty(PR_FALSE)
+   , mIsDestroyingFrameTree(PR_FALSE)
+   , mRebuildAllStyleData(PR_FALSE)
+   , mHasRootAbsPosContainingBlock(PR_FALSE)
++  , mHoverGeneration(0)
+ {
+   if (!gGotXBLFormPrefs) {
+     gGotXBLFormPrefs = PR_TRUE;
+ 
+     gUseXBLForms =
+       nsContentUtils::GetBoolPref("nglayout.debug.enable_xbl_forms");
+   }
+ 
+@@ -9995,16 +9996,20 @@ nsCSSFrameConstructor::DoContentStateCha
+           }
+         }
+       }
+     }
+ 
+     nsReStyleHint rshint = 
+       styleSet->HasStateDependentStyle(presContext, aContent, aStateMask);
+       
++    if ((aStateMask & NS_EVENT_STATE_HOVER) && rshint != 0) {
++      ++mHoverGeneration;
++    }
++
+     PostRestyleEvent(aContent, rshint, hint);
+   }
+ }
+ 
+ nsresult
+ nsCSSFrameConstructor::AttributeChanged(nsIContent* aContent,
+                                         PRInt32 aNameSpaceID,
+                                         nsIAtom* aAttribute,
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -150,16 +150,20 @@ public:
+                             PRInt32     aModType,
+                             PRUint32    aStateMask);
+ 
+   void BeginUpdate();
+   void EndUpdate();
+   void RecalcQuotesAndCounters();
+ 
+   void WillDestroyFrameTree();
++
++  // Get an integer that increments every time there is a style change
++  // as a result of a change to the :hover content state.
++  PRUint32 GetHoverGeneration() const { return mHoverGeneration; }
+ 
+   // Note: It's the caller's responsibility to make sure to wrap a
+   // ProcessRestyledFrames call in a view update batch.
+   // This function does not call ProcessAttachedQueue() on the binding manager.
+   // If the caller wants that to happen synchronously, it needs to handle that
+   // itself.
+   nsresult ProcessRestyledFrames(nsStyleChangeList& aRestyleArray);
+ 
+@@ -1184,16 +1188,17 @@ private:
+   nsCounterManager    mCounterManager;
+   PRUint16            mUpdateCount;
+   PRPackedBool        mQuotesDirty : 1;
+   PRPackedBool        mCountersDirty : 1;
+   PRPackedBool        mIsDestroyingFrameTree : 1;
+   PRPackedBool        mRebuildAllStyleData : 1;
+   // This is true if mDocElementContainingBlock supports absolute positioning
+   PRPackedBool        mHasRootAbsPosContainingBlock : 1;
++  PRUint32            mHoverGeneration;
+ 
+   nsRevocableEventPtr<RestyleEvent> mRestyleEvent;
+ 
+   nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
+ 
+   nsDataHashtable<nsISupportsHashKey, RestyleData> mPendingRestyles;
+ 
+   static nsIXBLService * gXBLService;
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -909,16 +909,18 @@ public:
+                          nsEventStatus*  aEventStatus);
+   NS_IMETHOD HandleDOMEventWithTarget(nsIContent* aTargetContent,
+                                       nsEvent* aEvent,
+                                       nsEventStatus* aStatus);
+   NS_IMETHOD ResizeReflow(nsIView *aView, nscoord aWidth, nscoord aHeight);
+   NS_IMETHOD_(PRBool) IsVisible();
+   NS_IMETHOD_(void) WillPaint();
+   NS_IMETHOD_(void) InvalidateFrameForView(nsIView *view);
++  NS_IMETHOD_(void) DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                           PRBool aFlushOnHoverChange);
+ 
+   // caret handling
+   NS_IMETHOD GetCaret(nsCaret **aOutCaret);
+   NS_IMETHOD_(void) MaybeInvalidateCaretPosition();
+   NS_IMETHOD SetCaretEnabled(PRBool aInEnable);
+   NS_IMETHOD SetCaretReadOnly(PRBool aReadOnly);
+   NS_IMETHOD GetCaretEnabled(PRBool *aOutEnabled);
+   NS_IMETHOD SetCaretVisibilityDuringSelection(PRBool aVisibility);
+@@ -4168,16 +4170,29 @@ PresShell::GetSelectionForCopy(nsISelect
+ 
+ /* Just hook this call into InvalidateOverflowRect */
+ void
+ PresShell::InvalidateFrameForView(nsIView *aView)
+ {
+   nsIFrame* frame = nsLayoutUtils::GetFrameFor(aView);
+   if (frame)
+     frame->InvalidateOverflowRect();
++}
++
++NS_IMETHODIMP_(void)
++PresShell::DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                  PRBool aFlushOnHoverChange)
++{
++  PRUint32 hoverGenerationBefore = mFrameConstructor->GetHoverGeneration();
++  nsEventStatus status;
++  view->GetViewManager()->DispatchEvent(&event, &status);
++  if (aFlushOnHoverChange &&
++      hoverGenerationBefore != mFrameConstructor->GetHoverGeneration()) {
++    FlushPendingNotifications(Flush_Layout);
++  }
+ }
+ 
+ NS_IMETHODIMP
+ PresShell::DoGetContents(const nsACString& aMimeType, PRUint32 aFlags, PRBool aSelectionOnly, nsAString& aOutValue)
+ {
+   aOutValue.Truncate();
+   
+   if (!mDocument) return NS_ERROR_FAILURE;
+diff --git a/view/public/nsIViewObserver.h b/view/public/nsIViewObserver.h
+--- a/view/public/nsIViewObserver.h
++++ b/view/public/nsIViewObserver.h
+@@ -115,13 +115,21 @@ public:
+    */
+   NS_IMETHOD_(void) WillPaint() = 0;
+ 
+   /**
+    * Notify the observer that it should invalidate the frame bounds for
+    * the frame associated with this view.
+    */
+   NS_IMETHOD_(void) InvalidateFrameForView(nsIView *aView) = 0;
++
++  /**
++   * Dispatch the given synthesized mouse move event, and if
++   * aFlushOnHoverChange is true, flush layout if :hover changes cause
++   * any restyles.
++   */
++  NS_IMETHOD_(void) DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                           PRBool aFlushOnHoverChange) = 0;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsIViewObserver, NS_IVIEWOBSERVER_IID)
+ 
+ #endif
+diff --git a/view/src/nsViewManager.cpp b/view/src/nsViewManager.cpp
+--- a/view/src/nsViewManager.cpp
++++ b/view/src/nsViewManager.cpp
+@@ -2405,21 +2405,22 @@ nsViewManager::ProcessSynthMouseMoveEven
+     offset.y = NSAppUnitsToIntPixels(offset.y, p2a);
+   }
+   nsMouseEvent event(PR_TRUE, NS_MOUSE_MOVE, view->GetWidget(),
+                      nsMouseEvent::eSynthesized);
+   event.refPoint = mMouseLocation - offset;
+   event.time = PR_IntervalNow();
+   // XXX set event.isShift, event.isControl, event.isAlt, event.isMeta ?
+ 
+-  nsEventStatus status;
+-  view->GetViewManager()->DispatchEvent(&event, &status);
++  view->GetViewManager()->GetViewObserver()
++    ->DispatchSynthMouseMove(&event, !aFromScroll);
+ 
+-  if (!aFromScroll)
++  if (!aFromScroll) {
+     mSynthMouseMoveEvent.Forget();
++  }
+ }
+ 
+ void
+ nsViewManager::InvalidateHierarchy()
+ {
+   if (mRootView) {
+     if (!IsRootVM()) {
+       NS_RELEASE(mRootViewManager);
