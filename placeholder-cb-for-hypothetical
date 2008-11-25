@@ -1,0 +1,251 @@
+Introduce two different definitions of the placeholder's containing block in InitAbsoluteConstraints, since we want to use a different one for the hypothetical box and for the direction.  (Bug 462844)  r+sr=bzbarsky  a=blocking1.9.1+
+
+diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
+--- a/layout/generic/nsHTMLReflowState.cpp
++++ b/layout/generic/nsHTMLReflowState.cpp
+@@ -693,25 +693,35 @@ nsHTMLReflowState::ComputeRelativeOffset
+   else {
+     offsets = new nsPoint(mComputedOffsets.left, mComputedOffsets.top);
+     if (offsets)
+       propTable->SetProperty(frame, nsGkAtoms::computedOffsetProperty,
+                               offsets, nsPointDtor, nsnull);
+   }
+ }
+ 
++inline PRBool
++IsAnonBlockPseudo(nsIAtom *aPseudo)
++{
++  return aPseudo == nsCSSAnonBoxes::mozAnonymousBlock ||
++         aPseudo == nsCSSAnonBoxes::mozAnonymousPositionedBlock;
++}
++
+ nsIFrame*
+-nsHTMLReflowState::GetNearestContainingBlock(nsIFrame* aFrame, nscoord& aCBLeftEdge,
+-                                             nscoord& aCBWidth)
++nsHTMLReflowState::GetHypotheticalBoxContainer(nsIFrame* aFrame,
++                                               nscoord& aCBLeftEdge,
++                                               nscoord& aCBWidth)
+ {
+-  for (aFrame = aFrame->GetParent(); aFrame && !aFrame->IsContainingBlock();
+-       aFrame = aFrame->GetParent())
+-    /* do nothing */;
++  do {
++    aFrame = aFrame->GetParent();
++    NS_ASSERTION(aFrame, "Must find containing block somewhere");
++  } while (!(aFrame->IsContainingBlock() ||
++             (aFrame->IsFrameOfType(nsIFrame::eBlockFrame) &&
++              IsAnonBlockPseudo(aFrame->GetStyleContext()->GetPseudoType()))));
+ 
+-  NS_ASSERTION(aFrame, "Must find containing block somewhere");
+   NS_ASSERTION(aFrame != frame, "How did that happen?");
+ 
+   /* Now aFrame is the containing block we want */
+ 
+   /* Check whether the containing block is currently being reflown.
+      If so, use the info from the reflow state. */
+   const nsHTMLReflowState* state;
+   if (aFrame->GetStateBits() & NS_FRAME_IN_REFLOW) {
+@@ -733,16 +743,26 @@ nsHTMLReflowState::GetNearestContainingB
+     NS_ASSERTION(!(aFrame->GetStateBits() & NS_FRAME_IN_REFLOW),
+                  "aFrame shouldn't be in reflow; we'll lie if it is");
+     nsMargin borderPadding = aFrame->GetUsedBorderAndPadding();
+     aCBLeftEdge = borderPadding.left;
+     aCBWidth = aFrame->GetSize().width - borderPadding.LeftRight();
+   }
+ 
+   return aFrame;
++}
++
++static nsIFrame*
++GetNearestContainingBlock(nsIFrame *aFrame)
++{
++  nsIFrame *cb = aFrame;
++  do {
++    cb = cb->GetParent();
++  } while (!cb->IsContainingBlock());
++  return cb;
+ }
+ 
+ // When determining the hypothetical box that would have been if the element
+ // had been in the flow we may not be able to exactly determine both the left
+ // and right edges. For example, if the element is a non-replaced inline-level
+ // element we would have to reflow it in order to determine it desired width.
+ // In that case depending on the progression direction either the left or
+ // right edge would be marked as not being exact
+@@ -1106,30 +1126,30 @@ nsHTMLReflowState::InitAbsoluteConstrain
+                   "containing block height must be constrained");
+ 
+   // Get the placeholder frame
+   nsIFrame*     placeholderFrame;
+ 
+   aPresContext->PresShell()->GetPlaceholderFrameFor(frame, &placeholderFrame);
+   NS_ASSERTION(nsnull != placeholderFrame, "no placeholder frame");
+ 
+-  // Find the nearest containing block frame to the placeholder frame,
+-  // and return its left edge and width.
+-  nscoord cbLeftEdge, cbWidth;
+-  nsIFrame* cbFrame = GetNearestContainingBlock(placeholderFrame, cbLeftEdge,
+-                                                cbWidth);
+-  
+   // If both 'left' and 'right' are 'auto' or both 'top' and 'bottom' are
+   // 'auto', then compute the hypothetical box of where the element would
+   // have been if it had been in the flow
+   nsHypotheticalBox hypotheticalBox;
+   if (((eStyleUnit_Auto == mStylePosition->mOffset.GetLeftUnit()) &&
+        (eStyleUnit_Auto == mStylePosition->mOffset.GetRightUnit())) ||
+       ((eStyleUnit_Auto == mStylePosition->mOffset.GetTopUnit()) &&
+        (eStyleUnit_Auto == mStylePosition->mOffset.GetBottomUnit()))) {
++    // Find the nearest containing block frame to the placeholder frame,
++    // and return its left edge and width.
++    nscoord cbLeftEdge, cbWidth;
++    nsIFrame* cbFrame = GetHypotheticalBoxContainer(placeholderFrame,
++                                                    cbLeftEdge,
++                                                    cbWidth);
+ 
+     CalculateHypotheticalBox(aPresContext, placeholderFrame, cbFrame,
+                              cbLeftEdge, cbWidth, cbrs, hypotheticalBox);
+   }
+ 
+   // Initialize the 'left' and 'right' computed offsets
+   // XXX Handle new 'static-position' value...
+   PRBool        leftIsAuto = PR_FALSE, rightIsAuto = PR_FALSE;
+@@ -1150,17 +1170,18 @@ nsHTMLReflowState::InitAbsoluteConstrain
+                                  mStylePosition->mOffset.GetRight());
+   }
+ 
+   // Use the horizontal component of the hypothetical box in the cases
+   // where it's needed.
+   if (leftIsAuto && rightIsAuto) {
+     // Use the direction of the original ("static-position") containing block
+     // to dictate whether 'left' or 'right' is treated like 'static-position'.
+-    if (NS_STYLE_DIRECTION_LTR == cbFrame->GetStyleVisibility()->mDirection) {
++    if (NS_STYLE_DIRECTION_LTR == GetNearestContainingBlock(placeholderFrame)
++                                    ->GetStyleVisibility()->mDirection) {
+       NS_ASSERTION(hypotheticalBox.mLeftIsExact, "should always have "
+                    "exact value on containing block's start side");
+       mComputedOffsets.left = hypotheticalBox.mLeft;
+       leftIsAuto = PR_FALSE;
+     } else {
+       NS_ASSERTION(hypotheticalBox.mRightIsExact, "should always have "
+                    "exact value on containing block's start side");
+       mComputedOffsets.right = containingBlockWidth - hypotheticalBox.mRight;
+diff --git a/layout/generic/nsHTMLReflowState.h b/layout/generic/nsHTMLReflowState.h
+--- a/layout/generic/nsHTMLReflowState.h
++++ b/layout/generic/nsHTMLReflowState.h
+@@ -457,21 +457,23 @@ protected:
+   void InitResizeFlags(nsPresContext* aPresContext);
+ 
+   void InitConstraints(nsPresContext* aPresContext,
+                        nscoord         aContainingBlockWidth,
+                        nscoord         aContainingBlockHeight,
+                        const nsMargin* aBorder,
+                        const nsMargin* aPadding);
+ 
+-  // Returns the nearest containing block frame for the specified frame.  Also
+-  // returns the left edge and width of the containing block's content area.
++  // Returns the nearest containing block or block frame (whether or not
++  // it is a containing block) for the specified frame.  Also returns
++  // the left edge and width of the containing block's content area.
+   // These are returned in the coordinate space of the containing block.
+-  nsIFrame* GetNearestContainingBlock(nsIFrame* aFrame, nscoord& aCBLeftEdge,
+-                                      nscoord& aCBWidth);
++  nsIFrame* GetHypotheticalBoxContainer(nsIFrame* aFrame,
++                                        nscoord& aCBLeftEdge,
++                                        nscoord& aCBWidth);
+ 
+   void CalculateHypotheticalBox(nsPresContext*    aPresContext,
+                                 nsIFrame*         aPlaceholderFrame,
+                                 nsIFrame*         aContainingBlock,
+                                 nscoord           aBlockLeftContentEdge,
+                                 nscoord           aBlockContentWidth,
+                                 const nsHTMLReflowState* cbrs,
+                                 nsHypotheticalBox& aHypotheticalBox);
+diff --git a/layout/reftests/bugs/462844-1.html b/layout/reftests/bugs/462844-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/462844-1.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE HTML>
++<title>Testcase, bug 462844</title>
++<div style="position: relative">
++	<div style="display:inline">
++		<div style="height: 100px"></div>
++		<div style="background: aqua; height: 20px;"></div>
++		<div style="display:block; position: absolute; top: auto; left: 0; background: yellow;">Should be just below aqua block</div>
++		<div style="height: 100px"></div>
++	</div>
++</div>
+diff --git a/layout/reftests/bugs/462844-2.html b/layout/reftests/bugs/462844-2.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/462844-2.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE HTML>
++<title>Testcase, bug 462844</title>
++<div style="position: relative">
++	<div style="display:inline">
++		<div style="height: 100px"></div>
++		<div style="background: aqua; height: 20px;"></div>
++		<div style="display:inline; position: absolute; top: auto; left: 0; background: yellow;">Should be just below aqua block</div>
++		<div style="height: 100px"></div>
++	</div>
++</div>
+diff --git a/layout/reftests/bugs/462844-3.html b/layout/reftests/bugs/462844-3.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/462844-3.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE HTML>
++<title>Testcase, bug 462844</title>
++<div style="position: relative">
++	<div>
++		<div style="height: 100px"></div>
++		<div style="background: aqua; height: 20px;"></div>
++		<div style="display:block; position: absolute; top: auto; left: 0; background: yellow;">Should be just below aqua block</div>
++		<div style="height: 100px"></div>
++	</div>
++</div>
+diff --git a/layout/reftests/bugs/462844-4.html b/layout/reftests/bugs/462844-4.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/462844-4.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE HTML>
++<title>Testcase, bug 462844</title>
++<div style="position: relative">
++	<div>
++		<div style="height: 100px"></div>
++		<div style="background: aqua; height: 20px;"></div>
++		<div style="display:block; position: absolute; top: auto; left: 0; background: yellow;">Should be just below aqua block</div>
++		<div style="height: 100px"></div>
++	</div>
++</div>
+diff --git a/layout/reftests/bugs/462844-ref.html b/layout/reftests/bugs/462844-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/462844-ref.html
+@@ -0,0 +1,5 @@
++<!DOCTYPE HTML>
++<title>Testcase, bug 462844</title>
++<div style="height: 100px"></div>
++<div style="background: aqua; height: 20px;"></div>
++<div style="display:block; background: yellow; width: -moz-fit-content">Should be just below aqua block</div>
+diff --git a/layout/reftests/bugs/reftest.list b/layout/reftests/bugs/reftest.list
+--- a/layout/reftests/bugs/reftest.list
++++ b/layout/reftests/bugs/reftest.list
+@@ -954,11 +954,15 @@ fails-if(MOZ_WIDGET_TOOLKIT=="cocoa") ==
+ == 458487-3.html 458487-3-ref.html
+ == 458487-4a.html 458487-4-ref.html
+ == 458487-4b.html 458487-4-ref.html
+ == 458487-4c.html 458487-4-ref.html
+ == 458487-5a.html 458487-5-ref.html
+ == 458487-5b.html 458487-5-ref.html
+ == 461266-1.html 461266-1-ref.html
+ fails == 461512-1.html 461512-1-ref.html # Bug 461512
++== 462844-1.html 462844-ref.html
++== 462844-2.html 462844-ref.html
++== 462844-3.html 462844-ref.html
++== 462844-4.html 462844-ref.html
+ == 463204-1.html 463204-1-ref.html
+ == 463217-1.xul 463217-1-ref.xul
+ == 464811-1.html 464811-1-ref.html
