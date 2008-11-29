@@ -1,0 +1,266 @@
+Allow PostRebuildAllStyleData to be called with an aExtraHint.  (Bug 458878)
+
+diff --git a/content/mathml/content/src/nsMathMLElement.cpp b/content/mathml/content/src/nsMathMLElement.cpp
+--- a/content/mathml/content/src/nsMathMLElement.cpp
++++ b/content/mathml/content/src/nsMathMLElement.cpp
+@@ -91,17 +91,17 @@ nsMathMLElement::BindToTree(nsIDocument*
+     // optimizations may have taken place assuming MathML was disabled.
+     // (See nsRuleNode::CheckSpecifiedProperties.)
+     // nsPresShellIterator skips hidden presshells, but that's OK because
+     // if we're changing the document for one of those presshells the whole
+     // presshell will be torn down.
+     nsPresShellIterator iter(aDocument);
+     nsCOMPtr<nsIPresShell> shell;
+     while ((shell = iter.GetNextShell()) != nsnull) {
+-      shell->GetPresContext()->PostRebuildAllStyleDataEvent();
++      shell->GetPresContext()->PostRebuildAllStyleDataEvent(nsChangeHint(0));
+     }
+   }
+ 
+   return rv;
+ }
+ 
+ PRBool
+ nsMathMLElement::ParseAttribute(PRInt32 aNamespaceID,
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -1849,16 +1849,17 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+   , mPageSequenceFrame(nsnull)
+   , mUpdateCount(0)
+   , mQuotesDirty(PR_FALSE)
+   , mCountersDirty(PR_FALSE)
+   , mIsDestroyingFrameTree(PR_FALSE)
+   , mRebuildAllStyleData(PR_FALSE)
+   , mHasRootAbsPosContainingBlock(PR_FALSE)
+   , mHoverGeneration(0)
++  , mRebuildAllExtraHint(nsChangeHint(0))
+ {
+   if (!gGotXBLFormPrefs) {
+     gGotXBLFormPrefs = PR_TRUE;
+ 
+     gUseXBLForms =
+       nsContentUtils::GetBoolPref("nglayout.debug.enable_xbl_forms");
+   }
+ 
+@@ -13350,64 +13351,64 @@ nsCSSFrameConstructor::RebuildAllStyleDa
+   // reconstructed will still have their old style context pointers
+   // until they are destroyed).
+   mPresShell->StyleSet()->EndReconstruct();
+ }
+ 
+ void
+ nsCSSFrameConstructor::ProcessPendingRestyles()
+ {
++  NS_PRECONDITION(mDocument, "No document?  Pshaw!\n");
++
+   PRUint32 count = mPendingRestyles.Count();
+-  if (!count) {
+-    // Nothing to do
+-    return;
+-  }
+-  
+-  NS_PRECONDITION(mDocument, "No document?  Pshaw!\n");
+-
+-  // Use the stack if we can, otherwise fall back on heap-allocation.
+-  nsAutoTArray<RestyleEnumerateData, RESTYLE_ARRAY_STACKSIZE> restyleArr;
+-  RestyleEnumerateData* restylesToProcess = restyleArr.AppendElements(count);
+-  
+-  if (!restylesToProcess) {
+-    return;
+-  }
+-
+-  RestyleEnumerateData* lastRestyle = restylesToProcess;
+-  mPendingRestyles.Enumerate(CollectRestyles, &lastRestyle);
+-
+-  NS_ASSERTION(lastRestyle - restylesToProcess == PRInt32(count),
+-               "Enumeration screwed up somehow");
+-
+-  // Clear the hashtable so we don't end up trying to process a restyle we're
+-  // already processing, sending us into an infinite loop.
+-  mPendingRestyles.Clear();
+-
+-  // Make sure to not rebuild quote or counter lists while we're
+-  // processing restyles
+-  BeginUpdate();
+-
+-  for (RestyleEnumerateData* currentRestyle = restylesToProcess;
+-       currentRestyle != lastRestyle;
+-       ++currentRestyle) {
+-    ProcessOneRestyle(currentRestyle->mContent,
+-                      currentRestyle->mRestyleHint,
+-                      currentRestyle->mChangeHint);
+-  }
+-
+-  EndUpdate();
+-
+-#ifdef DEBUG
+-  mPresShell->VerifyStyleTree();
+-#endif
++
++  if (count) {
++    // Use the stack if we can, otherwise fall back on heap-allocation.
++    nsAutoTArray<RestyleEnumerateData, RESTYLE_ARRAY_STACKSIZE> restyleArr;
++    RestyleEnumerateData* restylesToProcess = restyleArr.AppendElements(count);
++  
++    if (!restylesToProcess) {
++      return;
++    }
++
++    RestyleEnumerateData* lastRestyle = restylesToProcess;
++    mPendingRestyles.Enumerate(CollectRestyles, &lastRestyle);
++
++    NS_ASSERTION(lastRestyle - restylesToProcess == PRInt32(count),
++                 "Enumeration screwed up somehow");
++
++    // Clear the hashtable so we don't end up trying to process a restyle we're
++    // already processing, sending us into an infinite loop.
++    mPendingRestyles.Clear();
++
++    // Make sure to not rebuild quote or counter lists while we're
++    // processing restyles
++    BeginUpdate();
++
++    for (RestyleEnumerateData* currentRestyle = restylesToProcess;
++         currentRestyle != lastRestyle;
++         ++currentRestyle) {
++      ProcessOneRestyle(currentRestyle->mContent,
++                        currentRestyle->mRestyleHint,
++                        currentRestyle->mChangeHint);
++    }
++
++    EndUpdate();
++
++#ifdef DEBUG
++    mPresShell->VerifyStyleTree();
++#endif
++  }
+ 
+   if (mRebuildAllStyleData) {
+     // We probably wasted a lot of work up above, but this seems safest
+     // and it should be rarely used.
+-    RebuildAllStyleData(nsChangeHint(0));
++    nsChangeHint hint = mRebuildAllExtraHint;
++    mRebuildAllExtraHint = nsChangeHint(0);
++    RebuildAllStyleData(hint);
+   }
+ }
+ 
+ void
+ nsCSSFrameConstructor::PostRestyleEvent(nsIContent* aContent,
+                                         nsReStyleHint aRestyleHint,
+                                         nsChangeHint aMinChangeHint)
+ {
+@@ -13442,19 +13443,20 @@ nsCSSFrameConstructor::PostRestyleEvent(
+       // XXXbz and what?
+     } else {
+       mRestyleEvent = ev;
+     }
+   }
+ }
+ 
+ void
+-nsCSSFrameConstructor::PostRebuildAllStyleDataEvent()
++nsCSSFrameConstructor::PostRebuildAllStyleDataEvent(aChangeHint aExtraHint)
+ {
+   mRebuildAllStyleData = PR_TRUE;
++  mRebuildAllExtraHint |= aExtraHint;
+   // Get a restyle event posted if necessary
+   mPresShell->ReconstructStyleDataInternal();
+ }
+ 
+ NS_IMETHODIMP nsCSSFrameConstructor::RestyleEvent::Run()
+ {
+   if (!mConstructor)
+     return NS_OK;  // event was revoked
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -211,17 +211,17 @@ public:
+    * it will all be rebuilt. This is safe to call anytime; it will schedule
+    * a restyle and take effect next time style changes are flushed.
+    * This method is used to recompute the style data when some change happens
+    * outside of any style rules, like a color preference change or a change
+    * in a system font size, or to fix things up when an optimization in the
+    * style data has become invalid. We assume that the root frame will not
+    * need to be reframed.
+    */
+-  void PostRebuildAllStyleDataEvent();
++  void PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint);
+ 
+   // Request to create a continuing frame
+   nsresult CreateContinuingFrame(nsPresContext* aPresContext,
+                                  nsIFrame*       aFrame,
+                                  nsIFrame*       aParentFrame,
+                                  nsIFrame**      aContinuingFrame,
+                                  PRBool          aIsFluid = PR_TRUE);
+ 
+@@ -1189,16 +1189,17 @@ private:
+   PRUint16            mUpdateCount;
+   PRPackedBool        mQuotesDirty : 1;
+   PRPackedBool        mCountersDirty : 1;
+   PRPackedBool        mIsDestroyingFrameTree : 1;
+   PRPackedBool        mRebuildAllStyleData : 1;
+   // This is true if mDocElementContainingBlock supports absolute positioning
+   PRPackedBool        mHasRootAbsPosContainingBlock : 1;
+   PRUint32            mHoverGeneration;
++  nsChangeHint        mRebuildAllExtraHint;
+ 
+   nsRevocableEventPtr<RestyleEvent> mRestyleEvent;
+ 
+   nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
+ 
+   nsDataHashtable<nsISupportsHashKey, RestyleData> mPendingRestyles;
+ 
+   static nsIXBLService * gXBLService;
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1459,23 +1459,23 @@ nsPresContext::RebuildAllStyleData(nsCha
+   }
+ 
+   RebuildUserFontSet();
+ 
+   mShell->FrameConstructor()->RebuildAllStyleData(aExtraHint);
+ }
+ 
+ void
+-nsPresContext::PostRebuildAllStyleDataEvent()
++nsPresContext::PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint)
+ {
+   if (!mShell) {
+     // We must have been torn down. Nothing to do here.
+     return;
+   }
+-  mShell->FrameConstructor()->PostRebuildAllStyleDataEvent();
++  mShell->FrameConstructor()->PostRebuildAllStyleDataEvent(aExtraHint);
+ }
+ 
+ void
+ nsPresContext::MediaFeatureValuesChanged(PRBool aCallerWillRebuildStyleData)
+ {
+   mPendingMediaFeatureValuesChanged = PR_FALSE;
+   if (mShell->StyleSet()->MediumFeaturesChanged(this) &&
+       !aCallerWillRebuildStyleData) {
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -210,17 +210,17 @@ public:
+ #ifdef _IMPL_NS_LAYOUT
+   nsStyleSet* StyleSet() { return GetPresShell()->StyleSet(); }
+ 
+   nsFrameManager* FrameManager()
+     { return GetPresShell()->FrameManager(); } 
+ #endif
+ 
+   void RebuildAllStyleData(nsChangeHint aExtraHint);
+-  void PostRebuildAllStyleDataEvent();
++  void PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint);
+ 
+   void MediaFeatureValuesChanged(PRBool aCallerWillRebuildStyleData);
+   void PostMediaFeatureValuesChangedEvent();
+   NS_HIDDEN_(void) HandleMediaFeatureValuesChangedEvent();
+   void FlushPendingMediaFeatureValuesChanged() {
+     if (mPendingMediaFeatureValuesChanged)
+       MediaFeatureValuesChanged(PR_FALSE);
+   }
