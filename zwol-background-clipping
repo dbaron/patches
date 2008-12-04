@@ -1,0 +1,1224 @@
+From: Zack Weinberg <zweinberg@mozilla.com>
+
+Bug 456219 - fix background clipping with rounded corners
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -272,24 +272,16 @@ static void DrawBorderImageSide(gfxConte
+ static void DrawBorderImageSide(gfxContext *aThebesContext,
+                                 nsIDeviceContext* aDeviceContext,
+                                 imgIContainer* aImage,
+                                 gfxRect& aDestRect,
+                                 gfxSize aInterSize,
+                                 gfxRect& aSourceRect,
+                                 PRUint8 aHFillType,
+                                 PRUint8 aVFillType);
+-
+-static void PaintBackgroundColor(nsPresContext* aPresContext,
+-                                 nsIRenderingContext& aRenderingContext,
+-                                 nsIFrame* aForFrame,
+-                                 const nsRect& aBgClipArea,
+-                                 const nsStyleBackground& aColor,
+-                                 const nsStyleBorder& aBorder,
+-                                 PRBool aCanPaintNonWhite);
+ 
+ static nscolor MakeBevelColor(PRIntn whichSide, PRUint8 style,
+                               nscolor aBackgroundColor,
+                               nscolor aBorderColor);
+ 
+ static gfxRect GetTextDecorationRectInternal(const gfxPoint& aPt,
+                                              const gfxSize& aLineSize,
+                                              const gfxFloat aAscent,
+@@ -1238,18 +1230,17 @@ IsSolidBorderEdge(const nsStyleBorder& a
+ }
+ 
+ /**
+  * Returns true if all border edges are either missing or opaque.
+  */
+ static PRBool
+ IsSolidBorder(const nsStyleBorder& aBorder)
+ {
+-  if (aBorder.mBorderColors ||
+-      nsLayoutUtils::HasNonZeroCorner(aBorder.mBorderRadius))
++  if (aBorder.mBorderColors)
+     return PR_FALSE;
+   for (PRUint32 i = 0; i < 4; ++i) {
+     if (!IsSolidBorderEdge(aBorder, i))
+       return PR_FALSE;
+   }
+   return PR_TRUE;
+ }
+ 
+@@ -1262,86 +1253,192 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+                                       const nsStyleBackground& aColor,
+                                       const nsStyleBorder& aBorder,
+                                       PRBool aUsePrintSettings,
+                                       nsRect* aBGClipRect)
+ {
+   NS_PRECONDITION(aForFrame,
+                   "Frame is expected to be provided to PaintBackground");
+ 
+-  PRBool canDrawBackgroundImage = PR_TRUE;
+-  PRBool canDrawBackgroundColor = PR_TRUE;
+-
+-  if (aUsePrintSettings) {
+-    canDrawBackgroundImage = aPresContext->GetBackgroundImageDraw();
+-    canDrawBackgroundColor = aPresContext->GetBackgroundColorDraw();
+-  }
+-
+   // Check to see if we have an appearance defined.  If so, we let the theme
+   // renderer draw the background and bail out.
++  // XXXzw this ignores aBGClipRect.
+   const nsStyleDisplay* displayData = aForFrame->GetStyleDisplay();
+   if (displayData->mAppearance) {
+     nsITheme *theme = aPresContext->GetTheme();
+-    if (theme && theme->ThemeSupportsWidget(aPresContext, aForFrame, displayData->mAppearance)) {
++    if (theme && theme->ThemeSupportsWidget(aPresContext, aForFrame,
++                                            displayData->mAppearance)) {
+       nsRect dirty;
+       dirty.IntersectRect(aDirtyRect, aBorderArea);
+       theme->DrawWidgetBackground(&aRenderingContext, aForFrame, 
+                                   displayData->mAppearance, aBorderArea, dirty);
+       return;
+     }
+   }
+ 
+-  // Same coordinate space as aBorderArea
+-  nsRect bgClipArea;
+-  if (aBGClipRect) {
+-    bgClipArea = *aBGClipRect;
++  // Determine whether we are drawing background images and/or
++  // background colors.
++  PRBool drawBackgroundImage = PR_TRUE;
++  PRBool drawBackgroundColor = PR_TRUE;
++
++  if (aUsePrintSettings) {
++    drawBackgroundImage = aPresContext->GetBackgroundImageDraw();
++    drawBackgroundColor = aPresContext->GetBackgroundColorDraw();
+   }
+-  else {
+-    // The background is rendered over the 'background-clip' area.
+-    bgClipArea = aBorderArea;
+-    // If the border is solid, then clip the background to the padding-box
+-    // so that we don't draw unnecessary tiles.
+-    if (aColor.mBackgroundClip != NS_STYLE_BG_CLIP_BORDER ||
+-        IsSolidBorder(aBorder)) {
+-      nsMargin border = aForFrame->GetUsedBorder();
+-      aForFrame->ApplySkipSides(border);
+-      bgClipArea.Deflate(border);
++
++  if ((aColor.mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) ||
++      !aColor.mBackgroundImage) {
++    NS_ASSERTION((aColor.mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) &&
++                 !aColor.mBackgroundImage, "background flags/image mismatch");
++    drawBackgroundImage = PR_FALSE;
++  }
++
++  // If GetBackgroundColorDraw() is false, we are still expected to
++  // draw color in the background of any frame that's not completely
++  // transparent, but we are expected to use white instead of whatever
++  // color was specified.
++  nscolor bgColor;
++  if (drawBackgroundColor) {
++    bgColor = aColor.mBackgroundColor;
++    if (NS_GET_A(bgColor) == 0)
++      drawBackgroundColor = PR_FALSE;
++  } else {
++    bgColor = NS_RGB(255, 255, 255);
++    if (drawBackgroundImage || NS_GET_A(aColor.mBackgroundColor) > 0)
++      drawBackgroundColor = PR_TRUE;
++  }
++
++  // At this point, drawBackgroundImage and drawBackgroundColor are
++  // true if and only if we are actually supposed to paint an image or
++  // color into aDirtyRect, respectively.
++  if (!drawBackgroundImage && !drawBackgroundColor)
++    return;
++
++  // Compute the outermost boundary of the area that might be painted.
++  gfxContext *ctx = aRenderingContext.ThebesContext();
++  nscoord appUnitsPerPixel = aPresContext->AppUnitsPerDevPixel();
++
++  // Same coordinate space as aBorderArea & aBGClipRect
++  nsRect bgArea;
++  gfxCornerSizes bgRadii;
++  PRBool haveRoundedCorners;
++  PRBool radiiAreOuter = PR_TRUE;
++  {
++    nscoord radii[8];
++    haveRoundedCorners =
++      GetBorderRadiusTwips(aBorder.mBorderRadius, aForFrame->GetSize().width,
++                           radii);
++    if (haveRoundedCorners)
++      ComputePixelRadii(radii, aBorderArea, aForFrame->GetSkipSides(),
++                        appUnitsPerPixel, &bgRadii);
++  }
++  
++  // The background is rendered over the 'background-clip' area,
++  // which is normally equal to the border area but may be reduced
++  // to the padding area by CSS.  Also, if the border is solid, we
++  // don't need to draw outside the padding area.  In either case,
++  // if the borders are rounded, make sure we use the same inner
++  // radii as the border code will.
++  bgArea = aBorderArea;
++  if (aColor.mBackgroundClip != NS_STYLE_BG_CLIP_BORDER ||
++      IsSolidBorder(aBorder)) {
++    nsMargin border = aForFrame->GetUsedBorder();
++    aForFrame->ApplySkipSides(border);
++    bgArea.Deflate(border);
++    if (haveRoundedCorners) {
++      gfxCornerSizes outerRadii = bgRadii;
++      gfxFloat borderSizes[4] = {
++        border.top / appUnitsPerPixel, border.right / appUnitsPerPixel,
++        border.bottom / appUnitsPerPixel, border.left / appUnitsPerPixel
++      };
++      nsCSSBorderRenderer::ComputeInnerRadii(outerRadii, borderSizes,
++                                             &bgRadii);
++      radiiAreOuter = PR_FALSE;
+     }
+   }
+ 
+-  gfxContext *ctx = aRenderingContext.ThebesContext();
++  // The 'bgClipArea' (used only by the image tiling logic, far below)
++  // is the intersection of the bgArea computed above and the
++  // caller-provided aBGClipRect if any.  The dirtyRect is the
++  // intersection of that rectangle with the caller-provided
++  // aDirtyRect.  If the dirtyRect is empty there is nothing to draw.
+ 
+-  // The actual dirty rect is the intersection of the 'background-clip'
+-  // area and the dirty rect we were given
++  nsRect bgClipArea;
++  if (aBGClipRect)
++    bgClipArea.IntersectRect(bgArea, *aBGClipRect);
++  else
++    bgClipArea = bgArea;
++
+   nsRect dirtyRect;
+-  if (!dirtyRect.IntersectRect(bgClipArea, aDirtyRect)) {
+-    // Nothing to paint
++  dirtyRect.IntersectRect(bgClipArea, aDirtyRect);
++
++  if (dirtyRect.IsEmpty())
++    return;
++
++  // Compute the Thebes equivalent of the dirtyRect.
++  gfxRect gDirtyRect(RectToGfxRect(dirtyRect, appUnitsPerPixel));
++  gDirtyRect.Round();
++  gDirtyRect.Condition();
++  if (gDirtyRect.IsEmpty()) {
++    NS_WARNING("converted dirty rect should not be empty");
+     return;
+   }
+ 
+-  // if there is no background image or background images are turned off, try a color.
+-  if (!aColor.mBackgroundImage || !canDrawBackgroundImage) {
+-    PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, canDrawBackgroundColor);
++  // Make that rectangle the clipping area for all subsequent drawing.
++  gfxContextAutoSaveRestore autoSR(ctx);
++  ctx->Clip(gDirtyRect);
++
++  // If we have rounded corners, also clip to the rounded rectangle
++  // defined by bgArea and bgRadii (we don't know whether the rounded
++  // corners intrude on the dirtyRect or not).
++  if (haveRoundedCorners) {
++    gfxRect gBgArea(RectToGfxRect(bgArea, appUnitsPerPixel));
++    gBgArea.Round();
++    gBgArea.Condition();
++    if (gBgArea.IsEmpty()) {
++      NS_WARNING("converted background area should not be empty");
++      return;
++    }
++
++    ctx->NewPath();
++    ctx->RoundedRectangle(gBgArea, bgRadii, radiiAreOuter);
++    ctx->Clip();
++  }
++
++  // If we might be using a background color, go ahead and set it now.
++  if (drawBackgroundColor)
++    ctx->SetColor(gfxRGBA(bgColor));
++
++  // If there is no background image, draw a color.  (If there is
++  // neither a background image nor a color, we wouldn't have gotten
++  // this far.)
++  if (!drawBackgroundImage) {
++    ctx->NewPath();
++    ctx->Rectangle(gDirtyRect);
++    ctx->Fill();
+     return;
+   }
+-
+-  // We have a background image
+ 
+   // Lookup the image
+   imgIRequest *req = aPresContext->LoadImage(aColor.mBackgroundImage,
+                                              aForFrame);
+ 
+   PRUint32 status = imgIRequest::STATUS_ERROR;
+   if (req)
+     req->GetImageStatus(&status);
+ 
+-  if (!req || !(status & imgIRequest::STATUS_FRAME_COMPLETE) || !(status & imgIRequest::STATUS_SIZE_AVAILABLE)) {
+-    PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, canDrawBackgroundColor);
++  // While waiting for the image, draw a color, if any.
++  if (!req ||
++      !(status & imgIRequest::STATUS_FRAME_COMPLETE) ||
++      !(status & imgIRequest::STATUS_SIZE_AVAILABLE)) {
++    if (drawBackgroundColor) {
++      ctx->NewPath();
++      ctx->Rectangle(gDirtyRect);
++      ctx->Fill();
++    }
+     return;
+   }
+ 
+   nsCOMPtr<imgIContainer> image;
+   req->GetImage(getter_AddRefs(image));
+ 
+   nsSize imageSize;
+   image->GetWidth(&imageSize.width);
+@@ -1394,56 +1491,60 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+       nsMargin padding = geometryFrame->GetUsedPadding();
+       geometryFrame->ApplySkipSides(padding);
+       bgOriginRect.Deflate(padding);
+       NS_ASSERTION(aColor.mBackgroundOrigin == NS_STYLE_BG_ORIGIN_CONTENT,
+                    "unknown background-origin value");
+     }
+   }
+ 
+-  PRBool  needBackgroundColor = NS_GET_A(aColor.mBackgroundColor) > 0;
+   PRIntn  repeat = aColor.mBackgroundRepeat;
+-
+   switch (repeat) {
+     case NS_STYLE_BG_REPEAT_X:
+       break;
+     case NS_STYLE_BG_REPEAT_Y:
+       break;
+     case NS_STYLE_BG_REPEAT_XY:
+-      if (needBackgroundColor) {
+-        // If the image is completely opaque, we do not need to paint the
+-        // background color
++      if (drawBackgroundColor) {
++        // If the image is completely opaque, we may not need to paint
++        // the background color.
+         nsCOMPtr<gfxIImageFrame> gfxImgFrame;
+         image->GetCurrentFrame(getter_AddRefs(gfxImgFrame));
+         if (gfxImgFrame) {
+-          gfxImgFrame->GetNeedsBackground(&needBackgroundColor);
+-
+-          /* check for tiling of a image where frame smaller than container */
+-          nsSize iSize;
+-          image->GetWidth(&iSize.width);
+-          image->GetHeight(&iSize.height);
+-          nsRect iframeRect;
+-          gfxImgFrame->GetRect(iframeRect);
+-          if (iSize.width != iframeRect.width ||
+-              iSize.height != iframeRect.height) {
+-            needBackgroundColor = PR_TRUE;
++          gfxImgFrame->GetNeedsBackground(&drawBackgroundColor);
++          if (!drawBackgroundColor) {
++            // If the current frame is smaller than its container, we
++            // need to paint the background color even if the frame
++            // itself is opaque.
++            nsSize iSize;
++            image->GetWidth(&iSize.width);
++            image->GetHeight(&iSize.height);
++            nsRect iframeRect;
++            gfxImgFrame->GetRect(iframeRect);
++            if (iSize.width != iframeRect.width ||
++                iSize.height != iframeRect.height) {
++              drawBackgroundColor = PR_TRUE;
++            }
+           }
+         }
+       }
+       break;
+     case NS_STYLE_BG_REPEAT_OFF:
+     default:
+-      NS_ASSERTION(repeat == NS_STYLE_BG_REPEAT_OFF, "unknown background-repeat value");
++      NS_ASSERTION(repeat == NS_STYLE_BG_REPEAT_OFF,
++                   "unknown background-repeat value");
+       break;
+   }
+ 
+-  // The background color is rendered over the 'background-clip' area
+-  if (needBackgroundColor) {
+-    PaintBackgroundColor(aPresContext, aRenderingContext, aForFrame, bgClipArea,
+-                         aColor, aBorder, canDrawBackgroundColor);
++  // The background color is rendered over the entire dirty area,
++  // even if the image isn't.
++  if (drawBackgroundColor) {
++    ctx->NewPath();
++    ctx->Rectangle(gDirtyRect);
++    ctx->Fill();
+   }
+ 
+   // Compute the anchor point.
+   //
+   // relative to aBorderArea.TopLeft() (which is where the top-left
+   // of aForFrame's border-box will be rendered)
+   nsPoint imageTopLeft, anchor;
+   if (NS_STYLE_BG_ATTACHMENT_FIXED == aColor.mBackgroundAttachment) {
+@@ -1490,54 +1591,30 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+     anchor += offset;
+   } else {
+     ComputeBackgroundAnchorPoint(aColor, bgOriginRect.Size(), imageSize,
+                                  &imageTopLeft, &anchor);
+     imageTopLeft += bgOriginRect.TopLeft();
+     anchor += bgOriginRect.TopLeft();
+   }
+ 
+-  ctx->Save();
+-
+-  nscoord borderRadii[8];
+-  PRBool haveRadius = GetBorderRadiusTwips(aBorder.mBorderRadius,
+-                                           aForFrame->GetSize().width,
+-                                           borderRadii);
+-  if (haveRadius) {
+-    nscoord appUnitsPerPixel = aPresContext->DevPixelsToAppUnits(1);
+-    gfxCornerSizes radii;
+-    ComputePixelRadii(borderRadii, bgClipArea,
+-                      aForFrame ? aForFrame->GetSkipSides() : 0,
+-                      appUnitsPerPixel, &radii);
+-
+-    gfxRect oRect(RectToGfxRect(bgClipArea, appUnitsPerPixel));
+-    oRect.Round();
+-    oRect.Condition();
+-
+-    ctx->NewPath();
+-    ctx->RoundedRectangle(oRect, radii);
+-    ctx->Clip();
+-  }
+-
+   nsRect destArea(imageTopLeft + aBorderArea.TopLeft(), imageSize);
+   nsRect fillArea;
+   fillArea.IntersectRect(destArea, bgClipArea);
+   if (repeat & NS_STYLE_BG_REPEAT_X) {
+     fillArea.x = bgClipArea.x;
+     fillArea.width = bgClipArea.width;
+   }
+   if (repeat & NS_STYLE_BG_REPEAT_Y) {
+     fillArea.y = bgClipArea.y;
+     fillArea.height = bgClipArea.height;
+   }
+ 
+   nsLayoutUtils::DrawImage(&aRenderingContext, image,
+       destArea, fillArea, anchor + aBorderArea.TopLeft(), dirtyRect);
+-
+-  ctx->Restore();
+ }
+ 
+ static void
+ DrawBorderImage(nsPresContext* aPresContext,
+                 nsIRenderingContext& aRenderingContext,
+                 nsIFrame* aForFrame, const nsRect& aBorderArea,
+                 const nsStyleBorder& aBorderStyle)
+ {
+@@ -1920,88 +1997,16 @@ DrawBorderImageSide(gfxContext *aThebesC
+   aThebesContext->Translate(aDestRect.pos);
+   aThebesContext->SetPattern(pattern);
+   aThebesContext->NewPath();
+   aThebesContext->Rectangle(gfxRect(renderOffset, rectSize));
+   aThebesContext->SetOperator(gfxContext::OPERATOR_ADD);
+   aThebesContext->Fill();
+   aThebesContext->Restore();
+ }
+-
+-static void
+-PaintBackgroundColor(nsPresContext* aPresContext,
+-                     nsIRenderingContext& aRenderingContext,
+-                     nsIFrame* aForFrame,
+-                     const nsRect& aBgClipArea,
+-                     const nsStyleBackground& aColor,
+-                     const nsStyleBorder& aBorder,
+-                     PRBool aCanPaintNonWhite)
+-{
+-  // If we're only allowed to paint white, then don't bail out on transparent
+-  // color if we're not completely transparent.  See the corresponding check
+-  // for whether we're allowed to paint background images in
+-  // PaintBackgroundWithSC before the first call to PaintBackgroundColor.
+-  if (NS_GET_A(aColor.mBackgroundColor) == 0 &&
+-      (aCanPaintNonWhite || aColor.IsTransparent())) {
+-    // nothing to paint
+-    return;
+-  }
+-
+-  nscolor color = aColor.mBackgroundColor;
+-  if (!aCanPaintNonWhite) {
+-    color = NS_RGB(255, 255, 255);
+-  }
+-  aRenderingContext.SetColor(color);
+-
+-  if (!nsLayoutUtils::HasNonZeroCorner(aBorder.mBorderRadius)) {
+-    aRenderingContext.FillRect(aBgClipArea);
+-    return;
+-  }
+-
+-  gfxContext *ctx = aRenderingContext.ThebesContext();
+-
+-  // needed for our border thickness
+-  nscoord appUnitsPerPixel = aPresContext->AppUnitsPerDevPixel();
+-
+-  nscoord borderRadii[8];
+-  GetBorderRadiusTwips(aBorder.mBorderRadius, aForFrame->GetSize().width,
+-                       borderRadii);
+-
+-  // the bgClipArea is the outside
+-  gfxRect oRect(RectToGfxRect(aBgClipArea, appUnitsPerPixel));
+-  oRect.Round();
+-  oRect.Condition();
+-  if (oRect.IsEmpty())
+-    return;
+-
+-  // convert the radii
+-  gfxCornerSizes radii;
+-  ComputePixelRadii(borderRadii, aBgClipArea,
+-                    aForFrame ? aForFrame->GetSkipSides() : 0,
+-                    appUnitsPerPixel, &radii);
+-
+-  // Add 1.0 to any border radii; if we don't, the border and background
+-  // curves will combine to have fringing at the rounded corners.  Since
+-  // alpha is used for coverage, we have problems because the border and
+-  // background should have identical coverage, and the border should
+-  // overlay the background exactly.  The way to avoid this is by using
+-  // a supersampling scheme, but we don't have the mechanism in place to do
+-  // this.  So, this will do for now.
+-  for (int i = 0; i < 4; i++) {
+-    if (radii[i].width > 0.0)
+-      radii[i].width += 1.0;
+-    if (radii[i].height > 0.0)
+-      radii[i].height += 1.0;
+-  }
+-
+-  ctx->NewPath();
+-  ctx->RoundedRectangle(oRect, radii);
+-  ctx->Fill();
+-}
+-
+ 
+ // Begin table border-collapsing section
+ // These functions were written to not disrupt the normal ones and yet satisfy some additional requirements
+ // At some point, all functions should be unified to include the additional functionality that these provide
+ 
+ static nscoord
+ RoundIntToPixel(nscoord aValue, 
+                 nscoord aTwipsPerPixel,
+diff --git a/layout/base/nsCSSRenderingBorders.cpp b/layout/base/nsCSSRenderingBorders.cpp
+--- a/layout/base/nsCSSRenderingBorders.cpp
++++ b/layout/base/nsCSSRenderingBorders.cpp
+@@ -95,20 +95,16 @@
+  *         |- DrawDashedSide || DrawBorderSides with one side
+  */
+ 
+ static void ComputeBorderCornerDimensions(const gfxRect& aOuterRect,
+                                           const gfxRect& aInnerRect,
+                                           const gfxCornerSizes& aRadii,
+                                           gfxCornerSizes *aDimsResult);
+ 
+-static void ComputeInnerRadii(const gfxCornerSizes& radii,
+-                              const gfxFloat *borderSizes,
+-                              gfxCornerSizes *innerRadii);
+-
+ // given a side index, get the previous and next side index
+ #define NEXT_SIDE(_s) (((_s) + 1) & 3)
+ #define PREV_SIDE(_s) (((_s) + 3) & 3)
+ 
+ // from the given base color and the background color, turn
+ // color into a color for the given border pattern style
+ static gfxRGBA MakeBorderColor(const gfxRGBA& aColor,
+                                const gfxRGBA& aBackgroundColor,
+@@ -196,20 +192,20 @@ nsCSSBorderRenderer::nsCSSBorderRenderer
+   mInnerRect.Inset(mBorderWidths[0], mBorderWidths[1], mBorderWidths[2], mBorderWidths[3]);
+ 
+   ComputeBorderCornerDimensions(mOuterRect, mInnerRect, mBorderRadii, &mBorderCornerDimensions);
+ 
+   mOneUnitBorder = CheckFourFloatsEqual(mBorderWidths, 1.0);
+   mNoBorderRadius = AllCornersZeroSize(mBorderRadii);
+ }
+ 
+-void
+-ComputeInnerRadii(const gfxCornerSizes& aRadii,
+-                  const gfxFloat *aBorderSizes,
+-                  gfxCornerSizes *aInnerRadiiRet)
++/* static */ void
++nsCSSBorderRenderer::ComputeInnerRadii(const gfxCornerSizes& aRadii,
++                                       const gfxFloat *aBorderSizes,
++                                       gfxCornerSizes *aInnerRadiiRet)
+ {
+   gfxCornerSizes& iRadii = *aInnerRadiiRet;
+ 
+   iRadii[C_TL].width = PR_MAX(0.0, aRadii[C_TL].width - aBorderSizes[NS_SIDE_LEFT]);
+   iRadii[C_TL].height = PR_MAX(0.0, aRadii[C_TL].height - aBorderSizes[NS_SIDE_TOP]);
+ 
+   iRadii[C_TR].width = PR_MAX(0.0, aRadii[C_TR].width - aBorderSizes[NS_SIDE_RIGHT]);
+   iRadii[C_TR].height = PR_MAX(0.0, aRadii[C_TR].height - aBorderSizes[NS_SIDE_TOP]);
+diff --git a/layout/base/nsCSSRenderingBorders.h b/layout/base/nsCSSRenderingBorders.h
+--- a/layout/base/nsCSSRenderingBorders.h
++++ b/layout/base/nsCSSRenderingBorders.h
+@@ -195,16 +195,21 @@ struct nsCSSBorderRenderer {
+   // function used by the above to handle -moz-border-colors
+   void DrawBorderSidesCompositeColors(PRIntn aSides, const nsBorderColors *compositeColors);
+ 
+   // draw the given dashed side
+   void DrawDashedSide (PRUint8 aSide);
+ 
+   // draw the entire border
+   void DrawBorders ();
++
++  // utility function used for background painting as well as borders
++  static void ComputeInnerRadii(const gfxCornerSizes& aRadii,
++                                const gfxFloat *aBorderSizes,
++                                gfxCornerSizes *aInnerRadiiRet);
+ };
+ 
+ #ifdef DEBUG_NEW_BORDERS
+ #include <stdarg.h>
+ 
+ static inline void S(const gfxPoint& p) {
+   fprintf (stderr, "[%f,%f]", p.x, p.y);
+ }
+diff --git a/layout/reftests/bugs/456219-1-mask-wArB.png b/layout/reftests/bugs/456219-1-mask-wArB.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f7eb16ae0f482de9fa30d66ea003d812aae41a3
+GIT binary patch
+literal 163
+zc%17D@N?(olHy`uVBq!ia0vp^Q6S973?!M-E;|A#wg8_HS0K&Mz%cKLVhfPLSQ6wH
+z%;50sMjDXg?djqeVsSb-L89Wo4@MtDdxpsYj?4lFnV&Xf@@cfQx^OsH`V?$6*vn-Q
+z?D?RlDbT=z!E&Xz>d(VQY|?Ji8dKFIdve+)F|tcBFiiJm{hL~6w*zFGr>mdKI;Vst
+E09NZPG5`Po
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wArC.png b/layout/reftests/bugs/456219-1-mask-wArC.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..16f086e9e6b005e7d0325a27ddab3b3d03db26be
+GIT binary patch
+literal 218
+zc%17D@N?(olHy`uVBq!ia0vp^Q6S973?!M-E;|A#wg8_HS0K&Mz%cKLVhfPLSQ6wH
+z%;50sMjDXQ<muuVVsSb-L4u{>Bmaa4^$ZU;G<$M$xU>0ua<pJem?U|~vcbjB%)x@w
+z<CDNupMXAwj)cY{3kMedDTkTG8&^(fD7x`LDv?dn!7@QxB%yCPSGoufo5NiTS5G|+
+zPEOU%g(`MaQaUFk1Wq#YQgZkFry<E~dU`>M+LWBONsR0g3=B^*c==zXZm$D5($m$?
+JWt~$(69CH<Ktuol
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wArD.png b/layout/reftests/bugs/456219-1-mask-wArD.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f626b3151081b6b350ca640b544f3bbaab46a54
+GIT binary patch
+literal 269
+zc%17D@N?(olHy`uVBq!ia0vp^Q6S973?!M-E;|A#wg8_HS0K&Mz%cKLVhfPLSQ6wH
+z%;50sMjDW_)zif>#NzbX$%cG~40v4QHMn?0linP-pj^Og!F4?0&BZE_Jf`Ni5Bjh0
+zhS;c71}15L{Qp7x;}fIfRptk6AF#+U<vGmE$^CqI0rP{L3(F@mHh5WG*gJV^N!%T^
+z^#!aNaaBI%y62BQ<k+A(mHWnaMKe~m_FJ1=!WiqPiptBL`kwgr$HT`@gs1<HirRF?
+zGPB_9TJgY+7_P{&$RsVhiAy=cmfSHfuQ|2<%t?tPNz=(Ue0X-`?O~WIEcW>B&%CK1
+Oe|ft4xvX<aXaWFG+GhX&
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wArE.png b/layout/reftests/bugs/456219-1-mask-wArE.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..07f9989109c45bfea7299287c09e576b8770e289
+GIT binary patch
+literal 287
+zc%17D@N?(olHy`uVBq!ia0vp^Q6S973?!M-E;|A#wg8_HS0K&Mz%cKLVhfPLSQ6wH
+z%;50sMjDWF+|$J|#NzbbDYksg20U)@9E*5D6W?5DR4!<dQ+0oF!_fV)hpctTB4?Qs
+z>ZkfnB~(oOBmCRApkw)Ldu<!bqkrD2SETM>*v=Ea;G_V<^tsE9Hn1o7T+rz|uyaFM
+z+QVaqCNpHeskZ8F_3bQr$M9fHAL9a}7u_tHvAGw-N|%&p2jm~f@^7qa&SF+R`j(yf
+zySl>k+wU8<WbI#ksY0@o$NQKD^R$cI8X<a0DiddP_@`(#eHDE0(fNs1eI!q$WTaZ8
+f@vfh>J@$<8AxC8<zpp<g3-YO_tDnm{r-UW|4DW4_
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wBrC.png b/layout/reftests/bugs/456219-1-mask-wBrC.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1e2579559b5c333e7d6c8571c85c56bf794ec03
+GIT binary patch
+literal 166
+zc%17D@N?(olHy`uVBq!ia0vp^c_7Tl3?%<d-LeBnu?6^qxB_X028MZ06kC7{#*!ev
+zU<QY0H`0I{KTj9O5R22v2@<SJ8l*VBGM}<#SXiMTV$95SmgT9DlZMy~N!}Ax326lf
+zcJM7Jc0Z^gVc9TgPSdoP36YaFGDf$xrlyyznJK$hLxS}PBSW4uX9d@rdOMJXp00i_
+I>zopr05Z8To&W#<
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wBrD.png b/layout/reftests/bugs/456219-1-mask-wBrD.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..06c51ea30930fae95c52d6be25596348d719eb75
+GIT binary patch
+literal 222
+zc%17D@N?(olHy`uVBq!ia0vp^c_7Tl3?%<d-LeBnu?6^qxB_X028MZ06kC7{#*!ev
+zU<QY0H`0KdHcuDF5R21qr)=bHFc4toZ)#u)G-gva;F>+*qD1#3rT;>OtU@9lg~^s)
+z|D@v=yqIXFATw{3Y{Hiti~@^}D&EX1JlA7-)1~b6y#!;a+sVsIH#s~ry}9;U@}9mA
+z6Zahu`zAMid-BEmUt`Uev;+leZnzSCN<V|cqHC&yx(C;Wrp*WR;vFyA&b5dW+PbvW
+Qt{&u2Pgg&ebxsLQ0BpZeF8}}l
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wBrE.png b/layout/reftests/bugs/456219-1-mask-wBrE.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..71f76c24a13302b0edb393f38775464d061e5af4
+GIT binary patch
+literal 275
+zc%17D@N?(olHy`uVBq!ia0vp^c_7Tl3?%<d-LeBnu?6^qxB_X028MZ06kC7{#*!ev
+zU<QY0H`0Kd-JULvAr_~T6C_xdF#cx#BQIccjGc$4h(pg>z}Wo2P9X&)#&fKjbspSd
+zR%l{Bmh7g~*ua})b4Eu_Mc1HN&`o+l01uad7sIL2h5#8JjkE(gZMP0EedX`^TA(M)
+z#VYLfc+<fhyeHHS<v2Y4w4jCQPGP|DOMTWBjCc3+i@o{rm_yg;<8iyFpvI*!W@}FJ
+z*a})LP|5zn(lc$(MIrmBYYwL^&U~op)V*vdvLMZK3s3j7xfhMBqXG@MI+z&Fw8$uj
+SZr+jr@|~xvpUXO@geCwQU0*c-
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wCrC.png b/layout/reftests/bugs/456219-1-mask-wCrC.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0534182ce16b3b893718d64ce71643c5f219c62
+GIT binary patch
+literal 207
+zc%17D@N?(olHy`uVBq!ia0vp^c|aV%$P6S8J-w6)q}T#{LR^6~Lj%LSCyFgV24hK(
+zUoeBivm0qZPPwOxV~EA+<b(xU6B+~f7sN1&bSW}Ac{=Q5R}kT!a+_gcgo23jl+$ca
+zokR^CHPYBbq_nt#TaTqCI~Y!CWjyNiCuYXu1$|E&3T4@Z%S8nE+0uCysTxn3q!IP$
+z*nIH|Mto7*oKBZyL<-p+UX+@?<xF3gNB}3$;#{H2bp`KpKrZui^>bP0l+XkK%2Yp&
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wCrD.png b/layout/reftests/bugs/456219-1-mask-wCrD.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..02fd2f63cdfaa9fecd1f4bf9fb0cdd30ccffa35d
+GIT binary patch
+literal 251
+zc%17D@N?(olHy`uVBq!ia0vp^c|aV%$P6S8J-w6)q}T#{LR^6~Lj%LSCyFgV24hK(
+zUoeBivm0qZ&SFm&#}JFt$q5VeCa@<xV=u^K?AXxoQG&n0!%kwlWG4%gS;s6kjp^)8
+zvJFL+3R9S;XfrGnSrEf4!llL&%5s^-lqpT6hkNS;R_*D6TBlm3p6+=hJVV1rRBAf!
+zv0R6Z{f#_&XI=)(=M~bcGqAYp<EgXZVQ-#^UR2P*`RhI`_x!@rGi}dBA^WIn4yP?L
+uZgS~fUYP2+g@^m(IU5Tj>#9HpSq6qAGl@{mUz_AXzVLMQb6Mw<&;$Ur;ZZ^W
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wCrE.png b/layout/reftests/bugs/456219-1-mask-wCrE.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..02fd2f63cdfaa9fecd1f4bf9fb0cdd30ccffa35d
+GIT binary patch
+literal 251
+zc%17D@N?(olHy`uVBq!ia0vp^c|aV%$P6S8J-w6)q}T#{LR^6~Lj%LSCyFgV24hK(
+zUoeBivm0qZ&SFm&#}JFt$q5VeCa@<xV=u^K?AXxoQG&n0!%kwlWG4%gS;s6kjp^)8
+zvJFL+3R9S;XfrGnSrEf4!llL&%5s^-lqpT6hkNS;R_*D6TBlm3p6+=hJVV1rRBAf!
+zv0R6Z{f#_&XI=)(=M~bcGqAYp<EgXZVQ-#^UR2P*`RhI`_x!@rGi}dBA^WIn4yP?L
+uZgS~fUYP2+g@^m(IU5Tj>#9HpSq6qAGl@{mUz_AXzVLMQb6Mw<&;$Ur;ZZ^W
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wDrA.png b/layout/reftests/bugs/456219-1-mask-wDrA.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..02a90a00ea683ca761f4ae0128a6e116ca2f7669
+GIT binary patch
+literal 117
+zc%17D@N?(olHy`uVBq!ia0vp^@gU5|3?#QSb#4PvYymzYu0WchfnnYg#TFogu_VYZ
+zn8D%MjWi%f*3-o?#G*GjL4tL0f=CZj7NgiB3!f7*$CyJ(7#Lh!7%tqudaD_v-_zC4
+JWt~$(69Cxc9s>XX
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wDrB.png b/layout/reftests/bugs/456219-1-mask-wDrB.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e587ddf0761d8e8ec6fcfc6a0cc8248a9408f70f
+GIT binary patch
+literal 138
+zc%17D@N?(olHy`uVBq!ia0vp^@gU5|3?#QSb#4PvYymzYu0WchfnnYg#TFogu_VYZ
+zn8D%MjWi&~$kW9!#G*GjL4tL0f(VcJ0VmCN-kFD6&Lp}$GcZ&59ALpd!IJfa3}*_T
+feAi8Ri4|-Nvjv&6QqEL)gADa_^>bP0l+XkKvv(wl
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wDrC.png b/layout/reftests/bugs/456219-1-mask-wDrC.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6da26d4bf1b2decdc1e01be36b7eabba1e89f45
+GIT binary patch
+literal 222
+zc%17D@N?(olHy`uVBq!ia0vp^@gU5|3?#QSb#4PvYymzYu0WchfnnYg#TFogu_VYZ
+zn8D%MjWi&q&C|s(#G*GjL4wsm;Xk{}wT7EL@&`nuXFO>>VQkjm!M!5O;5p-z#|+ci
+znphOl+9X#on6sWrJa|%)^)S<ezJxAI9}7#3m%W0=JQEzertv8-wH7nXe9Z7vreP*i
+zcwWPqi47YRmwj@uOc0uNYUacziFq{*YZxXqE{IZ$<WAGDU=}k7U}RtrP7`=jaU^~c
+O$f2IDelF{r5}E)=1xOwM
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wDrD.png b/layout/reftests/bugs/456219-1-mask-wDrD.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..845abad041eff8695df8ee3ddeea0e6168b12c17
+GIT binary patch
+literal 279
+zc%17D@N?(olHy`uVBq!ia0vp^@gU5|3?#QSb#4PvYymzYu0WchfnnYg#TFogu_VYZ
+zn8D%MjWi%<zo(01h{fr*lQ;4nG7xaRe>8BClF$@Q4I?Jylqo$9o-Z#-v<hly3IxQ=
+zsqtRoxKbc*P5SBb=bw%Lusi%cBFFj8VXm1{f_OVK!{WoD4SWpU3|kmNPCW4zVUUsa
+zIsD_ICSxJzv+ikKQVkOl<~TF`opgEOAEvs5De?>N%WR4hUoG(EX^!k7hCrJWOFq11
+z*}H3U<ks+vkbP&4c<mMuSyna6^`MHS`q>LBt=3A(K3P&f_h(;v?)|)ffem{%+*Xs?
+Y!x*X~Ic1uDW+%vpp00i_>zopr0FHENkN^Mx
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wDrE.png b/layout/reftests/bugs/456219-1-mask-wDrE.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8de2e61ac785ccc987f520ef78c558c5cda66ad6
+GIT binary patch
+literal 312
+zc%17D@N?(olHy`uVBq!ia0vp^@gU5|3?#QSb#4PvYymzYu0WchfnnYg#TFogu_VYZ
+zn8D%MjWi(Vfv1aOh{fr*lWm2X3<O&3JD5ezWOybX6trnP99YESby`N({iB2!U(}QK
+z>5gkPd<8#kn!UaMZ{vTa2Rn3r#@HIzNjF$FN?%ad=ief@g<&dp0)v84%XYDyyBQMZ
+zSePHYcUta!)7+@Iq$!&(W$f5<G+(Io{JsNIB9&GMZ&)oQ(RetoA@*in^CR(B{Rgye
+zs4V%#b)iRWr`~FVqrZ0eZggXH_3h3ozs0`y+4?|%)bc|!E1Gsp&hUTemb=jLjp2mp
+zH&(XxTvn+(`$?zyV5O*l+TmxP?jOF<QhN3=^Nj1o^F8aB&rVllkrIBZ1_}aCS3j3^
+HP6<r_o~eFm
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wErB.png b/layout/reftests/bugs/456219-1-mask-wErB.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..59d8a14acda6e79cc30c5eaf42f2c1b379f820b8
+GIT binary patch
+literal 144
+zc%17D@N?(olHy`uVBq!ia0vp^DL@>>$P6S)ViHdQDYgKg5LY10(7-V7iDC<o!B`UH
+z7tG-B>_!@pW8vxI7-DfcIbng(kA_2&9UgvM@Zm;4#TgA7w~#nyF7c`546V-{nD1#w
+nusVxA@V?Go@O;1hVM85;&MR#5ZFD;KgN*ic^>bP0l+XkKjt?vD
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wErC.png b/layout/reftests/bugs/456219-1-mask-wErC.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5802482bb76317bc797ffdc511471764ebc7c518
+GIT binary patch
+literal 215
+zc%17D@N?(olHy`uVBq!ia0vp^DL@>>$P6S)ViHdQDYgKg5LY10(7-V7iDC<o!B`UH
+z7tG-B>_!@pQ}5~G7-DfcIbng=1V+I#@(XO3TO<Tj8a&H1-ZRWd$!Yi?wSiO1p(22n
+zDPfZ2smTnJeFEh8x%ydsHaS-McqAG8HIP#lljHAUFJomtlm4TEJ)nYb%cI_=gZvtO
+zFPUe&<S}(k@;~Vl@rgMruJNfB^OQAZ4AJ+tFuwk0sH4omAj%~$PeSj=IgkrIUHx3v
+IIVCg!0AkNUq5uE@
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wErD.png b/layout/reftests/bugs/456219-1-mask-wErD.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f69e1eef1b5dc64a62e6ea6fd2ae45f4c193d81
+GIT binary patch
+literal 279
+zc%17D@N?(olHy`uVBq!ia0vp^DL@>>$P6S)ViHdQDYgKg5LY10(7-V7iDC<o!B`UH
+z7tG-B>_!@pv)|LjF~s8Z-N}Z0hYWaJ<8N`5uDH@CJK=?(#LX9h7EJCZE*4FZYo4fB
+zI7OfJh=Xd&^cRt3Z;ssmU}}AEN9rzScV_X1YwB5y9G!fYG6@U`epkfpW_0CP9G@+$
+z`_V%+%ra={?3OvLYCG46OD)M^cThenZQ6R?$m(}f`4jIh+pqHj1fsqxz52qu?e%SE
+zO}js@J9nPC6DquFdf1dytJ&IJCU5nW5(};3Z}&NxsZZM*(JWU`8ET$z#=ffc<H7h_
+Y!iMb<>5LzB8bLnvboFyt=akR{0PXx}asU7T
+
+diff --git a/layout/reftests/bugs/456219-1-mask-wErE.png b/layout/reftests/bugs/456219-1-mask-wErE.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..66c6861634447a2e0f51d0fde946571a5581c8ec
+GIT binary patch
+literal 288
+zc%17D@N?(olHy`uVBq!ia0vp^DL@>>$P6S)ViHdQDYgKg5LY10(7-V7iDC<o!B`UH
+z7tG-B>_!@pbHdZbF~s8Z-N}Z0%?3QK@f?eII1G(KLi;Z$KhdytJ1*0^xS*xaC$~Ld
+zvcGYelJ}Q@H~DY!f7~wYuFfrCvX`9O*nW}sMQ_@H=t&$Oczx!-*A5lq35ZT=;A==*
+zYFN$hd}>Z7vtjJ@lC@2ZF$O0lM{vn+UbIkjq2G#WlcW}UojARIht99|BtMZAx|dZ%
+z`1}fIyY2M875jFNpX>AIsoQq%>~=1D7nr{C?v;dQj;%op@*1YU_4u^;O~je+?~{IC
+iZ?2a5d33Mkv!4vI%(B<mA6&KudDYX^&t;ucLK6T!KyvZ`
+
+diff --git a/layout/reftests/bugs/456219-1-ref.html b/layout/reftests/bugs/456219-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-1-ref.html
+@@ -0,0 +1,72 @@
++<!doctype html>
++<html><head>
++<title>background-clip interaction with border-radius</title>
++<style>
++/* If you fix bug #466572, you can substantially simplify this test
++   case. */
++
++table { table-layout: fixed; width: 550px }
++td { width: 110px; height: 110px; text-align: center }
++div.o { display: inline-block; }
++div.i {
++   z-index: 0;
++   width: 70px;
++   height: 70px;
++   border-style: solid;
++   border-color: transparent;
++   background-color: green;
++}
++.rA div.i { -moz-border-radius: 10px; }
++.rB div.i { -moz-border-radius: 20px; }
++.rC div.i { -moz-border-radius: 30px; }
++.rD div.i { -moz-border-radius: 40px; }
++.rE div.i { -moz-border-radius: 50px; }
++
++.wA div.i { border-width: 10px 10px 10px 10px; }
++.wB div.i { border-width: 20px 20px 20px 20px; }
++.wC div.i { border-width: 5px 20px 5px 20px; }
++.wD div.i { border-width: 20px 20px 5px 5px; }
++.wE div.i { border-width: 5px 10px 15px 20px; }
++</style>
++</head><body>
++<table>
++<tr class="wA">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div></div></td>
++  <td class="rD"><div class="o"><div class="i"></div></div></td>
++  <td class="rE"><div class="o"><div class="i"></div></div></td>
++</tr>
++<tr class="wB">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div></div></td>
++  <td class="rD"><div class="o"><div class="i"></div></div></td>
++  <td class="rE"><div class="o"><div class="i"></div></div></td>
++</tr>
++<tr class="wC">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div></div></td>
++  <td class="rD"><div class="o"><div class="i"></div></div></td>
++  <td class="rE"><div class="o"><div class="i"></div></div></td>
++</tr>
++<tr class="wD">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div></div></td>
++  <td class="rD"><div class="o"><div class="i"></div></div></td>
++  <td class="rE"><div class="o"><div class="i"></div></div></td>
++</tr>
++<tr class="wE">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div></div></td>
++  <td class="rD"><div class="o"><div class="i"></div></div></td>
++  <td class="rE"><div class="o"><div class="i"></div></div></td>
++</tr>
++</table>
++
++<p>Inside each green shape, there should be no white.</p>
++
++</body></html>
+diff --git a/layout/reftests/bugs/456219-1a.html b/layout/reftests/bugs/456219-1a.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-1a.html
+@@ -0,0 +1,81 @@
++<!doctype html>
++<html><head>
++<title>background-clip interaction with border-radius</title>
++<style>
++/* If you fix bug #466572, you can substantially simplify this test
++   case. */
++
++table { table-layout: fixed; width: 550px }
++td { width: 110px; height: 110px; text-align: center }
++div.i {
++   z-index: 0;
++   width: 70px;
++   height: 70px;
++   border-style: solid;
++   border-color: green;
++   -moz-background-clip: padding; 
++   background-color: green;
++}
++.rA div.i { -moz-border-radius: 10px; }
++.rB div.i { -moz-border-radius: 20px; }
++.rC div.i { -moz-border-radius: 30px; }
++.rD div.i { -moz-border-radius: 40px; }
++.rE div.i { -moz-border-radius: 50px; }
++
++.wA div.i { border-width: 10px 10px 10px 10px; }
++.wB div.i { border-width: 20px 20px 20px 20px; }
++.wC div.i { border-width: 5px 20px 5px 20px; }
++.wD div.i { border-width: 20px 20px 5px 5px; }
++.wE div.i { border-width: 5px 10px 15px 20px; }
++
++div.o {
++  display: inline-block;
++  position: relative;
++}
++img {
++  position: absolute; top: 0; left: 0;
++  z-index: 1;
++}
++</style>
++</head><body>
++<table>
++<tr class="wA">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wArB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wArC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wArD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wArE.png"></div></td>
++</tr>
++<tr class="wB">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrE.png"></div></td>
++</tr>
++<tr class="wC">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrE.png"></div></td>
++</tr>
++<tr class="wD">
++  <td class="rA"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrA.png"></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrE.png"></div></td>
++</tr>
++<tr class="wE">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wErB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wErC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wErD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wErE.png"></div></td>
++</tr>
++</table>
++
++<p>Inside each green shape, there should be no white.</p>
++
++</body></html>
+diff --git a/layout/reftests/bugs/456219-1b.html b/layout/reftests/bugs/456219-1b.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-1b.html
+@@ -0,0 +1,81 @@
++<!doctype html>
++<html><head>
++<title>background-clip interaction with border-radius</title>
++<style>
++/* If you fix bug #466572, you can substantially simplify this test
++   case. */
++
++table { table-layout: fixed; width: 550px }
++td { width: 110px; height: 110px; text-align: center }
++div.i {
++   z-index: 0;
++   width: 70px;
++   height: 70px;
++   border-style: solid;
++   border-color: green;
++   -moz-background-clip: padding; 
++   background-image: url("data:image/gif;base64,R0lGODdhAQABAPAAAACAAAAAACwAAAAAAQABAAACAkQBADs=");
++}
++.rA div.i { -moz-border-radius: 10px; }
++.rB div.i { -moz-border-radius: 20px; }
++.rC div.i { -moz-border-radius: 30px; }
++.rD div.i { -moz-border-radius: 40px; }
++.rE div.i { -moz-border-radius: 50px; }
++
++.wA div.i { border-width: 10px 10px 10px 10px; }
++.wB div.i { border-width: 20px 20px 20px 20px; }
++.wC div.i { border-width: 5px 20px 5px 20px; }
++.wD div.i { border-width: 20px 20px 5px 5px; }
++.wE div.i { border-width: 5px 10px 15px 20px; }
++
++div.o {
++  display: inline-block;
++  position: relative;
++}
++img {
++  position: absolute; top: 0; left: 0;
++  z-index: 1;
++}
++</style>
++</head><body>
++<table>
++<tr class="wA">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wArB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wArC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wArD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wArE.png"></div></td>
++</tr>
++<tr class="wB">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrE.png"></div></td>
++</tr>
++<tr class="wC">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrE.png"></div></td>
++</tr>
++<tr class="wD">
++  <td class="rA"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrA.png"></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrE.png"></div></td>
++</tr>
++<tr class="wE">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wErB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wErC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wErD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wErE.png"></div></td>
++</tr>
++</table>
++
++<p>Inside each green shape, there should be no white.</p>
++
++</body></html>
+diff --git a/layout/reftests/bugs/456219-1c.html b/layout/reftests/bugs/456219-1c.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-1c.html
+@@ -0,0 +1,81 @@
++<!doctype html>
++<html><head>
++<title>background-clip interaction with border-radius</title>
++<style>
++/* If you fix bug #466572, you can substantially simplify this test
++   case. */
++
++table { table-layout: fixed; width: 550px }
++td { width: 110px; height: 110px; text-align: center }
++div.i {
++   z-index: 0;
++   width: 70px;
++   height: 70px;
++   border-style: solid;
++   border-color: green;
++   -moz-background-clip: padding; 
++   background-image: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFoAAABaAQMAAAACZtNBAAAAA1BMVEUAgACc+aWRAAAAEklEQVQYGWNgGAWjYBSMgsECAASSAAFZGYSDAAAAAElFTkSuQmCC");
++}
++.rA div.i { -moz-border-radius: 10px; }
++.rB div.i { -moz-border-radius: 20px; }
++.rC div.i { -moz-border-radius: 30px; }
++.rD div.i { -moz-border-radius: 40px; }
++.rE div.i { -moz-border-radius: 50px; }
++
++.wA div.i { border-width: 10px 10px 10px 10px; }
++.wB div.i { border-width: 20px 20px 20px 20px; }
++.wC div.i { border-width: 5px 20px 5px 20px; }
++.wD div.i { border-width: 20px 20px 5px 5px; }
++.wE div.i { border-width: 5px 10px 15px 20px; }
++
++div.o {
++  display: inline-block;
++  position: relative;
++}
++img {
++  position: absolute; top: 0; left: 0;
++  z-index: 1;
++}
++
++</style>
++</head><body>
++<table>
++<tr class="wA">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wArB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wArC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wArD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wArE.png"></div></td>
++</tr>
++<tr class="wB">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wBrE.png"></div></td>
++</tr>
++<tr class="wC">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wCrE.png"></div></td>
++</tr>
++<tr class="wD">
++  <td class="rA"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrA.png"></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wDrE.png"></div></td>
++</tr>
++<tr class="wE">
++  <td class="rA"><div class="o"><div class="i"></div></div></td>
++  <td class="rB"><div class="o"><div class="i"></div><img src="456219-1-mask-wErB.png"></div></td>
++  <td class="rC"><div class="o"><div class="i"></div><img src="456219-1-mask-wErC.png"></div></td>
++  <td class="rD"><div class="o"><div class="i"></div><img src="456219-1-mask-wErD.png"></div></td>
++  <td class="rE"><div class="o"><div class="i"></div><img src="456219-1-mask-wErE.png"></div></td>
++</tr>
++</table>
++
++<p>Inside each green shape, there should be no white.</p>
++</body></html>
+diff --git a/layout/reftests/bugs/456219-2-mask.png b/layout/reftests/bugs/456219-2-mask.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1b5a9a3ff115acdea5d4a58257d040413dadc31
+GIT binary patch
+literal 203
+zc%17D@N?(olHy`uVBq!ia0vp^nIO!<3?xsl5#R(;S^+*Gt_+F{-2eac{{Qdr|G(q^
+z|IYvaSO5QC^Z$R{|Nk5Q|KIfg|K|VyxBUOV_5c5zH1@YZU5q6`e!&b5&u*jvIsTq5
+zjv*18Zx1RmHaLi|9t@TF#KO4mpzuShpa)6{91bi>6CY-lv7Pfvo4r9G+u&rZ%oDb`
+yF^Zm(RDkFuztzs93DQ1A{Jl50?zpDa|73W~&u**DW|j&xn!(f6&t;ucLK6U(4NrRj
+
+diff --git a/layout/reftests/bugs/456219-2-ref.html b/layout/reftests/bugs/456219-2-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-2-ref.html
+@@ -0,0 +1,23 @@
++<!DOCTYPE html>
++<html>
++<head>
++<title></title>
++<style type="text/css">
++body { background: white; color: black; margin: 0 }
++div {
++  background: aqua;
++  color: black;
++  height: 75px;
++  width: 75px;
++  padding: 15px;
++  border: 20px solid;
++  -moz-border-radius: 25px;
++  border-color: transparent;
++  -moz-background-clip: padding;
++}
++</style>
++</head>
++<body>
++<div></div>
++</body>
++</html>
+diff --git a/layout/reftests/bugs/456219-2.html b/layout/reftests/bugs/456219-2.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/bugs/456219-2.html
+@@ -0,0 +1,30 @@
++<!DOCTYPE html>
++<html>
++<head>
++<title></title>
++<style type="text/css">
++/* If you fix bug #466572, you can remove the IMG
++   and related styling from this test case.  */
++body { background: white; color: black; margin: 0 }
++div {
++  background: aqua;
++  color: black;
++  height: 75px;
++  width: 75px;
++  padding: 15px;
++  border: 20px solid;
++  -moz-border-radius: 25px;
++  border-color: white;
++}
++img {
++  position: absolute;
++  top: 20px;
++  left: 20px;
++}
++</style>
++</head>
++<body>
++<div></div>
++<img src="456219-2-mask.png">
++</body>
++</html>
+diff --git a/layout/reftests/bugs/reftest.list b/layout/reftests/bugs/reftest.list
+--- a/layout/reftests/bugs/reftest.list
++++ b/layout/reftests/bugs/reftest.list
+@@ -934,17 +934,21 @@ fails == 441259-2.html 441259-2-ref.html
+ # == 449653-1.html 449653-1-ref.html # Disabled for now - it needs privileges
+ == 450670-1.html 450670-1-ref.html
+ == 451168-1.html 451168-1-ref.html
+ == 452964-1.html 452964-1-ref.html
+ == 454361.html about:blank
+ == 455105-1.html 455105-ref.html
+ == 455105-2.html 455105-ref.html
+ == 455280-1.xhtml 455280-1-ref.xhtml
+-fails-if(MOZ_WIDGET_TOOLKIT=="cocoa") == 456147.xul 456147-ref.html # bug 456147, but not caused by it
++fails-if(MOZ_WIDGET_TOOLKIT=="cocoa") == 456147.xul 456147-ref.html # bug 458047
++== 456219-1a.html 456219-1-ref.html
++== 456219-1b.html 456219-1-ref.html
++== 456219-1c.html 456219-1-ref.html
++== 456219-2.html 456219-2-ref.html
+ == 456330-1.gif 456330-1-ref.png
+ == 456484-1.html 456484-1-ref.html
+ == 458487-1a.html 458487-1-ref.html
+ == 458487-1b.html 458487-1-ref.html
+ == 458487-1c.html 458487-1-ref.html
+ == 458487-1d.html 458487-1-ref.html
+ == 458487-1e.html 458487-1-ref.html
+ == 458487-1f.html 458487-1-ref.html
