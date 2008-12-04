@@ -1,0 +1,582 @@
+Make the code to suppress infinite synthesized mouse move loops work again with asynchronous style changes.  (Bug 302561)  r+sr=bzbarsky,roc  (NEED TO FIX CHROME TEST CRASH BEFORE RELANDING)
+
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -1848,16 +1848,17 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+   , mGfxScrollFrame(nsnull)
+   , mPageSequenceFrame(nsnull)
+   , mUpdateCount(0)
+   , mQuotesDirty(PR_FALSE)
+   , mCountersDirty(PR_FALSE)
+   , mIsDestroyingFrameTree(PR_FALSE)
+   , mRebuildAllStyleData(PR_FALSE)
+   , mHasRootAbsPosContainingBlock(PR_FALSE)
++  , mHoverGeneration(0)
+ {
+   if (!gGotXBLFormPrefs) {
+     gGotXBLFormPrefs = PR_TRUE;
+ 
+     gUseXBLForms =
+       nsContentUtils::GetBoolPref("nglayout.debug.enable_xbl_forms");
+   }
+ 
+@@ -10012,16 +10013,20 @@ nsCSSFrameConstructor::DoContentStateCha
+           }
+         }
+       }
+     }
+ 
+     nsReStyleHint rshint = 
+       styleSet->HasStateDependentStyle(presContext, aContent, aStateMask);
+       
++    if ((aStateMask & NS_EVENT_STATE_HOVER) && rshint != 0) {
++      ++mHoverGeneration;
++    }
++
+     PostRestyleEvent(aContent, rshint, hint);
+   }
+ }
+ 
+ nsresult
+ nsCSSFrameConstructor::AttributeChanged(nsIContent* aContent,
+                                         PRInt32 aNameSpaceID,
+                                         nsIAtom* aAttribute,
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -150,16 +150,20 @@ public:
+                             PRInt32     aModType,
+                             PRUint32    aStateMask);
+ 
+   void BeginUpdate();
+   void EndUpdate();
+   void RecalcQuotesAndCounters();
+ 
+   void WillDestroyFrameTree();
++
++  // Get an integer that increments every time there is a style change
++  // as a result of a change to the :hover content state.
++  PRUint32 GetHoverGeneration() const { return mHoverGeneration; }
+ 
+   // Note: It's the caller's responsibility to make sure to wrap a
+   // ProcessRestyledFrames call in a view update batch.
+   // This function does not call ProcessAttachedQueue() on the binding manager.
+   // If the caller wants that to happen synchronously, it needs to handle that
+   // itself.
+   nsresult ProcessRestyledFrames(nsStyleChangeList& aRestyleArray);
+ 
+@@ -1184,16 +1188,17 @@ private:
+   nsCounterManager    mCounterManager;
+   PRUint16            mUpdateCount;
+   PRPackedBool        mQuotesDirty : 1;
+   PRPackedBool        mCountersDirty : 1;
+   PRPackedBool        mIsDestroyingFrameTree : 1;
+   PRPackedBool        mRebuildAllStyleData : 1;
+   // This is true if mDocElementContainingBlock supports absolute positioning
+   PRPackedBool        mHasRootAbsPosContainingBlock : 1;
++  PRUint32            mHoverGeneration;
+ 
+   nsRevocableEventPtr<RestyleEvent> mRestyleEvent;
+ 
+   nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
+ 
+   nsDataHashtable<nsISupportsHashKey, RestyleData> mPendingRestyles;
+ 
+   static nsIXBLService * gXBLService;
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -909,16 +909,18 @@ public:
+                          nsEventStatus*  aEventStatus);
+   NS_IMETHOD HandleDOMEventWithTarget(nsIContent* aTargetContent,
+                                       nsEvent* aEvent,
+                                       nsEventStatus* aStatus);
+   NS_IMETHOD ResizeReflow(nsIView *aView, nscoord aWidth, nscoord aHeight);
+   NS_IMETHOD_(PRBool) IsVisible();
+   NS_IMETHOD_(void) WillPaint();
+   NS_IMETHOD_(void) InvalidateFrameForView(nsIView *view);
++  NS_IMETHOD_(void) DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                           PRBool aFlushOnHoverChange);
+ 
+   // caret handling
+   NS_IMETHOD GetCaret(nsCaret **aOutCaret);
+   NS_IMETHOD_(void) MaybeInvalidateCaretPosition();
+   NS_IMETHOD SetCaretEnabled(PRBool aInEnable);
+   NS_IMETHOD SetCaretReadOnly(PRBool aReadOnly);
+   NS_IMETHOD GetCaretEnabled(PRBool *aOutEnabled);
+   NS_IMETHOD SetCaretVisibilityDuringSelection(PRBool aVisibility);
+@@ -4168,16 +4170,31 @@ PresShell::GetSelectionForCopy(nsISelect
+ 
+ /* Just hook this call into InvalidateOverflowRect */
+ void
+ PresShell::InvalidateFrameForView(nsIView *aView)
+ {
+   nsIFrame* frame = nsLayoutUtils::GetFrameFor(aView);
+   if (frame)
+     frame->InvalidateOverflowRect();
++}
++
++NS_IMETHODIMP_(void)
++PresShell::DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                  PRBool aFlushOnHoverChange)
++{
++  PRUint32 hoverGenerationBefore = mFrameConstructor->GetHoverGeneration();
++  nsEventStatus status;
++  mViewManager->DispatchEvent(aEvent, &status);
++  if (aFlushOnHoverChange &&
++      hoverGenerationBefore != mFrameConstructor->GetHoverGeneration()) {
++    // Flush so that the resulting reflow happens now so that our caller
++    // can suppress any synthesized mouse moves caused by that reflow.
++    FlushPendingNotifications(Flush_Layout);
++  }
+ }
+ 
+ NS_IMETHODIMP
+ PresShell::DoGetContents(const nsACString& aMimeType, PRUint32 aFlags, PRBool aSelectionOnly, nsAString& aOutValue)
+ {
+   aOutValue.Truncate();
+   
+   if (!mDocument) return NS_ERROR_FAILURE;
+diff --git a/layout/style/test/Makefile.in b/layout/style/test/Makefile.in
+--- a/layout/style/test/Makefile.in
++++ b/layout/style/test/Makefile.in
+@@ -98,16 +98,17 @@ _TEST_FILES =	test_acid3_test46.html \
+ 		test_bug437915.html \
+ 		test_bug450191.html \
+ 		test_bug453896_deck.html \
+ 		test_cascade.html \
+ 		test_compute_data_with_start_struct.html \
+ 		test_css_eof_handling.html \
+ 		test_dont_use_document_colors.html \
+ 		test_font_face_parser.html \
++		test_hover.html \
+ 		test_inherit_computation.html \
+ 		test_inherit_storage.html \
+ 		test_initial_computation.html \
+ 		test_initial_storage.html \
+ 		test_media_queries.html \
+ 		test_media_queries_dynamic_xbl.html \
+ 		test_namespace_rule.html \
+ 		test_of_type_selectors.xhtml \
+diff --git a/layout/style/test/test_hover.html b/layout/style/test/test_hover.html
+new file mode 100644
+--- /dev/null
++++ b/layout/style/test/test_hover.html
+@@ -0,0 +1,273 @@
++<!DOCTYPE HTML>
++<html>
++<head>
++  <title>Test for :hover</title>
++  <script type="application/javascript" src="/MochiKit/MochiKit.js"></script>
++  <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
++  <script type="application/javascript" src="/tests/SimpleTest/EventUtils.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
++  <style type="text/css">
++
++  div#one { height: 10px; width: 10px; }
++  div#one:hover { background: #00f; }
++  div#one > div { height: 5px; width: 20px; }
++  div#one > div:hover { background: #f00; }
++
++  div#twoparent { overflow: hidden; height: 20px; }
++  div#two { width: 10px; height: 10px; }
++  div#two:hover { margin-left: 5px; background: #0f0; }
++  div#two + iframe { width: 50px; height: 10px; }
++  div#two:hover + iframe { width: 100px; }
++
++  </style>
++</head>
++<!-- need a set timeout because we need things to start after painting suppression ends -->
++<body onload="setTimeout(step1, 0)">
++<a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=">Mozilla Bug </a>
++<div id="display" style="position: absolute; top: 0; left: 0; width: 300px; height: 300px">
++
++  <div id="one"><div></div></div>
++
++  <div id="twoparent">
++    <div id="two"></div>
++    <iframe id="twoi" src="about:blank"></iframe>
++    <div style="width: 5000px; height: 10px;"></div>
++  </div>
++
++</div>
++<pre id="test">
++<script type="application/javascript">
++
++SimpleTest.waitForExplicitFinish();
++var div = document.getElementById("display");
++var divtwo = document.getElementById("two");
++var iframe = document.getElementById("twoi");
++var divtwoparent = document.getElementById("twoparent");
++
++iframe.contentDocument.open();
++iframe.contentDocument.write("<style type='text/css'>html, body { margin: 0; padding: 0; }<\/style><body>");
++iframe.contentDocument.close();
++
++var moveEvent = { type: "mousemove", clickCount: "0" };
++
++function step1() {
++    /** test basic hover **/
++    var divone = document.getElementById("one");
++    synthesizeMouse(divone, 5, 7, moveEvent, window);
++    is(getComputedStyle(divone, "").backgroundColor, "rgb(0, 0, 255)",
++       ":hover applies");
++    is(getComputedStyle(divone.firstChild, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    synthesizeMouse(divone, 5, 2, moveEvent, window);
++    is(getComputedStyle(divone, "").backgroundColor, "rgb(0, 0, 255)",
++       ":hover applies hierarchically");
++    is(getComputedStyle(divone.firstChild, "").backgroundColor, "rgb(255, 0, 0)",
++       ":hover applies");
++    synthesizeMouse(divone, 15, 7, moveEvent, window);
++    is(getComputedStyle(divone, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    is(getComputedStyle(divone.firstChild, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    synthesizeMouse(divone, 15, 2, moveEvent, window);
++    is(getComputedStyle(divone, "").backgroundColor, "rgb(0, 0, 255)",
++       ":hover applies hierarchically");
++    is(getComputedStyle(divone.firstChild, "").backgroundColor, "rgb(255, 0, 0)",
++       ":hover applies");
++
++    /** Test for Bug 302561 **/
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step2()");
++    is(iframe.contentDocument.body.offsetWidth, 50,
++       ":hover does not apply (iframe body width)");
++    synthesizeMouse(divtwoparent, 7, 5, moveEvent, window);
++    is(iframe.contentDocument.body.offsetWidth, 100,
++       ":hover applies (iframe body width)");
++}
++
++var step2called = false;
++function step2() {
++    is(step2called, false, "step2 called only once");
++    step2called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    is(iframe.contentDocument.body.offsetWidth, 100,
++       ":hover applies (iframe body width)");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step3()");
++    synthesizeMouse(divtwoparent, 2, 5, moveEvent, window);
++    is(iframe.contentDocument.body.offsetWidth, 50,
++       ":hover does not apply (iframe body width)");
++}
++
++var step3called = false;
++function step3() {
++    is(step3called, false, "step3 called only once");
++    step3called = true;
++    if (getComputedStyle(iframe, "").width == "100px") {
++        // The two resize events may be coalesced into a single one.
++        step4();
++        return;
++    }
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step4()");
++    /* expect to get a second resize from the oscillation */
++}
++
++var step4called = false;
++function step4() {
++    is(step4called, false, "step4 called only once (more than two cycles of oscillation)");
++    if (step4called)
++        return;
++    step4called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    setTimeout(step5, 500); // time to detect oscillations if they exist
++}
++
++var step5called = false;
++function step5() {
++    is(step5called, false, "step5 called only once");
++    step5called = true;
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step6()");
++    synthesizeMouse(divtwoparent, 25, 5, moveEvent, window);
++}
++
++var step6called = false;
++function step6() {
++    is(step6called, false, "step6 called only once");
++    step6called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step7()");
++    synthesizeMouse(divtwoparent, 2, 5, moveEvent, window);
++}
++
++var step7called = false;
++function step7() {
++    is(step7called, false, "step7 called only once");
++    step7called = true;
++    if (getComputedStyle(iframe, "").width == "50px") {
++        // The two resize events may be coalesced into a single one.
++        step8();
++        return;
++    }
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step8()");
++    /* expect to get a second resize from the oscillation */
++}
++
++var step8called = false;
++function step8() {
++    is(step8called, false, "step8 called only once (more than two cycles of oscillation)");
++    if (step8called)
++        return;
++    step8called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    setTimeout(step9, 500); // time to detect oscillations if they exist
++}
++
++/* test the same case with scrolltop */
++
++var step9called = false;
++function step9() {
++    is(step9called, false, "step9 called only once");
++    step9called = true;
++    iframe.contentDocument.body.removeAttribute("onresize");
++    /* move the mouse out of the way */
++    synthesizeMouse(divtwoparent, 200, 5, moveEvent, window);
++    divtwoparent.scrollLeft = 5;
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step10()");
++    synthesizeMouse(divtwoparent, 2, 5, moveEvent, window);
++    /* mouse now over 7, 5 */
++}
++
++var step10called = false;
++function step10() {
++    is(step10called, false, "step10 called only once");
++    step10called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step11()");
++    divtwoparent.scrollLeft = 0; /* mouse now over 2,5 */
++}
++
++var step11called = false;
++function step11() {
++    is(step11called, false, "step11 called only once");
++    step11called = true;
++    if (getComputedStyle(iframe, "").width == "100px") {
++        // The two resize events may be coalesced into a single one.
++        step12();
++        return;
++    }
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step12()");
++    /* expect to get a second resize from the oscillation */
++}
++
++var step12called = false;
++function step12() {
++    is(step12called, false, "step12 called only once (more than two cycles of oscillation)");
++    if (step12called)
++        return;
++    step12called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    setTimeout(step13, 500); // time to detect oscillations if they exist
++}
++
++var step13called = false;
++function step13() {
++    is(step13called, false, "step13 called only once");
++    step13called = true;
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step14()");
++    divtwoparent.scrollLeft = 25; /* mouse now over 27,5 */
++}
++
++var step14called = false;
++function step14() {
++    is(step14called, false, "step14 called only once");
++    step14called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step15()");
++    divtwoparent.scrollLeft = 0; /* mouse now over 2,5 */
++}
++
++var step15called = false;
++function step15() {
++    is(step15called, false, "step15 called only once");
++    step15called = true;
++    if (getComputedStyle(iframe, "").width == "50px") {
++        // The two resize events may be coalesced into a single one.
++        step16();
++        return;
++    }
++    is(getComputedStyle(divtwo, "").backgroundColor, "rgb(0, 255, 0)",
++       ":hover applies");
++    iframe.contentDocument.body.setAttribute("onresize", "parent.step16()");
++    /* expect to get a second resize from the oscillation */
++}
++
++var step16called = false;
++function step16() {
++    is(step16called, false, "step16 called only once (more than two cycles of oscillation)");
++    if (step16called)
++        return;
++    step16called = true;
++    is(getComputedStyle(divtwo, "").backgroundColor, "transparent",
++       ":hover does not apply");
++    setTimeout(finish, 500); // time to detect oscillations if they exist
++}
++
++function finish() {
++    document.getElementById("display").style.display = "none";
++    SimpleTest.finish();
++}
++
++</script>
++</pre>
++</body>
++</html>
+diff --git a/view/public/nsIViewObserver.h b/view/public/nsIViewObserver.h
+--- a/view/public/nsIViewObserver.h
++++ b/view/public/nsIViewObserver.h
+@@ -41,19 +41,20 @@
+ #include "nsISupports.h"
+ #include "nsEvent.h"
+ #include "nsColor.h"
+ #include "nsRect.h"
+ 
+ class nsIRenderingContext;
+ class nsGUIEvent;
+ 
++// cb03e6e3-9d14-4018-85f8-7d46af878c98
+ #define NS_IVIEWOBSERVER_IID   \
+-{ 0x63ae23ee, 0xe251, 0x4005, \
+-{ 0xaf, 0xe4, 0x5b, 0x0f, 0xa1, 0x5a, 0xb4, 0x99 } }
++{ 0xcb03e6e3, 0x9d14, 0x4018, \
++  { 0x85, 0xf8, 0x7d, 0x46, 0xaf, 0x87, 0x8c, 0x98 } }
+ 
+ class nsIViewObserver : public nsISupports
+ {
+ public:
+   
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_IVIEWOBSERVER_IID)
+ 
+   /* called when the observer needs to paint. This paints the entire
+@@ -115,13 +116,21 @@ public:
+    */
+   NS_IMETHOD_(void) WillPaint() = 0;
+ 
+   /**
+    * Notify the observer that it should invalidate the frame bounds for
+    * the frame associated with this view.
+    */
+   NS_IMETHOD_(void) InvalidateFrameForView(nsIView *aView) = 0;
++
++  /**
++   * Dispatch the given synthesized mouse move event, and if
++   * aFlushOnHoverChange is true, flush layout if :hover changes cause
++   * any restyles.
++   */
++  NS_IMETHOD_(void) DispatchSynthMouseMove(nsGUIEvent *aEvent,
++                                           PRBool aFlushOnHoverChange) = 0;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsIViewObserver, NS_IVIEWOBSERVER_IID)
+ 
+ #endif
+diff --git a/view/src/nsViewManager.cpp b/view/src/nsViewManager.cpp
+--- a/view/src/nsViewManager.cpp
++++ b/view/src/nsViewManager.cpp
+@@ -2307,26 +2307,54 @@ nsViewManager::SynthesizeMouseMove(PRBoo
+  * given that floating views don't supporting having a specific z-index.
+  * 
+  * We cannot exit early when aPt is outside the view bounds, because floating
+  * views aren't necessarily included in their parent's bounds, so this could
+  * traverse the entire view hierarchy --- use carefully.
+  */
+ static nsView* FindFloatingViewContaining(nsView* aView, nsPoint aPt)
+ {
++  if (aView->GetVisibility() == nsViewVisibility_kHide)
++    // No need to look into descendants.
++    return nsnull;
++
+   for (nsView* v = aView->GetFirstChild(); v; v = v->GetNextSibling()) {
+     nsView* r = FindFloatingViewContaining(v, aPt - v->GetOffsetTo(aView));
+     if (r)
+       return r;
+   }
+ 
+   if (aView->GetFloating() && aView->HasWidget() &&
+-      aView->GetDimensions().Contains(aPt) && IsViewVisible(aView))
++      aView->GetDimensions().Contains(aPt))
+     return aView;
+     
++  return nsnull;
++}
++
++/*
++ * This finds the first view containing the given point in a postorder
++ * traversal of the view tree that contains the point, assuming that the
++ * point is not in a floating view.  It assumes that only floating views
++ * extend outside the bounds of their parents.
++ *
++ * This methods should only be called if FindFloatingViewContaining
++ * returns null.
++ */
++static nsView* FindViewContaining(nsView* aView, nsPoint aPt)
++{
++  for (nsView* v = aView->GetFirstChild(); v; v = v->GetNextSibling()) {
++    if (aView->GetDimensions().Contains(aPt) &&
++        aView->GetVisibility() != nsViewVisibility_kHide) {
++      nsView* r = FindViewContaining(v, aPt - v->GetOffsetTo(aView));
++      if (r)
++        return r;
++      return v;
++    }
++  }
++
+   return nsnull;
+ }
+ 
+ void
+ nsViewManager::ProcessSynthMouseMoveEvent(PRBool aFromScroll)
+ {
+   // allow new event to be posted while handling this one only if the
+   // source of the event is a scroll (to prevent infinite reflow loops)
+@@ -2352,31 +2380,33 @@ nsViewManager::ProcessSynthMouseMoveEven
+   nsPoint pt = mMouseLocation;
+   PRInt32 p2a = mContext->AppUnitsPerDevPixel();
+   pt.x = NSIntPixelsToAppUnits(mMouseLocation.x, p2a);
+   pt.y = NSIntPixelsToAppUnits(mMouseLocation.y, p2a);
+   // This could be a bit slow (traverses entire view hierarchy)
+   // but it's OK to do it once per synthetic mouse event
+   nsView* view = FindFloatingViewContaining(mRootView, pt);
+   nsPoint offset(0, 0);
++  nsViewManager *pointVM;
+   if (!view) {
+     view = mRootView;
++    pointVM = FindViewContaining(mRootView, pt)->GetViewManager();
+   } else {
+     offset = view->GetOffsetTo(mRootView);
+     offset.x = NSAppUnitsToIntPixels(offset.x, p2a);
+     offset.y = NSAppUnitsToIntPixels(offset.y, p2a);
++    pointVM = view->GetViewManager();
+   }
+   nsMouseEvent event(PR_TRUE, NS_MOUSE_MOVE, view->GetWidget(),
+                      nsMouseEvent::eSynthesized);
+   event.refPoint = mMouseLocation - offset;
+   event.time = PR_IntervalNow();
+   // XXX set event.isShift, event.isControl, event.isAlt, event.isMeta ?
+ 
+-  nsEventStatus status;
+-  view->GetViewManager()->DispatchEvent(&event, &status);
++  pointVM->GetViewObserver()->DispatchSynthMouseMove(&event, !aFromScroll);
+ 
+   if (!aFromScroll)
+     mSynthMouseMoveEvent.Forget();
+ }
+ 
+ void
+ nsViewManager::InvalidateHierarchy()
+ {
