@@ -1514,7 +1514,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
  
        default:
          NS_NOTREACHED("unknown type");
-@@ -1544,16 +1558,73 @@ nsRuleNode::GetSVGResetData(nsStyleConte
+@@ -1544,16 +1558,74 @@ nsRuleNode::GetSVGResetData(nsStyleConte
    nsRuleDataSVG svgData; // Declare a struct with null CSS values.
    nsRuleData ruleData(NS_STYLE_INHERIT_BIT(SVGReset), mPresContext, aContext);
    ruleData.mSVGData = &svgData;
@@ -1529,6 +1529,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 +inline PRUint32
 +GetPseudoRestriction(nsStyleContext *aContext)
 +{
++  // This needs to match nsStyleSet::WalkRestrictionRule.
 +  PRUint32 pseudoRestriction = 0;
 +  nsIAtom *pseudoType = aContext->GetPseudoType();
 +  if (pseudoType) {
@@ -1588,7 +1589,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
  {
    // We start at the most specific rule in the tree.  
    void* startStruct = nsnull;
-@@ -1619,16 +1690,36 @@ nsRuleNode::WalkRuleTree(const nsStyleSt
+@@ -1619,16 +1691,28 @@ nsRuleNode::WalkRuleTree(const nsStyleSt
          detail == eRuleFullMixed ||
          detail == eRuleFullInherited)
        break; // We don't need to examine any more rules.  All properties
@@ -1606,17 +1607,9 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 +  if (pseudoRestriction) {
 +    UnsetPropertiesWithoutFlags(aSID, *aSpecificData, pseudoRestriction);
 +
-+    if (detail != CheckSpecifiedProperties(aSID, *aSpecificData)) {
-+      // Only change |detail| in conservative ways.  Otherwise we risk
-+      // setting bits that can't really be set all the way up the rule
-+      // tree.
-+      if (detail == eRuleFullMixed)
-+        detail = eRulePartialMixed;
-+      else if (detail == eRuleFullInherited)
-+        detail = eRulePartialInherited;
-+      else if (detail == eRuleFullReset)
-+        detail = eRulePartialReset;
-+    }
++    // We can adjust |detail| arbitrarily because of the restriction
++    // rule added in nsStyleSet::WalkRestrictionRule.
++    detail = CheckSpecifiedProperties(aSID, *aSpecificData);
    }
  
    NS_ASSERTION(!startStruct || (detail != eRuleFullReset &&
@@ -1625,3 +1618,207 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
                 "can't have start struct and be fully specified");
  
    PRBool isReset = nsCachedStyleData::IsReset(aSID);
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -53,16 +53,32 @@
+ #include "nsICSSStyleRule.h"
+ #include "nsCSSAnonBoxes.h"
+ #include "nsCSSPseudoElements.h"
+ #include "nsCSSRuleProcessor.h"
+ #include "nsIContent.h"
+ #include "nsIFrame.h"
+ #include "nsContentUtils.h"
+ 
++NS_IMPL_ISUPPORTS1(nsEmptyStyleRule, nsIStyleRule)
++
++NS_IMETHODIMP
++nsEmptyStyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
++{
++  return NS_OK;
++}
++
++#ifdef DEBUG
++NS_IMETHODIMP
++nsEmptyStyleRule::List(FILE* out, PRInt32 aIndent) const
++{
++  return NS_OK;
++}
++#endif
++
+ static const nsStyleSet::sheetType gCSSSheetTypes[] = {
+   nsStyleSet::eAgentSheet,
+   nsStyleSet::eUserSheet,
+   nsStyleSet::eDocSheet,
+   nsStyleSet::eOverrideSheet
+ };
+ 
+ nsStyleSet::nsStyleSet()
+@@ -75,16 +91,22 @@ nsStyleSet::nsStyleSet()
+     mAuthorStyleDisabled(PR_FALSE),
+     mDirty(0)
+ {
+ }
+ 
+ nsresult
+ nsStyleSet::Init(nsPresContext *aPresContext)
+ {
++  mFirstLineRule = new nsEmptyStyleRule;
++  mFirstLetterRule = new nsEmptyStyleRule;
++  if (!mFirstLineRule || !mFirstLetterRule) {
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
++
+   if (!BuildDefaultStyleData(aPresContext)) {
+     mDefaultStyleData.Destroy(0, aPresContext);
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
+   mRuleTree = nsRuleNode::CreateRootNode(aPresContext);
+   if (!mRuleTree) {
+     mDefaultStyleData.Destroy(0, aPresContext);
+@@ -684,16 +706,27 @@ nsStyleSet::ResolveStyleForNonElement(ns
+     result = GetContext(presContext, aParentContext,
+                         nsCSSAnonBoxes::mozNonElement).get();
+     NS_ASSERTION(mRuleWalker->AtRoot(), "rule walker must be at root");
+   }
+ 
+   return result;
+ }
+ 
++void
++nsStyleSet::WalkRestrictionRule(nsIAtom* aPseudoType)
++{
++  // This needs to match GetPseudoRestriction in nsRuleNode.cpp.
++  if (aPseudoType) {
++    if (aPseudoType == nsCSSPseudoElements::firstLetter)
++      mRuleWalker->Forward(mFirstLetterRule);
++    else if (aPseudoType == nsCSSPseudoElements::firstLine)
++      mRuleWalker->Forward(mFirstLineRule);
++  }
++}
+ 
+ static PRBool
+ EnumPseudoRulesMatching(nsIStyleRuleProcessor* aProcessor, void* aData)
+ {
+   PseudoRuleProcessorData* data =
+     static_cast<PseudoRuleProcessorData*>(aData);
+ 
+   aProcessor->RulesMatching(data);
+@@ -720,16 +753,17 @@ nsStyleSet::ResolvePseudoStyleFor(nsICon
+                "null content must correspond to anonymous box");
+   NS_ASSERTION(nsCSSAnonBoxes::IsAnonBox(aPseudoTag) ||
+                nsCSSPseudoElements::IsPseudoElement(aPseudoTag),
+                "aPseudoTag must be pseudo-element or anonymous box");
+ 
+   if (aPseudoTag && presContext) {
+     PseudoRuleProcessorData data(presContext, aParentContent, aPseudoTag,
+                                  aComparator, mRuleWalker);
++    WalkRestrictionRule(aPseudoTag);
+     FileRules(EnumPseudoRulesMatching, &data);
+ 
+     result = GetContext(presContext, aParentContext, aPseudoTag).get();
+ 
+     // Now reset the walker back to the root of the tree.
+     mRuleWalker->Reset();
+   }
+ 
+@@ -757,19 +791,22 @@ nsStyleSet::ProbePseudoStyleFor(nsIConte
+                "null content must correspond to anonymous box");
+   NS_ASSERTION(nsCSSAnonBoxes::IsAnonBox(aPseudoTag) ||
+                nsCSSPseudoElements::IsPseudoElement(aPseudoTag),
+                "aPseudoTag must be pseudo-element or anonymous box");
+ 
+   if (aPseudoTag && presContext) {
+     PseudoRuleProcessorData data(presContext, aParentContent, aPseudoTag,
+                                  nsnull, mRuleWalker);
++    WalkRestrictionRule(aPseudoTag);
++    // not the root if there was a restriction rule
++    nsRuleNode *adjustedRoot = mRuleWalker->GetCurrentNode();
+     FileRules(EnumPseudoRulesMatching, &data);
+ 
+-    if (!mRuleWalker->AtRoot())
++    if (mRuleWalker->GetCurrentNode() != adjustedRoot)
+       result = GetContext(presContext, aParentContext, aPseudoTag).get();
+ 
+     // Now reset the walker back to the root of the tree.
+     mRuleWalker->Reset();
+   }
+ 
+   // For :before and :after pseudo-elements, having display: none or no
+   // 'content' property is equivalent to not having the pseudo-element
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -49,19 +49,29 @@
+ 
+ #include "nsIStyleRuleProcessor.h"
+ #include "nsICSSStyleSheet.h"
+ #include "nsBindingManager.h"
+ #include "nsRuleNode.h"
+ #include "nsTArray.h"
+ #include "nsCOMArray.h"
+ #include "nsAutoPtr.h"
++#include "nsIStyleRule.h"
+ 
+ class nsIURI;
+ class nsCSSFontFaceRule;
++
++class nsEmptyStyleRule : public nsIStyleRule
++{
++  NS_DECL_ISUPPORTS
++  NS_IMETHOD MapRuleInfoInto(nsRuleData* aRuleData);
++#ifdef DEBUG
++  NS_IMETHOD List(FILE* out = stdout, PRInt32 aIndent = 0) const;
++#endif
++};
+ 
+ // The style set object is created by the document viewer and ownership is
+ // then handed off to the PresShell.  Only the PresShell should delete a
+ // style set.
+ 
+ class nsStyleSet
+ {
+  public:
+@@ -227,16 +237,20 @@ class nsStyleSet
+   PRBool BuildDefaultStyleData(nsPresContext* aPresContext);
+ 
+   // Update the rule processor list after a change to the style sheet list.
+   nsresult GatherRuleProcessors(sheetType aType);
+ 
+   void AddImportantRules(nsRuleNode* aCurrLevelNode,
+                          nsRuleNode* aLastPrevLevelNode);
+ 
++  // Move mRuleWalker forward by the appropriate rule if we need to add
++  // a rule due to property restrictions on pseudo-elements.
++  void WalkRestrictionRule(nsIAtom* aPseudoType);
++
+ #ifdef DEBUG
+   // Just like AddImportantRules except it doesn't actually add anything; it
+   // just asserts that there are no important rules between aCurrLevelNode and
+   // aLastPrevLevelNode.
+   void AssertNoImportantRules(nsRuleNode* aCurrLevelNode,
+                               nsRuleNode* aLastPrevLevelNode);
+   
+   // Just like AddImportantRules except it doesn't actually add anything; it
+@@ -282,16 +296,20 @@ class nsStyleSet
+                          // lexicographic tree of matched rules that style
+                          // contexts use to look up properties.
+   nsRuleWalker* mRuleWalker; // This is an instance of a rule walker that can
+                              // be used to navigate through our tree.
+ 
+   PRInt32 mDestroyedCount; // used to batch style context GC
+   nsTArray<nsStyleContext*> mRoots; // style contexts with no parent
+ 
++  // Empty style rules to force things that restrict which properties
++  // apply into different branches of the rule tree.
++  nsRefPtr<nsEmptyStyleRule> mFirstLineRule, mFirstLetterRule;
++
+   PRUint16 mBatching;
+ 
+   nsRuleNode* mOldRuleTree; // Old rule tree; used during tree reconstruction
+                             // (See BeginReconstruct and EndReconstruct)
+ 
+   unsigned mInShutdown : 1;
+   unsigned mAuthorStyleDisabled: 1;
+   unsigned mDirty : 7;  // one dirty bit is used per sheet type
