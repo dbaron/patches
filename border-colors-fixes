@@ -1,0 +1,386 @@
+Fix bugs in handling of inherit, initial, and none for -moz-border-*-colors.  (Bug 389404)
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -6585,47 +6585,45 @@ CSSParserImpl::ParseBorderWidth()
+   return ParseBoxProperties(mTempData.mMargin.mBorderWidth,
+                             kBorderWidthIDs);
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseBorderColors(nsCSSValueList** aResult,
+                                  nsCSSProperty aProperty)
+ {
+-  nsCSSValue value;
+-  if (ParseVariant(value, VARIANT_HCK|VARIANT_NONE, nsCSSProps::kBorderColorKTable)) {
+-    nsCSSValueList* listHead = new nsCSSValueList();
+-    nsCSSValueList* list = listHead;
+-    if (!list) {
+-      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+-      return PR_FALSE;
+-    }
+-    list->mValue = value;
+-
+-    while (list) {
+-      if (ExpectEndProperty()) {
+-        mTempData.SetPropertyBit(aProperty);
+-        *aResult = listHead;
+-        return PR_TRUE;
+-      }
+-      // FIXME Bug 389404: We should not accept inherit, -moz-initial,
+-      // or none as anything other than the first value.
+-      if (ParseVariant(value, VARIANT_HCK|VARIANT_NONE, nsCSSProps::kBorderColorKTable)) {
+-        list->mNext = new nsCSSValueList();
+-        list = list->mNext;
+-        if (list)
+-          list->mValue = value;
+-        else
+-          mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+-      }
+-      else
+-        break;
+-    }
+-    delete listHead;
+-  }
++  nsCSSValueList *list = nsnull;
++  for (nsCSSValueList **curp = &list, *cur; ; curp = &cur->mNext) {
++    cur = *curp = new nsCSSValueList();
++    if (!cur) {
++      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      break;
++    }
++    if (!ParseVariant(cur->mValue,
++                      (cur == list)
++                        ? (VARIANT_HCK | VARIANT_NONE)
++                        : (VARIANT_COLOR | VARIANT_KEYWORD),
++                      nsCSSProps::kBorderColorKTable)) {
++      break;
++    }
++    if (ExpectEndProperty()) {
++      // Only success case here, since having the failure case at the
++      // end allows more sharing of code.
++      mTempData.SetPropertyBit(aProperty);
++      *aResult = list;
++      return PR_TRUE;
++    }
++    if (cur->mValue.GetUnit() != eCSSUnit_Color &&
++        cur->mValue.GetUnit() != eCSSUnit_Keyword) {
++      // 'inherit', 'initial', and 'none' are only allowed on their own
++      break;
++    }
++  }
++  // Have failure case at the end so we can |break| to get to it.
++  delete list;
+   return PR_FALSE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseRect(nsCSSRect& aRect, nsCSSProperty aPropID)
+ {
+   nsCSSRect rect;
+   PRBool result;
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -4119,35 +4119,56 @@ nsRuleNode::ComputeBorderData(void* aSta
+       }
+       else if (eCSSUnit_Inherit == unit) {
+         inherited = PR_TRUE;
+         border->SetBorderStyle(side, parentBorder->GetBorderStyle(side));
+       }
+     }
+   }
+ 
+-  // -moz-border-*-colors: color, string, enum
++  // -moz-border-*-colors: color, string, enum, none, inherit/initial
+   nscolor borderColor;
+   nscolor unused = NS_RGB(0,0,0);
+   
+   { // scope for compilers with broken |for| loop scoping
+     NS_FOR_CSS_SIDES(side) {
+       nsCSSValueList* list =
+           marginData.mBorderColors.*(nsCSSValueListRect::sides[side]);
+-      // FIXME Bug 389404: Implement inherit and -moz-initial.
+       if (list) {
+-        // Some composite border color information has been specified for this
+-        // border side.
+-        border->EnsureBorderColors();
+-        border->ClearBorderColors(side);
+-        while (list) {
+-          if (SetColor(list->mValue, unused, mPresContext,
+-                       aContext, borderColor, inherited))
+-            border->AppendBorderColor(side, borderColor);
+-          list = list->mNext;
++        if (eCSSUnit_Initial == list->mValue.GetUnit() ||
++            eCSSUnit_None == list->mValue.GetUnit()) {
++          NS_ASSERTION(!list->mNext, "should have only one item");
++          border->ClearBorderColors(side);
++        }
++        else if (eCSSUnit_Inherit == list->mValue.GetUnit()) {
++          NS_ASSERTION(!list->mNext, "should have only one item");
++          nsBorderColors *parentColors;
++          parentBorder->GetCompositeColors(side, &parentColors);
++          if (parentColors) {
++            border->EnsureBorderColors(side);
++            border->ClearBorderColors(side);
++            mBorderColors[side] = parentColors->Clone();
++          } else {
++            border->ClearBorderColors(side);
++          }
++        }
++        else {
++          // Some composite border color information has been specified for this
++          // border side.
++          border->EnsureBorderColors();
++          border->ClearBorderColors(side);
++          while (list) {
++            if (SetColor(list->mValue, unused, mPresContext,
++                         aContext, borderColor, inherited))
++              border->AppendBorderColor(side, borderColor);
++            else {
++              NS_NOTREACHED("unexpected item in -moz-border-*-colors list");
++            }
++            list = list->mNext;
++          }
+         }
+       }
+     }
+   }
+ 
+   // border-color, border-*-color: color, string, enum, inherit
+   nsCSSRect ourBorderColor(marginData.mBorderColor);
+   PRBool foreground;
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -495,17 +495,17 @@ struct nsStyleBorder {
+       mBorderColors = new nsBorderColors*[4];
+       if (mBorderColors)
+         for (PRInt32 i = 0; i < 4; i++)
+           mBorderColors[i] = nsnull;
+     }
+   }
+ 
+   void ClearBorderColors(PRUint8 aSide) {
+-    if (mBorderColors[aSide]) {
++    if (mBorderColors && mBorderColors[aSide]) {
+       delete mBorderColors[aSide];
+       mBorderColors[aSide] = nsnull;
+     }
+   }
+ 
+   // Return whether aStyle is a visible style.  Invisible styles cause
+   // the relevant computed border width to be 0.
+   // Note that this does *not* consider the effects of 'border-image':
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -109,17 +109,17 @@ var gCSSProperties = {
+ 		invalid_values: []
+ 	},
+ 	"-moz-border-bottom-colors": {
+ 		domProp: "MozBorderBottomColors",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "red green", "red #fc3", "#ff00cc", "currentColor", "blue currentColor orange currentColor" ],
+-		invalid_values: [ "red none", "red inherit", "red, green" ]
++		invalid_values: [ "red none", "red inherit", "red, green", "none red", "inherit red" ]
+ 	},
+ 	"-moz-border-end": {
+ 		domProp: "MozBorderEnd",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "-moz-border-end-color", "-moz-border-end-style", "-moz-border-end-width" ],
+ 		initial_values: [ "none", "medium", "currentColor", "none medium currentcolor" ],
+ 		other_values: [ "solid", "thin", "green", "medium solid", "green solid", "10px solid", "thick solid", "5px green none" ],
+@@ -172,17 +172,17 @@ var gCSSProperties = {
+ 		                  "url('border.png') 27 27 27 27 /" ]
+ 	},
+ 	"-moz-border-left-colors": {
+ 		domProp: "MozBorderLeftColors",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "red green", "red #fc3", "#ff00cc", "currentColor", "blue currentColor orange currentColor" ],
+-		invalid_values: [ "red none", "red inherit", "red, green" ]
++		invalid_values: [ "red none", "red inherit", "red, green", "none red", "inherit red" ]
+ 	},
+ 	"-moz-border-radius": {
+ 		domProp: "MozBorderRadius",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "-moz-border-radius-bottomleft", "-moz-border-radius-bottomright", "-moz-border-radius-topleft", "-moz-border-radius-topright" ],
+ 		initial_values: [ "0", "0px", "0px 0 0 0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", "3em 2px", "2pt 3% 4em", "2px 2px 2px 2px", // circular
+@@ -231,17 +231,17 @@ var gCSSProperties = {
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-border-right-colors": {
+ 		domProp: "MozBorderRightColors",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "red green", "red #fc3", "#ff00cc", "currentColor", "blue currentColor orange currentColor" ],
+-		invalid_values: [ "red none", "red inherit", "red, green" ]
++		invalid_values: [ "red none", "red inherit", "red, green", "none red", "inherit red" ]
+ 	},
+ 	"-moz-border-start": {
+ 		domProp: "MozBorderStart",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "-moz-border-start-color", "-moz-border-start-style", "-moz-border-start-width" ],
+ 		initial_values: [ "none", "medium", "currentColor", "none medium currentcolor" ],
+ 		other_values: [ "solid", "thin", "green", "medium solid", "green solid", "10px solid", "thick solid", "5px green none" ],
+@@ -277,17 +277,17 @@ var gCSSProperties = {
+ 		invalid_values: [ "5%" ]
+ 	},
+ 	"-moz-border-top-colors": {
+ 		domProp: "MozBorderTopColors",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "red green", "red #fc3", "#ff00cc", "currentColor", "blue currentColor orange currentColor" ],
+-		invalid_values: [ "red none", "red inherit", "red, green" ]
++		invalid_values: [ "red none", "red inherit", "red, green", "none red", "inherit red" ]
+ 	},
+ 	"-moz-box-align": {
+ 		domProp: "MozBoxAlign",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "stretch" ],
+ 		other_values: [ "start", "center", "baseline", "end" ],
+ 		invalid_values: []
+diff --git a/layout/style/test/test_inherit_computation.html b/layout/style/test/test_inherit_computation.html
+--- a/layout/style/test/test_inherit_computation.html
++++ b/layout/style/test/test_inherit_computation.html
+@@ -17,28 +17,16 @@
+ <div id="testnode"><span id="nparent"><span id="nchild"></span></span></div>
+   
+ </div>
+ <pre id="test">
+ <script class="testbody" type="text/javascript">
+ 
+ /** Test for computation of CSS 'inherit' **/
+ 
+-var gBrokenInherit = {
+-  // Not implemented in nsRuleNode
+-  "-moz-border-bottom-colors": true,
+-  "-moz-border-left-colors": true,
+-  "-moz-border-right-colors": true,
+-  "-moz-border-top-colors": true,
+-};
+-
+-function xfail_inherit(property, matching_initial) {
+-  return property in gBrokenInherit;
+-}
+-
+ // elements without a frame
+ var gNParent = document.getElementById("nparent");
+ var gNChild = document.getElementById("nchild");
+ // elements with a frame
+ var gFParent = document.getElementById("fparent");
+ var gFChild = document.getElementById("fchild");
+ 
+ var gStyleSheet = document.getElementById("stylesheet").sheet;
+@@ -81,33 +69,29 @@ function test_property(property)
+     isnot(other_computed_f, initial_computed_f,
+           "should be testing with values that compute to different things " +
+           "for '" + property + "'");
+     gChildRule3.style.setProperty(property, "inherit", "");
+     gFChild.className="allother";
+     gNChild.className="allother";
+     var inherit_initial_computed_n = get_computed_value_node(gNChild, property);
+     var inherit_initial_computed_f = get_computed_value_node(gFChild, property);
+-    (xfail_inherit(property, true) ? todo_is : is)(
+-       inherit_initial_computed_n, initial_computed_n,
++    is(inherit_initial_computed_n, initial_computed_n,
+        "inherit should cause inheritance of initial value for '" +
+        property + "'");
+-    (xfail_inherit(property, true) ? todo_is : is)(
+-       inherit_initial_computed_f, initial_computed_f,
++    is(inherit_initial_computed_f, initial_computed_f,
+        "inherit should cause inheritance of initial value for '" +
+        property + "'");
+     gParentRuleTop.style.setProperty(property, info.other_values[0], "");
+     var inherit_other_computed_n = get_computed_value_node(gNChild, property);
+     var inherit_other_computed_f = get_computed_value_node(gFChild, property);
+-    (xfail_inherit(property, false) ? todo_is : is)(
+-       inherit_other_computed_n, other_computed_n,
++    is(inherit_other_computed_n, other_computed_n,
+        "inherit should cause inheritance of other value for '" +
+        property + "'");
+-    (xfail_inherit(property, false) ? todo_is : is)(
+-       inherit_other_computed_f, other_computed_f,
++    is(inherit_other_computed_f, other_computed_f,
+        "inherit should cause inheritance of other value for '" +
+        property + "'");
+     gParentRuleTop.style.removeProperty(property);
+     gChildRule1.style.removeProperty(property);
+     gChildRule3.style.setProperty(property, info.other_values[0], "");
+     gFChild.className="";
+     gNChild.className="";
+   } else {
+@@ -120,34 +104,30 @@ function test_property(property)
+           "should be testing with values that compute to different things " +
+           "for '" + property + "'");
+     isnot(other_computed_f, initial_computed_f,
+           "should be testing with values that compute to different things " +
+           "for '" + property + "'");
+     gChildRule2.style.setProperty(property, "inherit", "");
+     var inherit_other_computed_n = get_computed_value_node(gNChild, property);
+     var inherit_other_computed_f = get_computed_value_node(gFChild, property);
+-    (xfail_inherit(property, false) ? todo_is : is)(
+-       inherit_other_computed_n, other_computed_n,
++    is(inherit_other_computed_n, other_computed_n,
+        "inherit should cause inheritance of other value for '" +
+        property + "'");
+-    (xfail_inherit(property, false) ? todo_is : is)(
+-       inherit_other_computed_f, other_computed_f,
++    is(inherit_other_computed_f, other_computed_f,
+        "inherit should cause inheritance of other value for '" +
+        property + "'");
+     gParentRuleTop.style.removeProperty(property);
+     gChildRule1.style.setProperty(property, info.other_values[0], "");
+     var inherit_initial_computed_n = get_computed_value_node(gNChild, property);
+     var inherit_initial_computed_f = get_computed_value_node(gFChild, property);
+-    (xfail_inherit(property, true) ? todo_is : is)(
+-       inherit_initial_computed_n, initial_computed_n,
++    is(inherit_initial_computed_n, initial_computed_n,
+        "inherit should cause inheritance of initial value for '" +
+        property + "'");
+-    (xfail_inherit(property, true) ? todo_is : is)(
+-       inherit_initial_computed_f, initial_computed_f,
++    is(inherit_initial_computed_f, initial_computed_f,
+        "inherit should cause inheritance of initial value for '" +
+        property + "'");
+     gParentRuleTop.style.removeProperty(property);
+     gChildRule1.style.removeProperty(property);
+     gChildRule2.style.removeProperty(property);
+   }
+ 
+   if ("prerequisites" in info) {
+diff --git a/layout/style/test/test_property_syntax_errors.html b/layout/style/test/test_property_syntax_errors.html
+--- a/layout/style/test/test_property_syntax_errors.html
++++ b/layout/style/test/test_property_syntax_errors.html
+@@ -17,20 +17,16 @@
+   
+ </div>
+ <pre id="test">
+ <script class="testbody" type="text/javascript">
+ 
+ var gDeclaration = document.getElementById("testnode").style;
+ 
+ var gKnownFails = {
+-  "-moz-border-bottom-colors": [ "red none", "red inherit" ],
+-  "-moz-border-left-colors": [ "red none", "red inherit" ],
+-  "-moz-border-right-colors": [ "red none", "red inherit" ],
+-  "-moz-border-top-colors": [ "red none", "red inherit" ],
+   "pitch-range": [ " -0.01", "100.2", "108", "-3" ],
+   "richness": [ " -0.01", "100.2", "108", "-3" ],
+   "stress": [ " -0.01", "100.2", "108", "-3" ],
+   "volume": [ " -0.01", "100.2", "108", "-3" ],
+   "text-decoration": [ "line-through blink line-through" ],
+   "stroke-miterlimit": [ "0.9", "0" ]
+ }
+ 
