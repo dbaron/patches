@@ -1,0 +1,203 @@
+Prevent posting media query changed events during construction.  (Bug 468645)
+
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -270,16 +270,17 @@ public:
+   NS_IMETHOD EndObservingDocument() = 0;
+ 
+   /**
+    * Determine if InitialReflow() was previously called.
+    * @param aDidInitialReflow PR_TRUE if InitalReflow() was previously called,
+    * PR_FALSE otherwise.
+    */
+   NS_IMETHOD GetDidInitialReflow(PRBool *aDidInitialReflow) = 0;
++  PRBool DidInitialReflow() const { return mDidInitialReflow; }
+ 
+   /**
+    * Perform the initial reflow. Constructs the frame for the root content
+    * object and then reflows the frame model into the specified width and
+    * height.
+    *
+    * The coordinates for aWidth and aHeight must be in standard nscoords.
+    *
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1171,18 +1171,22 @@ nsPresContext::SetFullZoom(float aZoom)
+   }
+ 
+   NS_ASSERTION(mSupressResizeReflow == PR_FALSE, "two zooms happening at the same time? impossible!");
+   mSupressResizeReflow = PR_TRUE;
+ 
+   mFullZoom = aZoom;
+   GetViewManager()->SetWindowDimensions(NSToCoordRound(oldWidthDevPixels * AppUnitsPerDevPixel()),
+                                         NSToCoordRound(oldHeightDevPixels * AppUnitsPerDevPixel()));
+-  MediaFeatureValuesChanged(PR_TRUE);
+-  RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++  if (mShell && mShell->DidInitialReflow())
++    MediaFeatureValuesChanged(PR_TRUE);
++    RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++  } else {
++    AssertNoStyleDataToRebuild();
++  }
+ 
+   mSupressResizeReflow = PR_FALSE;
+ 
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ }
+ 
+ void
+ nsPresContext::SetImageLoaders(nsIFrame* aTargetFrame,
+@@ -1862,16 +1866,24 @@ nsPresContext::UserFontSetUpdated()
+   //   2. Changing the value of the 'ex' and 'ch' units in style data,
+   //      which also depend on font metrics.  Updating this information
+   //      requires rebuilding the rule tree from the top, avoiding the
+   //      reuse of cached data even when no style rules have changed.
+ 
+   PostRebuildAllStyleDataEvent(NS_STYLE_HINT_REFLOW);
+ }
+ 
++#ifdef DEBUG
++void
++nsPresContext::AssertNoStyleDataToRebuild()
++{
++  StyleSet()->AssertNoStyleDataToRebuild();
++}
++#endif
++
+ void
+ nsPresContext::FireDOMPaintEvent()
+ {
+   nsCOMPtr<nsPIDOMWindow> ourWindow = mDocument->GetWindow();
+   if (!ourWindow)
+     return;
+ 
+   nsISupports* eventTarget = ourWindow;
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -441,17 +441,20 @@ public:
+   nsRect GetVisibleArea() { return mVisibleArea; }
+ 
+   /**
+    * Set the currently visible area. The units for r are standard
+    * nscoord units (as scaled by the device context).
+    */
+   void SetVisibleArea(const nsRect& r) {
+     mVisibleArea = r;
+-    PostMediaFeatureValuesChangedEvent();
++    if (mShell && mShell->DidInitialReflow())
++      PostMediaFeatureValuesChangedEvent();
++    else
++      AssertNoStyleDataToRebuild();
+   }
+ 
+   /**
+    * Return true if this presentation context is a paginated
+    * context.
+    */
+   PRBool IsPaginated() const { return mPaginated; }
+   
+@@ -507,17 +510,20 @@ public:
+ 
+   nsIDeviceContext* DeviceContext() { return mDeviceContext; }
+   nsIEventStateManager* EventStateManager() { return mEventManager; }
+   nsIAtom* GetLangGroup() { return mLangGroup; }
+ 
+   float TextZoom() { return mTextZoom; }
+   void SetTextZoom(float aZoom) {
+     mTextZoom = aZoom;
+-    RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++    if (mShell && mShell->DidInitialReflow())
++      RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++    else
++      AssertNoStyleDataToRebuild();
+   }
+ 
+   float GetFullZoom() { return mFullZoom; }
+   void SetFullZoom(float aZoom);
+ 
+   nscoord GetAutoQualityMinFontSize() {
+     return DevPixelsToAppUnits(mAutoQualityMinFontSizePixelsPref);
+   }
+@@ -800,16 +806,22 @@ protected:
+ 
+   NS_HIDDEN_(void) UpdateCharSet(const nsAFlatCString& aCharSet);
+ 
+   void HandleRebuildUserFontSet() {
+     mPostedFlushUserFontSet = PR_FALSE;
+     FlushUserFontSet();
+   }
+ 
++#ifdef DEBUG
++  void AssertNoStyleDataToRebuild();
++#else
++  void AssertNoStyleDataToRebuild() {}
++#endif
++
+   // IMPORTANT: The ownership implicit in the following member variables
+   // has been explicitly checked.  If you add any members to this class,
+   // please make the ownership explicit (pinkerton, scc).
+   
+   nsPresContextType     mType;
+   nsIPresShell*         mShell;         // [WEAK]
+   nsCOMPtr<nsIDocument> mDocument;
+   nsIDeviceContext*     mDeviceContext; // [STRONG] could be weak, but
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -211,16 +211,26 @@ nsStyleSet::GatherRuleProcessors(sheetTy
+         break;
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ #ifdef DEBUG
++void
++nsStyleSet::AssertNoStyleDataToRebuild()
++{
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(mRuleProcessors); ++i) {
++    NS_ASSERTION(!mRuleProcessors[i], "should not have anything to rebuild");
++  }
++}
++#endif
++
++#ifdef DEBUG
+ #define CHECK_APPLICABLE \
+ PR_BEGIN_MACRO \
+   PRBool applicable = PR_TRUE; \
+   aSheet->GetApplicable(applicable); \
+   NS_ASSERTION(applicable, "Inapplicable sheet being placed in style set"); \
+ PR_END_MACRO
+ #else
+ #define CHECK_APPLICABLE
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -222,16 +222,23 @@ class nsStyleSet
+   nsresult BeginReconstruct();
+   // Note: EndReconstruct should not be called if BeginReconstruct fails
+   void EndReconstruct();
+ 
+   // Let the style set know that a particular sheet is the quirks sheet.  This
+   // sheet must already have been added to the UA sheets.  The pointer must not
+   // be null.  This should only be called once for a given style set.
+   void SetQuirkStyleSheet(nsIStyleSheet* aQuirkStyleSheet);
++
++#ifdef DEBUG
++  // Assert that we haven't yet created any rule processors, and thus
++  // that things that change the results of media queries or things that
++  // require style data rebuilds don't need to happen yet.
++  void AssertNoStyleDataToRebuild();
++#endif
+   
+  private:
+   // Not to be implemented
+   nsStyleSet(const nsStyleSet& aCopy);
+   nsStyleSet& operator=(const nsStyleSet& aCopy);
+ 
+   // Returns false on out-of-memory.
+   PRBool BuildDefaultStyleData(nsPresContext* aPresContext);
