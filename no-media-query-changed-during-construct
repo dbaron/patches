@@ -24,7 +24,7 @@ diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
 diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 --- a/layout/base/nsPresContext.cpp
 +++ b/layout/base/nsPresContext.cpp
-@@ -1171,18 +1171,22 @@ nsPresContext::SetFullZoom(float aZoom)
+@@ -1171,18 +1171,20 @@ nsPresContext::SetFullZoom(float aZoom)
    }
  
    NS_ASSERTION(mSupressResizeReflow == PR_FALSE, "two zooms happening at the same time? impossible!");
@@ -35,11 +35,9 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
                                          NSToCoordRound(oldHeightDevPixels * AppUnitsPerDevPixel()));
 -  MediaFeatureValuesChanged(PR_TRUE);
 -  RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
-+  if (mShell && mShell->DidInitialReflow()) {
++  if (HasCachedStyleData()) {
 +    MediaFeatureValuesChanged(PR_TRUE);
 +    RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
-+  } else {
-+    AssertNoStyleDataToRebuild();
 +  }
  
    mSupressResizeReflow = PR_FALSE;
@@ -49,35 +47,25 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  
  void
  nsPresContext::SetImageLoaders(nsIFrame* aTargetFrame,
-@@ -1862,16 +1866,24 @@ nsPresContext::UserFontSetUpdated()
-   //   2. Changing the value of the 'ex' and 'ch' units in style data,
-   //      which also depend on font metrics.  Updating this information
-   //      requires rebuilding the rule tree from the top, avoiding the
-   //      reuse of cached data even when no style rules have changed.
+@@ -1948,8 +1950,14 @@ nsPresContext::NotifyInvalidation(const 
+                                           &nsPresContext::FireDOMPaintEvent);
+     NS_DispatchToCurrentThread(ev);
+   }
  
-   PostRebuildAllStyleDataEvent(NS_STYLE_HINT_REFLOW);
+   nsRegion* r = aIsCrossDoc ? &mCrossDocDirtyRegion : &mSameDocDirtyRegion;
+   r->Or(*r, aRect);
+   r->SimplifyOutward(10);
  }
- 
-+#ifdef DEBUG
-+void
-+nsPresContext::AssertNoStyleDataToRebuild()
-+{
-+  StyleSet()->AssertNoStyleDataToRebuild();
-+}
-+#endif
 +
- void
- nsPresContext::FireDOMPaintEvent()
- {
-   nsCOMPtr<nsPIDOMWindow> ourWindow = mDocument->GetWindow();
-   if (!ourWindow)
-     return;
- 
-   nsISupports* eventTarget = ourWindow;
++PRBool
++nsPresContext::HasCachedStyleData()
++{
++  return mShell && mShell->StyleSet()->HasCachedStyleData();
++}
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
-@@ -441,17 +441,20 @@ public:
+@@ -441,17 +441,18 @@ public:
    nsRect GetVisibleArea() { return mVisibleArea; }
  
    /**
@@ -87,10 +75,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    void SetVisibleArea(const nsRect& r) {
      mVisibleArea = r;
 -    PostMediaFeatureValuesChangedEvent();
-+    if (mShell && mShell->DidInitialReflow())
++    if (HasCachedStyleData())
 +      PostMediaFeatureValuesChangedEvent();
-+    else
-+      AssertNoStyleDataToRebuild();
    }
  
    /**
@@ -99,7 +85,7 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
     */
    PRBool IsPaginated() const { return mPaginated; }
    
-@@ -507,17 +510,20 @@ public:
+@@ -507,17 +508,18 @@ public:
  
    nsIDeviceContext* DeviceContext() { return mDeviceContext; }
    nsIEventStateManager* EventStateManager() { return mEventManager; }
@@ -109,10 +95,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    void SetTextZoom(float aZoom) {
      mTextZoom = aZoom;
 -    RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
-+    if (mShell && mShell->DidInitialReflow())
++    if (HasCachedStyleData())
 +      RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
-+    else
-+      AssertNoStyleDataToRebuild();
    }
  
    float GetFullZoom() { return mFullZoom; }
@@ -121,7 +105,7 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    nscoord GetAutoQualityMinFontSize() {
      return DevPixelsToAppUnits(mAutoQualityMinFontSizePixelsPref);
    }
-@@ -800,16 +806,22 @@ protected:
+@@ -800,16 +802,19 @@ protected:
  
    NS_HIDDEN_(void) UpdateCharSet(const nsAFlatCString& aCharSet);
  
@@ -130,11 +114,8 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
      FlushUserFontSet();
    }
  
-+#ifdef DEBUG
-+  void AssertNoStyleDataToRebuild();
-+#else
-+  void AssertNoStyleDataToRebuild() {}
-+#endif
++  // Can't be inline because we can't include nsStyleSet.h.
++  PRBool HasCachedStyleData();
 +
    // IMPORTANT: The ownership implicit in the following member variables
    // has been explicitly checked.  If you add any members to this class,
@@ -144,58 +125,28 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    nsIPresShell*         mShell;         // [WEAK]
    nsCOMPtr<nsIDocument> mDocument;
    nsIDeviceContext*     mDeviceContext; // [STRONG] could be weak, but
-diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
---- a/layout/base/nsPresShell.cpp
-+++ b/layout/base/nsPresShell.cpp
-@@ -2332,39 +2332,42 @@ PresShell::InitialReflow(nscoord aWidth,
- {
-   if (mIsDestroying) {
-     return NS_OK;
-   }
- 
-   NS_ASSERTION(!mDidInitialReflow, "Why are we being called?");
- 
-   nsCOMPtr<nsIPresShell> kungFuDeathGrip(this);
--  mDidInitialReflow = PR_TRUE;
- 
- #ifdef NS_DEBUG
-   if (VERIFY_REFLOW_NOISY_RC & gVerifyReflowFlags) {
-     if (mDocument) {
-       nsIURI *uri = mDocument->GetDocumentURI();
-       if (uri) {
-         nsCAutoString url;
-         uri->GetSpec(url);
-         printf("*** PresShell::InitialReflow (this=%p, url='%s')\n", (void*)this, url.get());
-       }
-     }
-   }
- #endif
- 
-+  // Call SetVisibleArea before setting mDidInitialReflow so we don't
-+  // think we need to handle media query changes.
-+  mPresContext->SetVisibleArea(nsRect(0, 0, aWidth, aHeight));
-+
-+  mDidInitialReflow = PR_TRUE;
-+
-   if (mCaret)
-     mCaret->EraseCaret();
- 
-   // XXX Do a full invalidate at the beginning so that invalidates along
-   // the way don't have region accumulation issues?
- 
--  mPresContext->SetVisibleArea(nsRect(0, 0, aWidth, aHeight));
--
-   nsIContent *root = mDocument ? mDocument->GetRootContent() : nsnull;
- 
-   // Get the root frame from the frame manager
-   nsIFrame* rootFrame = FrameManager()->GetRootFrame();
-   
-   if (root) {
-     MOZ_TIMER_DEBUGLOG(("Reset and start: Frame Creation: PresShell::InitialReflow(), this=%p\n",
-                         (void*)this));
 diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
 --- a/layout/style/nsRuleNode.h
 +++ b/layout/style/nsRuleNode.h
+@@ -396,17 +396,17 @@ private:
+     kHashType = 0x1
+   };
+   enum {
+     // Maximum to have in a list before converting to a hashtable.
+     // XXX Need to optimize this.
+     kMaxChildrenInList = 32
+   };
+ 
+-  PRBool HaveChildren() {
++  PRBool HaveChildren() const {
+     return mChildren.asVoid != nsnull;
+   }
+   PRBool ChildrenAreHashed() {
+     return (PRWord(mChildren.asVoid) & kTypeMask) == kHashType;
+   }
+   nsRuleNode* ChildrenList() {
+     return mChildren.asList;
+   }
 @@ -746,11 +746,20 @@ public:
    // Expose this so media queries can use it
    static nscoord CalcLengthWithInitialFont(nsPresContext* aPresContext,
@@ -206,21 +157,21 @@ diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
                              nsPresContext* aPresContext,
                              PRBool& aInherited);
 +
-+#ifdef DEBUG
-+  void AssertTreeHasNoCachedData() {
++  // Return whether the rule tree for which this node is the root has
++  // cached data such that we need to do dynamic change handling for
++  // changes that change the results of media queries or require
++  // rebuilding all style data.
++  PRBool TreeHasCachedData() const {
 +    NS_ASSERTION(IsRoot(), "should only be called on root of rule tree");
-+    NS_ASSERTION(!HaveChildren(), "should not have children");
-+    NS_ASSERTION(!mStyleData.mInheritedData && !mStyleData.mResetData,
-+                 "should not have cached data");
++    return HaveChildren() || mStyleData.mInheritedData || mStyleData.mResetData;
 +  }
-+#endif
  };
  
  #endif
 diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
 --- a/layout/style/nsStyleSet.h
 +++ b/layout/style/nsStyleSet.h
-@@ -222,16 +222,31 @@ class nsStyleSet
+@@ -222,16 +222,28 @@ class nsStyleSet
    nsresult BeginReconstruct();
    // Note: EndReconstruct should not be called if BeginReconstruct fails
    void EndReconstruct();
@@ -230,20 +181,17 @@ diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
    // be null.  This should only be called once for a given style set.
    void SetQuirkStyleSheet(nsIStyleSheet* aQuirkStyleSheet);
 +
-+#ifdef DEBUG
-+  // Assert that things that change the results of media queries or
-+  // things that require style data rebuilds don't need to cause
-+  // any rebuilding to happen yet.
-+  void AssertNoStyleDataToRebuild() {
-+    // Assert that the root rule node has no children and no style data.
-+    if (mRuleTree) {
-+      mRuleTree->AssertTreeHasNoCachedData();
-+    }
-+    // We don't care whether we have cached rule processors or whether
-+    // they have cached rule cascades; getting the rule cascades again
-+    // in order to do rule matching will get the correct rule cascade.
++  // Return whether the rule tree has cached data such that we need to
++  // do dynamic change handling for changes that change the results of
++  // media queries or require rebuilding all style data.
++  // We don't care whether we have cached rule processors or whether
++  // they have cached rule cascades; getting the rule cascades again in
++  // order to do rule matching will get the correct rule cascade.
++  PRBool HasCachedStyleData() const {
++    if (!mRuleTree)
++      return PR_FALSE;
++    return mRuleTree->TreeHasCachedData();
 +  }
-+#endif
    
   private:
    // Not to be implemented
