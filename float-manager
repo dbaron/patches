@@ -1,5 +1,26 @@
 Replace space manager with a more limited float manager.  (Bug 191448)
 
+diff --git a/content/base/src/nsGkAtomList.h b/content/base/src/nsGkAtomList.h
+--- a/content/base/src/nsGkAtomList.h
++++ b/content/base/src/nsGkAtomList.h
+@@ -1624,17 +1624,16 @@ GK_ATOM(overflowProperty, "OverflowPrope
+ GK_ATOM(overflowContainersProperty, "OverflowContainersProperty")             // nsFrameList*
+ GK_ATOM(excessOverflowContainersProperty, "ExcessOverflowContainersProperty") // nsFrameList*
+ GK_ATOM(overflowLinesProperty, "OverflowLinesProperty")    // list of nsLineBox*
+ GK_ATOM(overflowOutOfFlowsProperty, "OverflowOutOfFlowsProperty")      // nsFrameList*
+ GK_ATOM(overflowPlaceholdersProperty, "OverflowPlaceholdersProperty")  // nsFrameList*
+ GK_ATOM(preEffectsBBoxProperty, "PreEffectsBBoxProperty") // nsRect*
+ GK_ATOM(preTransformBBoxProperty, "PreTransformBBoxProperty") // nsRect*
+ GK_ATOM(rowUnpaginatedHeightProperty, "RowUnpaginatedHeightProperty")  // nscoord*
+-GK_ATOM(spaceManagerProperty, "SpaceManagerProperty")      // the space manager for a block
+ GK_ATOM(tabWidthProperty, "TabWidthProperty")              // nsTArray<TabSetting>* array of tab widths
+ GK_ATOM(tableBCProperty, "TableBCProperty")                // table border collapsing info (e.g. damage area, table border widths)
+ GK_ATOM(usedMarginProperty, "UsedMarginProperty") // nsMargin*
+ GK_ATOM(usedPaddingProperty, "UsedPaddingProperty") // nsMargin*
+ GK_ATOM(viewProperty, "ViewProperty")                      
+ 
+ // Content property names
+ GK_ATOM(genConInitializerProperty, "QuoteNodeProperty")
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
@@ -1833,10 +1854,11 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    // only when there are actually floats to manage.  Otherwise things
    // like tables will gain significant bloat.
 -  PRBool needSpaceManager = nsBlockFrame::BlockNeedsSpaceManager(this);
-+  PRBool needSpaceManager = nsBlockFrame::BlockNeedsFloatManager(this);
-   if (needSpaceManager)
+-  if (needSpaceManager)
 -    autoSpaceManager.CreateSpaceManager(aPresContext);
-+    autoFloatManager.CreateSpaceManager(aPresContext);
++  PRBool needFloatManager = nsBlockFrame::BlockNeedsFloatManager(this);
++  if (needFloatManager)
++    autoFloatManager.CreateFloatManager(aPresContext);
  
    // OK, some lines may be reflowed. Blow away any saved line cursor because
    // we may invalidate the nondecreasing combinedArea.y/yMost invariant,
@@ -1845,26 +1867,103 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
  
    if (IsFrameTreeTooDeep(aReflowState, aMetrics)) {
  #ifdef DEBUG_kipp
-@@ -1122,17 +1122,17 @@ nsBlockFrame::Reflow(nsPresContext*     
-     // this is a leak of the space manager, but it's only in debug if verify reflow is enabled, so not a big deal
-     nsIPresShell *shell = aPresContext->GetPresShell();
-     if (shell) {
-       nsHTMLReflowState&  reflowState = (nsHTMLReflowState&)aReflowState;
-       rv = SetProperty(nsGkAtoms::spaceManagerProperty,
-                        reflowState.mSpaceManager,
-                        nsnull /* should be nsSpaceManagerDestroyer*/);
- 
--      autoSpaceManager.DebugOrphanSpaceManager();
-+      autoFloatManager.DebugOrphanFloatManager();
+@@ -918,17 +918,17 @@ nsBlockFrame::Reflow(nsPresContext*     
      }
-   }
  #endif
+     aStatus = NS_FRAME_COMPLETE;
+     return NS_OK;
+   }
  
+   PRBool marginRoot = BlockIsMarginRoot(this);
+   nsBlockReflowState state(aReflowState, aPresContext, this, aMetrics,
+-                           marginRoot, marginRoot, needSpaceManager);
++                           marginRoot, marginRoot, needFloatManager);
+ 
+ #ifdef IBMBIDI
+   if (GetStateBits() & NS_BLOCK_NEEDS_BIDI_RESOLUTION)
+     static_cast<nsBlockFrame*>(GetFirstContinuation())->ResolveBidi();
+ #endif // IBMBIDI
+ 
+   if (RenumberLists(aPresContext)) {
+     AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+@@ -973,18 +973,18 @@ nsBlockFrame::Reflow(nsPresContext*     
+                  "Somehow we failed to fit all content, even though we have unlimited space!");
+     if (NS_FRAME_IS_FULLY_COMPLETE(state.mReflowStatus)) {
+       // find the nearest block ancestor that uses the same space manager
+       for (const nsHTMLReflowState* ancestorRS = aReflowState.parentReflowState; 
+            ancestorRS; 
+            ancestorRS = ancestorRS->parentReflowState) {
+         nsIFrame* ancestor = ancestorRS->frame;
+         if (nsLayoutUtils::GetAsBlock(ancestor) &&
+-            aReflowState.mSpaceManager == ancestorRS->mSpaceManager) {
+-          // Put the continued floats in ancestor since it uses the same space manager
++            aReflowState.mFloatManager == ancestorRS->mFloatManager) {
++          // Put the continued floats in ancestor since it uses the same float manager
+           nsFrameList* ancestorPlace =
+             ((nsBlockFrame*)ancestor)->GetOverflowPlaceholders();
+           // The ancestor should have this list, since it's being reflowed. But maybe
+           // it isn't because of reflow roots or something.
+           if (ancestorPlace) {
+             for (nsIFrame* f = state.mOverflowPlaceholders.FirstChild();
+                  f; f = f->GetNextSibling()) {
+               NS_ASSERTION(IsContinuationPlaceholder(f),
+@@ -1109,34 +1109,16 @@ nsBlockFrame::Reflow(nsPresContext*     
+   // Compute our final size
+   nscoord bottomEdgeOfChildren;
+   ComputeFinalSize(aReflowState, state, aMetrics, &bottomEdgeOfChildren);
+   ComputeCombinedArea(aReflowState, aMetrics, bottomEdgeOfChildren);
+   // Factor overflow container child bounds into the overflow area
+   aMetrics.mOverflowArea.UnionRect(aMetrics.mOverflowArea,
+                                    overflowContainerBounds);
+ 
+-  // see if verifyReflow is enabled, and if so store off the space manager pointer
+-#ifdef DEBUG
+-  PRInt32 verifyReflowFlags = nsIPresShell::GetVerifyReflowFlags();
+-  if (VERIFY_REFLOW_INCLUDE_SPACE_MANAGER & verifyReflowFlags)
+-  {
+-    // this is a leak of the space manager, but it's only in debug if verify reflow is enabled, so not a big deal
+-    nsIPresShell *shell = aPresContext->GetPresShell();
+-    if (shell) {
+-      nsHTMLReflowState&  reflowState = (nsHTMLReflowState&)aReflowState;
+-      rv = SetProperty(nsGkAtoms::spaceManagerProperty,
+-                       reflowState.mSpaceManager,
+-                       nsnull /* should be nsSpaceManagerDestroyer*/);
+-
+-      autoSpaceManager.DebugOrphanSpaceManager();
+-    }
+-  }
+-#endif
+-
    // Let the absolutely positioned container reflow any absolutely positioned
    // child frames that need to be reflowed, e.g., elements with a percentage
    // based width/height
    // We want to do this under either of two conditions:
-@@ -1324,17 +1324,17 @@ nsBlockFrame::ComputeFinalSize(const nsH
+   //  1. If we didn't do the incremental reflow above.
+   //  2. If our size changed.
+   // Even though it's the padding edge that's the containing block, we
+   // can use our rect (the border edge) since if the border style
+@@ -1196,18 +1178,18 @@ nsBlockFrame::Reflow(nsPresContext*     
+   // Determine if we need to repaint our border, background or outline
+   CheckInvalidateSizeChange(aMetrics);
+ 
+   FinishAndStoreOverflow(&aMetrics);
+ 
+   // Clear the space manager pointer in the block reflow state so we
+   // don't waste time translating the coordinate system back on a dead
+   // space manager.
+-  if (needSpaceManager)
+-    state.mSpaceManager = nsnull;
++  if (needFloatManager)
++    state.mFloatManager = nsnull;
+ 
+   aStatus = state.mReflowStatus;
+ 
+ #ifdef DEBUG
+   if (gNoisyReflow) {
+     IndentBy(stdout, gNoiseIndent);
+     ListTag(stdout);
+     printf(": status=%x (%scomplete) metrics=%d,%d carriedMargin=%d",
+@@ -1324,17 +1306,17 @@ nsBlockFrame::ComputeFinalSize(const nsH
      if (bottomEdgeOfChildren < aState.mReflowState.availableHeight)
      {
        // Truncate bottom margin if it doesn't fit to our available height.
@@ -1883,26 +1982,218 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    }
  
    // Compute final height
-@@ -4994,17 +4994,17 @@ static void MarkAllDescendantLinesDirty(
+@@ -1647,36 +1629,36 @@ nsBlockFrame::PrepareResizeReflow(nsBloc
+  * |aDeltaY| indicates how much it will later be slid (assuming it
+  * doesn't get marked dirty and reflowed entirely).
+  */
+ void
+ nsBlockFrame::PropagateFloatDamage(nsBlockReflowState& aState,
+                                    nsLineBox* aLine,
+                                    nscoord aDeltaY)
+ {
+-  nsSpaceManager *spaceManager = aState.mReflowState.mSpaceManager;
++  nsFloatManager *floatManager = aState.mReflowState.mFloatManager;
+   NS_ASSERTION((aState.mReflowState.parentReflowState &&
+-                aState.mReflowState.parentReflowState->mSpaceManager == spaceManager) ||
++                aState.mReflowState.parentReflowState->mFloatManager == floatManager) ||
+                 aState.mReflowState.mBlockDelta == 0, "Bad block delta passed in");
+ 
+   // Check to see if there are any floats; if there aren't, there can't
+   // be any float damage
+-  if (!spaceManager->HasAnyFloats())
++  if (!floatManager->HasAnyFloats())
+     return;
+ 
+   // Check the damage region recorded in the float damage.
+-  if (spaceManager->HasFloatDamage()) {
++  if (floatManager->HasFloatDamage()) {
+     // Need to check mBounds *and* mCombinedArea to find intersections 
+     // with aLine's floats
+     nscoord lineYA = aLine->mBounds.y + aDeltaY;
+     nscoord lineYB = lineYA + aLine->mBounds.height;
+     nscoord lineYCombinedA = aLine->GetCombinedArea().y + aDeltaY;
+     nscoord lineYCombinedB = lineYCombinedA + aLine->GetCombinedArea().height;
+-    if (spaceManager->IntersectsDamage(lineYA, lineYB) ||
+-        spaceManager->IntersectsDamage(lineYCombinedA, lineYCombinedB)) {
++    if (floatManager->IntersectsDamage(lineYA, lineYB) ||
++        floatManager->IntersectsDamage(lineYCombinedA, lineYCombinedB)) {
+       aLine->MarkDirty();
+       return;
+     }
+   }
+ 
+   // Check if the line is moving relative to the space manager
+   if (aDeltaY + aState.mReflowState.mBlockDelta != 0) {
+     if (aLine->IsBlock()) {
+@@ -3002,20 +2984,20 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+     
+     // Reflow the block into the available space
+     // construct the html reflow state for the block. ReflowBlock 
+     // will initialize it
+     nsHTMLReflowState blockHtmlRS(aState.mPresContext, aState.mReflowState, frame, 
+                                   nsSize(availSpace.width, availSpace.height));
+     blockHtmlRS.mFlags.mHasClearance = aLine->HasClearance();
+     
+-    nsSpaceManager::SavedState spaceManagerState;
++    nsFloatManager::SavedState floatManagerState;
+     if (mayNeedRetry) {
+       blockHtmlRS.mDiscoveredClearance = &clearanceFrame;
+-      aState.mSpaceManager->PushState(&spaceManagerState);
++      aState.mFloatManager->PushState(&floatManagerState);
+     } else if (!applyTopMargin) {
+       blockHtmlRS.mDiscoveredClearance = aState.mReflowState.mDiscoveredClearance;
+     }
+     
+     nsReflowStatus frameReflowStatus = NS_FRAME_COMPLETE;
+     rv = brc.ReflowBlock(availSpace, applyTopMargin, aState.mPrevBottomMargin,
+                          clearance, aState.IsAdjacentWithTop(),
+                          aLine.get(), blockHtmlRS, frameReflowStatus, aState);
+@@ -3026,17 +3008,17 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+     if (!mayNeedRetry && clearanceFrame &&
+         frame->GetRect().y != passOriginalY) {
+       Invalidate(frame->GetOverflowRect() + frame->GetPosition());
+     }
+     
+     NS_ENSURE_SUCCESS(rv, rv);
+     
+     if (mayNeedRetry && clearanceFrame) {
+-      aState.mSpaceManager->PopState(&spaceManagerState);
++      aState.mFloatManager->PopState(&floatManagerState);
+       aState.mY = startingY;
+       aState.mPrevBottomMargin = incomingMargin;
+       continue;
+     }
+     
+     aState.mPrevChild = frame;
+     
+ #if defined(REFLOW_STATUS_COVERAGE)
+@@ -3255,28 +3237,28 @@ nsBlockFrame::ReflowInlineFrames(nsBlock
+   LineReflowStatus lineReflowStatus = LINE_REFLOW_REDO_NEXT_BAND;
+   PRBool movedPastFloat = PR_FALSE;
+   do {
+     PRBool allowPullUp = PR_TRUE;
+     nsIContent* forceBreakInContent = nsnull;
+     PRInt32 forceBreakOffset = -1;
+     gfxBreakPriority forceBreakPriority = eNoBreak;
+     do {
+-      nsSpaceManager::SavedState spaceManagerState;
+-      aState.mReflowState.mSpaceManager->PushState(&spaceManagerState);
++      nsFloatManager::SavedState floatManagerState;
++      aState.mReflowState.mFloatManager->PushState(&floatManagerState);
+ 
+       // Once upon a time we allocated the first 30 nsLineLayout objects
+       // on the stack, and then we switched to the heap.  At that time
+       // these objects were large (1100 bytes on a 32 bit system).
+       // Then the nsLineLayout object was shrunk to 156 bytes by
+       // removing some internal buffers.  Given that it is so much
+       // smaller, the complexity of 2 different ways of allocating
+       // no longer makes sense.  Now we always allocate on the stack.
+       nsLineLayout lineLayout(aState.mPresContext,
+-                              aState.mReflowState.mSpaceManager,
++                              aState.mReflowState.mFloatManager,
+                               &aState.mReflowState, &aLine);
+       lineLayout.Init(&aState, aState.mMinLineHeight, aState.mLineNumber);
+       if (forceBreakInContent) {
+         lineLayout.ForceBreakAtPosition(forceBreakInContent, forceBreakOffset);
+       }
+       rv = DoReflowInlineFrames(aState, lineLayout, aLine,
+                                 aKeepReflowGoing, &lineReflowStatus,
+                                 allowPullUp);
+@@ -3289,17 +3271,17 @@ nsBlockFrame::ReflowInlineFrames(nsBlock
+           // If there is no saved break position, then this will set
+           // set forceBreakInContent to null and we won't back up, which is
+           // correct.
+           forceBreakInContent = lineLayout.GetLastOptionalBreakPosition(&forceBreakOffset, &forceBreakPriority);
+         } else {
+           forceBreakInContent = nsnull;
+         }
+         // restore the space manager state
+-        aState.mReflowState.mSpaceManager->PopState(&spaceManagerState);
++        aState.mReflowState.mFloatManager->PopState(&floatManagerState);
+         // Clear out float lists
+         aState.mCurrentLineFloats.DeleteAll();
+         aState.mBelowCurrentLineFloats.DeleteAll();
+       }
+       
+ #ifdef DEBUG
+       spins++;
+       if (1000 == spins) {
+@@ -4991,32 +4973,32 @@ static void MarkAllDescendantLinesDirty(
+         MarkAllDescendantLinesDirty(bf);
+       }
+     }
      line->MarkDirty();
      ++line;
    }
  }
  
- static void MarkSameSpaceManagerLinesDirty(nsBlockFrame* aBlock)
- {
-   nsBlockFrame* blockWithSpaceMgr = aBlock;
+-static void MarkSameSpaceManagerLinesDirty(nsBlockFrame* aBlock)
+-{
+-  nsBlockFrame* blockWithSpaceMgr = aBlock;
 -  while (!(blockWithSpaceMgr->GetStateBits() & NS_BLOCK_SPACE_MGR)) {
-+  while (!(blockWithSpaceMgr->GetStateBits() & NS_BLOCK_FLOAT_MGR)) {
-     nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithSpaceMgr->GetParent());
+-    nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithSpaceMgr->GetParent());
++static void MarkSameFloatManagerLinesDirty(nsBlockFrame* aBlock)
++{
++  nsBlockFrame* blockWithFloatMgr = aBlock;
++  while (!(blockWithFloatMgr->GetStateBits() & NS_BLOCK_FLOAT_MGR)) {
++    nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithFloatMgr->GetParent());
      if (!bf) {
        break;
      }
-     blockWithSpaceMgr = bf;
+-    blockWithSpaceMgr = bf;
++    blockWithFloatMgr = bf;
    }
      
    // Mark every line at and below the line where the float was
-@@ -6808,33 +6808,33 @@ nsBlockFrame::BlockIsMarginRoot(nsIFrame
+   // dirty, and mark their lines dirty too. We could probably do
+   // something more efficient --- e.g., just dirty the lines that intersect
+   // the float vertically.
+-  MarkAllDescendantLinesDirty(blockWithSpaceMgr);
++  MarkAllDescendantLinesDirty(blockWithFloatMgr);
+ }
+ 
+ /**
+  * Returns PR_TRUE if aFrame is a block that has one or more float children.
+  */
+ static PRBool BlockHasAnyFloats(nsIFrame* aFrame)
+ {
+   nsBlockFrame* block = nsLayoutUtils::GetAsBlock(aFrame);
+@@ -5047,32 +5029,32 @@ nsBlockFrame::RemoveFrame(nsIAtom*  aLis
+   nsFrame::ListTag(stdout, aOldFrame);
+   printf("\n");
+ #endif
+ 
+   if (nsnull == aListName) {
+     PRBool hasFloats = BlockHasAnyFloats(aOldFrame);
+     rv = DoRemoveFrame(aOldFrame, REMOVE_FIXED_CONTINUATIONS);
+     if (hasFloats) {
+-      MarkSameSpaceManagerLinesDirty(this);
++      MarkSameFloatManagerLinesDirty(this);
+     }
+   }
+   else if (nsGkAtoms::absoluteList == aListName) {
+     return mAbsoluteContainer.RemoveFrame(this, aListName, aOldFrame);
+   }
+   else if (nsGkAtoms::floatList == aListName) {
+     nsIFrame* curFrame = aOldFrame;
+     // Make sure to delete all the continuations for the float frame
+     // we are removing; this way is a bit messy, but so is the rest of the code.
+     // See bug 390762.
+     do {
+       nsIFrame* continuation = curFrame->GetNextContinuation();
+       nsBlockFrame* curParent = static_cast<nsBlockFrame*>(curFrame->GetParent());
+       curParent->RemoveFloat(curFrame);
+-      MarkSameSpaceManagerLinesDirty(curParent);
++      MarkSameFloatManagerLinesDirty(curParent);
+       curFrame = continuation;
+     } while (curFrame);
+   }
+ #ifdef IBMBIDI
+   else if (nsGkAtoms::nextBidi == aListName) {
+     // Skip the call to |FrameNeedsReflow| below by returning now.
+     return DoRemoveFrame(aOldFrame, REMOVE_FIXED_CONTINUATIONS);
+   }
+@@ -6808,33 +6790,33 @@ nsBlockFrame::BlockIsMarginRoot(nsIFrame
    nsIFrame* parent = aBlock->GetParent();
    return (aBlock->GetStateBits() & NS_BLOCK_MARGIN_ROOT) ||
      (parent && !parent->IsFloatContainingBlock() &&
@@ -3939,7 +4230,7 @@ rename from layout/generic/nsSpaceManager.h
 rename to layout/generic/nsFloatManager.h
 --- a/layout/generic/nsSpaceManager.h
 +++ b/layout/generic/nsFloatManager.h
-@@ -31,237 +31,60 @@
+@@ -31,236 +31,61 @@
   * use your version of this file under the terms of the MPL, indicate your
   * decision by deleting the provisions above and replace them with the notice
   * and other provisions required by the GPL or the LGPL. If you do not delete
@@ -4175,7 +4466,8 @@ rename to layout/generic/nsFloatManager.h
    };
  
 -  PRBool HasAnyFloats() { return mFrameInfoMap != nsnull; }
--
++  PRBool HasAnyFloats(); /* XXX REIMPLEMENT */
+ 
    /**
     * Methods for dealing with the propagation of float damage during
     * reflow.
@@ -4183,8 +4475,7 @@ rename to layout/generic/nsFloatManager.h
    PRBool HasFloatDamage()
    {
      return !mFloatDamage.IsEmpty();
-   }
-@@ -272,235 +95,71 @@ public:
+@@ -272,235 +97,62 @@ public:
    }
  
    PRBool IntersectsDamage(nscoord aIntervalBegin, nscoord aIntervalEnd)
@@ -4409,19 +4700,16 @@ rename to layout/generic/nsFloatManager.h
     */
    nsresult
 -  CreateSpaceManager(nsPresContext *aPresContext);
-+  CreateFloatManager(nsPresContext *aPresContext);
- 
- #ifdef DEBUG
-   /**
+-
+-#ifdef DEBUG
+-  /**
 -   * `Orphan' any space manager that the nsAutoSpaceManager created;
 -   * i.e., make it so that we don't destroy the space manager when we
-+   * `Orphan' any float manager that the nsAutoFloatManager created;
-+   * i.e., make it so that we don't destroy the float manager when we
-    * go out of scope.
-    */
+-   * go out of scope.
+-   */
 -  void DebugOrphanSpaceManager() { mOwns = PR_FALSE; }
-+  void DebugOrphanFloatManager() { mOwns = PR_FALSE; }
- #endif
+-#endif
++  CreateFloatManager(nsPresContext *aPresContext);
  
  protected:
    nsHTMLReflowState &mReflowState;
