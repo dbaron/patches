@@ -1526,6 +1526,25 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
  #ifdef DEBUG
        spins++;
        if (1000 == spins) {
+@@ -6771,17 +6771,17 @@ nsBlockFrame::CheckFloats(nsBlockReflowS
+     // be larger than necessary, causing this block to get an
+     // incorrect desired height (or width).  Some of these floats
+     // may not actually have been added to the space manager because
+     // they weren't reflowed before being pushed; that's OK,
+     // RemoveRegions will ignore them. It is safe to do this here
+     // because we know from here on the space manager will only be
+     // used for its XMost and YMost, not to place new floats and
+     // lines.
+-    aState.mSpaceManager->RemoveTrailingRegions(oofs.FirstChild());
++    aState.mFloatManager->RemoveTrailingRegions(oofs.FirstChild());
+   }
+ }
+ 
+ /* static */
+ PRBool
+ nsBlockFrame::BlockIsMarginRoot(nsIFrame* aBlock)
+ {
+   NS_PRECONDITION(aBlock, "Must have a frame");
 diff --git a/layout/generic/nsBlockReflowContext.cpp b/layout/generic/nsBlockReflowContext.cpp
 --- a/layout/generic/nsBlockReflowContext.cpp
 +++ b/layout/generic/nsBlockReflowContext.cpp
@@ -1724,7 +1743,7 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
   * Reconstruct the vertical margin before the line |aLine| in order to
   * do an incremental reflow that begins with |aLine| without reflowing
   * the line before it.  |aLine| may point to the fencepost at the end of
-@@ -424,20 +424,20 @@ nsBlockReflowState::RecoverFloats(nsLine
+@@ -424,27 +424,27 @@ nsBlockReflowState::RecoverFloats(nsLine
          nsPoint p = floatFrame->GetPosition();
          floatFrame->SetPosition(nsPoint(p.x, p.y + aDeltaY));
          nsContainerFrame::PositionFrameView(floatFrame);
@@ -1745,8 +1764,16 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
                 fc->mRegion.width, fc->mRegion.height);
        }
  #endif
-       mSpaceManager->AddRectRegion(floatFrame, fc->mRegion);
+-      mSpaceManager->AddRectRegion(floatFrame, fc->mRegion);
++      mSpaceManager->AddFloat(floatFrame, fc->mRegion);
        fc = fc->Next();
+     }
+   } else if (aLine->IsBlock()) {
+     nsBlockFrame *kid = nsLayoutUtils::GetAsBlock(aLine->mFirstChild);
+     // don't recover any state inside a block that has its own space
+     // manager (we don't currently have any blocks like this, though,
+     // thanks to our use of extra frames for 'overflow')
+     if (kid && !nsBlockFrame::BlockNeedsFloatManager(kid)) {
 @@ -459,26 +459,26 @@ nsBlockReflowState::RecoverFloats(nsLine
                                         nsGkAtoms::computedOffsetProperty));
  
@@ -1901,6 +1928,25 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
        }
  
        // See if there is now enough height for the float.
+@@ -939,17 +939,17 @@ nsBlockReflowState::FlowAndPlaceFloat(ns
+     region.width = 0;
+   }
+   if (region.height < 0) {
+     region.height = 0;
+   }
+ #ifdef DEBUG
+   nsresult rv =
+ #endif
+-  mSpaceManager->AddRectRegion(floatFrame, region);
++  mSpaceManager->AddFloat(floatFrame, region);
+   NS_ABORT_IF_FALSE(NS_SUCCEEDED(rv), "bad float placement");
+ 
+   // Save away the floats region in the spacemanager, after making
+   // it relative to the containing block's frame instead of relative
+   // to the spacemanager translation (which is inset by the
+   // border+padding).
+   // XXX Maybe RecoverFloats should calc/add in the borderPadding itself?
+   // It's kind of confusing to have the spacemanager translation be different
 @@ -961,25 +961,25 @@ nsBlockReflowState::FlowAndPlaceFloat(ns
    // space manager.
    if (aFloatCache->mRegion != oldRegion) {
@@ -1919,8 +1965,9 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
 -  mSpaceManager->GetTranslation(tx, ty);
 +  mFloatManager->GetTranslation(tx, ty);
    nsFrame::ListTag(stdout, mBlock);
-   printf(": FlowAndPlaceFloat: AddRectRegion: txy=%d,%d (%d,%d) {%d,%d,%d,%d}\n",
+-  printf(": FlowAndPlaceFloat: AddRectRegion: txy=%d,%d (%d,%d) {%d,%d,%d,%d}\n",
 -         tx, ty, mSpaceManagerX, mSpaceManagerY,
++  printf(": FlowAndPlaceFloat: AddFloat: txy=%d,%d (%d,%d) {%d,%d,%d,%d}\n",
 +         tx, ty, mFloatManagerX, mFloatManagerY,
           aFloatCache->mRegion.x, aFloatCache->mRegion.y,
           aFloatCache->mRegion.width, aFloatCache->mRegion.height);
@@ -3563,7 +3610,7 @@ rename from layout/generic/nsSpaceManager.h
 rename to layout/generic/nsFloatManager.h
 --- a/layout/generic/nsSpaceManager.h
 +++ b/layout/generic/nsFloatManager.h
-@@ -31,236 +31,83 @@
+@@ -31,236 +31,100 @@
   * use your version of this file under the terms of the MPL, indicate your
   * decision by deleting the provisions above and replace them with the notice
   * and other provisions required by the GPL or the LGPL. If you do not delete
@@ -3716,11 +3763,18 @@ rename to layout/generic/nsFloatManager.h
 -   */
 -  PRBool YMost(nscoord& aYMost) const;
  
--  /**
+   /**
 -   * Returns a band starting at the specified y-offset. The band data
 -   * indicates which parts of the band are available, and which parts
 -   * are unavailable
--   *
++   * Get information about the band containing vertical coordinate |aY|,
++   * but up to at most |aMaxHeight| (which may be nscoord_MAX).  This
++   * will return the tallest rectangle whose top is |aY| and in which
++   * there are no changes in what floats are on the sides of that
++   * rectangle, but will limit the height of the rectangle to
++   * |aMaxHeight|.  The left and right edges of the rectangle give the
++   * area available for line boxes in that space.
+    *
 -   * The band data that is returned is in the coordinate space of the
 -   * local coordinate system.
 -   *
@@ -3738,11 +3792,22 @@ rename to layout/generic/nsFloatManager.h
 -   * @return  NS_OK if successful and NS_ERROR_FAILURE if the band data is not
 -   *            not large enough. The 'count' member of the band data struct
 -   *            indicates how large the array of trapezoids needs to be
--   */
++   * @param aY [in] vertical coordinate for top of available space
++   *           desired
++   * @param aMaxHeight [in] maximum height of available space desired
++   * @param aAvailSpace [out] the resulting rectangle for line boxes
++   * @param aFloatCount [out] the number of floats on the sides of
++   *                    aAvailSpace, including those that do not reduce
++   *                    the line box width at all (because they are
++   *                    entirely in the margins)
+    */
 -  nsresult GetBandData(nscoord       aYOffset,
 -                       const nsSize& aMaxSize,
 -                       nsBandData&   aBandData) const;
--
++  void GetBandInfo(nscoord aY, nscoord aMaxHeight,
++                   nsRect& aAvailSpace, PRUint32* aFloatCount);
++  /* XXX REIMPLEMENT */
+ 
 -  /**
 -   * Add a rectangular region of unavailable space. The space is
 -   * relative to the local coordinate system.
@@ -3756,20 +3821,23 @@ rename to layout/generic/nsFloatManager.h
 -   */
 -  nsresult AddRectRegion(nsIFrame*     aFrame,
 -                         const nsRect& aUnavailableSpace);
--
--  /**
--   * Remove the regions associated with this floating frame and its
--   * next-sibling list.  Some of the frames may never have been added;
--   * we just skip those. This is not fully general; it only works as
--   * long as the N frames to be removed are the last N frames to have
--   * been added; if there's a frame in the middle of them that should
--   * not be removed, YOU LOSE.
--   *
--   * This can only be done at the end of the life of this space manager. The only
--   * methods it is safe to call after this are XMost() and YMost().
--   */
--  nsresult RemoveTrailingRegions(nsIFrame* aFrameList);
--
++  nsresult AddFloat(nsIFrame* aFrame, const nsRect& aMarginRect);
++  /* XXX REIMPLEMENT */
+ 
+   /**
+    * Remove the regions associated with this floating frame and its
+    * next-sibling list.  Some of the frames may never have been added;
+    * we just skip those. This is not fully general; it only works as
+    * long as the N frames to be removed are the last N frames to have
+    * been added; if there's a frame in the middle of them that should
+    * not be removed, YOU LOSE.
+    *
+    * This can only be done at the end of the life of this space manager. The only
+    * methods it is safe to call after this are XMost() and YMost().
+    */
+   nsresult RemoveTrailingRegions(nsIFrame* aFrameList);
++  /* XXX REIMPLEMENT */
+ 
 -protected:
 -  /**
 -   * Remove the region associated with aFrane.
@@ -3800,28 +3868,6 @@ rename to layout/generic/nsFloatManager.h
  
 -  PRBool HasAnyFloats() { return mFrameInfoMap != nsnull; }
 +  PRBool HasAnyFloats(); /* XXX REIMPLEMENT */
-+
-+  /**
-+   * Get information about the band containing vertical coordinate |aY|,
-+   * but up to at most |aMaxHeight| (which may be nscoord_MAX).  This
-+   * will return the tallest rectangle whose top is |aY| and in which
-+   * there are no changes in what floats are on the sides of that
-+   * rectangle, but will limit the height of the rectangle to
-+   * |aMaxHeight|.  The left and right edges of the rectangle give the
-+   * area available for line boxes in that space.
-+   *
-+   * @param aY [in] vertical coordinate for top of available space
-+   *           desired
-+   * @param aMaxHeight [in] maximum height of available space desired
-+   * @param aAvailSpace [out] the resulting rectangle for line boxes
-+   * @param aFloatCount [out] the number of floats on the sides of
-+   *                    aAvailSpace, including those that do not reduce
-+   *                    the line box width at all (because they are
-+   *                    entirely in the margins)
-+   */
-+  void GetBandInfo(nscoord aY, nscoord aMaxHeight,
-+                   nsRect& aAvailSpace, PRUint32* aFloatCount);
-+  /* XXX REIMPLEMENT */
  
    /**
     * Methods for dealing with the propagation of float damage during
@@ -3830,7 +3876,7 @@ rename to layout/generic/nsFloatManager.h
    PRBool HasFloatDamage()
    {
      return !mFloatDamage.IsEmpty();
-@@ -272,220 +119,56 @@ public:
+@@ -272,220 +136,56 @@ public:
    }
  
    PRBool IntersectsDamage(nscoord aIntervalBegin, nscoord aIntervalEnd)
