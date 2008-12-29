@@ -353,7 +353,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    { "really-noisy-reflow", &nsBlockFrame::gReallyNoisyReflow },
    { "intrinsic", &nsBlockFrame::gNoisyIntrinsic },
 -  { "space-manager", &nsBlockFrame::gNoisySpaceManager },
-+  { "space-manager", &nsBlockFrame::gNoisyFloatManager },
++  { "float-manager", &nsBlockFrame::gNoisyFloatManager },
    { "verify-lines", &nsBlockFrame::gVerifyLines },
    { "damage-repair", &nsBlockFrame::gNoisyDamageRepair },
    { "lame-paint-metrics", &nsBlockFrame::gLamePaintMetrics },
@@ -362,7 +362,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
  };
  #define NUM_DEBUG_FLAGS (sizeof(gFlags) / sizeof(gFlags[0]))
  
-@@ -893,17 +893,17 @@ nsBlockFrame::Reflow(nsPresContext*     
+@@ -893,18 +893,18 @@ nsBlockFrame::Reflow(nsPresContext*     
  
    // Should we create a space manager?
    nsAutoSpaceManager autoSpaceManager(const_cast<nsHTMLReflowState &>(aReflowState));
@@ -372,8 +372,9 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    // only when there are actually floats to manage.  Otherwise things
    // like tables will gain significant bloat.
 -  PRBool needSpaceManager = nsBlockFrame::BlockNeedsSpaceManager(this);
-+  PRBool needSpaceManager = nsBlockFrame::BlockNeedsFloatManager(this);
-   if (needSpaceManager)
+-  if (needSpaceManager)
++  PRBool needFloatManager = nsBlockFrame::BlockNeedsFloatManager(this);
++  if (needFloatManager)
      autoSpaceManager.CreateSpaceManager(aPresContext);
  
    // OK, some lines may be reflowed. Blow away any saved line cursor because
@@ -381,6 +382,45 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    // and we may even delete the line with the line cursor.
    ClearLineCursor();
  
+   if (IsFrameTreeTooDeep(aReflowState, aMetrics)) {
+@@ -918,17 +918,17 @@ nsBlockFrame::Reflow(nsPresContext*     
+     }
+ #endif
+     aStatus = NS_FRAME_COMPLETE;
+     return NS_OK;
+   }
+ 
+   PRBool marginRoot = BlockIsMarginRoot(this);
+   nsBlockReflowState state(aReflowState, aPresContext, this, aMetrics,
+-                           marginRoot, marginRoot, needSpaceManager);
++                           marginRoot, marginRoot, needFloatManager);
+ 
+ #ifdef IBMBIDI
+   if (GetStateBits() & NS_BLOCK_NEEDS_BIDI_RESOLUTION)
+     static_cast<nsBlockFrame*>(GetFirstContinuation())->ResolveBidi();
+ #endif // IBMBIDI
+ 
+   if (RenumberLists(aPresContext)) {
+     AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+@@ -1178,17 +1178,17 @@ nsBlockFrame::Reflow(nsPresContext*     
+   // Determine if we need to repaint our border, background or outline
+   CheckInvalidateSizeChange(aMetrics);
+ 
+   FinishAndStoreOverflow(&aMetrics);
+ 
+   // Clear the space manager pointer in the block reflow state so we
+   // don't waste time translating the coordinate system back on a dead
+   // space manager.
+-  if (needSpaceManager)
++  if (needFloatManager)
+     state.mSpaceManager = nsnull;
+ 
+   aStatus = state.mReflowStatus;
+ 
+ #ifdef DEBUG
+   if (gNoisyReflow) {
+     IndentBy(stdout, gNoiseIndent);
+     ListTag(stdout);
 @@ -1306,17 +1306,17 @@ nsBlockFrame::ComputeFinalSize(const nsH
      if (bottomEdgeOfChildren < aState.mReflowState.availableHeight)
      {
@@ -400,25 +440,81 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    }
  
    // Compute final height
-@@ -4976,17 +4976,17 @@ static void MarkAllDescendantLinesDirty(
+@@ -4973,32 +4973,32 @@ static void MarkAllDescendantLinesDirty(
+         MarkAllDescendantLinesDirty(bf);
+       }
+     }
      line->MarkDirty();
      ++line;
    }
  }
  
- static void MarkSameSpaceManagerLinesDirty(nsBlockFrame* aBlock)
- {
-   nsBlockFrame* blockWithSpaceMgr = aBlock;
+-static void MarkSameSpaceManagerLinesDirty(nsBlockFrame* aBlock)
+-{
+-  nsBlockFrame* blockWithSpaceMgr = aBlock;
 -  while (!(blockWithSpaceMgr->GetStateBits() & NS_BLOCK_SPACE_MGR)) {
-+  while (!(blockWithSpaceMgr->GetStateBits() & NS_BLOCK_FLOAT_MGR)) {
-     nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithSpaceMgr->GetParent());
+-    nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithSpaceMgr->GetParent());
++static void MarkSameFloatManagerLinesDirty(nsBlockFrame* aBlock)
++{
++  nsBlockFrame* blockWithFloatMgr = aBlock;
++  while (!(blockWithFloatMgr->GetStateBits() & NS_BLOCK_FLOAT_MGR)) {
++    nsBlockFrame* bf = nsLayoutUtils::GetAsBlock(blockWithFloatMgr->GetParent());
      if (!bf) {
        break;
      }
-     blockWithSpaceMgr = bf;
+-    blockWithSpaceMgr = bf;
++    blockWithFloatMgr = bf;
    }
      
    // Mark every line at and below the line where the float was
+   // dirty, and mark their lines dirty too. We could probably do
+   // something more efficient --- e.g., just dirty the lines that intersect
+   // the float vertically.
+-  MarkAllDescendantLinesDirty(blockWithSpaceMgr);
++  MarkAllDescendantLinesDirty(blockWithFloatMgr);
+ }
+ 
+ /**
+  * Returns PR_TRUE if aFrame is a block that has one or more float children.
+  */
+ static PRBool BlockHasAnyFloats(nsIFrame* aFrame)
+ {
+   nsBlockFrame* block = nsLayoutUtils::GetAsBlock(aFrame);
+@@ -5029,32 +5029,32 @@ nsBlockFrame::RemoveFrame(nsIAtom*  aLis
+   nsFrame::ListTag(stdout, aOldFrame);
+   printf("\n");
+ #endif
+ 
+   if (nsnull == aListName) {
+     PRBool hasFloats = BlockHasAnyFloats(aOldFrame);
+     rv = DoRemoveFrame(aOldFrame, REMOVE_FIXED_CONTINUATIONS);
+     if (hasFloats) {
+-      MarkSameSpaceManagerLinesDirty(this);
++      MarkSameFloatManagerLinesDirty(this);
+     }
+   }
+   else if (nsGkAtoms::absoluteList == aListName) {
+     return mAbsoluteContainer.RemoveFrame(this, aListName, aOldFrame);
+   }
+   else if (nsGkAtoms::floatList == aListName) {
+     nsIFrame* curFrame = aOldFrame;
+     // Make sure to delete all the continuations for the float frame
+     // we are removing; this way is a bit messy, but so is the rest of the code.
+     // See bug 390762.
+     do {
+       nsIFrame* continuation = curFrame->GetNextContinuation();
+       nsBlockFrame* curParent = static_cast<nsBlockFrame*>(curFrame->GetParent());
+       curParent->RemoveFloat(curFrame);
+-      MarkSameSpaceManagerLinesDirty(curParent);
++      MarkSameFloatManagerLinesDirty(curParent);
+       curFrame = continuation;
+     } while (curFrame);
+   }
+ #ifdef IBMBIDI
+   else if (nsGkAtoms::nextBidi == aListName) {
+     // Skip the call to |FrameNeedsReflow| below by returning now.
+     return DoRemoveFrame(aOldFrame, REMOVE_FIXED_CONTINUATIONS);
+   }
 @@ -6790,33 +6790,33 @@ nsBlockFrame::BlockIsMarginRoot(nsIFrame
    nsIFrame* parent = aBlock->GetParent();
    return (aBlock->GetStateBits() & NS_BLOCK_MARGIN_ROOT) ||
