@@ -1018,7 +1018,7 @@ rename to layout/generic/nsFloatManager.cpp
 -    mMaximalLeftYMost(nscoord_MIN),
 -    mMaximalRightYMost(nscoord_MIN),
 -    mCachedBandPosition(nsnull)
-+  : mX(0), mY(0),
++  : mX(0), mY(0), mFloats(nsnull),
 +    mFloatDamage(PSArenaAllocCB, PSArenaFreeCB, aPresShell)
  {
    MOZ_COUNT_CTOR(nsFloatManager);
@@ -1034,7 +1034,6 @@ rename to layout/generic/nsFloatManager.cpp
 -    delete mFrameInfoMap;
 -    mFrameInfoMap = next;
 -  }
-+  PR_INIT_CLIST(&mFloats);
  }
  
  nsFloatManager::~nsFloatManager()
@@ -1043,10 +1042,11 @@ rename to layout/generic/nsFloatManager.cpp
 -  mBandList.Clear();
 -  ClearFrameInfo();
 +
-+  while (!PR_CLIST_IS_EMPTY(&mFloats)) {
-+    FloatInfo *i = FloatsTail();
-+    PR_REMOVE_LINK(i);
++  FloatInfo *i = mFloats;
++  while (i) {
++    FloatInfo *prev = i->mPrev;
 +    delete i;
++    i = prev;
 +  }
  }
  
@@ -1075,7 +1075,7 @@ rename to layout/generic/nsFloatManager.cpp
      return;
    }
  
-@@ -189,842 +137,170 @@ void nsFloatManager::Shutdown()
+@@ -189,842 +137,160 @@ void nsFloatManager::Shutdown()
      if (floatManager)
        nsMemory::Free(floatManager);
    }
@@ -1116,7 +1116,7 @@ rename to layout/generic/nsFloatManager.cpp
 +  // If there are no floats at all, or we're below the last one, return
 +  // quickly.
 +  if (!HasAnyFloats() ||
-+      (FloatsTail()->mLeftYMost <= top && FloatsTail()->mRightYMost <= top)) {
++      (mFloats->mLeftYMost <= top && mFloats->mRightYMost <= top)) {
 +    *aHasFloats = PR_FALSE;
 +    aAvailSpace.SetRect(0, aYOffset, aContentAreaWidth, aMaxHeight);
 +    return;
@@ -1141,9 +1141,10 @@ rename to layout/generic/nsFloatManager.cpp
 +
 +  // Walk backwards through the floats until we either hit the front of
 +  // the list or we're above |top|.
-+  const FloatInfo *i = FloatsTail(); 
 +  PRBool haveFloats = PR_FALSE;
-+  for (;;) {
++  for (const FloatInfo *i = mFloats; 
++       i && (i->mLeftYMost > top || i->mRightYMost > top);
++       i = i->mPrev) {
 +    nscoord floatTop = i->mRect.y, floatBottom = i->mRect.YMost();
 +    if (floatTop > top) {
 +      // This float is below our band.  Shrink our band's height if needed.
@@ -1170,12 +1171,6 @@ rename to layout/generic/nsFloatManager.cpp
 +          right = leftEdge;
 +      }
 +    }
-+
-+    if (i == FloatsHead())
-+      break;
-+    i = i->Prev();
-+    if (i->mLeftYMost <= top && i->mRightYMost <= top)
-+      break;
 +  }
 +
 +  *aHasFloats = haveFloats;
@@ -1218,7 +1213,7 @@ rename to layout/generic/nsFloatManager.cpp
 -  aBandData.mCount = 0;
 +  // Set mLeftYMost and mRightYMost.
 +  if (HasAnyFloats()) {
-+    FloatInfo *tail = FloatsTail();
++    FloatInfo *tail = mFloats;
 +    info->mLeftYMost = tail->mLeftYMost;
 +    info->mRightYMost = tail->mRightYMost;
 +  } else {
@@ -1320,7 +1315,8 @@ rename to layout/generic/nsFloatManager.cpp
 -    *trapezoid = nsRect(left - mX, localY, rightEdge - left, height);
 -    aBandData.mCount++;
 -  }
-+  PR_APPEND_LINK(info, &mFloats);
++  info->mPrev = mFloats;
++  mFloats = info;
  
    return NS_OK;
  }
@@ -1891,11 +1887,11 @@ rename to layout/generic/nsFloatManager.cpp
 -  while (mFrameInfoMap && frameSet.Contains(mFrameInfoMap->mFrame)) {
 -    RemoveRegion(mFrameInfoMap->mFrame);
 +  while (HasAnyFloats()) {
-+    FloatInfo *i = FloatsTail();
++    FloatInfo *i = mFloats;
 +    if (!frameSet.Contains(i->mFrame)) {
 +      break;
 +    }
-+    PR_REMOVE_LINK(i);
++    mFloats = i->mPrev;
 +    delete i;
    }
  
@@ -1903,16 +1899,9 @@ rename to layout/generic/nsFloatManager.cpp
 -  for (FrameInfo* frameInfo = mFrameInfoMap; frameInfo;
 -       frameInfo = frameInfo->mNext) {
 -    NS_ASSERTION(!frameSet.Contains(frameInfo->mFrame),
--                 "Frame region deletion was requested but we couldn't delete it");
-+  if (HasAnyFloats()) {
-+    FloatInfo *i = FloatsHead();
-+    for (;;) {
-+      NS_ASSERTION(!frameSet.Contains(i->mFrame),
-+                   "Frame region deletion was requested but we couldn't delete it");
-+      if (i == FloatsTail())
-+        break;
-+      i = i->Next();
-+    }
++  for (FloatInfo *i = mFloats; i; i = i->mPrev) {
++    NS_ASSERTION(!frameSet.Contains(i->mFrame),
+                  "Frame region deletion was requested but we couldn't delete it");
    }
  #endif
  
@@ -2040,7 +2029,7 @@ rename to layout/generic/nsFloatManager.cpp
    // This is a cheap push implementation, which
    // only saves the (x,y) and last frame in the mFrameInfoMap
    // which is enough info to get us back to where we should be
-@@ -1039,403 +315,148 @@ nsFloatManager::PushState(SavedState* aS
+@@ -1039,403 +305,134 @@ nsFloatManager::PushState(SavedState* aS
    // since that could lead to bugs where damage is missed/dropped when
    // we move from position A to B (during the intermediate incremental
    // reflow mentioned above) and then from B to C during the subsequent
@@ -2060,7 +2049,7 @@ rename to layout/generic/nsFloatManager.cpp
 -  } else {
 -    aState->mLastFrame = nsnull;
 -  }
-+  aState->mLastFloatInfo = HasAnyFloats() ? FloatsTail() : nsnull;
++  aState->mLastFloatInfo = mFloats;
  }
  
  void
@@ -2072,7 +2061,7 @@ rename to layout/generic/nsFloatManager.cpp
 +  mY = aState->mY;
 +
 +  if (HasAnyFloats()) {
-+    if (aState->mLastFloatInfo == FloatsTail()) {
++    if (aState->mLastFloatInfo == mFloats) {
 +      // No changes to state.
 +      return;
 +    }
@@ -2097,28 +2086,16 @@ rename to layout/generic/nsFloatManager.cpp
 -  // to until we hit mLastFrame.
 -  while (mFrameInfoMap && mFrameInfoMap->mFrame != aState->mLastFrame) {
 -    RemoveRegion(mFrameInfoMap->mFrame);
-+  PRCList *desiredTail;
-+  if (aState->mLastFloatInfo) {
-+    desiredTail = aState->mLastFloatInfo;
-+  } else {
-+    desiredTail = &mFloats;
-   }
+-  }
 -
-+  while (PR_LIST_TAIL(&mFloats) != desiredTail) {
-+    FloatInfo *i = FloatsTail();
-+    PR_REMOVE_LINK(i);
-+    delete i;
-+  }
-   // If we trip this assertion it means that someone added
-   // PushState()/PopState() calls around code that actually
-   // removed mLastFrame from mFrameInfoMap, which means our
-   // state is now out of sync with what we thought it should be.
+-  // If we trip this assertion it means that someone added
+-  // PushState()/PopState() calls around code that actually
+-  // removed mLastFrame from mFrameInfoMap, which means our
+-  // state is now out of sync with what we thought it should be.
 -
 -  NS_ASSERTION(((aState->mLastFrame && mFrameInfoMap) ||
 -               (!aState->mLastFrame && !mFrameInfoMap)),
-+  NS_ASSERTION(((aState->mLastFloatInfo && HasAnyFloats()) ||
-+               (!aState->mLastFloatInfo && !HasAnyFloats())),
-                "Unexpected outcome!");
+-               "Unexpected outcome!");
 -
 -  mX = aState->mX;
 -  mY = aState->mY;
@@ -2127,6 +2104,15 @@ rename to layout/generic/nsFloatManager.cpp
 -  mHaveCachedRightYMost = aState->mHaveCachedRightYMost;
 -  mMaximalLeftYMost = aState->mMaximalLeftYMost;
 -  mMaximalRightYMost = aState->mMaximalRightYMost;
++  FloatInfo *i = mFloats;
++  do {
++    FloatInfo *prev = i->mPrev;
++    delete i;
++    i = prev;
++  } while (i && i != aState->mLastFloatInfo);
++  NS_ASSERTION(i == aState->mLastFloatInfo,
++               "somebody misused PushState/PopState");
++  mFloats = i;
  }
  
  nscoord
@@ -2139,7 +2125,7 @@ rename to layout/generic/nsFloatManager.cpp
 +  if (!HasAnyFloats()) {
 +    return nscoord_MIN;
 +  }
-+  return FloatsTail()->mRect.y - mY;
++  return mFloats->mRect.y - mY;
  }
  
  #ifdef DEBUG
@@ -2162,15 +2148,11 @@ rename to layout/generic/nsFloatManager.cpp
 -  fprintf(out, " xy=%d,%d <\n", mX, mY);
 -  if (mBandList.IsEmpty()) {
 -    fprintf(out, "  no bands\n");
-+  const FloatInfo *i = FloatsHead();
-+  for (;;) {
++  for (const FloatInfo *i = mFloats; i; i = i->mPrev) {
 +    printf("Float: frame=%p rect={%d,%d,%d,%d} ymost={l:%d, r:%d}\n",
 +           static_cast<void*>(i->mFrame),
 +           i->mRect.x, i->mRect.y, i->mRect.width, i->mRect.height,
 +           i->mLeftYMost, i->mRightYMost);
-+    if (i == FloatsTail())
-+      break;
-+    i = i->Next();
    }
 -  else {
 -    BandRect* band = mBandList.Head();
@@ -2320,7 +2302,7 @@ rename to layout/generic/nsFloatManager.cpp
 -    mHaveCachedRightYMost = mHaveCachedLeftYMost = PR_TRUE;
 -  }
 -  
-+  const FloatInfo *tail = FloatsTail();
++  const FloatInfo *tail = mFloats;
    switch (aBreakType) {
      case NS_STYLE_CLEAR_LEFT_AND_RIGHT:
 -      NS_ASSERTION(mHaveCachedLeftYMost && mHaveCachedRightYMost,
@@ -2356,7 +2338,7 @@ rename to layout/generic/nsFloatManager.cpp
 +// FloatInfo
 +
 +nsFloatManager::FloatInfo::FloatInfo(nsIFrame* aFrame, const nsRect& aRect)
-+  : mFrame(aFrame), mRect(aRect)
++  : mPrev(nsnull), mFrame(aFrame), mRect(aRect)
  {
 -  NS_ASSERTION(!mBandList.IsEmpty(), "no bands");
 -  BandRect* band = nsnull;
@@ -2384,7 +2366,6 @@ rename to layout/generic/nsFloatManager.cpp
 -{
 -  MOZ_COUNT_CTOR(nsFloatManager::FrameInfo);
 +  MOZ_COUNT_CTOR(nsFloatManager::FloatInfo);
-+  PR_INIT_CLIST(this);
  }
  
  #ifdef NS_BUILD_REFCNT_LOGGING
@@ -2513,7 +2494,7 @@ rename from layout/generic/nsSpaceManager.h
 rename to layout/generic/nsFloatManager.h
 --- a/layout/generic/nsSpaceManager.h
 +++ b/layout/generic/nsFloatManager.h
-@@ -16,267 +16,152 @@
+@@ -16,267 +16,151 @@
   * The Original Code is mozilla.org code.
   *
   * The Initial Developer of the Original Code is
@@ -2549,7 +2530,7 @@ rename to layout/generic/nsFloatManager.h
 +#ifndef nsFloatManager_h_
 +#define nsFloatManager_h_
  
- #include "prclist.h"
+-#include "prclist.h"
  #include "nsIntervalSet.h"
 -#include "nsISupports.h"
  #include "nsCoord.h"
@@ -2796,7 +2777,7 @@ rename to layout/generic/nsFloatManager.h
    };
  
 -  PRBool HasAnyFloats() { return mFrameInfoMap != nsnull; }
-+  PRBool HasAnyFloats() const { return !PR_CLIST_IS_EMPTY(&mFloats); }
++  PRBool HasAnyFloats() const { return !mFloats; }
  
    /**
     * Methods for dealing with the propagation of float damage during
@@ -2823,7 +2804,7 @@ rename to layout/generic/nsFloatManager.h
     * Saves the current state of the float manager into aState.
     */
    void PushState(SavedState* aState);
-@@ -287,205 +172,109 @@ public:
+@@ -287,205 +171,86 @@ public:
     * These states must be managed using stack discipline. PopState can only
     * be used after PushState has been used to save the state, and it can only
     * be used once --- although it can be omitted; saved states can be ignored.
@@ -2871,18 +2852,12 @@ rename to layout/generic/nsFloatManager.h
 +private:
  
 -    FrameInfo(nsIFrame* aFrame, const nsRect& aRect);
-+  struct FloatInfo : public PRCList {
++  struct FloatInfo {
++    FloatInfo *mPrev; // the previous float
 +    nsIFrame *const mFrame;
 +    nsRect mRect;
 +    // The lowest bottoms of left/right floats up to and including this one.
 +    nscoord mLeftYMost, mRightYMost;
-+
-+    FloatInfo* Next() { return static_cast<FloatInfo*>(PR_NEXT_LINK(this)); }
-+    FloatInfo* Prev() { return static_cast<FloatInfo*>(PR_PREV_LINK(this)); }
-+    const FloatInfo* Next() const
-+      { return static_cast<const FloatInfo*>(PR_NEXT_LINK(this)); }
-+    const FloatInfo* Prev() const
-+      { return static_cast<const FloatInfo*>(PR_PREV_LINK(this)); }
 +
 +    FloatInfo(nsIFrame* aFrame, const nsRect& aRect);
  #ifdef NS_BUILD_REFCNT_LOGGING
@@ -2897,7 +2872,10 @@ rename to layout/generic/nsFloatManager.h
 -    nscoord   mLeft, mTop;
 -    nscoord   mRight, mBottom;
 -    nsSmallVoidArray mFrames;  // list of frames occupying the space
--
++  nscoord         mX, mY;     // translation from local to global coordinate space
++  FloatInfo*      mFloats;    // singly linked list, backwards
++  nsIntervalSet   mFloatDamage;
+ 
 -    BandRect(nscoord aLeft, nscoord aTop,
 -             nscoord aRight, nscoord aBottom,
 -             nsIFrame* aFrame);
@@ -3014,27 +2992,9 @@ rename to layout/generic/nsFloatManager.h
 -                 aBandRect->Prev()->mBottom != aBandRect->mBottom,
 -                 "aBandRect should be first rect within its band");
 -    mCachedBandPosition = aBandRect;
-+  FloatInfo* FloatsHead() {
-+    NS_PRECONDITION(HasAnyFloats(), "call only when floats present");
-+    return static_cast<FloatInfo*>(PR_LIST_HEAD(&mFloats));
-+  }
-+  FloatInfo* FloatsTail() {
-+    NS_PRECONDITION(HasAnyFloats(), "call only when floats present");
-+    return static_cast<FloatInfo*>(PR_LIST_TAIL(&mFloats));
-+  }
-+  const FloatInfo* FloatsHead() const {
-+    NS_PRECONDITION(HasAnyFloats(), "call only when floats present");
-+    return static_cast<const FloatInfo*>(PR_LIST_HEAD(&mFloats));
-+  }
-+  const FloatInfo* FloatsTail() const {
-+    NS_PRECONDITION(HasAnyFloats(), "call only when floats present");
-+    return static_cast<const FloatInfo*>(PR_LIST_TAIL(&mFloats));
-   }
- 
-+  nscoord         mX, mY;     // translation from local to global coordinate space
-+  PRCList         mFloats; /* PRCList of FloatInfo */
-+  nsIntervalSet   mFloatDamage;
- 
+-  }
+-
+-
 -private:
    static PRInt32 sCachedFloatManagerCount;
 -  static void* sCachedFloatManagers[NS_SPACE_MANAGER_CACHE_SIZE];
