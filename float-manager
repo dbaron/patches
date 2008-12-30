@@ -2266,7 +2266,7 @@ rename to layout/generic/nsFloatManager.cpp
  PSArenaAllocCB(size_t aSize, void* aClosure)
  {
    return static_cast<nsIPresShell*>(aClosure)->AllocateFrame(aSize);
-@@ -100,933 +58,236 @@ PSArenaAllocCB(size_t aSize, void* aClos
+@@ -100,933 +58,267 @@ PSArenaAllocCB(size_t aSize, void* aClos
  // PresShell Arena free callback (for nsIntervalSet use below)
  static void
  PSArenaFreeCB(size_t aSize, void* aPtr, void* aClosure)
@@ -2295,10 +2295,7 @@ rename to layout/generic/nsFloatManager.cpp
 -  mFrameInfoMap = nsnull;
 +  MOZ_COUNT_CTOR(nsFloatManager);
 +  PR_INIT_CLIST(&mFloats);
-+  PR_INIT_CLIST(&mBands);
-+  mBands.mTop = nscoord_MIN;
-+  mBands.mLeft = nscoord_MIN;
-+  mBands.mRight = nscoord_MAX;
++  InitBands();
  }
  
 -void
@@ -2315,27 +2312,21 @@ rename to layout/generic/nsFloatManager.cpp
 +    FloatInfo *i = FloatsTail();
 +    PR_REMOVE_LINK(i);
 +    delete i;
-+  }
-+
-+  while (!PR_CLIST_IS_EMPTY(&mBands)) {
-+    Band *b = BandsTail(); // BandsHead() == &mBands
-+    PR_REMOVE_LINK(b);
-+    delete b;
    }
- }
+-}
  
 -nsSpaceManager::~nsSpaceManager()
-+// static
-+void* nsFloatManager::operator new(size_t aSize) CPP_THROW_NEW
- {
+-{
 -  MOZ_COUNT_DTOR(nsSpaceManager);
 -  mBandList.Clear();
 -  ClearFrameInfo();
--}
--
--// static
++  DestroyBands();
+ }
+ 
+ // static
 -void* nsSpaceManager::operator new(size_t aSize) CPP_THROW_NEW
--{
++void* nsFloatManager::operator new(size_t aSize) CPP_THROW_NEW
+ {
 -  if (sCachedSpaceManagerCount > 0) {
 +  if (sCachedFloatManagerCount > 0) {
      // We have cached unused instances of this class, return a cached
@@ -2468,7 +2459,7 @@ rename to layout/generic/nsFloatManager.cpp
 -                                      nscoord         aY,
 -                                      const nsSize&   aMaxSize,
 -                                      nsBandData&     aBandData) const
-+nsFloatManager::SplitBands(nscoord aTop, nscoord aBottom,
++nsFloatManager::SplitBands(nscoord aTop, nscoord aBottom, PRIntn aFloatIndex,
 +                           Band** aTopBandIn, Band** aTopBandBelow)
  {
 -  nscoord          topOfBand = aBand->mTop;
@@ -2562,6 +2553,7 @@ rename to layout/generic/nsFloatManager.cpp
 +    Band *clone = new Band(*lowerSplit);
 +    if (!clone)
 +      return NS_ERROR_OUT_OF_MEMORY;
++    clone->mCreatedForIndex = aFloatIndex;
 +    clone->mTop = aBottom;
 +    PR_INIT_CLIST(clone);
 +    PR_INSERT_AFTER(clone, lowerSplit);
@@ -2577,53 +2569,66 @@ rename to layout/generic/nsFloatManager.cpp
 -      // Not enough space in the array of trapezoids
 -      aBandData.mCount++;
 -      return NS_ERROR_FAILURE;
--    }
--    trapezoid->mFrames = nsnull;
--
--    // Assign the trapezoid a rectangular shape. The trapezoid must be in the
--    // local coordinate space, so convert the current left coordinate
--    *trapezoid = nsRect(left - mX, localY, rightEdge - left, height);
--    aBandData.mCount++;
 +  Band *upperSplit = lowerSplit;
 +  while (upperSplit->mTop > aTop)
-+    upperSplit = lowerSplit->Prev();
++    upperSplit = upperSplit->Prev();
 +  if (upperSplit->mTop != aTop || aBottom == aTop) {
 +    Band *clone = new Band(*upperSplit);
 +    if (!clone)
 +      return NS_ERROR_OUT_OF_MEMORY;
++    clone->mCreatedForIndex = aFloatIndex;
 +    clone->mTop = aTop;
 +    PR_INIT_CLIST(clone);
 +    PR_INSERT_AFTER(clone, upperSplit);
 +    *aTopBandIn = clone;
 +  } else {
 +    *aTopBandIn = upperSplit;
-   }
- 
-   return NS_OK;
- }
- 
- nsresult
--nsSpaceManager::GetBandData(nscoord       aYOffset,
--                            const nsSize& aMaxSize,
--                            nsBandData&   aBandData) const
++  }
++
++  return NS_OK;
++}
++
++void
++nsFloatManager::FindSplitFor(nscoord aTop, nscoord aBottom, PRIntn aFloatIndex,
++                             Band** aTopBandIn, Band** aTopBandBelow) const
++{
++  if (aBottom < aTop) {
++    // This might happen due to integer overflow, so we should handle it.
++    NS_NOTREACHED("out of order");
++    aBottom = aTop;
++  }
++
++  Band *lowerSplit = BandsTail();
++  while (lowerSplit->mTop > aBottom ||
++         (lowerSplit->mTop == aBottom && lowerSplit->mIndex > aFloatIndex))
++    lowerSplit = lowerSplit->Prev();
++
++  Band *upperSplit = lowerSplit;
++  while (upperSplit->mTop > aTop ||
++         (upperSplit->mTop == aTop && upperSplit->mIndex > aFloatIndex))
++    upperSplit = upperSplit->Prev();
++
++  *aTopBandIn = upperSplit;
++  *aTopBandBelow = lowerSplit;
++}
++
++nsresult
 +nsFloatManager::AddFloat(nsIFrame* aFloatFrame, const nsRect& aMarginRect)
- {
--  NS_PRECONDITION(aBandData.mSize >= 1, "bad band data");
--  nsresult  result = NS_OK;
++{
 +  FloatInfo *info = new FloatInfo(aFloatFrame, aMarginRect + nsPoint(mX, mY));
 +  if (!info)
 +    return NS_ERROR_OUT_OF_MEMORY;
- 
--  // Convert the y-offset to world coordinates
--  nscoord   y = mY + aYOffset;
++
 +  // Set mLeftYMost and mRightYMost.
 +  if (HasAnyFloats()) {
 +    FloatInfo *tail = FloatsTail();
 +    info->mLeftYMost = tail->mLeftYMost;
 +    info->mRightYMost = tail->mRightYMost;
++    info->mIndex = tail->mIndex + 1;
 +  } else {
 +    info->mLeftYMost = nscoord_MIN;
 +    info->mRightYMost = nscoord_MIN;
++    info->mIndex = 1; // reserve 0 for the initial band
 +  }
 +  PRUint8 floatStyle = aFloatFrame->GetStyleDisplay()->mFloats;
 +  NS_ASSERTION(floatStyle == NS_STYLE_FLOAT_LEFT ||
@@ -2633,28 +2638,63 @@ rename to layout/generic/nsFloatManager.cpp
 +  nscoord thisYMost = info->mRect.YMost();
 +  if (thisYMost > sideYMost)
 +    sideYMost = thisYMost;
- 
--  // If there are no unavailable rects or the offset is below the bottommost
--  // band, then all the space is available
--  nscoord yMost;
--  nscoord maxHeight = aMaxSize.height == NS_UNCONSTRAINEDSIZE ? NS_UNCONSTRAINEDSIZE 
--    : PR_MAX(0, aMaxSize.height - aYOffset);
++
 +  PR_APPEND_LINK(info, &mFloats);
- 
--  if (!YMost(yMost) || (y >= yMost)) {
--    // All the requested space is available
--    aBandData.mCount = 1;
--    aBandData.mTrapezoids[0] = nsRect(0, aYOffset, aMaxSize.width, maxHeight);
--    aBandData.mTrapezoids[0].mFrames = nsnull;
++
 +  Band *band, *band_end;
-+  nsresult rv = SplitBands(info->mRect.y, info->mRect.YMost(),
++  nsresult rv = SplitBands(info->mRect.y, info->mRect.YMost(), info->mIndex,
 +                           &band, &band_end);
 +  NS_ENSURE_SUCCESS(rv, rv);
 +  if (floatStyle == NS_STYLE_FLOAT_LEFT) {
 +    for ( ; band != band_end; band = band->Next()) {
 +      band->mLeft = PR_MAX(info->mRect.XMost(), band->mLeft);
+     }
+-    trapezoid->mFrames = nsnull;
+-
+-    // Assign the trapezoid a rectangular shape. The trapezoid must be in the
+-    // local coordinate space, so convert the current left coordinate
+-    *trapezoid = nsRect(left - mX, localY, rightEdge - left, height);
+-    aBandData.mCount++;
++  } else {
++    for ( ; band != band_end; band = band->Next()) {
++      band->mRight = PR_MIN(info->mRect.x, band->mRight);
 +    }
-   } else {
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+-nsSpaceManager::GetBandData(nscoord       aYOffset,
+-                            const nsSize& aMaxSize,
+-                            nsBandData&   aBandData) const
++nsFloatManager::RemoveTrailingRegions(nsIFrame* aFrameList)
+ {
+-  NS_PRECONDITION(aBandData.mSize >= 1, "bad band data");
+-  nsresult  result = NS_OK;
++  nsIFrame *floatFrame;
++  do {
++    FloatInfo *i = FloatsTail();
++    floatFrame = i->mFrame;
++    PR_REMOVE_LINK(i);
++    delete i;
++  } while (floatFrame != aFrameList);
+ 
+-  // Convert the y-offset to world coordinates
+-  nscoord   y = mY + aYOffset;
+-
+-  // If there are no unavailable rects or the offset is below the bottommost
+-  // band, then all the space is available
+-  nscoord yMost;
+-  nscoord maxHeight = aMaxSize.height == NS_UNCONSTRAINEDSIZE ? NS_UNCONSTRAINEDSIZE 
+-    : PR_MAX(0, aMaxSize.height - aYOffset);
+-
+-  if (!YMost(yMost) || (y >= yMost)) {
+-    // All the requested space is available
+-    aBandData.mCount = 1;
+-    aBandData.mTrapezoids[0] = nsRect(0, aYOffset, aMaxSize.width, maxHeight);
+-    aBandData.mTrapezoids[0].mFrames = nsnull;
+-  } else {
 -    // Find the first band that contains the y-offset or is below the y-offset
 -    BandRect* band = GuessBandWithTopAbove(y);
 -
@@ -2676,11 +2716,9 @@ rename to layout/generic/nsFloatManager.cpp
 -        // Skip to the next band
 -        band = GetNextBand(band);
 -      }
-+    for ( ; band != band_end; band = band->Next()) {
-+      band->mRight = PR_MIN(info->mRect.x, band->mRight);
-     }
-   }
- 
+-    }
+-  }
+-
 -  NS_POSTCONDITION(aBandData.mCount > 0, "unexpected band data count");
 -  return result;
 -}
@@ -3204,14 +3242,15 @@ rename to layout/generic/nsFloatManager.cpp
 -                 "Frame region deletion was requested but we couldn't delete it");
 -  }
 -#endif
--
++  // Just leave mBands inconsistent with mFloats; ClearFloats doesn't
++  // need it, and that's all that's allowed to be called now.
+ 
    return NS_OK;
  }
  
- nsresult
+-nsresult
 -nsSpaceManager::RemoveRegion(nsIFrame* aFrame)
-+nsFloatManager::RemoveTrailingRegions(nsIFrame* aFrameList)
- {
+-{
 -  // Get the frame info associated with aFrame
 -  FrameInfo*  frameInfo = GetFrameInfoFor(aFrame);
 -
@@ -3319,10 +3358,9 @@ rename to layout/generic/nsFloatManager.cpp
 -  }
 -
 -  DestroyFrameInfo(frameInfo);
-+  NS_NOTYETIMPLEMENTED("write me");
-   return NS_OK;
- }
- 
+-  return NS_OK;
+-}
+-
  void
 -nsSpaceManager::PushState(SavedState* aState)
 +nsFloatManager::PushState(SavedState* aState)
@@ -3334,7 +3372,7 @@ rename to layout/generic/nsFloatManager.cpp
    // which is enough info to get us back to where we should be
    // when pop is called.
    //
-@@ -1039,439 +300,153 @@ nsSpaceManager::PushState(SavedState* aS
+@@ -1039,439 +331,216 @@ nsSpaceManager::PushState(SavedState* aS
    // since that could lead to bugs where damage is missed/dropped when
    // we move from position A to B (during the intermediate incremental
    // reflow mentioned above) and then from B to C during the subsequent
@@ -3355,7 +3393,6 @@ rename to layout/generic/nsFloatManager.cpp
 -    aState->mLastFrame = nsnull;
 -  }
 +  aState->mLastFloatInfo = HasAnyFloats() ? FloatsTail() : nsnull;
-+  NS_NOTYETIMPLEMENTED("write more");
  }
  
  void
@@ -3364,10 +3401,25 @@ rename to layout/generic/nsFloatManager.cpp
  {
    NS_PRECONDITION(aState, "No state to restore?");
  
++  mX = aState->mX;
++  mY = aState->mY;
++
++  if (HasAnyFloats()) {
++    if (aState->mLastFloatInfo == FloatsTail()) {
++      // No changes to state.
++      return;
++    }
++  } else {
++    // No floats, therefore nothing to do.
++    NS_ASSERTION(!aState->mLastFloatInfo, "must not have had floats before");
++    return;
++  }
++
    // This is a quick and dirty pop implementation, to
    // match the current implementation of PushState(). The
    // idea here is to remove any frames that have been added
-   // to the mFrameInfoMap since the last call to PushState().
+-  // to the mFrameInfoMap since the last call to PushState().
++  // to the mFloats since the last call to PushState().
  
 -  // Say we don't have cached left- and right-YMost, so that we don't
 -  // try to check for it in RemoveRegion.  We'll restore these from
@@ -3378,27 +3430,80 @@ rename to layout/generic/nsFloatManager.cpp
 -  // to until we hit mLastFrame.
 -  while (mFrameInfoMap && mFrameInfoMap->mFrame != aState->mLastFrame) {
 -    RemoveRegion(mFrameInfoMap->mFrame);
--  }
-+  NS_NOTYETIMPLEMENTED("write me");
- 
++  PRCList *desiredTail;
++  if (aState->mLastFloatInfo) {
++    desiredTail = aState->mLastFloatInfo;
++  } else {
++    desiredTail = &mFloats;
+   }
+-
++  while (PR_LIST_TAIL(&mFloats) != desiredTail) {
++    FloatInfo *i = FloatsTail();
++    PR_REMOVE_LINK(i);
++    delete i;
++  }
    // If we trip this assertion it means that someone added
    // PushState()/PopState() calls around code that actually
    // removed mLastFrame from mFrameInfoMap, which means our
    // state is now out of sync with what we thought it should be.
- 
+-
 -  NS_ASSERTION(((aState->mLastFrame && mFrameInfoMap) ||
 -               (!aState->mLastFrame && !mFrameInfoMap)),
 +  NS_ASSERTION(((aState->mLastFloatInfo && HasAnyFloats()) ||
 +               (!aState->mLastFloatInfo && !HasAnyFloats())),
                 "Unexpected outcome!");
  
-   mX = aState->mX;
-   mY = aState->mY;
+-  mX = aState->mX;
+-  mY = aState->mY;
 -  mLowestTop = aState->mLowestTop;
 -  mHaveCachedLeftYMost = aState->mHaveCachedLeftYMost;
 -  mHaveCachedRightYMost = aState->mHaveCachedRightYMost;
 -  mMaximalLeftYMost = aState->mMaximalLeftYMost;
 -  mMaximalRightYMost = aState->mMaximalRightYMost;
++  // Remove any extra bands and reset the coordinates for bands that
++  // might have bad information.
++  if (!aState->mLastFloatInfo) {
++    // Remove all the bands and return.
++    DestroyBands();
++    InitBands();
++    return;
++  }
++
++  nscoord lastFloatTop = aState->mLastFloatInfo->mRect.x;
++  PRUintn lastFloatIndex = aState->mLastFloatInfo->mIndex;
++  Band *b = BandsTail();
++  do {
++    if (b->mCreatedForIndex > lastFloatIndex) {
++      Band *toDelete = b;
++      b = b->Prev();
++      PR_REMOVE_LINK(toDelete);
++      delete toDelete;
++      continue;
++    }
++
++    b->mLeft = nscoord_MIN;
++    b->mRight = nscoord_MAX;
++
++    b = b->Prev();
++  // REVIEW: check that this condition is correct:
++  } while (b->mTop > lastFloatTop ||
++           (b->mTop == lastFloatTop && b->mCreatedForIndex > lastFloatIndex));
++
++  // Recompute the coordinates for the bands that we reset.
++  for (FloatInfo *i = FloatsTail();
++       // REVIEW: check this condition:
++       i->mLeftYMost >= lastFloatTop || i->mRightYMost >= lastFloatTop;
++       i = i->Prev()) {
++    Band *band, *band_end;
++    FindSplitFor(i->mRect.y, i->mRect.YMost(), i->mIndex, &band, &band_end);
++    for (; band != band_end; band = band->Next()) {
++      band->mLeft = PR_MAX(band->mLeft, i->mRect.x);
++      band->mRight = PR_MIN(band->mRight, i->mRect.XMost());
++    }
++
++    if (i == FloatsHead())
++      break;
++  }
  }
  
  nscoord
@@ -3828,7 +3933,7 @@ rename from layout/generic/nsSpaceManager.h
 rename to layout/generic/nsFloatManager.h
 --- a/layout/generic/nsSpaceManager.h
 +++ b/layout/generic/nsFloatManager.h
-@@ -16,476 +16,287 @@
+@@ -16,476 +16,309 @@
   * The Original Code is mozilla.org code.
   *
   * The Initial Developer of the Original Code is
@@ -4192,6 +4297,7 @@ rename to layout/generic/nsFloatManager.h
 +    nsRect mRect;
 +    // The lowest bottoms of left/right floats up to and including this one.
 +    nscoord mLeftYMost, mRightYMost;
++    PRUintn mIndex; // index in the list
 +
 +    FloatInfo* Next() { return static_cast<FloatInfo*>(PR_NEXT_LINK(this)); }
 +    FloatInfo* Prev() { return static_cast<FloatInfo*>(PR_PREV_LINK(this)); }
@@ -4241,6 +4347,7 @@ rename to layout/generic/nsFloatManager.h
 +    nscoord mTop, mLeft, mRight;
 +    // bottom is the start of the next band, or nscoord_MAX for last band
 +    // Note: bands may have 0 height (when there is a 0-height float).
++    PRIntn mCreatedForIndex;
  
 -    // List operations
 -    BandRect* Next() const {return (BandRect*)PR_NEXT_LINK(this);}
@@ -4305,22 +4412,19 @@ rename to layout/generic/nsFloatManager.h
 +   * |aBottom|.  The caller must modify the left or right of the bands in
 +   * [aTopBandIn, aTopBandBelow) for the float.
 +   */
-+  nsresult SplitBands(nscoord aTop, nscoord aBottom,
++  nsresult SplitBands(nscoord aTop, nscoord aBottom, PRIntn aFloatIndex,
 +                      Band** aTopBandIn, Band** aTopBandBelow);
  
 -    // Operations
 -    void      Append(BandRect* aBandRect) {PR_APPEND_LINK(aBandRect, this);}
-+  nscoord         mX, mY;     // translation from local to global coordinate space
-+  PRCList         mFloats; /* PRCList of FloatInfo */
-+  Band            mBands;  /* PRCList of Band, always have one entry */
-+  nsIntervalSet   mFloatDamage;
++  /** Find the split previously made by an analogous call to SplitBands */
++  void FindSplitFor(nscoord aTop, nscoord aBottom, PRIntn aFloatIndex,
++                    Band** aTopBandIn, Band** aTopBandBelow) const;
  
 -    // Remove and delete all the band rects in the list
 -    void      Clear();
 -  };
-+  static PRInt32 sCachedFloatManagerCount;
-+  static void* sCachedFloatManagers[NS_FLOAT_MANAGER_CACHE_SIZE];
- 
+-
 -protected:
 -  nscoord         mX, mY;     // translation from local to global coordinate space
 -  BandList        mBandList;  // header/sentinel for circular linked list of band rects
@@ -4375,15 +4479,35 @@ rename to layout/generic/nsFloatManager.h
 -                 aBandRect->Prev()->mBottom != aBandRect->mBottom,
 -                 "aBandRect should be first rect within its band");
 -    mCachedBandPosition = aBandRect;
--  }
--
--
++  void InitBands() {
++    PR_INIT_CLIST(&mBands);
++    mBands.mTop = nscoord_MIN;
++    mBands.mLeft = nscoord_MIN;
++    mBands.mRight = nscoord_MAX;
++    mBands.mCreatedForIndex = 0;
+   }
+ 
++  void DestroyBands() {
++    while (!PR_CLIST_IS_EMPTY(&mBands)) {
++      Band *b = BandsTail(); // BandsHead() == &mBands
++      PR_REMOVE_LINK(b);
++      delete b;
++    }
++  }
+ 
 -private:
 -  static PRInt32 sCachedSpaceManagerCount;
 -  static void* sCachedSpaceManagers[NS_SPACE_MANAGER_CACHE_SIZE];
--
++  nscoord         mX, mY;     // translation from local to global coordinate space
++  PRCList         mFloats; /* PRCList of FloatInfo */
++  Band            mBands;  /* PRCList of Band, always have one entry */
++  nsIntervalSet   mFloatDamage;
+ 
 -  nsSpaceManager(const nsSpaceManager&);  // no implementation
 -  void operator=(const nsSpaceManager&);  // no implementation
++  static PRInt32 sCachedFloatManagerCount;
++  static void* sCachedFloatManagers[NS_FLOAT_MANAGER_CACHE_SIZE];
++
 +  nsFloatManager(const nsFloatManager&);  // no implementation
 +  void operator=(const nsFloatManager&);  // no implementation
  };
