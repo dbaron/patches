@@ -16,7 +16,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 -      // because we are only checking the top of the line
 -      aState.GetAvailableSpace(aLine->mBounds.y + aDeltaY, PR_FALSE);
 +      aState.GetAvailableSpaceForHeight(aLine->mBounds.y + aDeltaY,
-+                                        aLine->mBounds.height, PR_FALSE);
++                                        aLine->mBounds.height);
        PRBool wasImpactedByFloat = aLine->IsImpactedByFloat();
        PRBool isImpactedByFloat = aState.IsImpactedByFloat();
  
@@ -25,6 +25,279 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
         this, wasImpactedByFloat, isImpactedByFloat);
  #endif
  
+@@ -3219,16 +3218,23 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+ nsresult
+ nsBlockFrame::ReflowInlineFrames(nsBlockReflowState& aState,
+                                  line_iterator aLine,
+                                  PRBool* aKeepReflowGoing)
+ {
+   nsresult rv = NS_OK;
+   *aKeepReflowGoing = PR_TRUE;
+ 
++  // Setup initial coordinate system for reflowing the inline frames
++  // into. Apply a previous block frame's bottom margin first.
++  if (ShouldApplyTopMargin(aState, aLine)) {
++    aState.mY += aState.mPrevBottomMargin.get();
++  }
++  aState.GetAvailableSpace();
++
+ #ifdef DEBUG
+   PRInt32 spins = 0;
+ #endif
+   LineReflowStatus lineReflowStatus = LINE_REFLOW_REDO_NEXT_BAND;
+   PRBool movedPastFloat = PR_FALSE;
+   do {
+     PRBool allowPullUp = PR_TRUE;
+     nsIContent* forceBreakInContent = nsnull;
+@@ -3253,17 +3259,18 @@ nsBlockFrame::ReflowInlineFrames(nsBlock
+         lineLayout.ForceBreakAtPosition(forceBreakInContent, forceBreakOffset);
+       }
+       rv = DoReflowInlineFrames(aState, lineLayout, aLine,
+                                 aKeepReflowGoing, &lineReflowStatus,
+                                 allowPullUp);
+       lineLayout.EndLineReflow();
+ 
+       if (LINE_REFLOW_REDO_NO_PULL == lineReflowStatus ||
+-          LINE_REFLOW_REDO_NEXT_BAND == lineReflowStatus) {
++          LINE_REFLOW_REDO_NEXT_BAND == lineReflowStatus ||
++          LINE_REFLOW_REDO_MORE_FLOATS == lineReflowStatus) {
+         if (lineLayout.NeedsBackup()) {
+           NS_ASSERTION(!forceBreakInContent, "Backing up twice; this should never be necessary");
+           // If there is no saved break position, then this will set
+           // set forceBreakInContent to null and we won't back up, which is
+           // correct.
+           forceBreakInContent = lineLayout.GetLastOptionalBreakPosition(&forceBreakOffset, &forceBreakPriority);
+         } else {
+           forceBreakInContent = nsnull;
+@@ -3286,17 +3293,19 @@ nsBlockFrame::ReflowInlineFrames(nsBlock
+ 
+       // Don't allow pullup on a subsequent LINE_REFLOW_REDO_NO_PULL pass
+       allowPullUp = PR_FALSE;
+     } while (NS_SUCCEEDED(rv) && LINE_REFLOW_REDO_NO_PULL == lineReflowStatus);
+ 
+     if (LINE_REFLOW_REDO_NEXT_BAND == lineReflowStatus) {
+       movedPastFloat = PR_TRUE;
+     }
+-  } while (NS_SUCCEEDED(rv) && LINE_REFLOW_REDO_NEXT_BAND == lineReflowStatus);
++  } while (NS_SUCCEEDED(rv) &&
++           (LINE_REFLOW_REDO_NEXT_BAND == lineReflowStatus ||
++            LINE_REFLOW_REDO_MORE_FLOATS == lineReflowStatus));
+ 
+   // If we did at least one REDO_FOR_FLOAT, then the line did not fit next to some float.
+   // Mark it as impacted by a float, even if it no longer is next to a float.
+   if (movedPastFloat) {
+     aLine->SetLineIsImpactedByFloat(PR_TRUE);
+   }
+ 
+   return rv;
+@@ -3332,22 +3341,16 @@ nsBlockFrame::DoReflowInlineFrames(nsBlo
+                                    PRBool* aKeepReflowGoing,
+                                    LineReflowStatus* aLineReflowStatus,
+                                    PRBool aAllowPullUp)
+ {
+   // Forget all of the floats on the line
+   aLine->FreeFloats(aState.mFloatCacheFreeList);
+   aState.mFloatCombinedArea.SetRect(0, 0, 0, 0);
+ 
+-  // Setup initial coordinate system for reflowing the inline frames
+-  // into. Apply a previous block frame's bottom margin first.
+-  if (ShouldApplyTopMargin(aState, aLine)) {
+-    aState.mY += aState.mPrevBottomMargin.get();
+-  }
+-  aState.GetAvailableSpace();
+   PRBool impactedByFloats = aState.IsImpactedByFloat() ? PR_TRUE : PR_FALSE;
+   aLine->SetLineIsImpactedByFloat(impactedByFloats);
+ #ifdef REALLY_NOISY_REFLOW
+   printf("nsBlockFrame::DoReflowInlineFrames %p impacted = %d\n",
+          this, impactedByFloats);
+ #endif
+ 
+   const nsMargin& borderPadding = aState.BorderPadding();
+@@ -3499,55 +3502,48 @@ nsBlockFrame::DoReflowInlineFrames(nsBlo
+     NS_ASSERTION(NS_UNCONSTRAINEDSIZE != aState.mAvailSpaceRect.height,
+                  "unconstrained height on totally empty line");
+ 
+     // See the analogous code for blocks in nsBlockReflowState::ClearFloats.
+     if (aState.mAvailSpaceRect.height > 0) {
+       NS_ASSERTION(aState.IsImpactedByFloat(),
+                    "redo line on totally empty line with non-empty band...");
+       aState.mY += aState.mAvailSpaceRect.height;
++      aState.GetAvailableSpace();
+     } else {
+       NS_ASSERTION(NS_UNCONSTRAINEDSIZE != aState.mReflowState.availableHeight,
+                    "We shouldn't be running out of height here");
+       if (NS_UNCONSTRAINEDSIZE == aState.mReflowState.availableHeight) {
+         // just move it down a bit to try to get out of this mess
+         aState.mY += 1;
++        aState.GetAvailableSpace();
+       } else {
+         // There's nowhere to retry placing the line. Just treat it as if
+         // we placed the float but it was truncated so we need this line
+         // to go to the next page/column.
+         lineReflowStatus = LINE_REFLOW_TRUNCATED;
+         // Push the line that didn't fit
+         PushTruncatedPlaceholderLine(aState, aLine, *aKeepReflowGoing);
+       }
+     }
+-      
+-    // We don't want to advance by the bottom margin anymore (we did it
+-    // once at the beginning of this function, which will just be called
+-    // again), and we certainly don't want to go back if it's negative
+-    // (infinite loop, bug 153429).
+-    aState.mPrevBottomMargin.Zero();
+ 
+     // XXX: a small optimization can be done here when paginating:
+     // if the new Y coordinate is past the end of the block then
+     // push the line and return now instead of later on after we are
+     // past the float.
+   }
+-  else if (LINE_REFLOW_REDO_NO_PULL == lineReflowStatus) {
+-    // We don't want to advance by the bottom margin anymore (we did it
+-    // once at the beginning of this function, which will just be called
+-    // again), and we certainly don't want to go back if it's negative
+-    // (infinite loop, bug 153429).
+-    aState.mPrevBottomMargin.Zero();
+-  }
+-  else if (LINE_REFLOW_TRUNCATED != lineReflowStatus) {
++  else if (LINE_REFLOW_TRUNCATED != lineReflowStatus &&
++           LINE_REFLOW_REDO_NO_PULL != lineReflowStatus) {
+     // If we are propagating out a break-before status then there is
+     // no point in placing the line.
+     if (!NS_INLINE_IS_BREAK_BEFORE(aState.mReflowStatus)) {
+-      PlaceLine(aState, aLineLayout, aLine, aKeepReflowGoing);
++      if (!PlaceLine(aState, aLineLayout, aLine, aKeepReflowGoing)) {
++        lineReflowStatus = LINE_REFLOW_REDO_MORE_FLOATS;
++        // PlaceLine already called GetAvailableSpace for us.
++      }
+     }
+   }
+ #ifdef DEBUG
+   if (gNoisyReflow) {
+     printf("Line reflow status = %s\n", LineReflowStatusNames[lineReflowStatus]);
+   }
+ #endif
+   *aLineReflowStatus = lineReflowStatus;
+@@ -3949,16 +3945,30 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+         aLine == mLines.begin().next()))) {
+     nsHTMLReflowMetrics metrics;
+     ReflowBullet(aState, metrics, aState.mY);
+     aLineLayout.AddBulletFrame(mBullet, metrics);
+     addedBullet = PR_TRUE;
+   }
+   aLineLayout.VerticalAlignLine();
+ 
++  nsRect oldAvailSpaceRect(aState.mAvailSpaceRect);
++  aState.GetAvailableSpace(aLine->mBounds.y, aLine->mBounds.height);
++  NS_ASSERTION(aState.mAvailSpaceRect.y == oldAvailSpaceRect.y, "yikes");
++  NS_ASSERTION(aState.mAvailSpaceRect.x >= oldAvailSpaceRect.x,
++               "should never have more room");
++  NS_ASSERTION(aState.mAvailSpaceRect.XMost() <= oldAvailSpaceRect.XMost(),
++               "should never have more room");
++  // Restore the height to the position of the next band.
++  aState.mAvailSpaceRect.height = oldAvailSpaceRect.height;
++  if (oldAvailSpaceRect.x != aState.mAvailSpaceRect.x ||
++      oldAvailSpaceRect.width != aState.mAvailSpaceRect.width) {
++    return PR_FALSE;
++  }
++
+ #ifdef DEBUG
+   {
+     static nscoord lastHeight = 0;
+     if (CRAZY_HEIGHT(aLine->mBounds.y)) {
+       lastHeight = aLine->mBounds.y;
+       if (abs(aLine->mBounds.y - lastHeight) > CRAZY_H/10) {
+         nsFrame::ListTag(stdout);
+         printf(": line=%p y=%d line.bounds.height=%d\n",
+@@ -4042,17 +4052,17 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+     PushLines(aState, aLine.prev());
+ 
+     // Stop reflow and whack the reflow status if reflow hasn't
+     // already been stopped.
+     if (*aKeepReflowGoing) {
+       NS_FRAME_SET_INCOMPLETE(aState.mReflowStatus);
+       *aKeepReflowGoing = PR_FALSE;
+     }
+-    return;
++    return PR_TRUE;
+   }
+ 
+   // May be needed below
+   PRBool wasAdjacentWIthTop = aState.IsAdjacentWithTop();
+ 
+   aState.mY = newY;
+   
+   // Add the already placed current-line floats to the line
+@@ -4099,16 +4109,17 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+ #endif
+   }
+ 
+   // Apply break-after clearing if necessary
+   // This must stay in sync with |ReflowDirtyLines|.
+   if (aLine->HasFloatBreakAfter()) {
+     aState.mY = aState.ClearFloats(aState.mY, aLine->GetBreakTypeAfter());
+   }
++  return PR_TRUE;
+ }
+ 
+ void
+ nsBlockFrame::PushLines(nsBlockReflowState&  aState,
+                         nsLineList::iterator aLineBefore)
+ {
+   nsLineList::iterator overBegin(aLineBefore.next());
+ 
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -56,16 +56,20 @@ enum LineReflowStatus {
+   // try to pull up content from the next line if possible.
+   LINE_REFLOW_OK,
+   // The line was completely reflowed and fit in available width, but we should
+   // not try to pull up content from the next line.
+   LINE_REFLOW_STOP,
+   // We need to reflow the line again at its current vertical position. The
+   // new reflow should not try to pull up any frames from the next line.
+   LINE_REFLOW_REDO_NO_PULL,
++  // We need to reflow the line again using the floats from its height
++  // this reflow, since its height made it hit floats that were not
++  // adjacent to its top.
++  LINE_REFLOW_REDO_MORE_FLOATS,
+   // We need to reflow the line again at a lower vertical postion where there
+   // may be more horizontal space due to different float configuration.
+   LINE_REFLOW_REDO_NEXT_BAND,
+   // The line did not fit in the available vertical space. Try pushing it to
+   // the next page or column if it's not the first line on the current page/column.
+   LINE_REFLOW_TRUNCATED
+ };
+ 
+@@ -473,21 +477,23 @@ protected:
+    * @param aLine            the line to reflow.  can contain a single block frame
+    *                         or contain 1 or more inline frames.
+    * @param aKeepReflowGoing [OUT] indicates whether the caller should continue to reflow more lines
+    */
+   nsresult ReflowLine(nsBlockReflowState& aState,
+                       line_iterator aLine,
+                       PRBool* aKeepReflowGoing);
+ 
+-  // Return PR_TRUE if aLine gets pushed.
+-  void PlaceLine(nsBlockReflowState& aState,
+-                 nsLineLayout&       aLineLayout,
+-                 line_iterator       aLine,
+-                 PRBool*             aKeepReflowGoing);
++  // Return false if it needs another reflow because of reduced space
++  // between floats that are next to it (but not next to its top), and
++  // return true otherwise.
++  PRBool PlaceLine(nsBlockReflowState& aState,
++                   nsLineLayout&       aLineLayout,
++                   line_iterator       aLine,
++                   PRBool*             aKeepReflowGoing);
+ 
+   /**
+    * Mark |aLine| dirty, and, if necessary because of possible
+    * pull-up, mark the previous line dirty as well. Also invalidates textruns
+    * on those lines because the text in the lines might have changed due to
+    * addition/removal of frames.
+    * @param aLine the line to mark dirty
+    * @param aLineList the line list containing that line, null means the line
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
