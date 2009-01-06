@@ -105,7 +105,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +      }
 +
 +      PRBool advanced = PR_FALSE;
-+      if (brc.GetMetrics().width > aState.mAvailSpaceRect.width) {
++      if (!aState.ReplacedBlockFitsInAvailSpace(replacedBlock)) {
 +        // Advance to the next band.
 +        advanced = PR_TRUE;
 +        nscoord newY = aState.mY;
@@ -140,15 +140,89 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
          frame->GetRect().y != passOriginalY) {
        Invalidate(frame->GetOverflowRect() + frame->GetPosition());
      }
+@@ -6821,17 +6881,17 @@ nsBlockFrame::BlockCanIntersectFloats(ns
+ }
+ 
+ // Note that this width can vary based on the vertical position.
+ // However, the cases where it varies are the cases where the width fits
+ // in the available space given, which means that variation shouldn't
+ // matter.
+ /* static */
+ nsBlockFrame::ReplacedElementWidthToClear
+-nsBlockFrame::WidthToClearPastFloats(nsBlockReflowState& aState,
++nsBlockFrame::WidthToClearPastFloats(const nsBlockReflowState& aState,
+                                      nsIFrame* aFrame)
+ {
+   nscoord leftOffset, rightOffset;
+   nsCSSOffsetState offsetState(aFrame, aState.mReflowState.rendContext,
+                                aState.mContentArea.width);
+ 
+   ReplacedElementWidthToClear result;
+   // A table outer frame is an exception in that it is a block child
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -306,17 +306,17 @@ public:
+    * care about (which need not be its current mY)
+    */
+   struct ReplacedElementWidthToClear {
+     nscoord marginLeft, borderBoxWidth, marginRight;
+     nscoord MarginBoxWidth() const
+       { return marginLeft + borderBoxWidth + marginRight; }
+   };
+   static ReplacedElementWidthToClear
+-    WidthToClearPastFloats(nsBlockReflowState& aState, nsIFrame* aFrame);
++    WidthToClearPastFloats(const nsBlockReflowState& aState, nsIFrame* aFrame);
+ 
+   /**
+    * Walks up the frame tree, starting with aCandidate, and returns the first
+    * block frame that it encounters.
+    */
+   static nsBlockFrame* GetNearestAncestorBlock(nsIFrame* aCandidate);
+   
+ protected:
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
-@@ -1141,27 +1141,20 @@ nsBlockReflowState::ClearFloats(nscoord 
-             replacedWidth.borderBoxWidth +
-             PR_MAX(mContentArea.width -
-                      PR_MIN(mContentArea.width, mAvailSpaceRect.XMost()),
-                    replacedWidth.marginRight) <=
-           mContentArea.width) {
+@@ -197,17 +197,17 @@ nsBlockReflowState::FreeLineBox(nsLineBo
+ }
+ 
+ void
+ nsBlockReflowState::ComputeReplacedBlockOffsetsForFloats(nsIFrame* aFrame,
+                                                          nscoord& aLeftResult,
+                                                          nscoord& aRightResult,
+                                                          nsBlockFrame::
+                                                       ReplacedElementWidthToClear
+-                                                                 *aReplacedWidth)
++                                                                 *aReplacedWidth) const
+ {
+   // The frame is clueless about the float manager and therefore we
+   // only give it free space. An example is a table frame - the
+   // tables do not flow around floats.
+   // However, we can let its margins intersect floats.
+   NS_ASSERTION(mAvailSpaceRect.x >= 0, "bad avail space rect x");
+   NS_ASSERTION(mAvailSpaceRect.width == 0 ||
+                mAvailSpaceRect.XMost() <= mContentArea.width,
+@@ -1129,39 +1129,25 @@ nsBlockReflowState::ClearFloats(nscoord 
+ 
+   if (aBreakType != NS_STYLE_CLEAR_NONE) {
+     newY = bp.top + mFloatManager->ClearFloats(newY - bp.top, aBreakType);
+   }
+ 
+   if (aReplacedBlock) {
+     for (;;) {
+       GetAvailableSpace(newY, PR_FALSE);
+-      nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
+-        nsBlockFrame::WidthToClearPastFloats(*this, aReplacedBlock);
+-      if (!mBandHasFloats ||
+-          PR_MAX(mAvailSpaceRect.x, replacedWidth.marginLeft) +
+-            replacedWidth.borderBoxWidth +
+-            PR_MAX(mContentArea.width -
+-                     PR_MIN(mContentArea.width, mAvailSpaceRect.XMost()),
+-                   replacedWidth.marginRight) <=
+-          mContentArea.width) {
++
++      if (ReplacedBlockFitsInAvailSpace(aReplacedBlock)) {
          break;
        }
        // See the analogous code for inlines in nsBlockFrame::DoReflowInlineFrames
@@ -178,7 +252,7 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
 diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
 --- a/layout/generic/nsBlockReflowState.h
 +++ b/layout/generic/nsBlockReflowState.h
-@@ -113,16 +113,32 @@ public:
+@@ -113,16 +113,46 @@ public:
    PRBool PlaceBelowCurrentLineFloats(nsFloatCacheFreeList& aFloats, PRBool aForceFit);
  
    // Returns the first coordinate >= aY that clears the
@@ -203,6 +277,20 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
 +    return PR_TRUE;
 +  }
 +
++  // Requires the caller to have made an appropriate GetAvailableSpace
++  // or GetAvailableSpaceForHeight call already.
++  PRBool ReplacedBlockFitsInAvailSpace(nsIFrame* aReplacedBlock) const {
++    nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
++      nsBlockFrame::WidthToClearPastFloats(*this, aReplacedBlock);
++    return !mBandHasFloats ||
++           PR_MAX(mAvailSpaceRect.x, replacedWidth.marginLeft) +
++             replacedWidth.borderBoxWidth +
++             PR_MAX(mContentArea.width -
++                      PR_MIN(mContentArea.width, mAvailSpaceRect.XMost()),
++                    replacedWidth.marginRight) <=
++           mContentArea.width;
++  }
++
    PRBool IsAdjacentWithTop() const {
      return mY ==
        ((mFlags & BRS_ISFIRSTINFLOW) ? mReflowState.mComputedBorderPadding.top : 0);
@@ -211,6 +299,25 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
    /**
     * Adjusts the border/padding to return 0 for the top if
     * we are not the first in flow.
+@@ -148,17 +178,17 @@ public:
+ 
+   // Caller must have called GetAvailableSpace for the correct position
+   // (which need not be the current mY).  Callers need only pass
+   // aReplacedWidth for outer table frames.
+   void ComputeReplacedBlockOffsetsForFloats(nsIFrame* aFrame,
+                                             nscoord& aLeftResult,
+                                             nscoord& aRightResult,
+                                        nsBlockFrame::ReplacedElementWidthToClear
+-                                                      *aReplacedWidth = nsnull);
++                                                *aReplacedWidth = nsnull) const;
+ 
+   // Caller must have called GetAvailableSpace for the current mY
+   void ComputeBlockAvailSpace(nsIFrame* aFrame,
+                               const nsStyleDisplay* aDisplay,
+                               PRBool aBlockAvoidsFloats,
+                               nsRect& aResult);
+ 
+ protected:
 diff --git a/layout/reftests/bugs/25888-1l.html b/layout/reftests/bugs/25888-1l-block.html
 copy from layout/reftests/bugs/25888-1l.html
 copy to layout/reftests/bugs/25888-1l-block.html
