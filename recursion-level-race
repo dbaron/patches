@@ -1,0 +1,152 @@
+Add ability to mark JSDHashTable/PLDHashTable as immutable and thus prevent RECURSION_LEVEL assertions from firing due to lookups racing on multiple threads.  (Bug 469004)
+
+diff --git a/js/src/jsdhash.cpp b/js/src/jsdhash.cpp
+--- a/js/src/jsdhash.cpp
++++ b/js/src/jsdhash.cpp
+@@ -66,28 +66,37 @@
+  * non-DEBUG components.
+  */
+ #ifdef DEBUG
+ 
+ #define JSDHASH_ONELINE_ASSERT JS_ASSERT
+ #define RECURSION_LEVEL(table_) (*(uint32*)(table_->entryStore + \
+                                             JS_DHASH_TABLE_SIZE(table_) * \
+                                             table_->entrySize))
++#define IMMUTABLE_RECURSION_LEVEL ((uint32)-1)
+ 
+ #define ENTRY_STORE_EXTRA                   sizeof(uint32)
+-#define INCREMENT_RECURSION_LEVEL(table_)   \
+-    JS_BEGIN_MACRO                          \
+-      ++RECURSION_LEVEL(table_);            \
++#define INCREMENT_RECURSION_LEVEL(table_)                                     \
++    JS_BEGIN_MACRO                                                            \
++      if (RECURSION_LEVEL(table_) != IMMUTABLE_RECURSION_LEVEL) {             \
++        ++RECURSION_LEVEL(table_);                                            \
++      }                                                                       \
+     JS_END_MACRO
+-#define DECREMENT_RECURSION_LEVEL(table_)                  \
+-    JS_BEGIN_MACRO                                         \
+-      JSDHASH_ONELINE_ASSERT(RECURSION_LEVEL(table_) > 0); \
+-      --RECURSION_LEVEL(table_);                           \
++#define DECREMENT_RECURSION_LEVEL(table_)                                     \
++    JS_BEGIN_MACRO                                                            \
++      if (RECURSION_LEVEL(table_) != IMMUTABLE_RECURSION_LEVEL) {             \
++        JSDHASH_ONELINE_ASSERT(RECURSION_LEVEL(table_) > 0);                  \
++        --RECURSION_LEVEL(table_);                                            \
++      }                                                                       \
+     JS_END_MACRO
+ 
++#define NOT_REENTERING(table_)                                                \
++    (RECURSION_LEVEL(table_) == 0 ||                                          \
++     RECURSION_LEVEL(table_) == IMMUTABLE_RECURSION_LEVEL)
++
+ #else
+ 
+ #define ENTRY_STORE_EXTRA 0
+ #define INCREMENT_RECURSION_LEVEL(table_)   JS_BEGIN_MACRO JS_END_MACRO
+ #define DECREMENT_RECURSION_LEVEL(table_)   JS_BEGIN_MACRO JS_END_MACRO
+ 
+ #endif /* defined(DEBUG) */
+ 
+@@ -377,17 +386,17 @@ JS_DHashTableFinish(JSDHashTable *table)
+         if (ENTRY_IS_LIVE(entry)) {
+             METER(table->stats.removeEnums++);
+             table->ops->clearEntry(table, entry);
+         }
+         entryAddr += entrySize;
+     }
+ 
+     DECREMENT_RECURSION_LEVEL(table);
+-    JS_ASSERT(RECURSION_LEVEL(table) == 0);
++    JS_ASSERT(NOT_REENTERING(table));
+ 
+     /* Free entry storage last. */
+     table->ops->freeTable(table, table->entryStore);
+ }
+ 
+ static JSDHashEntryHdr * JS_DHASH_FASTCALL
+ SearchTable(JSDHashTable *table, const void *key, JSDHashNumber keyHash,
+             JSDHashOperator op)
+@@ -683,16 +692,18 @@ JS_DHashTableOperate(JSDHashTable *table
+     return entry;
+ }
+ 
+ JS_PUBLIC_API(void)
+ JS_DHashTableRawRemove(JSDHashTable *table, JSDHashEntryHdr *entry)
+ {
+     JSDHashNumber keyHash;      /* load first in case clearEntry goofs it */
+ 
++    JS_ASSERT(RECURSION_LEVEL(table) != IMMUTABLE_RECURSION_LEVEL);
++
+     JS_ASSERT(JS_DHASH_ENTRY_IS_LIVE(entry));
+     keyHash = entry->keyHash;
+     table->ops->clearEntry(table, entry);
+     if (keyHash & COLLISION_FLAG) {
+         MARK_ENTRY_REMOVED(entry);
+         table->removedCount++;
+     } else {
+         METER(table->stats.removeFrees++);
+@@ -758,16 +769,24 @@ JS_DHashTableEnumerate(JSDHashTable *tab
+         (void) ChangeTable(table, ceiling);
+     }
+ 
+     DECREMENT_RECURSION_LEVEL(table);
+ 
+     return i;
+ }
+ 
++#ifdef DEBUG
++JS_PUBLIC_API(void)
++JS_DHashMarkTableImmutable(JSDHashTable *table)
++{
++    RECURSION_LEVEL(table) = IMMUTABLE_RECURSION_LEVEL;
++}
++#endif
++
+ #ifdef JS_DHASHMETER
+ #include <math.h>
+ 
+ JS_PUBLIC_API(void)
+ JS_DHashTableDumpMeter(JSDHashTable *table, JSDHashEnumerator dump, FILE *fp)
+ {
+     char *entryAddr;
+     uint32 entrySize, entryCount;
+diff --git a/js/src/jsdhash.h b/js/src/jsdhash.h
+--- a/js/src/jsdhash.h
++++ b/js/src/jsdhash.h
+@@ -571,16 +571,35 @@ JS_DHashTableRawRemove(JSDHashTable *tab
+  */
+ typedef JSDHashOperator
+ (* JSDHashEnumerator)(JSDHashTable *table, JSDHashEntryHdr *hdr, uint32 number,
+                       void *arg);
+ 
+ extern JS_PUBLIC_API(uint32)
+ JS_DHashTableEnumerate(JSDHashTable *table, JSDHashEnumerator etor, void *arg);
+ 
++#ifdef DEBUG
++/**
++ * Mark a table as immutable for the remainder of its lifetime.  This
++ * changes the implementation from ASSERTing one set of invariants to
++ * ASSERTing a different set.
++ *
++ * When a table is NOT marked as immutable, the table implementation
++ * asserts that the table is not mutated from its own callbacks.  It
++ * assumes the caller protects the table from being accessed on multiple
++ * threads simultaneously.
++ *
++ * When the table is marked as immutable, the re-entry assertions will
++ * no longer trigger erroneously due to multi-threaded access.  Instead,
++ * mutations will cause assertions.
++ */
++extern JS_PUBLIC_API(void)
++JS_DHashMarkTableImmutable(JSDHashTable *table);
++#endif
++
+ #ifdef JS_DHASHMETER
+ #include <stdio.h>
+ 
+ extern JS_PUBLIC_API(void)
+ JS_DHashTableDumpMeter(JSDHashTable *table, JSDHashEnumerator dump, FILE *fp);
+ #endif
+ 
+ JS_END_EXTERN_C
