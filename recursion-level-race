@@ -150,3 +150,180 @@ diff --git a/js/src/jsdhash.h b/js/src/jsdhash.h
  #endif
  
  JS_END_EXTERN_C
+diff --git a/parser/htmlparser/src/nsHTMLEntities.cpp b/parser/htmlparser/src/nsHTMLEntities.cpp
+--- a/parser/htmlparser/src/nsHTMLEntities.cpp
++++ b/parser/htmlparser/src/nsHTMLEntities.cpp
+@@ -151,16 +151,20 @@ nsHTMLEntities::AddRefTable(void)
+                          (PL_DHashTableOperate(&gUnicodeToEntity,
+                                                   NS_INT32_TO_PTR(node->mUnicode),
+                                                   PL_DHASH_ADD));
+       NS_ASSERTION(entry, "Error adding an entry");
+       // Prefer earlier entries when we have duplication.
+       if (!entry->node)
+         entry->node = node;
+     }
++#ifdef DEBUG
++    PL_DHashMarkTableImmutable(&gUnicodeToEntity);
++    PL_DHashMarkTableImmutable(&gEntityToUnicode);
++#endif
+   }
+   ++gTableRefCnt;
+   return NS_OK;
+ }
+ 
+ void
+ nsHTMLEntities::ReleaseTable(void) 
+ {
+diff --git a/xpcom/glue/pldhash.c b/xpcom/glue/pldhash.c
+--- a/xpcom/glue/pldhash.c
++++ b/xpcom/glue/pldhash.c
+@@ -67,28 +67,37 @@
+  * non-DEBUG components.
+  */
+ #ifdef DEBUG
+ 
+ #define JSDHASH_ONELINE_ASSERT PR_ASSERT
+ #define RECURSION_LEVEL(table_) (*(PRUint32*)(table_->entryStore + \
+                                             PL_DHASH_TABLE_SIZE(table_) * \
+                                             table_->entrySize))
++#define IMMUTABLE_RECURSION_LEVEL ((PRUint32)-1)
+ 
+ #define ENTRY_STORE_EXTRA                   sizeof(PRUint32)
+-#define INCREMENT_RECURSION_LEVEL(table_)   \
+-    PR_BEGIN_MACRO                          \
+-      ++RECURSION_LEVEL(table_);            \
++#define INCREMENT_RECURSION_LEVEL(table_)                                     \
++    PR_BEGIN_MACRO                                                            \
++      if (RECURSION_LEVEL(table_) != IMMUTABLE_RECURSION_LEVEL) {             \
++        ++RECURSION_LEVEL(table_);                                            \
++      }                                                                       \
+     PR_END_MACRO
+-#define DECREMENT_RECURSION_LEVEL(table_)                  \
+-    PR_BEGIN_MACRO                                         \
+-      NS_ASSERTION(RECURSION_LEVEL(table_) > 0, "RECURSION_LEVEL(table_) > 0"); \
+-      --RECURSION_LEVEL(table_);                           \
++#define DECREMENT_RECURSION_LEVEL(table_)                                     \
++    PR_BEGIN_MACRO                                                            \
++      if (RECURSION_LEVEL(table_) != IMMUTABLE_RECURSION_LEVEL) {             \
++        NS_ASSERTION(RECURSION_LEVEL(table_) > 0, "RECURSION_LEVEL(table_) > 0");                  \
++        --RECURSION_LEVEL(table_);                                            \
++      }                                                                       \
+     PR_END_MACRO
+ 
++#define NOT_REENTERING(table_)                                                \
++    (RECURSION_LEVEL(table_) == 0 ||                                          \
++     RECURSION_LEVEL(table_) == IMMUTABLE_RECURSION_LEVEL)
++
+ #else
+ 
+ #define ENTRY_STORE_EXTRA 0
+ #define INCREMENT_RECURSION_LEVEL(table_)   PR_BEGIN_MACRO PR_END_MACRO
+ #define DECREMENT_RECURSION_LEVEL(table_)   PR_BEGIN_MACRO PR_END_MACRO
+ 
+ #endif /* defined(DEBUG) */
+ 
+@@ -381,18 +390,18 @@ PL_DHashTableFinish(PLDHashTable *table)
+         if (ENTRY_IS_LIVE(entry)) {
+             METER(table->stats.removeEnums++);
+             table->ops->clearEntry(table, entry);
+         }
+         entryAddr += entrySize;
+     }
+ 
+     DECREMENT_RECURSION_LEVEL(table);
+-    NS_ASSERTION(RECURSION_LEVEL(table) == 0,
+-                 "RECURSION_LEVEL(table) == 0");
++    NS_ASSERTION(NOT_REENTERING(table),
++                 "NOT_REENTERING(table)");
+ 
+     /* Free entry storage last. */
+     table->ops->freeTable(table, table->entryStore);
+ }
+ 
+ static PLDHashEntryHdr * PL_DHASH_FASTCALL
+ SearchTable(PLDHashTable *table, const void *key, PLDHashNumber keyHash,
+             PLDHashOperator op)
+@@ -693,16 +702,19 @@ PL_DHashTableOperate(PLDHashTable *table
+     return entry;
+ }
+ 
+ void
+ PL_DHashTableRawRemove(PLDHashTable *table, PLDHashEntryHdr *entry)
+ {
+     PLDHashNumber keyHash;      /* load first in case clearEntry goofs it */
+ 
++    NS_ASSERTION(RECURSION_LEVEL(table) != IMMUTABLE_RECURSION_LEVEL,
++                 "RECURSION_LEVEL(table) != IMMUTABLE_RECURSION_LEVEL");
++
+     NS_ASSERTION(PL_DHASH_ENTRY_IS_LIVE(entry),
+                  "PL_DHASH_ENTRY_IS_LIVE(entry)");
+     keyHash = entry->keyHash;
+     table->ops->clearEntry(table, entry);
+     if (keyHash & COLLISION_FLAG) {
+         MARK_ENTRY_REMOVED(entry);
+         table->removedCount++;
+     } else {
+@@ -770,16 +782,24 @@ PL_DHashTableEnumerate(PLDHashTable *tab
+         (void) ChangeTable(table, ceiling);
+     }
+ 
+     DECREMENT_RECURSION_LEVEL(table);
+ 
+     return i;
+ }
+ 
++#ifdef DEBUG
++void
++PL_DHashMarkTableImmutable(PLDHashTable *table)
++{
++    RECURSION_LEVEL(table) = IMMUTABLE_RECURSION_LEVEL;
++}
++#endif
++
+ #ifdef PL_DHASHMETER
+ #include <math.h>
+ 
+ void
+ PL_DHashTableDumpMeter(PLDHashTable *table, PLDHashEnumerator dump, FILE *fp)
+ {
+     char *entryAddr;
+     PRUint32 entrySize, entryCount;
+diff --git a/xpcom/glue/pldhash.h b/xpcom/glue/pldhash.h
+--- a/xpcom/glue/pldhash.h
++++ b/xpcom/glue/pldhash.h
+@@ -572,16 +572,35 @@ PL_DHashTableRawRemove(PLDHashTable *tab
+  */
+ typedef PLDHashOperator
+ (* PLDHashEnumerator)(PLDHashTable *table, PLDHashEntryHdr *hdr, PRUint32 number,
+                       void *arg);
+ 
+ NS_COM_GLUE PRUint32
+ PL_DHashTableEnumerate(PLDHashTable *table, PLDHashEnumerator etor, void *arg);
+ 
++#ifdef DEBUG
++/**
++ * Mark a table as immutable for the remainder of its lifetime.  This
++ * changes the implementation from ASSERTing one set of invariants to
++ * ASSERTing a different set.
++ *
++ * When a table is NOT marked as immutable, the table implementation
++ * asserts that the table is not mutated from its own callbacks.  It
++ * assumes the caller protects the table from being accessed on multiple
++ * threads simultaneously.
++ *
++ * When the table is marked as immutable, the re-entry assertions will
++ * no longer trigger erroneously due to multi-threaded access.  Instead,
++ * mutations will cause assertions.
++ */
++NS_COM_GLUE void
++PL_DHashMarkTableImmutable(PLDHashTable *table);
++#endif
++
+ #ifdef PL_DHASHMETER
+ #include <stdio.h>
+ 
+ NS_COM_GLUE void
+ PL_DHashTableDumpMeter(PLDHashTable *table, PLDHashEnumerator dump, FILE *fp);
+ #endif
+ 
+ PR_END_EXTERN_C
