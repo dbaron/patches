@@ -1,0 +1,118 @@
+Add assertions to EndReconstruct that all style contexts have been reresolved.
+
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -102,17 +102,66 @@ public:
+     }
+     return mRefCnt;
+   }
+ 
+   nsPresContext* PresContext() const { return mRuleNode->GetPresContext(); }
+ 
+   nsStyleContext* GetParent() const { return mParent; }
+ 
+-  nsStyleContext* GetFirstChild() const { return mChild; }
++  class ChildEnumerator;
++  friend class ChildEnumerator;
++  class ChildEnumerator {
++  public:
++    // Returns null when there are no more children.
++    nsStyleContext* GetNext() {
++      switch (mState) {
++        case START:
++          mNextChild = mParent->mEmptyChild;
++          mState = EMPTY_CHILDREN;
++        case EMPTY_CHILDREN:
++          if (mNextChild) {
++            nsStyleContext *result = mNextChild;
++            mNextChild = result->mNextSibling;
++            if (mNextChild == mParent->mEmptyChild) {
++              mNextChild = mParent->mChild;
++              mState = NORMAL_CHILDREN;
++            }
++            return result;
++          } else {
++            mState = NORMAL_CHILDREN;
++          }
++        case NORMAL_CHILDREN:
++          if (mNextChild) {
++            nsStyleContext *result = mNextChild;
++            mNextChild = result->mNextSibling;
++            if (mNextChild == mParent->mChild) {
++              mState = DONE;
++            }
++            return result;
++          } else {
++            mState = DONE;
++          }
++        case DONE:
++          return nsnull;
++      }
++    }
++  private:
++    friend class nsStyleContext;
++    ChildEnumerator(nsStyleContext* aStyleContext)
++      : mParent(aStyleContext) {}
++
++    nsStyleContext *mParent, *mNextChild;
++    enum State { START, EMPTY_CHILDREN, NORMAL_CHILDREN, DONE };
++    State mState;
++  };
++
++  // Returns an enumerator; the enumerator becomes invalid if this object
++  // is mutated.
++  ChildEnumerator Children() const { return ChildEnumerator(this); }
+ 
+   nsIAtom* GetPseudoType() const { return mPseudoTag; }
+ 
+   NS_HIDDEN_(already_AddRefed<nsStyleContext>)
+   FindChildWithRules(const nsIAtom* aPseudoTag, nsRuleNode* aRules);
+ 
+   NS_HIDDEN_(PRBool)    Equals(const nsStyleContext* aOther) const;
+   PRBool    HasTextDecorations() { return !!(mBits & NS_STYLE_HAS_TEXT_DECORATIONS); }
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -151,16 +151,41 @@ nsStyleSet::BeginReconstruct()
+   mRuleWalker = ruleWalker;
+ 
+   return NS_OK;
+ }
+ 
+ void
+ nsStyleSet::EndReconstruct()
+ {
++#ifdef DEBUG
++  {
++    nsTArray<nsStyleContext*> queue(mRoots);
++    PRInt32 len;
++    while ((len = mRoots.Length) > 0) {
++      nsStyleContext *sc = queue[len-1];
++      queue.RemoveElementAt(len-1);
++
++      // Enqueue the children.
++      nsStyleContext::ChildEnumerator kids(sc->Children());
++      nsStyleContext *kid;
++      while ((kid = kids.GetNext())) {
++        queue.AppendElement(kid);
++      }
++
++      nsRuleNode *n = sc->GetRuleNode();
++      while (n) {
++        if (n->GetParent())
++          n = n->GetParent();
++      }
++
++      NS_ASSERTION(n == mRuleTree, "style context still has old rule tree");
++    }
++  }
++#endif
+   NS_ASSERTION(mOldRuleTree, "Unmatched begin/end?");
+   // Reset the destroyed count; it's no longer valid
+   mDestroyedCount = 0;
+   // Destroy the old rule tree (all the associated style contexts should have
+   // been destroyed by the caller beforehand)
+   mOldRuleTree->Destroy();
+   mOldRuleTree = nsnull;
+ }
