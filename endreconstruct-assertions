@@ -1,9 +1,37 @@
 Add assertions to EndReconstruct that all style contexts have been reresolved.
 
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -75,16 +75,24 @@ nsStyleContext::nsStyleContext(nsStyleCo
+     mBits(0),
+     mRefCnt(0)
+ {
+   mNextSibling = this;
+   mPrevSibling = this;
+   if (mParent) {
+     mParent->AddRef();
+     mParent->AddChild(this);
++#ifdef DEBUG
++    nsRuleNode *r1 = mParent->GetRuleNode(), *r2 = aRuleNode;
++    while (r1->GetParent())
++      r1 = r1->GetParent();
++    while (r2->GetParent())
++      r2 = r2->GetParent();
++    NS_ASSERTION(r1 == r2, "must be in the same rule tree as parent");
++#endif
+   }
+ 
+   ApplyStyleFixups(aPresContext);
+ 
+   #define eStyleStruct_LastItem (nsStyleStructID_Length - 1)
+   NS_ASSERTION(NS_STYLE_INHERIT_MASK & NS_STYLE_INHERIT_BIT(LastItem),
+                "NS_STYLE_INHERIT_MASK must be bigger, and other bits shifted");
+   #undef eStyleStruct_LastItem
 diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
 --- a/layout/style/nsStyleContext.h
 +++ b/layout/style/nsStyleContext.h
-@@ -102,17 +102,72 @@ public:
+@@ -102,18 +102,16 @@ public:
      }
      return mRefCnt;
    }
@@ -13,63 +41,7 @@ diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
    nsStyleContext* GetParent() const { return mParent; }
  
 -  nsStyleContext* GetFirstChild() const { return mChild; }
-+  class ChildEnumerator;
-+  friend class ChildEnumerator;
-+  class ChildEnumerator {
-+  public:
-+    // Returns null when there are no more children.
-+    nsStyleContext* GetNext() {
-+      switch (mState) {
-+        case START:
-+          mNextChild = mParent->mEmptyChild;
-+          mState = EMPTY_CHILDREN;
-+        case EMPTY_CHILDREN:
-+          NS_ASSERTION(mState == EMPTY_CHILDREN, "bad state");
-+          if (mNextChild) {
-+            nsStyleContext *result = mNextChild;
-+            mNextChild = result->mNextSibling;
-+            if (mNextChild == mParent->mEmptyChild) {
-+              mNextChild = mParent->mChild;
-+              mState = NORMAL_CHILDREN;
-+            }
-+            return result;
-+          } else {
-+            mNextChild = mParent->mChild;
-+            mState = NORMAL_CHILDREN;
-+          }
-+        case NORMAL_CHILDREN:
-+          NS_ASSERTION(mState == NORMAL_CHILDREN, "bad state");
-+          if (mNextChild) {
-+            nsStyleContext *result = mNextChild;
-+            mNextChild = result->mNextSibling;
-+            if (mNextChild == mParent->mChild) {
-+              mState = DONE;
-+            }
-+            return result;
-+          } else {
-+            mState = DONE;
-+          }
-+        default:
-+        case DONE:
-+          NS_ASSERTION(mState == DONE, "bad state");
-+          return nsnull;
-+      }
-+    }
-+  private:
-+    friend class nsStyleContext;
-+    ChildEnumerator(const nsStyleContext* aStyleContext)
-+      : mParent(aStyleContext), mState(START) {}
-+
-+    const nsStyleContext *mParent;
-+    nsStyleContext *mNextChild;
-+    enum State { START, EMPTY_CHILDREN, NORMAL_CHILDREN, DONE };
-+    State mState;
-+  };
-+
-+  // Returns an enumerator; the enumerator becomes invalid if this object
-+  // is mutated.
-+  ChildEnumerator Children() const { return ChildEnumerator(this); }
- 
+-
    nsIAtom* GetPseudoType() const { return mPseudoTag; }
  
    NS_HIDDEN_(already_AddRefed<nsStyleContext>)
@@ -77,10 +49,30 @@ diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
  
    NS_HIDDEN_(PRBool)    Equals(const nsStyleContext* aOther) const;
    PRBool    HasTextDecorations() { return !!(mBits & NS_STYLE_HAS_TEXT_DECORATIONS); }
+ 
+@@ -173,17 +171,17 @@ public:
+ #endif
+ 
+ protected:
+   NS_HIDDEN_(void) AddChild(nsStyleContext* aChild);
+   NS_HIDDEN_(void) RemoveChild(nsStyleContext* aChild);
+ 
+   NS_HIDDEN_(void) ApplyStyleFixups(nsPresContext* aPresContext);
+ 
+-  nsStyleContext* mParent;
++  nsStyleContext* const mParent;
+ 
+   // Children are kept in two circularly-linked lists.  The list anchor
+   // is not part of the list (null for empty), and we point to the first
+   // child.
+   // mEmptyChild for children whose rule node is the root rule node, and
+   // mChild for other children.  The order of children is not
+   // meaningful.
+   nsStyleContext* mChild;
 diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 --- a/layout/style/nsStyleSet.cpp
 +++ b/layout/style/nsStyleSet.cpp
-@@ -139,28 +139,53 @@ nsStyleSet::BeginReconstruct()
+@@ -139,28 +139,45 @@ nsStyleSet::BeginReconstruct()
      newTree->Destroy();
      return NS_ERROR_OUT_OF_MEMORY;
    }
@@ -105,27 +97,19 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
  nsStyleSet::EndReconstruct()
  {
 +#ifdef DEBUG
-+  {
-+    nsTArray<nsStyleContext*> queue(mRoots);
-+    PRInt32 len;
-+    while ((len = queue.Length()) > 0) {
-+      nsStyleContext *sc = queue[len-1];
-+      queue.RemoveElementAt(len-1);
-+
-+      // Enqueue the children.
-+      nsStyleContext::ChildEnumerator kids(sc->Children());
-+      nsStyleContext *kid;
-+      while ((kid = kids.GetNext())) {
-+        queue.AppendElement(kid);
-+      }
-+
-+      nsRuleNode *n = sc->GetRuleNode();
-+      while (n->GetParent()) {
-+        n = n->GetParent();
-+      }
-+
-+      NS_ASSERTION(n == mRuleTree, "style context has old rule node");
++  for (PRInt32 i = mRoots.Length() - 1; i >= 0; --i) {
++    nsRuleNode *n = mRoots[i]->GetRuleNode();
++    while (n->GetParent()) {
++      n = n->GetParent();
 +    }
++    // Since nsStyleContext's mParent and mRuleNode are immutable, and
++    // style contexts own their parents, and nsStyleContext asserts in
++    // its constructor that the style context and its parent are in the
++    // same rule tree, we don't need to check any of the children of
++    // mRoots; we only need to check the rule nodes of mRoots
++    // themselves.
++
++    NS_ASSERTION(n == mRuleTree, "style context has old rule node");
 +  }
 +#endif
    NS_ASSERTION(mOldRuleTree, "Unmatched begin/end?");
