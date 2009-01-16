@@ -1,0 +1,220 @@
+Avoid building user font set when handling units involving font metrics in media query expressions.  (Bug 473892)
+
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1145,20 +1145,22 @@ nsPresContext::SetImageAnimationModeInte
+ 
+ void
+ nsPresContext::SetImageAnimationModeExternal(PRUint16 aMode)
+ {
+   SetImageAnimationModeInternal(aMode);
+ }
+ 
+ already_AddRefed<nsIFontMetrics>
+-nsPresContext::GetMetricsFor(const nsFont& aFont)
++nsPresContext::GetMetricsFor(const nsFont& aFont, PRBool aUseUserFontSet)
+ {
+   nsIFontMetrics* metrics = nsnull;
+-  mDeviceContext->GetMetricsFor(aFont, mLangGroup, GetUserFontSet(), metrics);
++  mDeviceContext->GetMetricsFor(aFont, mLangGroup,
++                                aUseUserFontSet ? GetUserFontSet() : nsnull,
++                                metrics);
+   return metrics;
+ }
+ 
+ const nsFont*
+ nsPresContext::GetDefaultFont(PRUint8 aFontID) const
+ {
+   const nsFont *font;
+   switch (aFontID) {
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -284,19 +284,24 @@ public:
+   {
+     NS_ASSERTION(mShell, "freeing after shutdown");
+     if (mShell)
+       mShell->FreeFrame(aSize, aFreeChunk);
+   }
+ 
+   /**
+    * Get the font metrics for a given font.
++   *
++   * If aUseUserFontSet is false, don't build or use the user font set.
++   * This is intended only for nsRuleNode::CalcLengthWithInitialFont
++   * (which is used from media query matching, which is in turn called
++   * when building the user font set).
+    */
+   NS_HIDDEN_(already_AddRefed<nsIFontMetrics>)
+-  GetMetricsFor(const nsFont& aFont);
++  GetMetricsFor(const nsFont& aFont, PRBool aUseUserFontSet = PR_TRUE);
+ 
+   /**
+    * Get the default font corresponding to the given ID.  This object is
+    * read-only, you must copy the font to modify it.
+    * 
+    * When aFontID is kPresContext_DefaultVariableFontID or
+    * kPresContext_DefaultFixedFontID (which equals
+    * kGenericFont_moz_fixed, which is used for the -moz-fixed generic),
+diff --git a/layout/style/crashtests/473892-1.html b/layout/style/crashtests/473892-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/style/crashtests/473892-1.html
+@@ -0,0 +1,12 @@
++<!DOCTYPE html>
++<html>
++<head>
++<style type="text/css">
++
++@media (width: 5ex) { }
++
++</style>
++</head>
++<body>
++</body>
++</html>
+diff --git a/layout/style/crashtests/crashtests.list b/layout/style/crashtests/crashtests.list
+--- a/layout/style/crashtests/crashtests.list
++++ b/layout/style/crashtests/crashtests.list
+@@ -22,9 +22,10 @@ load 447776-1.html
+ load 447783-1.html
+ load 448161-1.html
+ load 448161-2.html
+ load 456196.html
+ load 460217-1.html
+ load 466845-1.html
+ HTTP(..) load 472237-1.html
+ load 473720-1.html
++load 473892-1.html
+ load 473914-1.html
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -166,16 +166,17 @@ static nsString& Unquote(nsString& aStri
+   return aString;
+ }
+ 
+ static nscoord CalcLengthWith(const nsCSSValue& aValue,
+                               nscoord aFontSize,
+                               const nsStyleFont* aStyleFont,
+                               nsStyleContext* aStyleContext,
+                               nsPresContext* aPresContext,
++                              PRBool aUseUserFontSet,
+                               PRBool& aInherited)
+ {
+   NS_ASSERTION(aValue.IsLengthUnit(), "not a length unit");
+   NS_ASSERTION(aStyleFont || aStyleContext, "Must have style data");
+   NS_ASSERTION(aPresContext, "Must have prescontext");
+ 
+   if (aValue.IsFixedLengthUnit()) {
+     return aPresContext->TwipsToAppUnits(aValue.GetLengthTwips());
+@@ -197,25 +198,27 @@ static nscoord CalcLengthWith(const nsCS
+   switch (unit) {
+     case eCSSUnit_EM: {
+       return NSToCoordRoundWithClamp(aValue.GetFloatValue() * float(aFontSize));
+       // XXX scale against font metrics height instead?
+     }
+     case eCSSUnit_XHeight: {
+       nsFont font = aStyleFont->mFont;
+       font.size = aFontSize;
+-      nsCOMPtr<nsIFontMetrics> fm = aPresContext->GetMetricsFor(font);
++      nsCOMPtr<nsIFontMetrics> fm =
++        aPresContext->GetMetricsFor(font, aUseUserFontSet);
+       nscoord xHeight;
+       fm->GetXHeight(xHeight);
+       return NSToCoordRoundWithClamp(aValue.GetFloatValue() * float(xHeight));
+     }
+     case eCSSUnit_Char: {
+       nsFont font = aStyleFont->mFont;
+       font.size = aFontSize;
+-      nsCOMPtr<nsIFontMetrics> fm = aPresContext->GetMetricsFor(font);
++      nsCOMPtr<nsIFontMetrics> fm =
++        aPresContext->GetMetricsFor(font, aUseUserFontSet);
+       nsCOMPtr<nsIThebesFontMetrics> tfm(do_QueryInterface(fm));
+       gfxFloat zeroWidth = (tfm->GetThebesFontGroup()->GetFontAt(0)
+                             ->GetMetrics().zeroOrAveCharWidth);
+ 
+       return NSToCoordRoundWithClamp(aValue.GetFloatValue() *
+                             NS_ceil(aPresContext->AppUnitsPerDevPixel() *
+                                     zeroWidth));
+     }
+@@ -229,17 +232,18 @@ static nscoord CalcLengthWith(const nsCS
+ /* static */ nscoord
+ nsRuleNode::CalcLength(const nsCSSValue& aValue,
+                        nsStyleContext* aStyleContext,
+                        nsPresContext* aPresContext,
+                        PRBool& aInherited)
+ {
+   NS_ASSERTION(aStyleContext, "Must have style data");
+ 
+-  return CalcLengthWith(aValue, -1, nsnull, aStyleContext, aPresContext, aInherited);
++  return CalcLengthWith(aValue, -1, nsnull, aStyleContext, aPresContext,
++                        PR_TRUE, aInherited);
+ }
+ 
+ /* Inline helper function to redirect requests to CalcLength. */
+ static inline nscoord CalcLength(const nsCSSValue& aValue,
+                                  nsStyleContext* aStyleContext,
+                                  nsPresContext* aPresContext,
+                                  PRBool& aInherited)
+ {
+@@ -249,17 +253,17 @@ static inline nscoord CalcLength(const n
+ 
+ /* static */ nscoord
+ nsRuleNode::CalcLengthWithInitialFont(nsPresContext* aPresContext,
+                                       const nsCSSValue& aValue)
+ {
+   nsStyleFont defaultFont(aPresContext);
+   PRBool inherited;
+   return CalcLengthWith(aValue, -1, &defaultFont, nsnull, aPresContext,
+-                        inherited);
++                        PR_FALSE, inherited);
+ }
+ 
+ #define SETCOORD_NORMAL                 0x01   // N
+ #define SETCOORD_AUTO                   0x02   // A
+ #define SETCOORD_INHERIT                0x04   // H
+ #define SETCOORD_PERCENT                0x08   // P
+ #define SETCOORD_FACTOR                 0x10   // F
+ #define SETCOORD_LENGTH                 0x20   // L
+@@ -2336,17 +2340,17 @@ nsRuleNode::SetFontSize(nsPresContext* a
+       NS_NOTREACHED("unexpected value");
+     }
+   }
+   else if (aFontData.mSize.IsLengthUnit()) {
+     // Note that font-based length units use the parent's size unadjusted
+     // for scriptlevel changes. A scriptlevel change between us and the parent
+     // is simply ignored.
+     *aSize = CalcLengthWith(aFontData.mSize, aParentSize, aParentFont, nsnull,
+-                        aPresContext, aInherited);
++                            aPresContext, PR_TRUE, aInherited);
+     zoom = aFontData.mSize.IsFixedLengthUnit() ||
+            aFontData.mSize.GetUnit() == eCSSUnit_Pixel;
+   }
+   else if (eCSSUnit_Percent == aFontData.mSize.GetUnit()) {
+     aInherited = PR_TRUE;
+     // Note that % units use the parent's size unadjusted for scriptlevel
+     // changes. A scriptlevel change between us and the parent is simply
+     // ignored.
+@@ -2598,18 +2602,18 @@ nsRuleNode::SetFont(nsPresContext* aPres
+   // they're available for font-size computation.
+ 
+   // -moz-script-min-size: length
+   if (aFontData.mScriptMinSize.IsLengthUnit()) {
+     // scriptminsize in font units (em, ex) has to be interpreted relative
+     // to the parent font, or the size definitions are circular and we
+     // 
+     aFont->mScriptMinSize =
+-      CalcLengthWith(aFontData.mScriptMinSize, aParentFont->mSize, aParentFont, nsnull,
+-                     aPresContext, aInherited);
++      CalcLengthWith(aFontData.mScriptMinSize, aParentFont->mSize, aParentFont,
++                     nsnull, aPresContext, PR_TRUE, aInherited);
+   }
+ 
+   // -moz-script-size-multiplier: factor, inherit, initial
+   SetFactor(aFontData.mScriptSizeMultiplier, aFont->mScriptSizeMultiplier,
+             aInherited, aParentFont->mScriptSizeMultiplier,
+             NS_MATHML_DEFAULT_SCRIPT_SIZE_MULTIPLIER,
+             SETFCT_POSITIVE);
+   
