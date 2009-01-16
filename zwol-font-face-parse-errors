@@ -1,0 +1,205 @@
+From: Zack Weinberg <zweinberg@mozilla.com>
+
+Bug 473720: don't treat a parse error in a known CSS @-rule as an unknown @-rule
+
+diff --git a/layout/style/crashtests/473720-1.html b/layout/style/crashtests/473720-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/style/crashtests/473720-1.html
+@@ -0,0 +1,15 @@
++<html><head><style>
++/* Recovery from an unparseable recognized @-rule is not the same thing
++   as recovery from an unrecognized @-rule.  */
++
++@charset # { }
++@import # { }
++@namespace # { }
++@media # { }
++@-moz-document # { }
++@font-face # { }
++@page # { }
++@-non-mozilla # { }
++@nonstandard # { }
++
++</style></head></html>
+diff --git a/layout/style/crashtests/crashtests.list b/layout/style/crashtests/crashtests.list
+--- a/layout/style/crashtests/crashtests.list
++++ b/layout/style/crashtests/crashtests.list
+@@ -21,9 +21,9 @@ load 447776-1.html
+ load 447776-1.html
+ load 447783-1.html
+ load 448161-1.html
+ load 448161-2.html
+ load 456196.html
+ load 460217-1.html
+ load 466845-1.html
+ HTTP(..) load 472237-1.html
+-load about:blank # 472237 doesn't occur when it's the last in the list
++load 473720-1.html
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -1352,69 +1352,67 @@ CSSParserImpl::SkipAtRule()
+   }
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseAtRule(RuleAppendFunc aAppendFunc,
+                            void* aData)
+ {
++  nsCSSSection newSection;
++  PRBool (CSSParserImpl::*parseFunc)(RuleAppendFunc, void*);
++
+   if ((mSection <= eCSSSection_Charset) &&
+       (mToken.mIdent.LowerCaseEqualsLiteral("charset"))) {
+-    if (ParseCharsetRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_Import;  // only one charset allowed
+-      return PR_TRUE;
+-    }
+-  }
+-  if ((mSection <= eCSSSection_Import) &&
+-      mToken.mIdent.LowerCaseEqualsLiteral("import")) {
+-    if (ParseImportRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_Import;
+-      return PR_TRUE;
+-    }
+-  }
+-  if ((mSection <= eCSSSection_NameSpace) &&
+-      mToken.mIdent.LowerCaseEqualsLiteral("namespace")) {
+-    if (ParseNameSpaceRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_NameSpace;
+-      return PR_TRUE;
+-    }
+-  }
+-  if (mToken.mIdent.LowerCaseEqualsLiteral("media")) {
+-    if (ParseMediaRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_General;
+-      return PR_TRUE;
+-    }
+-  }
+-  if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-document")) {
+-    if (ParseMozDocumentRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_General;
+-      return PR_TRUE;
+-    }
+-  }
+-  if (mToken.mIdent.LowerCaseEqualsLiteral("font-face")) {
+-    if (ParseFontFaceRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_General;
+-      return PR_TRUE;
+-    }
+-  }
+-  if (mToken.mIdent.LowerCaseEqualsLiteral("page")) {
+-    if (ParsePageRule(aAppendFunc, aData)) {
+-      mSection = eCSSSection_General;
+-      return PR_TRUE;
+-    }
+-  }
+-
+-  if (!NonMozillaVendorIdentifier(mToken.mIdent)) {
+-    REPORT_UNEXPECTED_TOKEN(PEUnknownAtRule);
++    parseFunc = &CSSParserImpl::ParseCharsetRule;
++    newSection = eCSSSection_Import;  // only one charset allowed
++
++  } else if ((mSection <= eCSSSection_Import) &&
++             mToken.mIdent.LowerCaseEqualsLiteral("import")) {
++    parseFunc = &CSSParserImpl::ParseImportRule;
++    newSection = eCSSSection_Import;
++
++  } else if ((mSection <= eCSSSection_NameSpace) &&
++             mToken.mIdent.LowerCaseEqualsLiteral("namespace")) {
++    parseFunc = &CSSParserImpl::ParseNameSpaceRule;
++    newSection = eCSSSection_NameSpace;
++
++  } else if (mToken.mIdent.LowerCaseEqualsLiteral("media")) {
++    parseFunc = &CSSParserImpl::ParseMediaRule;
++    newSection = eCSSSection_General;
++
++  } else if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-document")) {
++    parseFunc = &CSSParserImpl::ParseMozDocumentRule;
++    newSection = eCSSSection_General;
++
++  } else if (mToken.mIdent.LowerCaseEqualsLiteral("font-face")) {
++    parseFunc = &CSSParserImpl::ParseFontFaceRule;
++    newSection = eCSSSection_General;
++
++  } else if (mToken.mIdent.LowerCaseEqualsLiteral("page")) {
++    parseFunc = &CSSParserImpl::ParsePageRule;
++    newSection = eCSSSection_General;
++
++  } else {
++    if (!NonMozillaVendorIdentifier(mToken.mIdent)) {
++      REPORT_UNEXPECTED_TOKEN(PEUnknownAtRule);
++      OUTPUT_ERROR();
++    }
++    // Skip over unsupported at rule, don't advance section
++    return SkipAtRule();
++  }
++
++  if (!(this->*parseFunc)(aAppendFunc, aData)) {
++    // Skip over invalid at rule, don't advance section
+     OUTPUT_ERROR();
+-  }
+-
+-  // Skip over unsupported at rule, don't advance section
+-  return SkipAtRule();
++    return SkipAtRule();
++  }
++
++  mSection = newSection;
++  return PR_TRUE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseCharsetRule(RuleAppendFunc aAppendFunc,
+                                 void* aData)
+ {
+   if (!GetToken(PR_TRUE)) {
+     REPORT_UNEXPECTED_EOF(PECharsetRuleEOF);
+@@ -2035,18 +2033,20 @@ CSSParserImpl::ProcessNameSpace(const ns
+   return result;
+ }
+ 
+ // font-face-rule: '@font-face' '{' font-description '}'
+ // font-description: font-descriptor+
+ PRBool
+ CSSParserImpl::ParseFontFaceRule(RuleAppendFunc aAppendFunc, void* aData)
+ {
+-  if (!ExpectSymbol('{', PR_TRUE))
+-    return PR_FALSE;
++  if (!ExpectSymbol('{', PR_TRUE)) {
++    REPORT_UNEXPECTED_TOKEN(PEBadDeclBlockStart);
++    return PR_FALSE;
++  }
+ 
+   nsRefPtr<nsCSSFontFaceRule> rule(new nsCSSFontFaceRule());
+   if (!rule) {
+     mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+     return PR_FALSE;
+   }
+ 
+   for (;;) {
+@@ -2065,18 +2065,20 @@ CSSParserImpl::ParseFontFaceRule(RuleApp
+ 
+     if (!ParseFontDescriptor(rule)) {
+       REPORT_UNEXPECTED(PEDeclSkipped);
+       OUTPUT_ERROR();
+       if (!SkipDeclaration(PR_TRUE))
+         break;
+     }
+   }
+-  if (!ExpectSymbol('}', PR_TRUE))
+-    return PR_FALSE;
++  if (!ExpectSymbol('}', PR_TRUE)) {
++    REPORT_UNEXPECTED_TOKEN(PEBadDeclOrRuleEnd2);
++    return PR_FALSE;
++  }
+   (*aAppendFunc)(rule, aData);
+   return PR_TRUE;
+ }
+ 
+ // font-descriptor: font-family-desc
+ //                | font-style-desc
+ //                | font-weight-desc
+ //                | font-stretch-desc
