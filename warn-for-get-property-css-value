@@ -1,0 +1,195 @@
+Warn when nsIDOMCSSStyleDeclaration::GetPropertyCSSValue is called.  (Bug 474655)
+
+diff --git a/dom/locales/en-US/chrome/layout/css.properties b/dom/locales/en-US/chrome/layout/css.properties
+--- a/dom/locales/en-US/chrome/layout/css.properties
++++ b/dom/locales/en-US/chrome/layout/css.properties
+@@ -32,16 +32,18 @@
+ # the provisions above, a recipient may use your version of this file under
+ # the terms of any one of the MPL, the GPL or the LGPL.
+ #
+ # ***** END LICENSE BLOCK *****
+ 
+ MimeNotCss=The stylesheet %1$S was not loaded because its MIME type, "%2$S", is not "text/css".
+ MimeNotCssWarn=The stylesheet %1$S was loaded as CSS even though its MIME type, "%2$S", is not "text/css".
+ 
++UseOfGetPropertyCSSValueWarning=Use of getPropertyCSSValue() is deprecated.  To upgrade your code, use getPropertyValue() instead.
++
+ PEUnexpEOF2=Unexpected end of file while searching for %1$S.
+ PEParseRuleWSOnly=Whitespace-only string given to be parsed as rule.
+ PEDeclDropped=Declaration dropped.
+ PEDeclSkipped=Skipped to next declaration.
+ PEUnknownProperty=Unknown property '%1$S'.
+ PEValueParsingError=Error in parsing value for '%1$S'.
+ PEExpectEndValue=Expected end of value but found '%1$S'.
+ PESkipAtRuleEOF=end of unknown at-rule
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -1665,16 +1665,23 @@ nsCSSFontFaceStyleDecl::GetPropertyValue
+   return GetPropertyValue(nsCSSProps::LookupFontDesc(propertyName), aResult);
+ }
+ 
+ // nsIDOMCSSValue getPropertyCSSValue (in DOMString propertyName);
+ NS_IMETHODIMP
+ nsCSSFontFaceStyleDecl::GetPropertyCSSValue(const nsAString & propertyName,
+                                             nsIDOMCSSValue **aResult NS_OUTPARAM)
+ {
++  nsCOMPtr<nsIURI> sheetURI;
++  if (mSheet) {
++    sheet->GetSheetURI(getter_AddRefs(sheetURI));
++  }
++  nsStyleUtil::ReportUseOfDeprecatedMethod(sheetURI,
++                                           "UseOfGetPropertyCSSValueWarning");
++
+   // ??? nsDOMCSSDeclaration returns null/NS_OK, but that seems wrong.
+   return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ // DOMString removeProperty (in DOMString propertyName) raises (DOMException);
+ NS_IMETHODIMP
+ nsCSSFontFaceStyleDecl::RemoveProperty(const nsAString & propertyName,
+                                        nsAString & aResult NS_OUTPARAM)
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -292,31 +292,43 @@ nsComputedDOMStyle::GetParentRule(nsIDOM
+ NS_IMETHODIMP
+ nsComputedDOMStyle::GetPropertyValue(const nsAString& aPropertyName,
+                                      nsAString& aReturn)
+ {
+   nsCOMPtr<nsIDOMCSSValue> val;
+ 
+   aReturn.Truncate();
+ 
+-  nsresult rv = GetPropertyCSSValue(aPropertyName, getter_AddRefs(val));
++  nsresult rv = GetPropertyCSSValueInternal(aPropertyName, getter_AddRefs(val));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   if (val) {
+     rv = val->GetCssText(aReturn);
+   }
+ 
+   return rv;
+ }
+ 
+ 
+ NS_IMETHODIMP
+ nsComputedDOMStyle::GetPropertyCSSValue(const nsAString& aPropertyName,
+                                         nsIDOMCSSValue** aReturn)
+ {
++  nsCOMPtr<nsIDocument> document = do_QueryReferent(mDocumentWeak);
++  nsStyleUtil::
++    ReportUseOfDeprecatedMethod(document ? document->GetDocumentURI() : nsnull,
++                                "UseOfGetPropertyCSSValueWarning");
++
++  return GetPropertyCSSValueInternal(aPropertyName, aReturn);
++}
++
++nsresult
++nsComputedDOMStyle::GetPropertyCSSValueInterval(const nsAString& aPropertyName,
++                                                nsIDOMCSSValue** aReturn)
++{
+   NS_ENSURE_ARG_POINTER(aReturn);
+   *aReturn = nsnull;
+ 
+   nsCOMPtr<nsIDocument> document = do_QueryReferent(mDocumentWeak);
+   NS_ENSURE_TRUE(document, NS_ERROR_NOT_AVAILABLE);
+ 
+   // Flush _before_ getting the presshell, since that could create a new
+   // presshell.  Also note that we want to flush the style on the document
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -71,16 +71,18 @@ public:
+   NS_DECL_NSIDOMCSSSTYLEDECLARATION
+ 
+   nsComputedDOMStyle();
+   virtual ~nsComputedDOMStyle();
+ 
+   static void Shutdown();
+ 
+ private:
++  nsresult GetPropertyCSSValueInternal(const nsAString& aPropertyName,
++                                       nsIDOMCSSValue** aReturn);
+   void FlushPendingReflows();
+   
+ #define STYLE_STRUCT(name_, checkdata_cb_, ctor_args_)                  \
+   const nsStyle##name_ * GetStyle##name_() {                            \
+     return mStyleContextHolder->GetStyle##name_();                      \
+   }
+ #include "nsStyleStructList.h"
+ #undef STYLE_STRUCT
+diff --git a/layout/style/nsDOMCSSDeclaration.cpp b/layout/style/nsDOMCSSDeclaration.cpp
+--- a/layout/style/nsDOMCSSDeclaration.cpp
++++ b/layout/style/nsDOMCSSDeclaration.cpp
+@@ -141,16 +141,31 @@ nsDOMCSSDeclaration::GetLength(PRUint32*
+ }
+ 
+ NS_IMETHODIMP
+ nsDOMCSSDeclaration::GetPropertyCSSValue(const nsAString& aPropertyName,
+                                          nsIDOMCSSValue** aReturn)
+ {
+   NS_ENSURE_ARG_POINTER(aReturn);
+ 
++  nsCOMPtr<nsICSSLoader> cssLoader;
++  nsCOMPtr<nsICSSParser> cssParser;
++  nsCOMPtr<nsIURI> baseURI, sheetURI;
++  nsCOMPtr<nsIPrincipal> sheetPrincipal;
++  
++  result = GetCSSParsingEnvironment(getter_AddRefs(sheetURI),
++                                    getter_AddRefs(baseURI),
++                                    getter_AddRefs(sheetPrincipal),
++                                    getter_AddRefs(cssLoader),
++                                    getter_AddRefs(cssParser));
++  if (NS_SUCCEEDED(result)) {
++    nsStyleUtil::ReportUseOfDeprecatedMethod(sheetURI,
++                                             "UseOfGetPropertyCSSValueWarning");
++  }
++
+   // We don't support CSSValue yet so we'll just return null...
+   *aReturn = nsnull;
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDOMCSSDeclaration::Item(PRUint32 aIndex, nsAString& aReturn)
+diff --git a/layout/style/nsStyleUtil.cpp b/layout/style/nsStyleUtil.cpp
+--- a/layout/style/nsStyleUtil.cpp
++++ b/layout/style/nsStyleUtil.cpp
+@@ -601,8 +601,17 @@ nsStyleUtil::IsSignificantChild(nsIConte
+     return PR_TRUE;
+   }
+ 
+   return aTextIsSignificant && isText && aChild->TextLength() != 0 &&
+          (aWhitespaceIsSignificant ||
+           !aChild->TextIsOnlyWhitespace());
+ }
+ 
++/* static */ void
++nsStyleUtil::ReportUseOfDeprecatedMethod(nsIURI* aURI, const char* aWarning)
++{
++  nsContentUtils::ReportToConsole(nsContentUtils::eCSS_PROPERTIES,
++                                  aWarning, nsnull, 0, aURI,
++                                  EmptyString(), 0, 0,
++                                  nsIScriptError::warningFlag,
++                                  "CSS Object Model");
++}
+diff --git a/layout/style/nsStyleUtil.h b/layout/style/nsStyleUtil.h
+--- a/layout/style/nsStyleUtil.h
++++ b/layout/style/nsStyleUtil.h
+@@ -104,12 +104,14 @@ public:
+   static float ColorComponentToFloat(PRUint8 aAlpha);
+ 
+   /*
+    * Does this child count as significant for selector matching?
+    */
+   static PRBool IsSignificantChild(nsIContent* aChild,
+                                    PRBool aTextIsSignificant,
+                                    PRBool aWhitespaceIsSignificant);
++
++  static void ReportUseOfDeprecatedMethod(nsIURI* aURI, const char* aWarning);
+ };
+ 
+ 
+ #endif /* nsStyleUtil_h___ */
