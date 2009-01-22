@@ -226,7 +226,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
  {
    NS_ASSERTION(aContext, "Cannot find NonTransparentBackground in a null context" );
    
-@@ -1226,16 +1231,51 @@ IsSolidBorder(const nsStyleBorder& aBord
+@@ -1226,16 +1231,88 @@ IsSolidBorder(const nsStyleBorder& aBord
      return PR_FALSE;
    for (PRUint32 i = 0; i < 4; ++i) {
      if (!IsSolidBorderEdge(aBorder, i))
@@ -256,17 +256,54 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 +
 +static void
 +SetupBackgroundClip(PRUint8 aBackgroundClip, nsIFrame* aForFrame,
-+                    const nsRect& aBorderArea,
++                    const nsRect& aBorderArea, PRBool aHaveRoundedCorners,
++                    const gfxCornerSizes& aBGRadii,
++                    gfxContextAutoSaveRestore* aAutoSR,
 +                    /* OUT: */
 +                    nsRect* aBGClipArea)
 +{
 +  *aBGClipArea = aBorderArea;
++  PRBool radiiAreOuter = PR_TRUE;
++  gfxCornerSizes clippedRadii = bgRadii;
 +  if (aCurrentBackgroundClip != NS_STYLE_BG_CLIP_BORDER) {
 +    NS_ASSERTION(aCurrentBackgroundClip == NS_STYLE_BG_CLIP_PADDING,
 +                 "unexpected background-clip");
 +    nsMargin border = aForFrame->GetUsedBorder();
 +    aForFrame->ApplySkipSides(border);
 +    aBGClipArea->Deflate(border);
++
++    if (aHaveRoundedCorners) {
++      gfxFloat borderSizes[4] = {
++        border.top / appUnitsPerPixel, border.right / appUnitsPerPixel,
++        border.bottom / appUnitsPerPixel, border.left / appUnitsPerPixel
++      };
++      nsCSSBorderRenderer::ComputeInnerRadii(aBGRadii, borderSizes,
++                                             &clippedRadii);
++      radiiAreOuter = PR_FALSE;
++    }
++  }
++
++  // If we have rounded corners, clip all subsequent drawing to the
++  // rounded rectangle defined by bgArea and bgRadii (we don't know
++  // whether the rounded corners intrude on the dirtyRect or not).
++  // Do not do this if we have a caller-provided clip rect --
++  // as above with bgArea, arguably a bug, but table painting seems
++  // to depend on it.
++
++  if (aHaveRoundedCorners) {
++-    gfxRect bgAreaGfx(RectToGfxRect(*aBGClipArea, appUnitsPerPixel));
++-    bgAreaGfx.Round();
++-    bgAreaGfx.Condition();
++-    if (bgAreaGfx.IsEmpty()) {
++-      NS_WARNING("converted background area should not be empty");
++-      return;
++-    }
++
++    autoSR->~gfxContextAutoSaveRestore();
++    new (autoSR) gfxContextAutoSaveRestore(ctx);
++    ctx->NewPath();
++    ctx->RoundedRectangle(bgAreaGfx, bgRadii, radiiAreOuter);
++    ctx->Clip();
 +  }
 +}
 +
@@ -278,7 +315,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
                                        const nsRect& aBorderArea,
                                        const nsStyleBackground& aColor,
                                        const nsStyleBorder& aBorder,
-@@ -1266,30 +1306,31 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1266,30 +1343,31 @@ nsCSSRendering::PaintBackgroundWithSC(ns
    PRBool drawBackgroundImage = PR_TRUE;
    PRBool drawBackgroundColor = PR_TRUE;
  
@@ -317,7 +354,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
        drawBackgroundColor = PR_TRUE;
    }
  
-@@ -1299,106 +1340,110 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1299,106 +1377,71 @@ nsCSSRendering::PaintBackgroundWithSC(ns
    if (!drawBackgroundImage && !drawBackgroundColor)
      return;
  
@@ -330,7 +367,6 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    gfxCornerSizes bgRadii;
    PRBool haveRoundedCorners;
 -  PRBool radiiAreOuter = PR_TRUE;
-+-  PRBool radiiAreOuter = PR_TRUE;
    {
      nscoord radii[8];
      haveRoundedCorners =
@@ -372,14 +408,22 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 +  nsRect bgClipArea;
 +  PRUint8 currentBackgroundClip;
 +  PRBool isSolidBorder;
++  gfxContextAutoSaveRestore autoSR;
 +  if (aBGClipRect)
 +    bgClipArea = *aBGClipRect;
 +  else {
++    // The background is rendered over the 'background-clip' area,
++    // which is normally equal to the border area but may be reduced
++    // to the padding area by CSS.  Also, if the border is solid, we
++    // don't need to draw outside the padding area.  In either case,
++    // if the borders are rounded, make sure we use the same inner
++    // radii as the border code will.
 +    currentBackgroundClip = aColor.mBottomLayer->mClip;
 +    isSolidBorder = IsSolidBorder(aBorder);
 +    if (isSolidBorder)
 +      currentBackgroundClip = NS_STYLE_BG_CLIP_PADDING;
 +    SetupBackgroundClip(currentBackgroundClip, aForFrame, aBorderArea,
++                        haveRoundedCorners, bgRadii, &autoSR,
 +                        &bgClipArea);
    }
  
@@ -435,30 +479,6 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 -    ctx->RoundedRectangle(bgAreaGfx, bgRadii, radiiAreOuter);
 -    ctx->Clip();
 -  }
-+-  // The background is rendered over the 'background-clip' area,
-+-  // which is normally equal to the border area but may be reduced
-+-  // to the padding area by CSS.  Also, if the border is solid, we
-+-  // don't need to draw outside the padding area.  In either case,
-+-  // if the borders are rounded, make sure we use the same inner
-+-  // radii as the border code will.
-+-  bgArea = aBorderArea;
-+-  if (aColor.mBackgroundClip != NS_STYLE_BG_CLIP_BORDER ||
-+-      IsSolidBorder(aBorder)) {
-+-    nsMargin border = aForFrame->GetUsedBorder();
-+-    aForFrame->ApplySkipSides(border);
-+-    bgArea.Deflate(border);
-+-    if (haveRoundedCorners) {
-+-      gfxCornerSizes outerRadii = bgRadii;
-+-      gfxFloat borderSizes[4] = {
-+-        border.top / appUnitsPerPixel, border.right / appUnitsPerPixel,
-+-        border.bottom / appUnitsPerPixel, border.left / appUnitsPerPixel
-+-      };
-+-      nsCSSBorderRenderer::ComputeInnerRadii(outerRadii, borderSizes,
-+-                                             &bgRadii);
-+-      radiiAreOuter = PR_FALSE;
-+-    }
-+-  }
-+-
 +-  nsRect dirtyRect;
 +-  dirtyRect.IntersectRect(bgClipArea, aDirtyRect);
 +-
@@ -474,28 +494,6 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 +-    return;
 +-  }
 +-
-+-  // If we have rounded corners, clip all subsequent drawing to the
-+-  // rounded rectangle defined by bgArea and bgRadii (we don't know
-+-  // whether the rounded corners intrude on the dirtyRect or not).
-+-  // Do not do this if we have a caller-provided clip rect --
-+-  // as above with bgArea, arguably a bug, but table painting seems
-+-  // to depend on it.
-+-
-+-  gfxContextAutoSaveRestore autoSR;
-+-  if (haveRoundedCorners && !aBGClipRect) {
-+-    gfxRect bgAreaGfx(RectToGfxRect(bgArea, appUnitsPerPixel));
-+-    bgAreaGfx.Round();
-+-    bgAreaGfx.Condition();
-+-    if (bgAreaGfx.IsEmpty()) {
-+-      NS_WARNING("converted background area should not be empty");
-+-      return;
-+-    }
-+-
-+-    autoSR.SetContext(ctx);
-+-    ctx->NewPath();
-+-    ctx->RoundedRectangle(bgAreaGfx, bgRadii, radiiAreOuter);
-+-    ctx->Clip();
-+-  }
  
    // If we might be using a background color, go ahead and set it now.
    if (drawBackgroundColor)
@@ -504,7 +502,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    // If there is no background image, draw a color.  (If there is
    // neither a background image nor a color, we wouldn't have gotten
    // this far.)
-@@ -1409,31 +1454,95 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1409,31 +1452,96 @@ nsCSSRendering::PaintBackgroundWithSC(ns
      return;
    }
  
@@ -567,6 +565,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 +        if (currentBackgroundClip != newBackgroundClip) {
 +          currentBackgroundClip = newBackgroundClip;
 +          SetupBackgroundClip(currentBackgroundClip, aForFrame, aBorderArea,
++                              haveRoundedCorners, bgRadii, &autoSR,
 +                              &bgClipArea);
 +        }
 +      }
@@ -612,7 +611,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
  
    nsIntSize imageIntSize;
    image->GetWidth(&imageIntSize.width);
-@@ -1447,17 +1556,17 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1447,17 +1555,17 @@ nsCSSRendering::PaintBackgroundWithSC(ns
  
    // relative to aBorderArea
    nsRect bgOriginRect;
@@ -631,7 +630,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
        break;
      default:
        NS_ERROR("Unknown background-inline-policy value!  "
-@@ -1474,81 +1583,35 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1474,81 +1582,35 @@ nsCSSRendering::PaintBackgroundWithSC(ns
        "|:viewport| pseudo-element in |html.css|.");
      bgOriginRect = geometryFrame->GetRect();
    } else {
@@ -717,7 +716,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
      aPresContext->SetRenderedPositionVaryingContent();
  
      nsIFrame* topFrame =
-@@ -1572,42 +1635,43 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -1572,42 +1634,43 @@ nsCSSRendering::PaintBackgroundWithSC(ns
          aPresContext->PresShell()->GetRootScrollFrameAsScrollable();
        if (scrollableFrame) {
          nsMargin scrollbars = scrollableFrame->GetActualScrollbarSizes();
