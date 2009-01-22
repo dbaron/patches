@@ -1,20 +1,59 @@
-Implement CSS computation of font-stretch property.  (Bug 3512)  (HANDED OFF TO stuart / jdaggett, although maybe I should land this piece)
+Implement CSS computation of font-stretch property and store it in the gfx font structures.  (Bug 3512)
 
+diff --git a/content/canvas/src/nsCanvasRenderingContext2D.cpp b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+--- a/content/canvas/src/nsCanvasRenderingContext2D.cpp
++++ b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+@@ -1967,16 +1967,17 @@ nsCanvasRenderingContext2D::SetFont(cons
+     // un-zoom the font size to avoid being affected by text-only zoom
+     const nscoord fontSize = nsStyleFont::UnZoomText(parentContext->PresContext(), fontStyle->mFont.size);
+ 
+     PRBool printerFont = (presShell->GetPresContext()->Type() == nsPresContext::eContext_PrintPreview ||
+                           presShell->GetPresContext()->Type() == nsPresContext::eContext_Print);
+ 
+     gfxFontStyle style(fontStyle->mFont.style,
+                        fontStyle->mFont.weight,
++                       fontStyle->mFont.stretch,
+                        NSAppUnitsToFloatPixels(fontSize, aupcp),
+                        langGroup,
+                        fontStyle->mFont.sizeAdjust,
+                        fontStyle->mFont.systemFont,
+                        fontStyle->mFont.familyNameQuirks,
+                        printerFont);
+ 
+     CurrentState().fontGroup = gfxPlatform::GetPlatform()->CreateFontGroup(fontStyle->mFont.name, &style, presShell->GetPresContext()->GetUserFontSet());
 diff --git a/gfx/public/nsFont.h b/gfx/public/nsFont.h
 --- a/gfx/public/nsFont.h
 +++ b/gfx/public/nsFont.h
-@@ -80,16 +80,21 @@ struct NS_GFX nsFont {
+@@ -63,55 +63,59 @@ const PRUint8 kGenericFont_monospace    
+ const PRUint8 kGenericFont_cursive      = 0x10;
+ const PRUint8 kGenericFont_fantasy      = 0x20;
+ 
+ // Font structure.
+ struct NS_GFX nsFont {
+   // The family name of the font
+   nsString name;
+ 
+-  // The style of font (normal, italic, oblique)
++  // The style of font (normal, italic, oblique; see gfxFontConstants.h)
+   PRUint8 style;
+ 
+   // Force this font to not be considered a 'generic' font, even if
+   // the name is the same as a CSS generic font family.
+   PRUint8 systemFont;
+ 
+   // The variant of the font (normal, small-caps)
+   PRUint8 variant;
  
    // True if the character set quirks (for treatment of "Symbol",
    // "Wingdings", etc.) should be applied.
    PRUint8 familyNameQuirks;
  
-   // The weight of the font (0-999)
+-  // The weight of the font (0-999)
++  // The weight of the font; see gfxFontConstants.h.
    PRUint16 weight;
  
 +  // The stretch of the font (the sum of various NS_FONT_STRETCH_*
-+  // constants; see nsStyleConsts.h).
-+  // FIXME: These constants belong someplace else (probably gfxFontStyle)
++  // constants; see gfxFontConstants.h).
 +  PRInt16 stretch;
 +
    // The decorations on the font (underline, overline,
@@ -25,10 +64,49 @@ diff --git a/gfx/public/nsFont.h b/gfx/public/nsFont.h
    nscoord size;
  
    // The aspect-value (ie., the ratio actualsize:actualxheight) that any
+   // actual physical font created from this font structure must have when
+   // rendering or measuring a string. A value of 0 means no adjustment
+   // needs to be done.
+   float sizeAdjust;
+ 
+   // Initialize the font struct with an ASCII name
+   nsFont(const char* aName, PRUint8 aStyle, PRUint8 aVariant,
+-         PRUint16 aWeight, PRUint8 aDecoration, nscoord aSize,
+-         float aSizeAdjust=0.0f);
++         PRUint16 aWeight, PRInt16 aStretch, PRUint8 aDecoration,
++         nscoord aSize, float aSizeAdjust=0.0f);
+ 
+   // Initialize the font struct with a (potentially) unicode name
+   nsFont(const nsString& aName, PRUint8 aStyle, PRUint8 aVariant,
+-         PRUint16 aWeight, PRUint8 aDecoration, nscoord aSize,
+-         float aSizeAdjust=0.0f);
++         PRUint16 aWeight, PRInt16 aStretch, PRUint8 aDecoration,
++         nscoord aSize, float aSizeAdjust=0.0f);
+ 
+   // Make a copy of the given font
+   nsFont(const nsFont& aFont);
+ 
+   nsFont();
+   ~nsFont();
+ 
+   PRBool operator==(const nsFont& aOther) const {
 diff --git a/gfx/src/nsFont.cpp b/gfx/src/nsFont.cpp
 --- a/gfx/src/nsFont.cpp
 +++ b/gfx/src/nsFont.cpp
-@@ -47,44 +47,47 @@ nsFont::nsFont(const char* aName, PRUint
+@@ -36,55 +36,58 @@
+  * ***** END LICENSE BLOCK ***** */
+ 
+ #include "nsFont.h"
+ #include "nsString.h"
+ #include "nsUnicharUtils.h"
+ #include "nsCRT.h"
+ 
+ nsFont::nsFont(const char* aName, PRUint8 aStyle, PRUint8 aVariant,
+-               PRUint16 aWeight, PRUint8 aDecoration, nscoord aSize,
+-               float aSizeAdjust)
++               PRUint16 aWeight, PRInt16 aStretch, PRUint8 aDecoration,
++               nscoord aSize, float aSizeAdjust)
+ {
    NS_ASSERTION(aName && IsASCII(nsDependentCString(aName)),
                 "Must only pass ASCII names here");
    name.AssignASCII(aName);
@@ -37,15 +115,17 @@ diff --git a/gfx/src/nsFont.cpp b/gfx/src/nsFont.cpp
    variant = aVariant;
    familyNameQuirks = PR_FALSE;
    weight = aWeight;
-+  stretch = 0; // FIXME: make this a parameter!
++  stretch = aStretch;
    decorations = aDecoration;
    size = aSize;
    sizeAdjust = aSizeAdjust;
  }
  
  nsFont::nsFont(const nsString& aName, PRUint8 aStyle, PRUint8 aVariant,
-                PRUint16 aWeight, PRUint8 aDecoration, nscoord aSize,
-                float aSizeAdjust)
+-               PRUint16 aWeight, PRUint8 aDecoration, nscoord aSize,
+-               float aSizeAdjust)
++               PRUint16 aWeight, PRInt16 aStretch, PRUint8 aDecoration,
++               nscoord aSize, float aSizeAdjust)
    : name(aName)
  {
    style = aStyle;
@@ -53,7 +133,7 @@ diff --git a/gfx/src/nsFont.cpp b/gfx/src/nsFont.cpp
    variant = aVariant;
    familyNameQuirks = PR_FALSE;
    weight = aWeight;
-+  stretch = 0; // FIXME: make this a parameter!
++  stretch = aStretch;
    decorations = aDecoration;
    size = aSize;
    sizeAdjust = aSizeAdjust;
@@ -300,29 +380,50 @@ diff --git a/gfx/src/thebes/nsThebesDeviceContext.cpp b/gfx/src/thebes/nsThebesD
 diff --git a/gfx/src/thebes/nsThebesFontMetrics.cpp b/gfx/src/thebes/nsThebesFontMetrics.cpp
 --- a/gfx/src/thebes/nsThebesFontMetrics.cpp
 +++ b/gfx/src/thebes/nsThebesFontMetrics.cpp
-@@ -83,16 +83,19 @@ nsThebesFontMetrics::Init(const nsFont& 
+@@ -79,17 +79,18 @@ nsThebesFontMetrics::Init(const nsFont& 
+     nsCString langGroup;
+     if (aLangGroup) {
+         const char* lg;
+         mLangGroup->GetUTF8String(&lg);
          langGroup.Assign(lg);
      }
  
      PRBool printerFont = mDeviceContext->IsPrinterSurface();
-     mFontStyle = new gfxFontStyle(aFont.style, aFont.weight, size, langGroup,
+-    mFontStyle = new gfxFontStyle(aFont.style, aFont.weight, size, langGroup,
++    mFontStyle = new gfxFontStyle(aFont.style, aFont.weight, aFont.stretch,
++                                  size, langGroup,
                                    aFont.sizeAdjust, aFont.systemFont,
                                    aFont.familyNameQuirks,
                                    printerFont);
-+    // FIXME: pass this as a parameter in the line above once we have such
-+    // a parameter.
-+    mFontStyle->stretch = aFont.stretch;
  
      mFontGroup =
          gfxPlatform::GetPlatform()->CreateFontGroup(aFont.name, mFontStyle, 
                                                      aUserFontSet);
  
-     return NS_OK;
- }
- 
 diff --git a/gfx/thebes/public/gfxFont.h b/gfx/thebes/public/gfxFont.h
 --- a/gfx/thebes/public/gfxFont.h
 +++ b/gfx/thebes/public/gfxFont.h
+@@ -73,18 +73,18 @@ class gfxUserFontData;
+ // We should eliminate these synonyms when it won't cause many merge conflicts.
+ #define FONT_WEIGHT_NORMAL             NS_FONT_WEIGHT_NORMAL
+ #define FONT_WEIGHT_BOLD               NS_FONT_WEIGHT_BOLD
+ 
+ #define FONT_MAX_SIZE                  2000.0
+ 
+ struct THEBES_API gfxFontStyle {
+     gfxFontStyle();
+-    gfxFontStyle(PRUint8 aStyle, PRUint16 aWeight, gfxFloat aSize,
+-                 const nsACString& aLangGroup,
++    gfxFontStyle(PRUint8 aStyle, PRUint16 aWeight, PRInt16 aStretch,
++                 gfxFloat aSize, const nsACString& aLangGroup,
+                  float aSizeAdjust, PRPackedBool aSystemFont,
+                  PRPackedBool aFamilyNameQuirks,
+                  PRPackedBool aPrinterFont);
+     gfxFontStyle(const gfxFontStyle& aStyle);
+ 
+     // The style of font (normal, italic, oblique)
+     PRUint8 style : 7;
+ 
 @@ -102,16 +102,20 @@ struct THEBES_API gfxFontStyle {
  
      // The weight of the font.  100, 200, ... 900 are the weights, and
@@ -390,7 +491,7 @@ diff --git a/gfx/thebes/public/gfxFontConstants.h b/gfx/thebes/public/gfxFontCon
 diff --git a/gfx/thebes/src/gfxFont.cpp b/gfx/thebes/src/gfxFont.cpp
 --- a/gfx/thebes/src/gfxFont.cpp
 +++ b/gfx/thebes/src/gfxFont.cpp
-@@ -1223,28 +1223,30 @@ gfxFontGroup::GetGeneration()
+@@ -1223,28 +1223,29 @@ gfxFontGroup::GetGeneration()
      return mUserFontSet->GetGeneration();
  }
  
@@ -406,14 +507,16 @@ diff --git a/gfx/thebes/src/gfxFont.cpp b/gfx/thebes/src/gfxFont.cpp
  {
  }
  
- gfxFontStyle::gfxFontStyle(PRUint8 aStyle, PRUint16 aWeight, gfxFloat aSize,
-                            const nsACString& aLangGroup,
+-gfxFontStyle::gfxFontStyle(PRUint8 aStyle, PRUint16 aWeight, gfxFloat aSize,
+-                           const nsACString& aLangGroup,
++gfxFontStyle::gfxFontStyle(PRUint8 aStyle, PRUint16 aWeight, PRInt16 aStretch,
++                           gfxFloat aSize, const nsACString& aLangGroup,
                             float aSizeAdjust, PRPackedBool aSystemFont,
                             PRPackedBool aFamilyNameQuirks,
                             PRPackedBool aPrinterFont):
      style(aStyle), systemFont(aSystemFont), printerFont(aPrinterFont),
-     familyNameQuirks(aFamilyNameQuirks), weight(aWeight),
-+    stretch(NS_FONT_STRETCH_NORMAL), // FIXME: Make this a parameter!
+-    familyNameQuirks(aFamilyNameQuirks), weight(aWeight),
++    familyNameQuirks(aFamilyNameQuirks), weight(aWeight), stretch(aStretch),
      size(aSize), langGroup(aLangGroup), sizeAdjust(aSizeAdjust)
  {
      if (weight > 900)
@@ -422,7 +525,7 @@ diff --git a/gfx/thebes/src/gfxFont.cpp b/gfx/thebes/src/gfxFont.cpp
          weight = 100;
  
      if (size >= FONT_MAX_SIZE) {
-@@ -1259,17 +1261,17 @@ gfxFontStyle::gfxFontStyle(PRUint8 aStyl
+@@ -1259,17 +1260,17 @@ gfxFontStyle::gfxFontStyle(PRUint8 aStyl
          NS_WARNING("empty langgroup");
          langGroup.Assign("x-western");
      }
@@ -441,6 +544,147 @@ diff --git a/gfx/thebes/src/gfxFont.cpp b/gfx/thebes/src/gfxFont.cpp
  gfxFontStyle::ComputeWeightAndOffset(PRInt8 *outBaseWeight, PRInt8 *outOffset) const
  {
      PRInt8 baseWeight = (weight + 50) / 100;
+diff --git a/gfx/thebes/src/gfxPangoFonts.cpp b/gfx/thebes/src/gfxPangoFonts.cpp
+--- a/gfx/thebes/src/gfxPangoFonts.cpp
++++ b/gfx/thebes/src/gfxPangoFonts.cpp
+@@ -2233,17 +2233,19 @@ gfxFcFont::GetOrMakeFont(FcPattern *aPat
+         // name or style, as size is the only thing expected to be important.
+         PRUint8 style = gfxFontconfigUtils::GetThebesStyle(aPattern);
+         PRUint16 weight = gfxFontconfigUtils::GetThebesWeight(aPattern);
+ 
+         // The LangSet in the FcPattern does not have an order so there is no
+         // one particular language to choose and converting the set to a
+         // string through FcNameUnparse() is more trouble than it's worth.
+         NS_NAMED_LITERAL_CSTRING(langGroup, "x-unicode");
+-        gfxFontStyle fontStyle(style, weight, size, langGroup, 0.0,
++        // FIXME: Pass a real weight based on aPattern!
++        gfxFontStyle fontStyle(style, weight, NS_FONT_WEIGHT_NORMAL,
++                               size, langGroup, 0.0,
+                                PR_TRUE, PR_FALSE, PR_FALSE);
+ 
+         nsRefPtr<gfxFontEntry> fe;
+         FcChar8 *fc_file;
+         if (FcPatternGetString(aPattern,
+                                FC_FILE, 0, &fc_file) == FcResultMatch) {
+             int index;
+             if (FcPatternGetInteger(aPattern,
+diff --git a/gfx/thebes/test/gfxFontSelectionTests.h b/gfx/thebes/test/gfxFontSelectionTests.h
+--- a/gfx/thebes/test/gfxFontSelectionTests.h
++++ b/gfx/thebes/test/gfxFontSelectionTests.h
+@@ -101,23 +101,25 @@
+ 
+ void
+ SetupTests()
+ {
+     TestEntry *t;
+ 
+     /* some common styles */
+     gfxFontStyle style_western_normal_16 (FONT_STYLE_NORMAL,
++                                          NS_FONT_WEIGHT_NORMAL,
+                                           400,
+                                           16.0,
+                                           nsDependentCString("x-western"),
+                                           0.0,
+                                           PR_FALSE, PR_FALSE, PR_FALSE);
+ 
+     gfxFontStyle style_western_bold_16 (FONT_STYLE_NORMAL,
++                                        NS_FONT_WEIGHT_NORMAL,
+                                         700,
+                                         16.0,
+                                         nsDependentCString("x-western"),
+                                         0.0,
+                                         PR_FALSE, PR_FALSE, PR_FALSE);
+ 
+     /* Test 0 */
+     t = AddTest ("sans-serif",
+diff --git a/gfx/thebes/test/gfxTextRunPerfTest.cpp b/gfx/thebes/test/gfxTextRunPerfTest.cpp
+--- a/gfx/thebes/test/gfxTextRunPerfTest.cpp
++++ b/gfx/thebes/test/gfxTextRunPerfTest.cpp
+@@ -85,16 +85,17 @@ MakeContext ()
+ 
+ nsRefPtr<gfxFontGroup> fontGroup;
+ const char* lastFamilies = nsnull;
+ 
+ void
+ RunTest (TestEntry *test, gfxContext *ctx) {
+     if (!lastFamilies || strcmp(lastFamilies, test->mFamilies)) {
+         gfxFontStyle style_western_normal_16 (FONT_STYLE_NORMAL,
++                                              NS_FONT_WEIGHT_NORMAL,
+                                               400,
+                                               16.0,
+                                               nsDependentCString("x-western"),
+                                               0.0,
+                                               PR_FALSE, PR_FALSE, PR_FALSE);
+ 
+         fontGroup = gfxPlatform::GetPlatform()->CreateFontGroup(NS_ConvertUTF8toUTF16(test->mFamilies), &style_western_normal_16, nsnull);
+     }
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -174,29 +174,34 @@ static NS_DEFINE_CID(kLookAndFeelCID,  N
+ 
+ nsPresContext::nsPresContext(nsIDocument* aDocument, nsPresContextType aType)
+   : mType(aType), mDocument(aDocument), mTextZoom(1.0), mFullZoom(1.0),
+     mPageSize(-1, -1), mPPScale(1.0f),
+     mViewportStyleOverflow(NS_STYLE_OVERFLOW_AUTO, NS_STYLE_OVERFLOW_AUTO),
+     mImageAnimationModePref(imgIContainer::kNormalAnimMode),
+     // Font sizes default to zero; they will be set in GetFontPreferences
+     mDefaultVariableFont("serif", NS_FONT_STYLE_NORMAL, NS_FONT_VARIANT_NORMAL,
+-                         NS_FONT_WEIGHT_NORMAL, 0, 0),
++                         NS_FONT_WEIGHT_NORMAL, NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultFixedFont("monospace", NS_FONT_STYLE_NORMAL,
+-                      NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL, 0, 0),
++                      NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL,
++                      NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultSerifFont("serif", NS_FONT_STYLE_NORMAL, NS_FONT_VARIANT_NORMAL,
+-                      NS_FONT_WEIGHT_NORMAL, 0, 0),
++                      NS_FONT_WEIGHT_NORMAL, NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultSansSerifFont("sans-serif", NS_FONT_STYLE_NORMAL,
+-                          NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL, 0, 0),
++                          NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL,
++                          NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultMonospaceFont("monospace", NS_FONT_STYLE_NORMAL,
+-                          NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL, 0, 0),
++                          NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL,
++                          NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultCursiveFont("cursive", NS_FONT_STYLE_NORMAL,
+-                        NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL, 0, 0),
++                        NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL,
++                        NS_FONT_STRETCH_NORMAL, 0, 0),
+     mDefaultFantasyFont("fantasy", NS_FONT_STYLE_NORMAL,
+-                        NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL, 0, 0),
++                        NS_FONT_VARIANT_NORMAL, NS_FONT_WEIGHT_NORMAL,
++                        NS_FONT_STRETCH_NORMAL, 0, 0),
+     mCanPaginatedScroll(PR_FALSE),
+     mIsRootPaginatedDocument(PR_FALSE), mSupressResizeReflow(PR_FALSE)
+ {
+   // NOTE! nsPresContext::operator new() zeroes out all members, so don't
+   // bother initializing members to 0.
+ 
+   mDoScaledTwips = PR_TRUE;
+ 
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -7701,17 +7701,17 @@ void ReflowCountMgr::PaintCount(const ch
+       nsnull != mIndiFrameCounts && 
+       aFrame != nsnull) {
+     char * key = new char[16];
+     sprintf(key, "%p", (void*)aFrame);
+     IndiReflowCounter * counter = (IndiReflowCounter *)PL_HashTableLookup(mIndiFrameCounts, key);
+     if (counter != nsnull && counter->mName.EqualsASCII(aName)) {
+       aRenderingContext->PushState();
+       nsFont font("Times", NS_FONT_STYLE_NORMAL, NS_FONT_VARIANT_NORMAL,
+-                  NS_FONT_WEIGHT_NORMAL, 0,
++                  NS_FONT_WEIGHT_NORMAL, NS_FONT_STRETCH_NORMAL, 0,
+                   nsPresContext::CSSPixelsToAppUnits(11));
+ 
+       nsCOMPtr<nsIFontMetrics> fm = aPresContext->GetMetricsFor(font);
+       aRenderingContext->SetFont(fm);
+       char buf[16];
+       sprintf(buf, "%d", counter->mCount);
+       nscoord x = 0, y;
+       nscoord width, height;
 diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
 --- a/layout/base/nsStyleConsts.h
 +++ b/layout/base/nsStyleConsts.h
@@ -484,6 +728,69 @@ diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
  #define NS_STYLE_FONT_MESSAGE_BOX               4
  #define NS_STYLE_FONT_SMALL_CAPTION             5
  #define NS_STYLE_FONT_STATUS_BAR                6
+diff --git a/layout/mathml/base/src/nsMathMLChar.cpp b/layout/mathml/base/src/nsMathMLChar.cpp
+--- a/layout/mathml/base/src/nsMathMLChar.cpp
++++ b/layout/mathml/base/src/nsMathMLChar.cpp
+@@ -801,17 +801,17 @@ InitGlobals(nsPresContext* aPresContext)
+   value.Truncate();
+   rv = LoadProperties(value, mathfontProp);
+   if (NS_FAILED(rv)) return rv;
+ 
+   // Get the list of mathfonts having special glyph tables to be used for
+   // stretchy characters.
+   // We just want to iterate over the font-family list using the
+   // callback mechanism that nsFont has...
+-  nsFont font("", 0, 0, 0, 0, 0);
++  nsFont font("", 0, 0, 0, 0, 0, 0);
+   NS_NAMED_LITERAL_CSTRING(defaultKey, "font.mathfont-glyph-tables");
+   rv = mathfontProp->GetStringProperty(defaultKey, font.name);
+   if (NS_FAILED(rv)) return rv;
+ 
+   // Parse the font list and append an entry for each family to gGlyphTableList
+   nsAutoString missingFamilyList;
+ 
+ #if ALERT_MISSING_FONTS
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -5731,17 +5731,17 @@ CSSParserImpl::ParseFontDescriptorValue(
+     if (!ParseFamily(aValue) ||
+         aValue.GetUnit() != eCSSUnit_String)
+       return PR_FALSE;
+ 
+     // the style parameters to the nsFont constructor are ignored,
+     // because it's only being used to call EnumerateFamilies
+     nsAutoString valueStr;
+     aValue.GetStringValue(valueStr);
+-    nsFont font(valueStr, 0, 0, 0, 0, 0);
++    nsFont font(valueStr, 0, 0, 0, 0, 0, 0);
+     ExtractFirstFamilyData dat;
+ 
+     font.EnumerateFamilies(ExtractFirstFamily, (void*) &dat);
+     if (!dat.mGood)
+       return PR_FALSE;
+ 
+     aValue.SetStringValue(dat.mFamilyName, eCSSUnit_String);
+     return PR_TRUE;
+@@ -7295,17 +7295,17 @@ CSSParserImpl::ParseFontSrc(nsCSSValue& 
+         return PR_FALSE;
+       if (!ParseOneFamily(family))
+         return PR_FALSE;
+       if (!ExpectSymbol(')', PR_TRUE))
+         return PR_FALSE;
+ 
+       // the style parameters to the nsFont constructor are ignored,
+       // because it's only being used to call EnumerateFamilies
+-      nsFont font(family, 0, 0, 0, 0, 0);
++      nsFont font(family, 0, 0, 0, 0, 0, 0);
+       ExtractFirstFamilyData dat;
+ 
+       font.EnumerateFamilies(ExtractFirstFamily, (void*) &dat);
+       if (!dat.mGood)
+         return PR_FALSE;
+ 
+       cur.SetStringValue(dat.mFamilyName, eCSSUnit_Local_Font);
+       values.AppendElement(cur);
 diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
 --- a/layout/style/nsCSSPropList.h
 +++ b/layout/style/nsCSSPropList.h
@@ -751,3 +1058,27 @@ diff --git a/layout/style/test/property_database.js b/layout/style/test/property
  	"font-style": {
  		domProp: "fontStyle",
  		inherited: true,
+diff --git a/layout/svg/base/src/nsSVGGlyphFrame.cpp b/layout/svg/base/src/nsSVGGlyphFrame.cpp
+--- a/layout/svg/base/src/nsSVGGlyphFrame.cpp
++++ b/layout/svg/base/src/nsSVGGlyphFrame.cpp
+@@ -1272,18 +1272,18 @@ nsSVGGlyphFrame::EnsureTextRun(float *aD
+       textRunSize = size*contextScale;
+       textRunSize = PR_MAX(textRunSize, CLAMP_MIN_SIZE);
+       textRunSize = PR_MIN(textRunSize, CLAMP_MAX_SIZE);
+     }
+ 
+     const nsFont& font = fontData->mFont;
+     PRBool printerFont = (presContext->Type() == nsPresContext::eContext_PrintPreview ||
+                           presContext->Type() == nsPresContext::eContext_Print);
+-    gfxFontStyle fontStyle(font.style, font.weight, textRunSize, langGroup,
+-                           font.sizeAdjust, font.systemFont,
++    gfxFontStyle fontStyle(font.style, font.weight, font.stretch, textRunSize,
++                           langGroup, font.sizeAdjust, font.systemFont,
+                            font.familyNameQuirks,
+                            printerFont);
+ 
+     nsRefPtr<gfxFontGroup> fontGroup =
+       gfxPlatform::GetPlatform()->CreateFontGroup(font.name, &fontStyle, presContext->GetUserFontSet());
+ 
+     PRUint32 flags = gfxTextRunFactory::TEXT_NEED_BOUNDING_BOX |
+       nsLayoutUtils::GetTextRunFlagsForStyle(GetStyleContext(), GetStyleText(), GetStyleFont());
