@@ -1,0 +1,239 @@
+Keep old rule trees around until they are no longer referenced.
+
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -81,17 +81,17 @@ nsStyleContext::nsStyleContext(nsStyleCo
+     mParent->AddRef();
+     mParent->AddChild(this);
+ #ifdef DEBUG
+     nsRuleNode *r1 = mParent->GetRuleNode(), *r2 = aRuleNode;
+     while (r1->GetParent())
+       r1 = r1->GetParent();
+     while (r2->GetParent())
+       r2 = r2->GetParent();
+-    NS_ABORT_IF_FALSE(r1 == r2, "must be in the same rule tree as parent");
++    NS_ASSERTION(r1 == r2, "must be in the same rule tree as parent");
+ #endif
+   }
+ 
+   ApplyStyleFixups(aPresContext);
+ 
+   #define eStyleStruct_LastItem (nsStyleStructID_Length - 1)
+   NS_ASSERTION(NS_STYLE_INHERIT_MASK & NS_STYLE_INHERIT_BIT(LastItem),
+                "NS_STYLE_INHERIT_MASK must be bigger, and other bits shifted");
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -81,17 +81,16 @@ static const nsStyleSet::sheetType gCSSS
+   nsStyleSet::eOverrideSheet
+ };
+ 
+ nsStyleSet::nsStyleSet()
+   : mRuleTree(nsnull),
+     mRuleWalker(nsnull),
+     mDestroyedCount(0),
+     mBatching(0),
+-    mOldRuleTree(nsnull),
+     mInShutdown(PR_FALSE),
+     mAuthorStyleDisabled(PR_FALSE),
+     mDirty(0)
+ {
+ }
+ 
+ nsresult
+ nsStyleSet::Init(nsPresContext *aPresContext)
+@@ -121,70 +120,72 @@ nsStyleSet::Init(nsPresContext *aPresCon
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsStyleSet::BeginReconstruct()
+ {
+-  NS_ASSERTION(!mOldRuleTree, "Unmatched begin/end?");
++  NS_ASSERTION(mOldRuleTrees.IsEmpty(), "Unmatched begin/end?");
+   NS_ASSERTION(mRuleTree, "Reconstructing before first construction?");
+ 
+   // Create a new rule tree root
+   nsRuleNode* newTree =
+     nsRuleNode::CreateRootNode(mRuleTree->GetPresContext());
+   if (!newTree)
+     return NS_ERROR_OUT_OF_MEMORY;
+   nsRuleWalker* ruleWalker = new nsRuleWalker(newTree);
+   if (!ruleWalker) {
+     newTree->Destroy();
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
+   // Save the old rule tree so we can destroy it later
+-  mOldRuleTree = mRuleTree;
++  if (!mOldRuleTrees.AppendElement(mRuleTree)) {
++    delete ruleWalker;
++    newTree->Destroy();
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
+   // Delete mRuleWalker because it holds a reference to the rule tree root
+   delete mRuleWalker;
+   // We don't need to clear out mRoots; NotifyStyleContextDestroyed
+   // will, and they're useful in EndReconstruct if they don't get
+   // completely cleared out.
+ 
+   mRuleTree = newTree;
+   mRuleWalker = ruleWalker;
+ 
+   return NS_OK;
+ }
+ 
+ void
+ nsStyleSet::EndReconstruct()
+ {
++  NS_ASSERTION(!mOldRuleTrees.IsEmpty(), "Unmatched begin/end?");
+ #ifdef DEBUG
+   for (PRInt32 i = mRoots.Length() - 1; i >= 0; --i) {
+     nsRuleNode *n = mRoots[i]->GetRuleNode();
+     while (n->GetParent()) {
+       n = n->GetParent();
+     }
+     // Since nsStyleContext's mParent and mRuleNode are immutable, and
+     // style contexts own their parents, and nsStyleContext asserts in
+     // its constructor that the style context and its parent are in the
+     // same rule tree, we don't need to check any of the children of
+     // mRoots; we only need to check the rule nodes of mRoots
+     // themselves.
+ 
+-    NS_ABORT_IF_FALSE(n == mRuleTree, "style context has old rule node");
++    NS_ASSERTION(n == mRuleTree, "style context has old rule node");
+   }
+ #endif
+-  NS_ASSERTION(mOldRuleTree, "Unmatched begin/end?");
+-  // Reset the destroyed count; it's no longer valid
+-  mDestroyedCount = 0;
+-  // Destroy the old rule tree (all the associated style contexts should have
+-  // been destroyed by the caller beforehand)
+-  mOldRuleTree->Destroy();
+-  mOldRuleTree = nsnull;
++  // This *should* destroy the only element of mOldRuleTrees, but in
++  // case of some bugs (which would trigger the above assertions), it
++  // won't.
++  GCRuleTree();
+ }
+ 
+ void
+ nsStyleSet::SetQuirkStyleSheet(nsIStyleSheet* aQuirkStyleSheet)
+ {
+   NS_ASSERTION(aQuirkStyleSheet, "Must have quirk sheet if this is called");
+   NS_ASSERTION(!mQuirkStyleSheet, "Multiple calls to SetQuirkStyleSheet?");
+   NS_ASSERTION(mSheets[eAgentSheet].IndexOf(aQuirkStyleSheet) != -1,
+@@ -894,33 +895,50 @@ nsStyleSet::NotifyStyleContextDestroyed(
+   if (!aStyleContext->GetParent()) {
+     mRoots.RemoveElement(aStyleContext);
+   }
+ 
+   if (mOldRuleTree)
+     return;
+ 
+   if (++mDestroyedCount == kGCInterval) {
+-    mDestroyedCount = 0;
++    GCRuleTree();
++  }
++}
+ 
+-    // Mark the style context tree by marking all roots, which will mark
+-    // all descendants.  This will reach style contexts in the
+-    // undisplayed map and "additional style contexts" since they are
+-    // descendants of the root.
+-    for (PRInt32 i = mRoots.Length() - 1; i >= 0; --i) {
+-      mRoots[i]->Mark();
++void
++nsStyleSet::GCRuleTree()
++{
++  mDestroyedCount = 0;
++
++  // Mark the style context tree by marking all all style contexts which
++  // have no parent, which will mark all descendants.  This will reach
++  // style contexts in the undisplayed map and "additional style
++  // contexts" since they are descendants of the roots.
++  for (PRInt32 i = mRoots.Length() - 1; i >= 0; --i) {
++    mRoots[i]->Mark();
++  }
++
++  // Sweep the rule tree.
++#ifdef DEBUG
++  PRBool deleted =
++#endif
++    mRuleTree->Sweep();
++  NS_ASSERTION(!deleted, "Root node must not be gc'd");
++
++  // Sweep the old rule trees.
++  for (PRUint32 i = mOldRuleTrees.Length(); i > 0; ) {
++    --i;
++    nsRuleNode *tree = mOldRuleTrees[i];
++    if (mRuleTree->Sweep()) {
++      // It was deleted, as it should be.
++      mOldRuleTrees.RemoveElementAt(i);
++    } else {
++      NS_NOTREACHED("old rule tree still referenced");
+     }
+-
+-    // Sweep the rule tree.
+-#ifdef DEBUG
+-    PRBool deleted =
+-#endif
+-      mRuleTree->Sweep();
+-
+-    NS_ASSERTION(!deleted, "Root node must not be gc'd");
+   }
+ }
+ 
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ReParentStyleContext(nsPresContext* aPresContext,
+                                  nsStyleContext* aStyleContext, 
+                                  nsStyleContext* aNewParentContext)
+ {
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -241,16 +241,18 @@ class nsStyleSet
+  private:
+   // Not to be implemented
+   nsStyleSet(const nsStyleSet& aCopy);
+   nsStyleSet& operator=(const nsStyleSet& aCopy);
+ 
+   // Returns false on out-of-memory.
+   PRBool BuildDefaultStyleData(nsPresContext* aPresContext);
+ 
++  void GCRuleTree();
++
+   // Update the rule processor list after a change to the style sheet list.
+   nsresult GatherRuleProcessors(sheetType aType);
+ 
+   void AddImportantRules(nsRuleNode* aCurrLevelNode,
+                          nsRuleNode* aLastPrevLevelNode);
+ 
+   // Move mRuleWalker forward by the appropriate rule if we need to add
+   // a rule due to property restrictions on pseudo-elements.
+@@ -312,18 +314,20 @@ class nsStyleSet
+   nsTArray<nsStyleContext*> mRoots; // style contexts with no parent
+ 
+   // Empty style rules to force things that restrict which properties
+   // apply into different branches of the rule tree.
+   nsRefPtr<nsEmptyStyleRule> mFirstLineRule, mFirstLetterRule;
+ 
+   PRUint16 mBatching;
+ 
+-  nsRuleNode* mOldRuleTree; // Old rule tree; used during tree reconstruction
+-                            // (See BeginReconstruct and EndReconstruct)
++  // Old rule tree, which should only be non-empty between
++  // BeginReconstruct and EndReconstruct, but in case of bugs that cause
++  // style contexts to exist to long, may last longer.
++  nsTArray<nsRuleNode*> mOldRuleTrees;
+ 
+   unsigned mInShutdown : 1;
+   unsigned mAuthorStyleDisabled: 1;
+   unsigned mDirty : 7;  // one dirty bit is used per sheet type
+ 
+ };
+ 
+ #endif
