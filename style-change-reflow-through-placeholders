@@ -3,20 +3,54 @@ Correctly handle a style change reflow on a subtree that has placeholders with o
 diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
 --- a/layout/base/nsPresShell.cpp
 +++ b/layout/base/nsPresShell.cpp
-@@ -3183,16 +3183,24 @@ PresShell::FrameNeedsReflow(nsIFrame *aF
+@@ -3116,16 +3116,19 @@ PresShell::VerifyHasDirtyRootAncestor(ns
+ 
+ NS_IMETHODIMP
+ PresShell::FrameNeedsReflow(nsIFrame *aFrame, IntrinsicDirty aIntrinsicDirty,
+                             nsFrameState aBitToAdd)
+ {
+   NS_PRECONDITION(aBitToAdd == NS_FRAME_IS_DIRTY ||
+                   aBitToAdd == NS_FRAME_HAS_DIRTY_CHILDREN,
+                   "Unexpected bits being added");
++  NS_PRECONDITION(aIntrinsicDirty != eStyleChange ||
++                  aBitToAdd == NS_FRAME_IS_DIRTY,
++                  "bits don't correspond to style change reason");
+ 
+   NS_ASSERTION(!mIsReflowing, "can't mark frame dirty during reflow");
+ 
+   // If we've not yet done the initial reflow, then don't bother
+   // enqueuing a reflow command yet.
+   if (! mDidInitialReflow)
+     return NS_OK;
+ 
+@@ -3172,27 +3175,36 @@ PresShell::FrameNeedsReflow(nsIFrame *aF
+     // should contain the reflow.  That root could be aFrame itself if it's not
+     // dirty, or it could be some ancestor of aFrame.)
+     for (nsIFrame *a = aFrame;
+          a && !FRAME_IS_REFLOW_ROOT(a);
+          a = a->GetParent())
+       a->MarkIntrinsicWidthsDirty();
+   }
+ 
++  nsTArray<nsIFrame*> outOfFlows;
+   if (aIntrinsicDirty == eStyleChange) {
+     // Mark all descendants dirty (using an nsTArray stack rather than
+     // recursion).
      nsTArray<nsIFrame*> stack;
      stack.AppendElement(aFrame);
  
      while (stack.Length() != 0) {
-       nsIFrame *f =
-         stack.ElementAt(stack.Length() - 1);
+-      nsIFrame *f =
+-        stack.ElementAt(stack.Length() - 1);
++      nsIFrame *f = stack.ElementAt(stack.Length() - 1);
        stack.RemoveElementAt(stack.Length() - 1);
  
 +      if (f->GetType() == nsLayoutAtoms::placeholderFrame) {
 +        nsPlaceholderFrame *ph = static_cast<nsPlaceholderFrame*>(f);
 +        nsIFrame *oof = ph->GetOutOfFlowFrame();
 +        if (!nsLayoutUtils::IsProperAncestorFrame(aFrame, oof)) {
-+          // XXX enqueue for recursive call at end
++          // enqueue for recursive call at end
++          outOfFlows.AppendElement(oof);
 +        }
 +      }
 +
@@ -28,3 +62,28 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
               kid = kid->GetNextSibling()) {
            kid->MarkIntrinsicWidthsDirty();
            stack.AppendElement(kid);
+@@ -3231,16 +3243,24 @@ PresShell::FrameNeedsReflow(nsIFrame *aF
+       VerifyHasDirtyRootAncestor(f);
+ #endif
+       break;
+     }
+   }
+ 
+   PostReflowEvent();
+ 
++  // For style changes, do the same work for out of flows, but after
++  // we've done all the bit-munging above.
++  for (PRUint32 i = 0, iEnd = outOfFlows.Length(); i < iEnd; ++i) {
++    NS_ABORT_IF_FALSE(aIntrinsicDirty == eStyleChange &&
++                      aBitsToAdd == NS_FRAME_IS_DIRTY, "unexpected state");
++    FrameNeedsReflow(outOfFlows[i], eStyleChange, NS_FRAME_IS_DIRTY);
++  }
++
+   return NS_OK;
+ }
+ 
+ nsIScrollableView*
+ PresShell::GetViewToScroll(nsLayoutUtils::Direction aDirection)
+ {
+   nsCOMPtr<nsIEventStateManager> esm = mPresContext->EventStateManager();
+   nsIScrollableView* scrollView = nsnull;
