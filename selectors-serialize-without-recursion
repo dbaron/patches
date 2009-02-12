@@ -1,0 +1,237 @@
+Stop using potentially-deep recursion to serialize selectors.  (Bug 475215)
+
+diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
+--- a/layout/style/nsCSSStyleRule.cpp
++++ b/layout/style/nsCSSStyleRule.cpp
+@@ -463,54 +463,79 @@ static PRBool IsPseudoElement(nsIAtom* a
+     const char* str;
+     aAtom->GetUTF8String(&str);
+     return str && (*str == ':');
+   }
+ 
+   return PR_FALSE;
+ }
+ 
+-void nsCSSSelector::AppendNegationToString(nsAString& aString)
+-{
+-  aString.AppendLiteral(":not(");
+-}
+-
+ //
+ // Builds the textual representation of a selector. Called by DOM 2 CSS 
+ // StyleRule:selectorText
+ //
+ void
+ nsCSSSelector::ToString(nsAString& aString, nsICSSStyleSheet* aSheet,
+                         PRBool aAppend) const
+ {
+   if (!aAppend)
+    aString.Truncate();
++
++  // selectors are linked from right-to-left, so the next selector in
++  // the linked list actually precedes this one in the resulting string
++  nsAutoVoidArray<nsCSSSelector*, 8> stack;
++  for (nsCSSSelector *s = this; s; s = s->mNext) {
++    stack.AppendElement(s);
++  }
+    
++  PRBool hadPrevious = PR_FALSE;
++
++  while (!stack.IsEmpty()) {
++    PRUint32 index = stack.Length() - 1;
++    nsCSSSelector *s = stack.ElementAt(index);
++    stack.RemoveElementAt(index);
++
++    // Append the combinator, if needed.
++    if (hadPrevious) {
++      if (!IsPseudoElement(s->mTag)) {
++        aString.Append(PRUnichar(' '));
++        PRUnichar oper = s->mOperator;
++        if (oper != PRUnichar(0)) {
++          aString.Append(oper);
++          aString.Append(PRUnichar(' '));
++        }
++      }
++    } else {
++      hadPrevious = PR_TRUE;
++    }
++
++    s->AppendToStringWithoutCombinators(aString, aSheet);
++  }
+   ToStringInternal(aString, aSheet, IsPseudoElement(mTag), PR_FALSE);
+ }
+ 
+-void nsCSSSelector::ToStringInternal(nsAString& aString,
+-                                     nsICSSStyleSheet* aSheet,
+-                                     PRBool aIsPseudoElem,
+-                                     PRBool aIsNegated) const
++void
++nsCSSSelector::AppendToStringWithoutCombinators
++                   (nsAString& aString, nsICSSStyleSheet* aSheet) const
++{
++  AppendToStringWithoutCombinatorsOrNegations(aString, aSheet);
++
++  for (nsCSSSelector* negation = mNegations; negation;
++       negation = negation->mNegations) {
++    aString.AppendLiteral(":not(");
++    negation->AppendToStringWithoutCombinatorsOrNegations(aString, aSheet);
++    aString.Append(PRUnichar(')'));
++  }
++}
++
++void
++nsCSSSelector::AppendToStringWithoutCombinatorsOrNegations
++                   (nsAString& aString, nsICSSStyleSheet* aSheet) const
+ {
+   nsAutoString temp;
+-  PRBool isPseudoElement = IsPseudoElement(mTag);
+-  
+-  // selectors are linked from right-to-left, so the next selector in the linked list
+-  // actually precedes this one in the resulting string
+-  if (mNext) {
+-    mNext->ToStringInternal(aString, aSheet, IsPseudoElement(mTag), 0);
+-    if (!aIsNegated && !isPseudoElement) {
+-      // don't add a leading whitespace if we have a pseudo-element
+-      // or a negated simple selector
+-      aString.Append(PRUnichar(' '));
+-    }
+-  }
+-
+   // For non-pseudo-element selectors or for lone pseudo-elements, deal with
+   // namespace prefixes.
+   PRBool wroteNamespace = PR_FALSE;
+   if (!isPseudoElement || !mNext) {
+     // append the namespace prefix if needed
+     nsXMLNameSpaceMap *sheetNS = aSheet ? aSheet->GetNameSpaceMap() : nsnull;
+ 
+     // sheetNS is non-null if and only if we had an @namespace rule.  If it's
+@@ -687,32 +712,16 @@ void nsCSSSelector::ToStringInternal(nsA
+           }
+           aString.Append(temp);
+         }
+         aString.Append(PRUnichar(')'));
+       }
+       list = list->mNext;
+     }
+   }
+-
+-  if (!aIsNegated) {
+-    for (nsCSSSelector* negation = mNegations; negation;
+-         negation = negation->mNegations) {
+-      aString.AppendLiteral(":not(");
+-      negation->ToStringInternal(aString, aSheet, PR_FALSE, PR_TRUE);
+-      aString.Append(PRUnichar(')'));
+-    }
+-  }
+-
+-  // Append the operator only if the selector is not negated and is not
+-  // a pseudo-element
+-  if (!aIsNegated && mOperator && !aIsPseudoElem) {
+-    aString.Append(PRUnichar(' '));
+-    aString.Append(mOperator);
+-  }
+ }
+ 
+ PRBool
+ nsCSSSelector::CanBeNamespaced(PRBool aIsNegated) const
+ {
+   return !aIsNegated ||
+          (!mIDList && !mClassList && !mPseudoClassList && !mAttrList);
+ }
+diff --git a/layout/style/nsICSSStyleRule.h b/layout/style/nsICSSStyleRule.h
+--- a/layout/style/nsICSSStyleRule.h
++++ b/layout/style/nsICSSStyleRule.h
+@@ -168,20 +168,21 @@ public:
+ 
+   void ToString(nsAString& aString, nsICSSStyleSheet* aSheet,
+                 PRBool aAppend = PR_FALSE) const;
+ 
+ private:
+   void AddPseudoClassInternal(nsPseudoClassList *aPseudoClass);
+   nsCSSSelector* Clone(PRBool aDeepNext, PRBool aDeepNegations) const;
+ 
+-  void AppendNegationToString(nsAString& aString);
+-  void ToStringInternal(nsAString& aString, nsICSSStyleSheet* aSheet,
+-                        PRBool aIsPseudoElem,
+-                        PRBool aIsNegated) const;
++  void AppendToStringWithoutCombinators(nsAString& aString,
++                                        nsICSSStyleSheet* aSheet) const;
++  void AppendToStringWithoutCombinatorsOrNegations(nsAString& aString,
++                                                   nsICSSStyleSheet* aSheet)
++                                                        const;
+   // Returns true if this selector can have a namespace specified (which
+   // happens if and only if the default namespace would apply to this
+   // selector).
+   PRBool CanBeNamespaced(PRBool aIsNegated) const;
+   // Calculate the specificity of this selector (not including its mNext
+   // or its mNegations).
+   PRInt32 CalcWeightWithoutNegations() const;
+ 
+diff --git a/layout/style/test/test_selectors.html b/layout/style/test/test_selectors.html
+--- a/layout/style/test/test_selectors.html
++++ b/layout/style/test/test_selectors.html
+@@ -93,16 +93,25 @@ function run() {
+         var ser2 = style_text.parentNode.sheet.cssRules[0].selectorText;
+         is(ser2, ser1, "parse+serialize of selector \"" + selector +
+                        "\" is idempotent");
+ 
+         ifdoc.body.innerHTML = "";
+         style_text.data = "";
+     }
+ 
++    function should_serialize_to(selector, serialization)
++    {
++        style_text.data = selector + "{ z-index: " + zi + " }";
++        is(style_text.parentNode.sheet.cssRules[0].selectorText,
++           serialization,
++           "selector '" + selector + "' should serialize to '" +
++             serialization + "'.");
++    }
++
+     function test_parseable(selector)
+     {
+         var zi = ++gCounter;
+         ifdoc.body.innerHTML = "<p></p>";
+         style_text.data = "p, " + selector + "{ z-index: " + zi + " }";
+         var should_match = ifdoc.getElementsByTagName("p")[0];
+         is(ifwin.getComputedStyle(should_match, "").zIndex, zi,
+            "selector " + selector + " was parsed");
+@@ -454,16 +463,38 @@ function run() {
+                           pdaset([2], [2], []));
+     test_selector_in_html(":nth-of-type(2n-0)", mixed_elements,
+                           pdaset([2], [2], []),
+                           pdaset([1, 3, 4], [1], [1, 2]));
+     test_selector_in_html(":nth-last-of-type(even)", mixed_elements,
+                           pdaset([2], [1], []),
+                           pdaset([1, 3, 4], [2], [1, 2]));
+ 
++    // Test greediness of descendant combinators.
++    var four_children="<div id='a'><div id='b'><div id='c'><div id='d'><\/div><\/div><\/div><\/div>";
++    test_selector_in_html("#a > div div", four_children,
++                          idset(["c", "d"]), idset(["a", "b"]));
++    test_selector_in_html("#a > #b div", four_children,
++                          idset(["c", "d"]), idset(["a", "b"]));
++    test_selector_in_html("#a div > div", four_children,
++                          idset(["c", "d"]), idset(["a", "b"]));
++    test_selector_in_html("#a #b > div", four_children,
++                          idset(["c"]), idset(["a", "b", "d"]));
++    test_selector_in_html("#a > #b div", four_children,
++                          idset(["c", "d"]), idset(["a", "b"]));
++    test_selector_in_html("#a #c > div", four_children,
++                          idset(["d"]), idset(["a", "b", "c"]));
++    test_selector_in_html("#a > #c div", four_children,
++                          idset(["d"]), idset(["a", "b", "c"]));
++
++    // Test serialization of pseudo-elements.
++    should_serialize_to("p:first-letter", "p:first-letter");
++    should_serialize_to("div>p:first-letter", "div > p:first-letter");
++    should_serialize_to("span +div:first-line", "span + div:first-line");
++
+     SimpleTest.finish();
+ }
+ 
+ </script>
+ </pre>
+ </body>
+ </html>
+ 
