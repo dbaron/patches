@@ -1,9 +1,9 @@
-Switch away from nsBlockReflowState::mAvailSpaceRect in bullet reflow (for which flow around floats is a complete mess).  (Bug 25888)  (THIS IS ACTUALLY GOING TO REGRESS A BUNCH OF STUFF; PROBABLY BEST TO REPLACE WITH PATCH THAT ALSO FIXES BUG 428810)
+Switch away from nsBlockReflowState::mAvailSpaceRect in bullet reflow, and simultaneously refix bug 427370 in a way that also fixes bug 428810.  (Bug 25888)
 
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -6641,32 +6641,49 @@ nsBlockFrame::ReflowBullet(nsBlockReflow
+@@ -6641,32 +6641,53 @@ nsBlockFrame::ReflowBullet(nsBlockReflow
    // XXXwaterson Should this look just like the logic in
    // nsBlockReflowContext::ReflowBlock and nsLineLayout::ReflowFrame?
    nsHTMLReflowState reflowState(aState.mPresContext, rs,
@@ -12,28 +12,13 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
    mBullet->WillReflow(aState.mPresContext);
    mBullet->Reflow(aState.mPresContext, aMetrics, reflowState, status);
  
-+  // Calculate what used to be mOutsideBulletX
-+  nsRect floatAvailSpaceAtTop;
-+  aState.GetFloatAvailableSpace(aState.BorderPadding().top, PR_FALSE,
-+                                floatAvailSpaceAtTop);
-+  // Maybe calculate what used to be in mAvailSpaceRect, but it's really
-+  // quite unclear and perhaps different for different callers.
-+  // FIXME:  This code needs to be rewritten!
-+  nsRect floatAvailSpace;
-+  aState.GetFloatAvailableSpace(floatAvailSpace);
-+
-+  // FIXME (bug 25888): need to check the entire region that the first
-+  // line overlaps, not just the top pixel.
-+  // FIXME: We should probably use aLineTop in this calculation (and
-+  // make aLineTop correct).
-+
-   // Place the bullet now, separate it from mOutsideBulletX by its margin.
-   // If the mAvailSpaceRect position is outside the mOutsideBulletX
-   // position it means the line didn't care about the float edge and we
-   // use that position instead (there cannot be any floats at the start
-   // of the line this case since that would violate CSS 2.1 float rules).
-   // XXX we need to take floats inside the principal block that clears
-   // outside floats into account also (bug 428810).
+-  // Place the bullet now, separate it from mOutsideBulletX by its margin.
+-  // If the mAvailSpaceRect position is outside the mOutsideBulletX
+-  // position it means the line didn't care about the float edge and we
+-  // use that position instead (there cannot be any floats at the start
+-  // of the line this case since that would violate CSS 2.1 float rules).
+-  // XXX we need to take floats inside the principal block that clears
+-  // outside floats into account also (bug 428810).
 -  nscoord x = rs.mStyleVisibility->mDirection == NS_STYLE_DIRECTION_LTR ?
 -    PR_MIN(aState.mOutsideBulletX, aState.mAvailSpaceRect.x)
 -      - reflowState.mComputedMargin.right - aMetrics.width :
@@ -43,16 +28,42 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 -  // FIXME: come up with rules for when mAvailSpaceRect is valid so we
 -  // don't need to do this.
 -  aState.GetAvailableSpace();
++  // Get the float available space using our saved state from before we
++  // started reflowing the block, so that we ignore any floats inside
++  // the block.
++  // FIXME: aLineTop isn't actually set correctly by some callers, since
++  // they reposition the line.
++  nsRect floatAvailSpace;
++  aState.GetFloatAvailableSpaceWithState(aLineTop, PR_FALSE,
++                                         &aState.mFloatManagerStateBefore,
++                                         floatAvailSpace);
++  // FIXME (bug 25888): need to check the entire region that the first
++  // line overlaps, not just the top pixel.
++
++  // Place the bullet now.  We want to place the bullet relative to the
++  // border-box of the associated block (using the right/left margin of
++  // the bullet frame as separation).  However, if a line box would be
++  // displaced by floats that are *outside* the associated block, we
++  // want to displace it by the same amount.  That is, we act as though
++  // the edge of the floats is the content-edge of the block, and place
++  // the bullet at a position offset from there by the block's padding,
++  // the block's border, and the bullet frame's margin.
 +  nscoord x;
 +  if (rs.mStyleVisibility->mDirection == NS_STYLE_DIRECTION_LTR) {
-+    x = PR_MIN(floatAvailSpaceAtTop.x, floatAvailSpace.x)
-+      - reflowState.mComputedMargin.right - aMetrics.width;
++    // Note: mAvailSpaceRect.x is relative to the content box and never
++    // less than zero.  Converting to frame coordinates and subtracting
++    // the padding and border cancel each other out, and the PR_MAX()
++    // with 0 (or with the left border+padding) is even implied in the
++    // right place.
++    x = floatAvailSpace.x - reflowState.mComputedMargin.right - aMetrics.width;
 +  } else {
-+    nscoord offsetAtTop = 
-+      PR_MIN(rs.ComputedWidth(), floatAvailSpaceAtTop.XMost()) +
-+        rs.mComputedBorderPadding.LeftRight();
-+    x = PR_MAX(offsetAtTop, floatAvailSpace.XMost())
-+          + reflowState.mComputedMargin.left;
++    // The XMost() of the available space and the computed width both
++    // give us offsets from the left content edge.  Then we add the left
++    // border/padding to get into frame coordinates, and the right
++    // border/padding and the bullet's margin to offset the position.
++    x = PR_MIN(rs.ComputedWidth(), floatAvailSpace.XMost())
++        + rs.mComputedBorderPadding.LeftRight();
++        + reflowState.mComputedMargin.left;
 +  }
  
    // Approximate the bullets position; vertical alignment will provide
@@ -65,7 +76,25 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
-@@ -134,26 +134,16 @@ nsBlockReflowState::nsBlockReflowState(c
+@@ -97,16 +97,17 @@ nsBlockReflowState::nsBlockReflowState(c
+ 
+   NS_ASSERTION(mFloatManager,
+                "FloatManager should be set in nsBlockReflowState" );
+   if (mFloatManager) {
+     // Translate into our content area and then save the 
+     // coordinate system origin for later.
+     mFloatManager->Translate(borderPadding.left, borderPadding.top);
+     mFloatManager->GetTranslation(mFloatManagerX, mFloatManagerY);
++    mFloatManager->PushState(&mFloatManagerStateBefore); // never popped
+   }
+ 
+   mReflowStatus = NS_FRAME_COMPLETE;
+ 
+   mPresContext = aPresContext;
+   mNextInFlow = static_cast<nsBlockFrame*>(mBlock->GetNextInFlow());
+ 
+   NS_ASSERTION(NS_UNCONSTRAINEDSIZE != aReflowState.ComputedWidth(),
+@@ -134,26 +135,16 @@ nsBlockReflowState::nsBlockReflowState(c
    }
  
    mY = borderPadding.top;
@@ -92,10 +121,76 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
    if (mReflowState.availableHeight != NS_UNCONSTRAINEDSIZE ||
        !mOverflowPlaceholders.IsEmpty()) {
      mBlock->SetProperty(nsGkAtoms::overflowPlaceholdersProperty,
+@@ -330,35 +321,35 @@ nsBlockReflowState::ComputeBlockAvailSpa
+   }
+ 
+ #ifdef REALLY_NOISY_REFLOW
+   printf("  CBAS: result %d %d %d %d\n", aResult.x, aResult.y, aResult.width, aResult.height);
+ #endif
+ }
+ 
+ PRBool
+-nsBlockReflowState::GetFloatAvailableSpace(nscoord aY,
+-                                           PRBool aRelaxHeightConstraint,
+-                                           nsRect& aResult) const
++nsBlockReflowState::GetFloatAvailableSpaceWithState(
++                      nscoord aY, PRBool aRelaxHeightConstraint,
++                      nsFloatManager::SavedState *aState,
++                      nsRect& aResult) const
+ {
+ #ifdef DEBUG
+   // Verify that the caller setup the coordinate system properly
+   nscoord wx, wy;
+   mFloatManager->GetTranslation(wx, wy);
+   NS_ASSERTION((wx == mFloatManagerX) && (wy == mFloatManagerY),
+                "bad coord system");
+ #endif
+ 
+   PRBool hasFloats;
+   aResult = 
+     mFloatManager->GetBand(aY - BorderPadding().top, 
+                            aRelaxHeightConstraint ? nscoord_MAX
+                                                   : mContentArea.height,
+-                           mContentArea.width,
+-                           &hasFloats);
++                           mContentArea.width, aState, &hasFloats);
+   // Keep the width >= 0 for compatibility with nsSpaceManager.
+   if (aResult.width < 0)
+     aResult.width = 0;
+ 
+ #ifdef DEBUG
+   if (nsBlockFrame::gNoisyReflow) {
+     nsFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+     printf("GetAvailableSpace: band=%d,%d,%d,%d hasfloats=%d\n",
 diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
 --- a/layout/generic/nsBlockReflowState.h
 +++ b/layout/generic/nsBlockReflowState.h
-@@ -211,23 +211,16 @@ public:
+@@ -89,17 +89,23 @@ public:
+    * upper left.
+    *
+    * Returns whether there are floats present at the given vertical
+    * coordinate and within the width of the content rect.
+    */
+   PRBool GetFloatAvailableSpace(nsRect& aResult) const
+     { return GetFloatAvailableSpace(mY, PR_FALSE, aResult); }
+   PRBool GetFloatAvailableSpace(nscoord aY, PRBool aRelaxHeightConstraint,
+-                                nsRect& aResult) const;
++                                nsRect& aResult) const
++    { return GetFloatAvailableSpaceWithState(aY, aRelaxHeightconstraint,
++                                             nsnull, aResult); }
++  PRBool GetFloatAvailableSpaceWithState(nscoord aY,
++                                         PRBool aRelaxHeightConstraint,
++                                         nsFloatManager::SavedState *aState,
++                                         nsRect& aResult) const;
+   /* FIXME: To be removed */
+   void GetAvailableSpace() { GetAvailableSpace(mY, PR_FALSE); }
+   void GetAvailableSpace(nscoord aY, PRBool aRelaxHeightConstraint) {
+     mBandHasFloats =
+       GetFloatAvailableSpace(aY, aRelaxHeightConstraint, mAvailSpaceRect);
+   }
+ 
+   /*
+@@ -211,22 +217,21 @@ public:
    // padding. This, therefore, represents the inner "content area" (in
    // spacemanager coordinates) where child frames will be placed,
    // including child blocks and floats.
@@ -110,7 +205,12 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
 -  // That is, we act as though the edge of the floats is the content-edge of
 -  // the block, displaced by the block's padding and border.
 -  nscoord mOutsideBulletX;
--
++  // The float manager state as it was before the contents of this
++  // block.  This is needed for positioning bullets, since we only want
++  // to move the bullet to flow around floats that were before this
++  // block, not floats inside of it.
++  nsFloatManager::SavedState mFloatManagerStateBefore;
+ 
    nscoord mBottomEdge;
  
    // The content area to reflow child frames within. The x/y
@@ -118,4 +218,125 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
    // mBorderPadding.top. The width/height may be NS_UNCONSTRAINEDSIZE
    // if the container reflowing this frame has given the frame an
    // unconstrained area.
-   nsSize mContentArea;
+diff --git a/layout/generic/nsFloatManager.cpp b/layout/generic/nsFloatManager.cpp
+--- a/layout/generic/nsFloatManager.cpp
++++ b/layout/generic/nsFloatManager.cpp
+@@ -134,30 +134,41 @@ void nsFloatManager::Shutdown()
+   // Disable further caching.
+   sCachedFloatManagerCount = -1;
+ }
+ 
+ nsRect
+ nsFloatManager::GetBand(nscoord aYOffset,
+                         nscoord aMaxHeight,
+                         nscoord aContentAreaWidth,
++                        SavedState* aState,
+                         PRBool* aHasFloats) const
+ {
+   NS_ASSERTION(aMaxHeight >= 0, "unexpected max height");
+   NS_ASSERTION(aContentAreaWidth >= 0, "unexpected content area width");
+ 
+   nscoord top = aYOffset + mY;
+   if (top < nscoord_MIN) {
+     NS_WARNING("bad value");
+     top = nscoord_MIN;
+   }
+ 
++  // Determine the last float that we should consider.
++  PRUint32 floatCount;
++  if (aState) {
++    // Use the provided state.
++    floatCount = aState->mFloatInfoCount;
++    NS_ABORT_IF_FALSE(floatCount <= mFloats.Length(), "bad state");
++  } else {
++    // Use our current state.
++    floatCount = mFloats.Length();
++  }
++
+   // If there are no floats at all, or we're below the last one, return
+   // quickly.
+-  PRUint32 floatCount = mFloats.Length();
+   if (floatCount == 0 ||
+       (mFloats[floatCount-1].mLeftYMost <= top &&
+        mFloats[floatCount-1].mRightYMost <= top)) {
+     *aHasFloats = PR_FALSE;
+     return nsRect(0, aYOffset, aContentAreaWidth, aMaxHeight);
+   }
+ 
+   nscoord bottom;
+@@ -175,17 +186,17 @@ nsFloatManager::GetBand(nscoord aYOffset
+   if (right < left) {
+     NS_WARNING("bad value");
+     right = left;
+   }
+ 
+   // Walk backwards through the floats until we either hit the front of
+   // the list or we're above |top|.
+   PRBool haveFloats = PR_FALSE;
+-  for (PRUint32 i = mFloats.Length(); i > 0; --i) {
++  for (PRUint32 i = floatCount; i > 0; --i) {
+     const FloatInfo &fi = mFloats[i-1];
+     if (fi.mLeftYMost <= top && fi.mRightYMost <= top) {
+       // There aren't any more floats that could intersect this band.
+       break;
+     }
+     if (fi.mRect.IsEmpty()) {
+       // For compatibility, ignore floats with empty rects, even though it
+       // disagrees with the spec.  (We might want to fix this in the
+diff --git a/layout/generic/nsFloatManager.h b/layout/generic/nsFloatManager.h
+--- a/layout/generic/nsFloatManager.h
++++ b/layout/generic/nsFloatManager.h
+@@ -87,28 +87,31 @@ public:
+    * |aMaxHeight|.  The left and right edges of the rectangle give the
+    * area available for line boxes in that space.
+    *
+    * @param aY [in] vertical coordinate for top of available space
+    *           desired
+    * @param aMaxHeight [in] maximum height of available space desired
+    * @param aContentAreaWidth [in] the width of the content area (whose left
+    *                          edge must be zero in the current translation)
++   * @param aState [in] If null, use the current state, otherwise, do
++   *                    computation based only on floats present in the given
++   *                    saved state.
+    * @param aHasFloats [out] whether there are floats at the sides of
+    *                    the return value including those that do not
+    *                    reduce the line box width at all (because they
+    *                    are entirely in the margins)
+    * @return the resulting rectangle for line boxes.  It will not go
+    *         left of 0, nor right of aContentAreaWidth, but will be
+    *         narrower when floats are present.
+    *
+    * aY and aAvailSpace are positioned relative to the current translation
+    */
+   nsRect GetBand(nscoord aY, nscoord aMaxHeight, nscoord aContentAreaWidth,
+-                 PRBool* aHasFloats) const;
++                 SavedState* aState, PRBool* aHasFloats) const;
+ 
+   /**
+    * Add a float that comes after all floats previously added.  Its top
+    * must be even with or below the top of all previous floats.
+    *
+    * aMarginRect is relative to the current translation.  The caller
+    * must ensure aMarginRect.height >= 0 and aMarginRect.width >= 0.
+    */
+@@ -167,17 +170,19 @@ public:
+   void PushState(SavedState* aState);
+ 
+   /**
+    * Restores the float manager to the saved state.
+    * 
+    * These states must be managed using stack discipline. PopState can only
+    * be used after PushState has been used to save the state, and it can only
+    * be used once --- although it can be omitted; saved states can be ignored.
+-   * States must be popped in the reverse order they were pushed. 
++   * States must be popped in the reverse order they were pushed.  A
++   * call to PopState invalidates any saved states Pushed after the
++   * state passed to PopState was pushed.
+    */
+   void PopState(SavedState* aState);
+ 
+   /**
+    * Get the top of the last float placed into the float manager, to
+    * enforce the rule that a float can't be above an earlier float.
+    * Returns the minimum nscoord value if there are no floats.
+    *
