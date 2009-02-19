@@ -1,0 +1,948 @@
+Construct all our image loaders when we create frames so that we can allow arbitrary numbers of image loaders per frame (for multiple background images).  (Bug 322475)  r+sr=bzbarsky
+
+diff --git a/content/events/src/nsDOMDataContainerEvent.h b/content/events/src/nsDOMDataContainerEvent.h
+--- a/content/events/src/nsDOMDataContainerEvent.h
++++ b/content/events/src/nsDOMDataContainerEvent.h
+@@ -36,16 +36,17 @@
+  *
+  * ***** END LICENSE BLOCK ***** */
+ 
+ #ifndef nsDOMDataContainerEvent_h___
+ #define nsDOMDataContainerEvent_h___
+ 
+ #include "nsIDOMDataContainerEvent.h"
+ #include "nsDOMEvent.h"
++#include "nsInterfaceHashtable.h"
+ 
+ class nsDOMDataContainerEvent : public nsDOMEvent,
+                                 public nsIDOMDataContainerEvent
+ {
+ public:
+   nsDOMDataContainerEvent(nsPresContext* aPresContext, nsEvent* aEvent);
+ 
+   NS_DECL_ISUPPORTS_INHERITED
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -1513,19 +1513,22 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+   // this far.)
+   if (!drawBackgroundImage) {
+     ctx->NewPath();
+     ctx->Rectangle(dirtyRectGfx, PR_TRUE);
+     ctx->Fill();
+     return;
+   }
+ 
+-  // Lookup the image
+-  imgIRequest *req = aPresContext->LoadImage(aColor.mBackgroundImage,
+-                                             aForFrame);
++  // Ensure we get invalidated for loads of the image.  We need to do
++  // this here because this might be the only code that knows about the
++  // association of the style data with the frame.
++  aPresContext->SetupBackgroundImageLoaders(aForFrame, &aColor);
++
++  imgIRequest *req = aColor.mBackgroundImage;
+ 
+   PRUint32 status = imgIRequest::STATUS_ERROR;
+   if (req)
+     req->GetImageStatus(&status);
+ 
+   // While waiting for the image, draw a color, if any.
+   if (!req ||
+       !(status & imgIRequest::STATUS_FRAME_COMPLETE) ||
+@@ -1720,19 +1723,26 @@ DrawBorderImage(nsPresContext*       aPr
+                 nsIFrame*            aForFrame,
+                 const nsRect&        aBorderArea,
+                 const nsStyleBorder& aBorderStyle,
+                 const nsRect&        aDirtyRect)
+ {
+   if (aDirtyRect.IsEmpty())
+     return;
+ 
+-  // Clone the image loader and set up animation notifications.
+-  imgIRequest *req =
+-    aPresContext->LoadBorderImage(aBorderStyle.GetBorderImage(), aForFrame);
++  // Ensure we get invalidated for loads and animations of the image.
++  // We need to do this here because this might be the only code that
++  // knows about the association of the style data with the frame.
++  // XXX We shouldn't really... since if anybody is passing in a
++  // different style, they'll potentially have the wrong size for the
++  // border too.
++  aPresContext->SetupBorderImageLoaders(aForFrame, &aBorderStyle);
++
++  imgIRequest *req = aBorderStyle.GetBorderImage();
++
+ #ifdef DEBUG
+   {
+     PRUint32 status = imgIRequest::STATUS_ERROR;
+     if (req)
+       req->GetImageStatus(&status);
+ 
+     NS_ASSERTION(req && (status & imgIRequest::STATUS_FRAME_COMPLETE),
+                  "no image to draw");
+diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
+--- a/layout/base/nsFrameManager.cpp
++++ b/layout/base/nsFrameManager.cpp
+@@ -86,17 +86,16 @@
+ #include "nsContentUtils.h"
+ #include "nsReadableUtils.h"
+ #include "nsUnicharUtils.h"
+ #include "nsPrintfCString.h"
+ #include "nsLayoutErrors.h"
+ #include "nsLayoutUtils.h"
+ #include "nsAutoPtr.h"
+ #include "imgIRequest.h"
+-#include "nsStyleStructInlines.h"
+ 
+ #include "nsFrameManager.h"
+ #ifdef ACCESSIBILITY
+ #include "nsIAccessibilityService.h"
+ #include "nsIAccessibleEvent.h"
+ #endif
+ 
+   #ifdef DEBUG
+@@ -1080,34 +1079,16 @@ CaptureChange(nsStyleContext* aOldContex
+   nsChangeHint ourChange = aOldContext->CalcStyleDifference(aNewContext);
+   NS_UpdateHint(ourChange, aChangeToAssume);
+   if (NS_UpdateHint(aMinChange, ourChange)) {
+     aChangeList->AppendChange(aFrame, aContent, ourChange);
+   }
+   return aMinChange;
+ }
+ 
+-static PRBool
+-ShouldStopImage(imgIRequest *aOldImage, imgIRequest *aNewImage)
+-{
+-  if (!aOldImage)
+-    return PR_FALSE;
+-
+-  PRBool stopImages = !aNewImage;
+-  if (!stopImages) {
+-    nsCOMPtr<nsIURI> oldURI, newURI;
+-    aOldImage->GetURI(getter_AddRefs(oldURI));
+-    aNewImage->GetURI(getter_AddRefs(newURI));
+-    PRBool equal;
+-    stopImages =
+-      NS_FAILED(oldURI->Equals(newURI, &equal)) || !equal;
+-  }
+-  return stopImages;
+-}
+-
+ /**
+  * Recompute style for aFrame and accumulate changes into aChangeList
+  * given that aMinChange is already accumulated for an ancestor.
+  * aParentContent is the content node used to resolve the parent style
+  * context.  This means that, for pseudo-elements, it is the content
+  * that should be used for selector matching (rather than the fake
+  * content node attached to the frame).
+  */
+@@ -1259,43 +1240,16 @@ nsFrameManager::ReResolveStyleContext(ns
+       if (newContext != oldContext) {
+         aMinChange = CaptureChange(oldContext, newContext, aFrame,
+                                    content, aChangeList, aMinChange,
+                                    assumeDifferenceHint);
+         if (!(aMinChange & nsChangeHint_ReconstructFrame)) {
+           // if frame gets regenerated, let it keep old context
+           aFrame->SetStyleContext(newContext);
+         }
+-        // if old context had image and new context does not have the same image, 
+-        // stop the image load for the frame
+-        if (ShouldStopImage(
+-              oldContext->GetStyleBackground()->mBackgroundImage,
+-              newContext->GetStyleBackground()->mBackgroundImage)) {
+-          // stop the image loading for the frame, the image has changed
+-          aPresContext->StopBackgroundImageFor(aFrame);
+-        }
+-
+-        imgIRequest *newBorderImage =
+-          newContext->GetStyleBorder()->GetBorderImage();
+-        if (ShouldStopImage(oldContext->GetStyleBorder()->GetBorderImage(),
+-                            newBorderImage)) {
+-          // stop the image loading for the frame, the image has changed
+-          aPresContext->StopBorderImageFor(aFrame);
+-        }
+-
+-        // Since the CalcDifference call depended on the result of
+-        // GetActualBorder() and that result depends on whether the
+-        // image has loaded, start the image load now so that we'll get
+-        // notified when it completes loading and can do a restyle.
+-        // Otherwise, the image might finish loading from the network
+-        // before we start listening to its notifications, and then
+-        // we'll never know that it's finished loading.
+-        if (newBorderImage) {
+-          aPresContext->LoadBorderImage(newBorderImage, aFrame);
+-        }
+       }
+       oldContext->Release();
+     }
+     else {
+       NS_ERROR("resolve style context failed");
+       newContext = oldContext;  // new context failed, recover... (take ref)
+       oldContext = nsnull;
+     }
+diff --git a/layout/base/nsImageLoader.cpp b/layout/base/nsImageLoader.cpp
+--- a/layout/base/nsImageLoader.cpp
++++ b/layout/base/nsImageLoader.cpp
+@@ -58,79 +58,78 @@
+ #include "nsStyleContext.h"
+ #include "nsGkAtoms.h"
+ 
+ // Paint forcing
+ #include "prenv.h"
+ 
+ NS_IMPL_ISUPPORTS2(nsImageLoader, imgIDecoderObserver, imgIContainerObserver)
+ 
+-nsImageLoader::nsImageLoader() :
+-  mFrame(nsnull), mPresContext(nsnull)
++nsImageLoader::nsImageLoader(nsIFrame *aFrame, PRBool aReflowOnLoad, 
++                             nsImageLoader *aNextLoader)
++  : mFrame(aFrame),
++    mReflowOnLoad(aReflowOnLoad),
++    mNextLoader(aNextLoader)
+ {
+ }
+ 
+ nsImageLoader::~nsImageLoader()
+ {
+   mFrame = nsnull;
+-  mPresContext = nsnull;
+ 
+   if (mRequest) {
+     mRequest->CancelAndForgetObserver(NS_ERROR_FAILURE);
+   }
+ }
+ 
++/* static */ already_AddRefed<nsImageLoader>
++nsImageLoader::Create(nsIFrame *aFrame, imgIRequest *aRequest, 
++                      PRBool aReflowOnLoad, nsImageLoader *aNextLoader)
++{
++  nsRefPtr<nsImageLoader> loader =
++    new nsImageLoader(aFrame, aReflowOnLoad, aNextLoader);
+ 
+-void
+-nsImageLoader::Init(nsIFrame *aFrame, nsPresContext *aPresContext,
+-                    PRBool aReflowOnLoad)
+-{
+-  mFrame = aFrame;
+-  mPresContext = aPresContext;
+-  mReflowOnLoad = aReflowOnLoad;
++  loader->Load(aRequest);
++
++  return loader.forget();
+ }
+ 
+ void
+ nsImageLoader::Destroy()
+ {
++  // Destroy the chain with only one level of recursion.
++  nsRefPtr<nsImageLoader> list = mNextLoader;
++  mNextLoader = nsnull;
++  while (list) {
++    nsRefPtr<nsImageLoader> todestroy = list;
++    list = todestroy->mNextLoader;
++    todestroy->mNextLoader = nsnull;
++    todestroy->Destroy();
++  }
++
+   mFrame = nsnull;
+-  mPresContext = nsnull;
+ 
+   if (mRequest) {
+     mRequest->CancelAndForgetObserver(NS_ERROR_FAILURE);
+   }
+ 
+   mRequest = nsnull;
+ }
+ 
+ nsresult
+ nsImageLoader::Load(imgIRequest *aImage)
+ {
++  NS_ASSERTION(!mRequest, "can't reuse image loaders");
++
+   if (!mFrame)
+     return NS_ERROR_NOT_INITIALIZED;
+ 
+   if (!aImage)
+     return NS_ERROR_FAILURE;
+ 
+-  if (mRequest) {
+-    nsCOMPtr<nsIURI> oldURI;
+-    mRequest->GetURI(getter_AddRefs(oldURI));
+-    nsCOMPtr<nsIURI> newURI;
+-    aImage->GetURI(getter_AddRefs(newURI));
+-    PRBool eq = PR_FALSE;
+-    nsresult rv = newURI->Equals(oldURI, &eq);
+-    if (NS_SUCCEEDED(rv) && eq) {
+-      return NS_OK;
+-    }
+-
+-    // Now cancel the old request so it won't hold a stale ref to us.
+-    mRequest->CancelAndForgetObserver(NS_ERROR_FAILURE);
+-    mRequest = nsnull;
+-  }
+-
+   // Make sure to clone into a temporary, then set mRequest, since
+   // cloning may notify and we don't want to trigger paints from this
+   // code.
+   nsCOMPtr<imgIRequest> newRequest;
+   nsresult rv = aImage->Clone(this, getter_AddRefs(newRequest));
+   mRequest.swap(newRequest);
+   return rv;
+ }
+@@ -142,17 +141,17 @@ NS_IMETHODIMP nsImageLoader::OnStartCont
+ {
+   if (aImage)
+   {
+     /* Get requested animation policy from the pres context:
+      *   normal = 0
+      *   one frame = 1
+      *   one loop = 2
+      */
+-    aImage->SetAnimationMode(mPresContext->ImageAnimationMode());
++    aImage->SetAnimationMode(mFrame->PresContext()->ImageAnimationMode());
+     // Ensure the animation (if any) is started.
+     aImage->StartAnimation();
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP nsImageLoader::OnStopFrame(imgIRequest *aRequest,
+                                          gfxIImageFrame *aFrame)
+@@ -201,17 +200,17 @@ NS_IMETHODIMP nsImageLoader::FrameChange
+   return NS_OK;
+ }
+ 
+ 
+ void
+ nsImageLoader::RedrawDirtyFrame(const nsRect* aDamageRect)
+ {
+   if (mReflowOnLoad) {
+-    nsIPresShell *shell = mPresContext->GetPresShell();
++    nsIPresShell *shell = mFrame->PresContext()->GetPresShell();
+ #ifdef DEBUG
+     nsresult rv = 
+ #endif
+       shell->FrameNeedsReflow(mFrame, nsIPresShell::eStyleChange, NS_FRAME_IS_DIRTY);
+     NS_WARN_IF_FALSE(NS_SUCCEEDED(rv), "Could not reflow after loading border-image");
+     // The reflow might not do all the invalidation we need, so continue
+     // on with the invalidation codepath.
+   }
+diff --git a/layout/base/nsImageLoader.h b/layout/base/nsImageLoader.h
+--- a/layout/base/nsImageLoader.h
++++ b/layout/base/nsImageLoader.h
+@@ -32,58 +32,66 @@
+  * use your version of this file under the terms of the MPL, indicate your
+  * decision by deleting the provisions above and replace them with the notice
+  * and other provisions required by the GPL or the LGPL. If you do not delete
+  * the provisions above, a recipient may use your version of this file under
+  * the terms of any one of the MPL, the GPL or the LGPL.
+  *
+  * ***** END LICENSE BLOCK ***** */
+ 
+-/* class to notify frames of background image loads */
++/* class to notify frames of background and border image loads */
+ 
+ #include "nsStubImageDecoderObserver.h"
+ 
+-class nsPresContext;
+ class nsIFrame;
+ class nsIURI;
+ 
+ #include "imgIRequest.h"
+ #include "nsCOMPtr.h"
++#include "nsAutoPtr.h"
+ 
++/**
++ * Image loaders pass notifications for background and border image
++ * loading and animation on to the frames.
++ *
++ * Each frame's image loaders form a linked list.
++ */
+ class nsImageLoader : public nsStubImageDecoderObserver
+ {
++private:
++  nsImageLoader(nsIFrame *aFrame, PRBool aReflowOnLoad,
++                nsImageLoader *aNextLoader);
++  virtual ~nsImageLoader();
++
+ public:
+-  nsImageLoader();
+-  virtual ~nsImageLoader();
++  static already_AddRefed<nsImageLoader>
++    Create(nsIFrame *aFrame, imgIRequest *aRequest,
++           PRBool aReflowOnLoad, nsImageLoader *aNextLoader);
+ 
+   NS_DECL_ISUPPORTS
+ 
+   // imgIDecoderObserver (override nsStubImageDecoderObserver)
+   NS_IMETHOD OnStartContainer(imgIRequest *aRequest, imgIContainer *aImage);
+   NS_IMETHOD OnStopFrame(imgIRequest *aRequest, gfxIImageFrame *aFrame);
+   // Do not override OnDataAvailable since background images are not
+   // displayed incrementally; they are displayed after the entire image
+   // has been loaded.
+   // Note: Images referenced by the <img> element are displayed
+   // incrementally in nsImageFrame.cpp.
+ 
+   // imgIContainerObserver (override nsStubImageDecoderObserver)
+   NS_IMETHOD FrameChanged(imgIContainer *aContainer, gfxIImageFrame *newframe,
+                           nsIntRect *dirtyRect);
+ 
+-  void Init(nsIFrame *aFrame, nsPresContext *aPresContext,
+-            PRBool aReflowOnLoad);
+-  nsresult Load(imgIRequest *aImage);
+-
+   void Destroy();
+ 
+-  nsIFrame *GetFrame() { return mFrame; }
+   imgIRequest *GetRequest() { return mRequest; }
++  nsImageLoader *GetNextLoader() { return mNextLoader; }
+ 
+ private:
++  nsresult Load(imgIRequest *aImage);
+   void RedrawDirtyFrame(const nsRect* aDamageRect);
+ 
+-private:
+   nsIFrame *mFrame;
+-  nsPresContext *mPresContext;
+   nsCOMPtr<imgIRequest> mRequest;
+   PRBool mReflowOnLoad;
++  nsRefPtr<nsImageLoader> mNextLoader;
+ };
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -84,16 +84,17 @@
+ #include "nsStyleChangeList.h"
+ #include "nsRuleNode.h"
+ #include "nsEventDispatcher.h"
+ #include "gfxUserFontSet.h"
+ #include "gfxPlatform.h"
+ #include "nsCSSRules.h"
+ #include "nsFontFaceLoader.h"
+ #include "nsIEventListenerManager.h"
++#include "nsStyleStructInlines.h"
+ 
+ #ifdef MOZ_SMIL
+ #include "nsSMILAnimationController.h"
+ #endif // MOZ_SMIL
+ 
+ #ifdef IBMBIDI
+ #include "nsBidiPresUtils.h"
+ #endif // IBMBIDI
+@@ -154,17 +155,17 @@ IsVisualCharset(const nsCString& aCharse
+   else {
+     return PR_FALSE; // logical text type
+   }
+ }
+ #endif // IBMBIDI
+ 
+ 
+ static PLDHashOperator
+-destroy_loads(const void * aKey, nsCOMPtr<nsImageLoader>& aData, void* closure)
++destroy_loads(const void * aKey, nsRefPtr<nsImageLoader>& aData, void* closure)
+ {
+   aData->Destroy();
+   return PL_DHASH_NEXT;
+ }
+ 
+ static NS_DEFINE_CID(kLookAndFeelCID,  NS_LOOKANDFEEL_CID);
+ #include "nsContentCID.h"
+ 
+@@ -241,18 +242,18 @@ nsPresContext::nsPresContext(nsIDocument
+   }
+   NS_ASSERTION(mDocument, "Null document");
+   mUserFontSet = nsnull;
+   mUserFontSetDirty = PR_TRUE;
+ }
+ 
+ nsPresContext::~nsPresContext()
+ {
+-  mImageLoaders.Enumerate(destroy_loads, nsnull);
+-  mBorderImageLoaders.Enumerate(destroy_loads, nsnull);
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
++    mImageLoaders[i].Enumerate(destroy_loads, nsnull);
+ 
+   NS_PRECONDITION(!mShell, "Presshell forgot to clear our mShell pointer");
+   SetShell(nsnull);
+ 
+   if (mEventManager) {
+     // unclear if these are needed, but can't hurt
+     mEventManager->NotifyDestroyPresContext(this);
+     mEventManager->SetPresContext(nsnull);
+@@ -308,17 +309,17 @@ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIObserver)
+    NS_INTERFACE_MAP_ENTRY(nsIObserver)
+ NS_INTERFACE_MAP_END
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(nsPresContext)
+ NS_IMPL_CYCLE_COLLECTING_RELEASE(nsPresContext)
+ 
+ static PLDHashOperator
+-TraverseImageLoader(const void * aKey, nsCOMPtr<nsImageLoader>& aData,
++TraverseImageLoader(const void * aKey, nsRefPtr<nsImageLoader>& aData,
+                     void* aClosure)
+ {
+   nsCycleCollectionTraversalCallback *cb =
+     static_cast<nsCycleCollectionTraversalCallback*>(aClosure);
+ 
+   cb->NoteXPCOMChild(aData);
+ 
+   return PL_DHASH_NEXT;
+@@ -326,18 +327,18 @@ TraverseImageLoader(const void * aKey, n
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsPresContext)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mDocument);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mDeviceContext); // worth bothering?
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mEventManager);
+   // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mLookAndFeel); // a service
+   // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mLangGroup); // an atom
+ 
+-  tmp->mImageLoaders.Enumerate(TraverseImageLoader, &cb);
+-  tmp->mBorderImageLoaders.Enumerate(TraverseImageLoader, &cb);
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
++    tmp->mImageLoaders[i].Enumerate(TraverseImageLoader, &cb);
+ 
+   // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mTheme); // a service
+   // NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mLangService); // a service
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPrintSettings);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_NSCOMPTR(mPrefChangedTimer);
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsPresContext)
+@@ -349,20 +350,20 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+     tmp->mEventManager->SetPresContext(nsnull);
+ 
+     NS_RELEASE(tmp->mEventManager);
+   }
+ 
+   // NS_RELEASE(tmp->mLookAndFeel); // a service
+   // NS_RELEASE(tmp->mLangGroup); // an atom
+ 
+-  tmp->mImageLoaders.Enumerate(destroy_loads, nsnull);
+-  tmp->mImageLoaders.Clear();
+-  tmp->mBorderImageLoaders.Enumerate(destroy_loads, nsnull);
+-  tmp->mBorderImageLoaders.Clear();
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i) {
++    tmp->mImageLoaders[i].Enumerate(destroy_loads, nsnull);
++    tmp->mImageLoaders[i].Clear();
++  }
+ 
+   // NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mTheme); // a service
+   // NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mLangService); // a service
+   NS_IMPL_CYCLE_COLLECTION_UNLINK_NSCOMPTR(mPrintSettings);
+   if (tmp->mPrefChangedTimer)
+   {
+     tmp->mPrefChangedTimer->Cancel();
+     tmp->mPrefChangedTimer = nsnull;
+@@ -832,21 +833,19 @@ nsPresContext::Init(nsIDeviceContext* aD
+ 
+   mDeviceContext = aDeviceContext;
+   NS_ADDREF(mDeviceContext);
+ 
+   if (mDeviceContext->SetPixelScale(mFullZoom))
+     mDeviceContext->FlushFontCache();
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ 
+-  if (!mImageLoaders.Init())
+-    return NS_ERROR_OUT_OF_MEMORY;
+-  
+-  if (!mBorderImageLoaders.Init())
+-    return NS_ERROR_OUT_OF_MEMORY;
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
++    if (!mImageLoaders[i].Init())
++      return NS_ERROR_OUT_OF_MEMORY;
+   
+   // Get the look and feel service here; default colors will be initialized
+   // from calling GetUserPreferences() when we get a presshell.
+   nsresult rv = CallGetService(kLookAndFeelCID, &mLookAndFeel);
+   if (NS_FAILED(rv)) {
+     NS_ERROR("LookAndFeel service must be implemented for this toolkit");
+     return rv;
+   }
+@@ -1053,20 +1052,23 @@ static void SetImgAnimModeOnImgReq(imgIR
+     if (imgCon) {
+       imgCon->SetAnimationMode(aMode);
+     }
+   }
+ }
+ 
+  // Enumeration call back for HashTable
+ static PLDHashOperator
+-set_animation_mode(const void * aKey, nsCOMPtr<nsImageLoader>& aData, void* closure)
++set_animation_mode(const void * aKey, nsRefPtr<nsImageLoader>& aData, void* closure)
+ {
+-  imgIRequest* imgReq = aData->GetRequest();
+-  SetImgAnimModeOnImgReq(imgReq, (PRUint16)NS_PTR_TO_INT32(closure));
++  for (nsImageLoader *loader = aData; loader;
++       loader = loader->GetNextLoader()) {
++    imgIRequest* imgReq = loader->GetRequest();
++    SetImgAnimModeOnImgReq(imgReq, (PRUint16)NS_PTR_TO_INT32(closure));
++  }
+   return PL_DHASH_NEXT;
+ }
+ 
+ // IMPORTANT: Assumption is that all images for a Presentation 
+ // have the same Animation Mode (pavlov said this was OK)
+ //
+ // Walks content and set the animation mode
+ // this is a way to turn on/off image animations
+@@ -1117,18 +1119,18 @@ nsPresContext::SetImageAnimationModeInte
+                aMode == imgIContainer::kDontAnimMode ||
+                aMode == imgIContainer::kLoopOnceAnimMode, "Wrong Animation Mode is being set!");
+ 
+   // Image animation mode cannot be changed when rendering to a printer.
+   if (!IsDynamic())
+     return;
+ 
+   // Set the mode on the image loaders.
+-  mImageLoaders.Enumerate(set_animation_mode, NS_INT32_TO_PTR(aMode));
+-  mBorderImageLoaders.Enumerate(set_animation_mode, NS_INT32_TO_PTR(aMode));
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
++    mImageLoaders[i].Enumerate(set_animation_mode, NS_INT32_TO_PTR(aMode));
+ 
+   // Now walk the content tree and set the animation mode 
+   // on all the images.
+   if (mShell != nsnull) {
+     nsIDocument *doc = mShell->GetDocument();
+     if (doc) {
+       nsIContent *rootContent = doc->GetRootContent();
+       if (rootContent) {
+@@ -1223,77 +1225,62 @@ nsPresContext::SetFullZoom(float aZoom)
+     RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
+   }
+ 
+   mSupressResizeReflow = PR_FALSE;
+ 
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ }
+ 
+-imgIRequest*
+-nsPresContext::DoLoadImage(nsPresContext::ImageLoaderTable& aTable,
+-                           imgIRequest* aImage,
+-                           nsIFrame* aTargetFrame,
+-                           PRBool aReflowOnLoad)
++void
++nsPresContext::SetImageLoaders(nsIFrame* aTargetFrame,
++                               ImageLoadType aType,
++                               nsImageLoader* aImageLoaders)
+ {
+-  // look and see if we have a loader for the target frame.
+-  nsCOMPtr<nsImageLoader> loader;
+-  aTable.Get(aTargetFrame, getter_AddRefs(loader));
++  nsRefPtr<nsImageLoader> oldLoaders;
++  mImageLoaders[aType].Get(aTargetFrame, getter_AddRefs(oldLoaders));
+ 
+-  if (!loader) {
+-    loader = new nsImageLoader();
+-    if (!loader)
+-      return nsnull;
+-
+-    loader->Init(aTargetFrame, this, aReflowOnLoad);
+-    aTable.Put(aTargetFrame, loader);
++  if (aImageLoaders) {
++    mImageLoaders[aType].Put(aTargetFrame, aImageLoaders);
++  } else if (oldLoaders) {
++    mImageLoaders[aType].Remove(aTargetFrame);
+   }
+ 
+-  loader->Load(aImage);
+-
+-  imgIRequest *request = loader->GetRequest();
+-
+-  return request;
++  if (oldLoaders)
++    oldLoaders->Destroy();
+ }
+ 
+-imgIRequest*
+-nsPresContext::LoadImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
++void
++nsPresContext::SetupBackgroundImageLoaders(nsIFrame* aFrame,
++                                     const nsStyleBackground* aStyleBackground)
+ {
+-  return DoLoadImage(mImageLoaders, aImage, aTargetFrame, PR_FALSE);
++  nsRefPtr<nsImageLoader> loader =
++    nsImageLoader::Create(aFrame, aStyleBackground->mBackgroundImage,
++                          PR_FALSE, nsnull);
++  SetImageLoaders(aFrame, BACKGROUND_IMAGE, loader);
+ }
+ 
+-imgIRequest*
+-nsPresContext::LoadBorderImage(imgIRequest* aImage, nsIFrame* aTargetFrame)
++void
++nsPresContext::SetupBorderImageLoaders(nsIFrame* aFrame,
++                                       const nsStyleBorder* aStyleBorder)
+ {
+-  return DoLoadImage(mBorderImageLoaders, aImage, aTargetFrame,
+-                     aTargetFrame->GetStyleBorder()->ImageBorderDiffers());
++  nsRefPtr<nsImageLoader> loader =
++    nsImageLoader::Create(aFrame, aStyleBorder->GetBorderImage(),
++                          aStyleBorder->ImageBorderDiffers(), nsnull);
++  SetImageLoaders(aFrame, BORDER_IMAGE, loader);
+ }
+ 
+ void
+ nsPresContext::StopImagesFor(nsIFrame* aTargetFrame)
+ {
+-  StopBackgroundImageFor(aTargetFrame);
+-  StopBorderImageFor(aTargetFrame);
++  for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
++    SetImageLoaders(aTargetFrame, ImageLoadType(i), nsnull);
+ }
+ 
+ void
+-nsPresContext::DoStopImageFor(nsPresContext::ImageLoaderTable& aTable,
+-                              nsIFrame* aTargetFrame)
+-{
+-  nsCOMPtr<nsImageLoader> loader;
+-  aTable.Get(aTargetFrame, getter_AddRefs(loader));
+-
+-  if (loader) {
+-    loader->Destroy();
+-
+-    aTable.Remove(aTargetFrame);
+-  }
+-}
+-  
+-void
+ nsPresContext::SetContainer(nsISupports* aHandler)
+ {
+   mContainer = do_GetWeakReference(aHandler);
+   if (mContainer) {
+     GetDocumentColorPreferences();
+   }
+ }
+ 
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -55,17 +55,17 @@
+ #include "nsILanguageAtomService.h"
+ #include "nsIObserver.h"
+ #include "nsITimer.h"
+ #include "nsCRT.h"
+ #include "nsIPrintSettings.h"
+ #include "nsPropertyTable.h"
+ #include "nsGkAtoms.h"
+ #include "nsIDocument.h"
+-#include "nsInterfaceHashtable.h"
++#include "nsRefPtrHashtable.h"
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsChangeHint.h"
+ // This also pulls in gfxTypes.h, which we cannot include directly.
+ #include "gfxRect.h"
+ #include "nsRegion.h"
+ #include "nsTArray.h"
+ #include "nsAutoPtr.h"
+ #include "nsThreadUtils.h"
+@@ -88,16 +88,17 @@ class nsILinkHandler;
+ class nsStyleContext;
+ class nsIAtom;
+ class nsIEventStateManager;
+ class nsIURI;
+ class nsILookAndFeel;
+ class nsICSSPseudoComparator;
+ class nsIAtom;
+ struct nsStyleBackground;
++struct nsStyleBorder;
+ class nsIRunnable;
+ class gfxUserFontSet;
+ class nsUserFontSet;
+ struct nsFontFaceRuleContainer;
+ 
+ #ifdef MOZ_REFLOW_PERF
+ class nsIRenderingContext;
+ #endif
+@@ -373,51 +374,56 @@ public:
+   const nscolor FocusBackgroundColor() const { return mFocusBackgroundColor; }
+   const nscolor FocusTextColor() const { return mFocusTextColor; }
+ 
+   PRBool GetUseFocusColors() const { return mUseFocusColors; }
+   PRUint8 FocusRingWidth() const { return mFocusRingWidth; }
+   PRBool GetFocusRingOnAnything() const { return mFocusRingOnAnything; }
+   PRUint8 GetFocusRingStyle() const { return mFocusRingStyle; }
+ 
++  /**
++   * The types of image load types that the pres context needs image
++   * loaders to track invalidation for.
++   */
++  enum ImageLoadType {
++    BACKGROUND_IMAGE,
++    BORDER_IMAGE,
++    IMAGE_LOAD_TYPE_COUNT
++  };
+ 
+   /**
+-   * Set up observers so that aTargetFrame will be invalidated when
+-   * aImage loads, where aImage is its background image.  Only a single
+-   * image will be tracked per frame.
++   * Set the list of image loaders that track invalidation for a
++   * specific frame and type of image.  This list will replace any
++   * previous list for that frame and image type (and null will remove
++   * any previous list).
+    */
+-  NS_HIDDEN_(imgIRequest*) LoadImage(imgIRequest* aImage,
+-                                     nsIFrame* aTargetFrame);
++  NS_HIDDEN_(void) SetImageLoaders(nsIFrame* aTargetFrame,
++                                   ImageLoadType aType,
++                                   nsImageLoader* aImageLoaders);
++
+   /**
+-   * Set up observers so that aTargetFrame will be invalidated or
+-   * reflowed (as appropriate) when aImage loads, where aImage is its
+-   * *border* image.  Only a single image will be tracked per frame.
++   * Make an appropriate SetImageLoaders call (including potentially
++   * with null aImageLoaders) given that aFrame draws its background
++   * based on aStyleBackground.
+    */
+-  NS_HIDDEN_(imgIRequest*) LoadBorderImage(imgIRequest* aImage,
+-                                           nsIFrame* aTargetFrame);
++  NS_HIDDEN_(void) SetupBackgroundImageLoaders(nsIFrame* aFrame,
++                                               const nsStyleBackground*
++                                                 aStyleBackground);
+ 
+-private:
+-  typedef nsInterfaceHashtable<nsVoidPtrHashKey, nsImageLoader> ImageLoaderTable;
++  /**
++   * Make an appropriate SetImageLoaders call (including potentially
++   * with null aImageLoaders) given that aFrame draws its border
++   * based on aStyleBorder.
++   */
++  NS_HIDDEN_(void) SetupBorderImageLoaders(nsIFrame* aFrame,
++                                           const nsStyleBorder* aStyleBorder);
+ 
+-  NS_HIDDEN_(imgIRequest*) DoLoadImage(ImageLoaderTable& aTable,
+-                                       imgIRequest* aImage,
+-                                       nsIFrame* aTargetFrame,
+-                                       PRBool aReflowOnLoad);
+-
+-  NS_HIDDEN_(void) DoStopImageFor(ImageLoaderTable& aTable,
+-                                  nsIFrame* aTargetFrame);
+-public:
+-
+-  NS_HIDDEN_(void) StopBackgroundImageFor(nsIFrame* aTargetFrame)
+-  { DoStopImageFor(mImageLoaders, aTargetFrame); }
+-  NS_HIDDEN_(void) StopBorderImageFor(nsIFrame* aTargetFrame)
+-  { DoStopImageFor(mBorderImageLoaders, aTargetFrame); }
+   /**
+    * This method is called when a frame is being destroyed to
+-   * ensure that the image load gets disassociated from the prescontext
++   * ensure that the image loads get disassociated from the prescontext
+    */
+   NS_HIDDEN_(void) StopImagesFor(nsIFrame* aTargetFrame);
+ 
+   NS_HIDDEN_(void) SetContainer(nsISupports* aContainer);
+ 
+   virtual NS_HIDDEN_(already_AddRefed<nsISupports>) GetContainerExternal() const;
+   NS_HIDDEN_(already_AddRefed<nsISupports>) GetContainerInternal() const;
+ #ifdef _IMPL_NS_LAYOUT
+@@ -842,18 +848,19 @@ protected:
+   nsIEventStateManager* mEventManager;  // [STRONG]
+   nsILookAndFeel*       mLookAndFeel;   // [STRONG]
+   nsIAtom*              mMedium;        // initialized by subclass ctors;
+                                         // weak pointer to static atom
+ 
+   nsILinkHandler*       mLinkHandler;   // [WEAK]
+   nsIAtom*              mLangGroup;     // [STRONG]
+ 
+-  ImageLoaderTable      mImageLoaders;
+-  ImageLoaderTable      mBorderImageLoaders;
++  nsRefPtrHashtable<nsVoidPtrHashKey, nsImageLoader>
++                        mImageLoaders[IMAGE_LOAD_TYPE_COUNT];
++
+   nsWeakPtr             mContainer;
+ 
+   float                 mTextZoom;      // Text zoom, defaults to 1.0
+   float                 mFullZoom;      // Page zoom, defaults to 1.0
+ 
+   PRInt32               mCurAppUnitsPerDevPixel;
+   PRInt32               mAutoQualityMinFontSizePixelsPref;
+ 
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -513,29 +513,75 @@ nsFrame::Destroy()
+ NS_IMETHODIMP
+ nsFrame::GetOffsets(PRInt32 &aStart, PRInt32 &aEnd) const
+ {
+   aStart = 0;
+   aEnd = 0;
+   return NS_OK;
+ }
+ 
++static PRBool
++EqualImages(imgIRequest *aOldImage, imgIRequest *aNewImage)
++{
++  if (aOldImage == aNewImage)
++    return PR_TRUE;
++
++  if (!aOldImage || !aNewImage)
++    return PR_FALSE;
++
++  nsCOMPtr<nsIURI> oldURI, newURI;
++  aOldImage->GetURI(getter_AddRefs(oldURI));
++  aNewImage->GetURI(getter_AddRefs(newURI));
++  PRBool equal;
++  return NS_SUCCEEDED(oldURI->Equals(newURI, &equal)) && equal;
++}
++
+ // Subclass hook for style post processing
+ /* virtual */ void
+ nsFrame::DidSetStyleContext(nsStyleContext* aOldStyleContext)
+ {
+-  // We have to start loading the border image before or during reflow,
+-  // because the border-image's width overrides only apply once the
+-  // image is loaded.  Starting the load of the image means we'll get a
+-  // reflow when the image loads.  (Otherwise, if the image loads
+-  // between reflow and paint, we never get the notification and our
+-  // size ends up wrong.)
+-  imgIRequest *borderImage = GetStyleBorder()->GetBorderImage();
+-  if (borderImage) {
+-    PresContext()->LoadBorderImage(borderImage, this);
++  if (aOldStyleContext) {
++    // If the old context had a background image image and new context
++    // does not have the same image, clear the image load notifier
++    // (which keeps the image loading, if it still is) for the frame.
++    // We want to do this conservatively because some frames paint their
++    // backgrounds from some other frame's style data, and we don't want
++    // to clear those notifiers unless we have to.  (They'll be reset
++    // when we paint, although we could miss a notification in that
++    // interval.)
++    imgIRequest *oldBackgroundImage =
++      aOldStyleContext->GetStyleBackground()->mBackgroundImage;
++    if (oldBackgroundImage &&
++        !EqualImages(oldBackgroundImage,
++                     GetStyleBackground()->mBackgroundImage)) {
++      // stop the image loading for the frame, the image has changed
++      PresContext()->SetImageLoaders(this,
++        nsPresContext::BACKGROUND_IMAGE, nsnull);
++    }
++  }
++
++  imgIRequest *oldBorderImage = aOldStyleContext
++    ? aOldStyleContext->GetStyleBorder()->GetBorderImage()
++    : nsnull;
++  // For border-images, we can't be as conservative (we need to set the
++  // new loaders if there has been any change) since the CalcDifference
++  // call depended on the result of GetActualBorder() and that result
++  // depends on whether the image has loaded, start the image load now
++  // so that we'll get notified when it completes loading and can do a
++  // restyle.  Otherwise, the image might finish loading from the
++  // network before we start listening to its notifications, and then
++  // we'll never know that it's finished loading.  Likewise, we want to
++  // do this for freshly-created frames to prevent a similar race if the
++  // image loads between reflow (which can depend on whether the image
++  // is loaded) and paint.  We also don't really care about any callers
++  // who try to paint borders with a different style context, because
++  // they won't have the correct size for the border either.
++  if (!EqualImages(oldBorderImage, GetStyleBorder()->GetBorderImage())) {
++    // stop and restart the image loading/notification
++    PresContext()->SetupBorderImageLoaders(this, GetStyleBorder());
+   }
+ }
+ 
+ /* virtual */ nsMargin
+ nsIFrame::GetUsedMargin() const
+ {
+   NS_ASSERTION(nsLayoutUtils::sDisableGetUsedXAssertions ||
+                !NS_SUBTREE_DIRTY(this) ||

@@ -1,0 +1,4470 @@
+Implement multiple background layers, implement fallback background color, and make -moz-background-inline-policy no longer be part of the background shorthand.  (Bug 322475)  r+sr=roc,bzbarsky
+
+diff --git a/accessible/src/base/nsTextAttrs.cpp b/accessible/src/base/nsTextAttrs.cpp
+--- a/accessible/src/base/nsTextAttrs.cpp
++++ b/accessible/src/base/nsTextAttrs.cpp
+@@ -521,18 +521,18 @@ nsBGColorTextAttr::Format(const nscolor&
+   aFormattedValue = value;
+ }
+ 
+ PRBool
+ nsBGColorTextAttr::GetColor(nsIFrame *aFrame, nscolor *aColor)
+ {
+   const nsStyleBackground *styleBackground = aFrame->GetStyleBackground();
+ 
+-  if (!styleBackground->IsTransparent()) {
+-    *aColor = styleBackground->mBackgroundColor;
++  if (NS_GET_A(styleBackground->mFallbackBackgroundColor) > 0) {
++    *aColor = styleBackground->mFallbackBackgroundColor;
+     return PR_TRUE;
+   }
+ 
+   nsIFrame *parentFrame = aFrame->GetParent();
+   if (!parentFrame) {
+     *aColor = aFrame->PresContext()->DefaultBackgroundColor();
+     return PR_TRUE;
+   }
+diff --git a/content/html/content/src/nsGenericHTMLElement.cpp b/content/html/content/src/nsGenericHTMLElement.cpp
+--- a/content/html/content/src/nsGenericHTMLElement.cpp
++++ b/content/html/content/src/nsGenericHTMLElement.cpp
+@@ -1936,18 +1936,17 @@ nsGenericHTMLElement::MapImageBorderAttr
+ void
+ nsGenericHTMLElement::MapBackgroundInto(const nsMappedAttributes* aAttributes,
+                                         nsRuleData* aData)
+ {
+   if (!(aData->mSIDs & NS_STYLE_INHERIT_BIT(Background)))
+     return;
+ 
+   nsPresContext* presContext = aData->mPresContext;
+-  if (aData->mColorData->mBackImage.GetUnit() == eCSSUnit_Null &&
+-      presContext->UseDocumentColors()) {
++  if (!aData->mColorData->mBackImage && presContext->UseDocumentColors()) {
+     // background
+     const nsAttrValue* value = aAttributes->GetAttr(nsGkAtoms::background);
+     if (value && value->Type() == nsAttrValue::eString) {
+       const nsString& spec = value->GetStringValue();
+       if (!spec.IsEmpty()) {
+         // Resolve url to an absolute url
+         // XXX this breaks if the HTML element has an xml:base
+         // attribute (the xml:base will not be taken into account)
+@@ -1967,43 +1966,54 @@ nsGenericHTMLElement::MapBackgroundInto(
+             // XXXbz it would be nice to assert that doc->NodePrincipal() is
+             // the same as the principal of the node (which we'd need to store
+             // in the mapped attrs or something?)
+             nsCSSValue::Image *img =
+               new nsCSSValue::Image(uri, buffer, doc->GetDocumentURI(),
+                                     doc->NodePrincipal(), doc);
+             buffer->Release();
+             if (NS_LIKELY(img != 0)) {
+-              aData->mColorData->mBackImage.SetImageValue(img);
++              // Use nsRuleDataColor's temporary mTempBackImage to
++              // make a value list.
++              aData->mColorData->mTempBackImage.mValue.SetImageValue(img);
++              aData->mColorData->mBackImage =
++                &aData->mColorData->mTempBackImage;
+             }
+           }
+         }
+       }
+       else if (presContext->CompatibilityMode() == eCompatibility_NavQuirks) {
+         // in NavQuirks mode, allow the empty string to set the
+         // background to empty
+-        aData->mColorData->mBackImage.SetNoneValue();
++        // Use nsRuleDataColor's temporary mTempBackImage to make a value list.
++        aData->mColorData->mBackImage = nsnull;
++        aData->mColorData->mTempBackImage.mValue.SetNoneValue();
++        aData->mColorData->mBackImage = &aData->mColorData->mTempBackImage;
+       }
+     }
+   }
+ }
+ 
+ void
+ nsGenericHTMLElement::MapBGColorInto(const nsMappedAttributes* aAttributes,
+                                      nsRuleData* aData)
+ {
+   if (!(aData->mSIDs & NS_STYLE_INHERIT_BIT(Background)))
+     return;
+ 
+-  if (aData->mColorData->mBackColor.GetUnit() == eCSSUnit_Null &&
++  if (aData->mColorData->mBackColor.mXValue.GetUnit() == eCSSUnit_Null &&
+       aData->mPresContext->UseDocumentColors()) {
++    NS_ASSERTION(aData->mColorData->mBackColor.mYValue.GetUnit() ==
++                   eCSSUnit_Null,
++                 "half a property?");
+     const nsAttrValue* value = aAttributes->GetAttr(nsGkAtoms::bgcolor);
+     nscolor color;
+     if (value && value->GetColorValue(color)) {
+-      aData->mColorData->mBackColor.SetColorValue(color);
++      aData->mColorData->mBackColor.mXValue.SetColorValue(color);
++      aData->mColorData->mBackColor.mYValue.SetColorValue(color);
+     }
+   }
+ }
+ 
+ void
+ nsGenericHTMLElement::MapBackgroundAttributesInto(const nsMappedAttributes* aAttributes,
+                                                   nsRuleData* aData)
+ {
+diff --git a/content/mathml/content/src/nsMathMLElement.cpp b/content/mathml/content/src/nsMathMLElement.cpp
+--- a/content/mathml/content/src/nsMathMLElement.cpp
++++ b/content/mathml/content/src/nsMathMLElement.cpp
+@@ -372,20 +372,25 @@ nsMathMLElement::MapMathMLAttributesInto
+   }
+ 
+   if (aData->mSIDs & NS_STYLE_INHERIT_BIT(Background)) {
+     const nsAttrValue* value =
+       aAttributes->GetAttr(nsGkAtoms::mathbackground_);
+     if (!value) {
+       value = aAttributes->GetAttr(nsGkAtoms::background);
+     }
+-    if (value && aData->mColorData->mBackColor.GetUnit() == eCSSUnit_Null) {
++    if (value &&
++        aData->mColorData->mBackColor.mXValue.GetUnit() == eCSSUnit_Null) {
++      NS_ASSERTION(aData->mColorData->mBackColor.mYValue.GetUnit()
++                     == eCSSUnit_Null,
++                   "half a property?");
+       nscolor color;
+       if (value->GetColorValue(color)) {
+-        aData->mColorData->mBackColor.SetColorValue(color);
++        aData->mColorData->mBackColor.mXValue.SetColorValue(color);
++        aData->mColorData->mBackColor.mYValue.SetColorValue(color);
+       }
+     }
+   }
+ 
+   if (aData->mSIDs & NS_STYLE_INHERIT_BIT(Color)) {
+     const nsAttrValue* value = aAttributes->GetAttr(nsGkAtoms::mathcolor_);
+     if (!value) {
+       value = aAttributes->GetAttr(nsGkAtoms::color);
+diff --git a/gfx/thebes/public/gfxContext.h b/gfx/thebes/public/gfxContext.h
+--- a/gfx/thebes/public/gfxContext.h
++++ b/gfx/thebes/public/gfxContext.h
+@@ -671,16 +671,26 @@ public:
+   }
+ 
+   void SetContext(gfxContext *aContext) {
+     NS_ASSERTION(!mContext, "Not going to call Restore() on some context!!!");
+     mContext = aContext;
+     mContext->Save();    
+   }
+ 
++  void Reset(gfxContext *aContext) {
++    // Do the equivalent of destroying and re-creating this object.
++    NS_PRECONDITION(aContext, "must provide a context");
++    if (mContext) {
++      mContext->Restore();
++    }
++    mContext = aContext;
++    mContext->Save();
++  }
++
+ private:
+   gfxContext *mContext;
+ };
+ 
+ /**
+  * Sentry helper class for functions with multiple return points that need to
+  * back up the current path of a context and have it automatically restored
+  * before they return. This class assumes that the transformation matrix will
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -257,16 +257,27 @@ protected:
+     PRBool isValid1, isValid2;
+     nsBlockInFlowLineIterator it1(mBlockFrame, aFrame1, &isValid1);
+     nsBlockInFlowLineIterator it2(mBlockFrame, aFrame2, &isValid2);
+     return isValid1 && isValid2 && it1.GetLine() == it2.GetLine();
+   }
+ };
+ 
+ /* Local functions */
++static void PaintBackgroundLayer(nsPresContext* aPresContext,
++                                 nsIRenderingContext& aRenderingContext,
++                                 nsIFrame* aForFrame,
++                                 const nsRect& aDirtyRect,
++                                 const nsRect& aBorderArea,
++                                 const nsRect& aBGClipRect,
++                                 const nsStyleBackground& aBackground,
++                                 const nsStyleBackground::Layer& aLayer,
++                                 const nsStyleBorder& aBorder,
++                                 PRBool aUsePrintSettings);
++
+ static void DrawBorderImage(nsPresContext* aPresContext,
+                             nsIRenderingContext& aRenderingContext,
+                             nsIFrame* aForFrame,
+                             const nsRect& aBorderArea,
+                             const nsStyleBorder& aBorderStyle,
+                             const nsRect& aDirtyRect);
+ 
+ static void DrawBorderImageComponent(nsIRenderingContext& aRenderingContext,
+@@ -795,45 +806,39 @@ nsCSSRendering::PaintFocus(nsPresContext
+  * nsLayoutUtils::DrawImage. This is the same as aTopLeft, unless CSS
+  * specifies a percentage (including 'right' or 'bottom'), in which case
+  * it's that percentage within of aOriginBounds. So 'right' would set
+  * aAnchorPoint.x to aOriginBounds.XMost().
+  * 
+  * Points are returned relative to aOriginBounds.
+  */
+ static void
+-ComputeBackgroundAnchorPoint(const nsStyleBackground& aColor,
++ComputeBackgroundAnchorPoint(const nsStyleBackground::Layer& aLayer,
+                              const nsSize& aOriginBounds,
+                              const nsSize& aImageSize,
+                              nsPoint* aTopLeft,
+                              nsPoint* aAnchorPoint)
+ {
+-  if (NS_STYLE_BG_X_POSITION_LENGTH & aColor.mBackgroundFlags) {
+-    aTopLeft->x = aAnchorPoint->x = aColor.mBackgroundXPosition.mCoord;
++  if (!aLayer.mPosition.mXIsPercent) {
++    aTopLeft->x = aAnchorPoint->x = aLayer.mPosition.mXPosition.mCoord;
+   }
+-  else if (NS_STYLE_BG_X_POSITION_PERCENT & aColor.mBackgroundFlags) {
+-    double percent = aColor.mBackgroundXPosition.mFloat;
++  else {
++    double percent = aLayer.mPosition.mXPosition.mFloat;
+     aAnchorPoint->x = NSToCoordRound(percent*aOriginBounds.width);
+     aTopLeft->x = NSToCoordRound(percent*(aOriginBounds.width - aImageSize.width));
+   }
++
++  if (!aLayer.mPosition.mYIsPercent) {
++    aTopLeft->y = aAnchorPoint->y = aLayer.mPosition.mYPosition.mCoord;
++  }
+   else {
+-    aTopLeft->x = aAnchorPoint->x = 0;
+-  }
+-
+-  if (NS_STYLE_BG_Y_POSITION_LENGTH & aColor.mBackgroundFlags) {
+-    aTopLeft->y = aAnchorPoint->y = aColor.mBackgroundYPosition.mCoord;
+-  }
+-  else if (NS_STYLE_BG_Y_POSITION_PERCENT & aColor.mBackgroundFlags) {
+-    double percent = aColor.mBackgroundYPosition.mFloat;
++    double percent = aLayer.mPosition.mYPosition.mFloat;
+     aAnchorPoint->y = NSToCoordRound(percent*aOriginBounds.height);
+     aTopLeft->y = NSToCoordRound(percent*(aOriginBounds.height - aImageSize.height));
+   }
+-  else {
+-    aTopLeft->y = aAnchorPoint->y = 0;
+-  }
+ }
+ 
+ nsStyleContext*
+ nsCSSRendering::FindNonTransparentBackground(nsStyleContext* aContext,
+                                              PRBool aStartAtParent /*= PR_FALSE*/)
+ {
+   NS_ASSERTION(aContext, "Cannot find NonTransparentBackground in a null context" );
+   
+@@ -1337,16 +1342,106 @@ IsSolidBorder(const nsStyleBorder& aBord
+     return PR_FALSE;
+   for (PRUint32 i = 0; i < 4; ++i) {
+     if (!IsSolidBorderEdge(aBorder, i))
+       return PR_FALSE;
+   }
+   return PR_TRUE;
+ }
+ 
++static PRBool
++UseImageRequestForBackground(imgIRequest *aRequest)
++{
++  if (!aRequest)
++    return PR_FALSE;
++
++  PRUint32 status = imgIRequest::STATUS_ERROR;
++  aRequest->GetImageStatus(&status);
++
++  return (status & imgIRequest::STATUS_FRAME_COMPLETE) &&
++         (status & imgIRequest::STATUS_SIZE_AVAILABLE);
++}
++
++static inline void
++SetupDirtyRects(const nsRect& aBGClipArea, const nsRect& aCallerDirtyRect,
++                nscoord aAppUnitsPerPixel,
++                /* OUT: */
++                nsRect* aDirtyRect, gfxRect* aDirtyRectGfx)
++{
++  aDirtyRect->IntersectRect(aBGClipArea, aCallerDirtyRect);
++
++  // Compute the Thebes equivalent of the dirtyRect.
++  *aDirtyRectGfx = RectToGfxRect(*aDirtyRect, aAppUnitsPerPixel);
++  NS_WARN_IF_FALSE(aDirtyRect->IsEmpty() || !aDirtyRectGfx->IsEmpty(),
++                   "converted dirty rect should not be empty");
++  NS_ABORT_IF_FALSE(!aDirtyRect->IsEmpty() || aDirtyRectGfx->IsEmpty(),
++                    "second should be empty if first is");
++}
++
++static void
++SetupBackgroundClip(gfxContext *aCtx, PRUint8 aBackgroundClip,
++                    nsIFrame* aForFrame, const nsRect& aBorderArea,
++                    const nsRect& aCallerDirtyRect, PRBool aHaveRoundedCorners,
++                    const gfxCornerSizes& aBGRadii, nscoord aAppUnitsPerPixel,
++                    gfxContextAutoSaveRestore* aAutoSR,
++                    /* OUT: */
++                    nsRect* aBGClipArea, nsRect* aDirtyRect,
++                    gfxRect* aDirtyRectGfx)
++{
++  *aBGClipArea = aBorderArea;
++  PRBool radiiAreOuter = PR_TRUE;
++  gfxCornerSizes clippedRadii = aBGRadii;
++  if (aBackgroundClip != NS_STYLE_BG_CLIP_BORDER) {
++    NS_ASSERTION(aBackgroundClip == NS_STYLE_BG_CLIP_PADDING,
++                 "unexpected background-clip");
++    nsMargin border = aForFrame->GetUsedBorder();
++    aForFrame->ApplySkipSides(border);
++    aBGClipArea->Deflate(border);
++
++    if (aHaveRoundedCorners) {
++      gfxFloat borderSizes[4] = {
++        border.top / aAppUnitsPerPixel, border.right / aAppUnitsPerPixel,
++        border.bottom / aAppUnitsPerPixel, border.left / aAppUnitsPerPixel
++      };
++      nsCSSBorderRenderer::ComputeInnerRadii(aBGRadii, borderSizes,
++                                             &clippedRadii);
++      radiiAreOuter = PR_FALSE;
++    }
++  }
++
++  SetupDirtyRects(*aBGClipArea, aCallerDirtyRect, aAppUnitsPerPixel,
++                  aDirtyRect, aDirtyRectGfx);
++
++  if (aDirtyRectGfx->IsEmpty()) {
++    // Our caller won't draw anything under this condition, so no need
++    // to set more up.
++    return;
++  }
++
++  // If we have rounded corners, clip all subsequent drawing to the
++  // rounded rectangle defined by bgArea and bgRadii (we don't know
++  // whether the rounded corners intrude on the dirtyRect or not).
++  // Do not do this if we have a caller-provided clip rect --
++  // as above with bgArea, arguably a bug, but table painting seems
++  // to depend on it.
++
++  if (aHaveRoundedCorners) {
++    gfxRect bgAreaGfx(RectToGfxRect(*aBGClipArea, aAppUnitsPerPixel));
++    bgAreaGfx.Round();
++    bgAreaGfx.Condition();
++    NS_ABORT_IF_FALSE(!bgAreaGfx.IsEmpty(),
++                      "should have returned early after aDirtyRectGfx test");
++
++    aAutoSR->Reset(aCtx);
++    aCtx->NewPath();
++    aCtx->RoundedRectangle(bgAreaGfx, clippedRadii, radiiAreOuter);
++    aCtx->Clip();
++  }
++}
++
+ void
+ nsCSSRendering::PaintBackgroundWithSC(nsPresContext* aPresContext,
+                                       nsIRenderingContext& aRenderingContext,
+                                       nsIFrame* aForFrame,
+                                       const nsRect& aDirtyRect,
+                                       const nsRect& aBorderArea,
+                                       const nsStyleBackground& aColor,
+                                       const nsStyleBorder& aBorder,
+@@ -1377,30 +1472,36 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+   PRBool drawBackgroundImage = PR_TRUE;
+   PRBool drawBackgroundColor = PR_TRUE;
+ 
+   if (aUsePrintSettings) {
+     drawBackgroundImage = aPresContext->GetBackgroundImageDraw();
+     drawBackgroundColor = aPresContext->GetBackgroundColorDraw();
+   }
+ 
+-  if ((aColor.mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) ||
+-      !aColor.mBackgroundImage) {
+-    NS_ASSERTION((aColor.mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) &&
+-                 !aColor.mBackgroundImage, "background flags/image mismatch");
+-    drawBackgroundImage = PR_FALSE;
++  nsStyleBackground::Image bottomImage(aColor.BottomLayer().mImage);
++  PRBool useFallbackColor = PR_FALSE;
++  if (bottomImage.mSpecified) {
++    if (!drawBackgroundImage ||
++        !UseImageRequestForBackground(bottomImage.mRequest)) {
++      bottomImage.mRequest = nsnull;
++    }
++    useFallbackColor = bottomImage.mRequest == nsnull;
++  } else {
++    NS_ASSERTION(bottomImage.mRequest == nsnull, "malformed image struct");
+   }
+ 
+   // If GetBackgroundColorDraw() is false, we are still expected to
+   // draw color in the background of any frame that's not completely
+   // transparent, but we are expected to use white instead of whatever
+   // color was specified.
+   nscolor bgColor;
+   if (drawBackgroundColor) {
+-    bgColor = aColor.mBackgroundColor;
++    bgColor = useFallbackColor ? aColor.mFallbackBackgroundColor
++                               : aColor.mBackgroundColor;
+     if (NS_GET_A(bgColor) == 0)
+       drawBackgroundColor = PR_FALSE;
+   } else {
+     bgColor = NS_RGB(255, 255, 255);
+     if (drawBackgroundImage || !aColor.IsTransparent())
+       drawBackgroundColor = PR_TRUE;
+   }
+ 
+@@ -1410,139 +1511,160 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+   if (!drawBackgroundImage && !drawBackgroundColor)
+     return;
+ 
+   // Compute the outermost boundary of the area that might be painted.
+   gfxContext *ctx = aRenderingContext.ThebesContext();
+   nscoord appUnitsPerPixel = aPresContext->AppUnitsPerDevPixel();
+ 
+   // Same coordinate space as aBorderArea & aBGClipRect
+-  nsRect bgArea;
+   gfxCornerSizes bgRadii;
+   PRBool haveRoundedCorners;
+-  PRBool radiiAreOuter = PR_TRUE;
+   {
+     nscoord radii[8];
+     haveRoundedCorners =
+       GetBorderRadiusTwips(aBorder.mBorderRadius, aForFrame->GetSize().width,
+                            radii);
+     if (haveRoundedCorners)
+       ComputePixelRadii(radii, aBorderArea, aForFrame->GetSkipSides(),
+                         appUnitsPerPixel, &bgRadii);
+   }
+   
+-  // The background is rendered over the 'background-clip' area,
+-  // which is normally equal to the border area but may be reduced
+-  // to the padding area by CSS.  Also, if the border is solid, we
+-  // don't need to draw outside the padding area.  In either case,
+-  // if the borders are rounded, make sure we use the same inner
+-  // radii as the border code will.
+-  bgArea = aBorderArea;
+-  if (aColor.mBackgroundClip != NS_STYLE_BG_CLIP_BORDER ||
+-      IsSolidBorder(aBorder)) {
+-    nsMargin border = aForFrame->GetUsedBorder();
+-    aForFrame->ApplySkipSides(border);
+-    bgArea.Deflate(border);
+-    if (haveRoundedCorners) {
+-      gfxCornerSizes outerRadii = bgRadii;
+-      gfxFloat borderSizes[4] = {
+-        border.top / appUnitsPerPixel, border.right / appUnitsPerPixel,
+-        border.bottom / appUnitsPerPixel, border.left / appUnitsPerPixel
+-      };
+-      nsCSSBorderRenderer::ComputeInnerRadii(outerRadii, borderSizes,
+-                                             &bgRadii);
+-      radiiAreOuter = PR_FALSE;
+-    }
+-  }
+-
+   // The 'bgClipArea' (used only by the image tiling logic, far below)
+-  // is the caller-provided aBGClipRect if any, or else the bgArea
+-  // computed above.  (Arguably it should be the intersection, but
+-  // that breaks the table painter -- in particular, honoring the
+-  // bgArea when we have aBGClipRect breaks reftests/bugs/403429-1[ab].)
+-  // The dirtyRect is the intersection of that rectangle with the
+-  // caller-provided aDirtyRect.  If the dirtyRect is empty there is
+-  // nothing to draw.
+-
+-  nsRect bgClipArea;
+-  if (aBGClipRect)
++  // is the caller-provided aBGClipRect if any, or else the area
++  // determined by the value of 'background-clip' in
++  // SetupCurrentBackgroundClip.  (Arguably it should be the
++  // intersection, but that breaks the table painter -- in particular,
++  // taking the intersection breaks reftests/bugs/403429-1[ab].)
++  nsRect bgClipArea, dirtyRect;
++  gfxRect dirtyRectGfx;
++  PRUint8 currentBackgroundClip;
++  PRBool isSolidBorder;
++  gfxContextAutoSaveRestore autoSR;
++  if (aBGClipRect) {
+     bgClipArea = *aBGClipRect;
+-  else
+-    bgClipArea = bgArea;
+-
+-  nsRect dirtyRect;
+-  dirtyRect.IntersectRect(bgClipArea, aDirtyRect);
+-
+-  if (dirtyRect.IsEmpty())
+-    return;
+-
+-  // Compute the Thebes equivalent of the dirtyRect.
+-  gfxRect dirtyRectGfx(RectToGfxRect(dirtyRect, appUnitsPerPixel));
+-  if (dirtyRectGfx.IsEmpty()) {
+-    NS_WARNING("converted dirty rect should not be empty");
+-    return;
+-  }
+-
+-  // If we have rounded corners, clip all subsequent drawing to the
+-  // rounded rectangle defined by bgArea and bgRadii (we don't know
+-  // whether the rounded corners intrude on the dirtyRect or not).
+-  // Do not do this if we have a caller-provided clip rect --
+-  // as above with bgArea, arguably a bug, but table painting seems
+-  // to depend on it.
+-
+-  gfxContextAutoSaveRestore autoSR;
+-  if (haveRoundedCorners && !aBGClipRect) {
+-    gfxRect bgAreaGfx(RectToGfxRect(bgArea, appUnitsPerPixel));
+-    bgAreaGfx.Round();
+-    bgAreaGfx.Condition();
+-    if (bgAreaGfx.IsEmpty()) {
+-      NS_WARNING("converted background area should not be empty");
+-      return;
+-    }
+-
+-    autoSR.SetContext(ctx);
+-    ctx->NewPath();
+-    ctx->RoundedRectangle(bgAreaGfx, bgRadii, radiiAreOuter);
+-    ctx->Clip();
++    SetupDirtyRects(bgClipArea, aDirtyRect, appUnitsPerPixel,
++                    &dirtyRect, &dirtyRectGfx);
++  } else {
++    // The background is rendered over the 'background-clip' area,
++    // which is normally equal to the border area but may be reduced
++    // to the padding area by CSS.  Also, if the border is solid, we
++    // don't need to draw outside the padding area.  In either case,
++    // if the borders are rounded, make sure we use the same inner
++    // radii as the border code will.
++    // The background-color is drawn based on the bottom
++    // background-clip.
++    currentBackgroundClip = aColor.BottomLayer().mClip;
++    isSolidBorder = IsSolidBorder(aBorder);
++    if (isSolidBorder)
++      currentBackgroundClip = NS_STYLE_BG_CLIP_PADDING;
++    SetupBackgroundClip(ctx, currentBackgroundClip, aForFrame,
++                        aBorderArea, aDirtyRect, haveRoundedCorners,
++                        bgRadii, appUnitsPerPixel, &autoSR,
++                        &bgClipArea, &dirtyRect, &dirtyRectGfx);
+   }
+ 
+   // If we might be using a background color, go ahead and set it now.
+   if (drawBackgroundColor)
+     ctx->SetColor(gfxRGBA(bgColor));
+ 
+   // If there is no background image, draw a color.  (If there is
+   // neither a background image nor a color, we wouldn't have gotten
+   // this far.)
+   if (!drawBackgroundImage) {
+-    ctx->NewPath();
+-    ctx->Rectangle(dirtyRectGfx, PR_TRUE);
+-    ctx->Fill();
++    if (!dirtyRectGfx.IsEmpty()) {
++      ctx->NewPath();
++      ctx->Rectangle(dirtyRectGfx, PR_TRUE);
++      ctx->Fill();
++    }
+     return;
+   }
+ 
+   // Ensure we get invalidated for loads of the image.  We need to do
+   // this here because this might be the only code that knows about the
+   // association of the style data with the frame.
+   aPresContext->SetupBackgroundImageLoaders(aForFrame, &aColor);
+ 
+-  imgIRequest *req = aColor.mBackgroundImage;
++  if (bottomImage.mRequest &&
++      aColor.BottomLayer().mRepeat == NS_STYLE_BG_REPEAT_XY &&
++      drawBackgroundColor) {
++    nsCOMPtr<imgIContainer> image;
++    bottomImage.mRequest->GetImage(getter_AddRefs(image));
++    // If the image is completely opaque, we may not need to paint
++    // the background color.
++    nsCOMPtr<gfxIImageFrame> gfxImgFrame;
++    image->GetCurrentFrame(getter_AddRefs(gfxImgFrame));
++    if (gfxImgFrame) {
++      gfxImgFrame->GetNeedsBackground(&drawBackgroundColor);
++      if (!drawBackgroundColor) {
++        // If the current frame is smaller than its container, we
++        // need to paint the background color even if the frame
++        // itself is opaque.
++        nsIntSize iSize;
++        image->GetWidth(&iSize.width);
++        image->GetHeight(&iSize.height);
++        nsIntRect iframeRect;
++        gfxImgFrame->GetRect(iframeRect);
++        if (iSize.width != iframeRect.width ||
++            iSize.height != iframeRect.height) {
++          drawBackgroundColor = PR_TRUE;
++        }
++      }
++    }
++  }
+ 
+-  PRUint32 status = imgIRequest::STATUS_ERROR;
+-  if (req)
+-    req->GetImageStatus(&status);
+-
+-  // While waiting for the image, draw a color, if any.
+-  if (!req ||
+-      !(status & imgIRequest::STATUS_FRAME_COMPLETE) ||
+-      !(status & imgIRequest::STATUS_SIZE_AVAILABLE)) {
+-    if (drawBackgroundColor) {
++  // The background color is rendered over the entire dirty area,
++  // even if the image isn't.
++  if (drawBackgroundColor) {
++    if (!dirtyRectGfx.IsEmpty()) {
+       ctx->NewPath();
+       ctx->Rectangle(dirtyRectGfx, PR_TRUE);
+       ctx->Fill();
+     }
++  }
++
++  if (drawBackgroundImage) {
++    NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, &aColor) {
++      const nsStyleBackground::Layer &layer = aColor.mLayers[i];
++      if (!aBGClipRect) {
++        PRUint8 newBackgroundClip =
++          isSolidBorder ? NS_STYLE_BG_CLIP_PADDING : layer.mClip;
++        if (currentBackgroundClip != newBackgroundClip) {
++          currentBackgroundClip = newBackgroundClip;
++          SetupBackgroundClip(ctx, currentBackgroundClip, aForFrame,
++                              aBorderArea, aDirtyRect, haveRoundedCorners,
++                              bgRadii, appUnitsPerPixel, &autoSR,
++                              &bgClipArea, &dirtyRect, &dirtyRectGfx);
++        }
++      }
++      if (!dirtyRectGfx.IsEmpty()) {
++        PaintBackgroundLayer(aPresContext, aRenderingContext, aForFrame,
++                             dirtyRect, aBorderArea, bgClipArea, aColor,
++                             layer, aBorder, aUsePrintSettings);
++      }
++    }
++  }
++}
++
++static void
++PaintBackgroundLayer(nsPresContext* aPresContext,
++                     nsIRenderingContext& aRenderingContext,
++                     nsIFrame* aForFrame,
++                     const nsRect& aDirtyRect, // intersected with aBGClipRect
++                     const nsRect& aBorderArea,
++                     const nsRect& aBGClipRect,
++                     const nsStyleBackground& aBackground,
++                     const nsStyleBackground::Layer& aLayer,
++                     const nsStyleBorder& aBorder,
++                     PRBool aUsePrintSettings)
++{
++  // Lookup the image
++  imgIRequest *req = aLayer.mImage.mRequest;
++  if (!UseImageRequestForBackground(req)) {
++    // There's no image or it's not ready to be painted.
+     return;
+   }
+ 
+   nsCOMPtr<imgIContainer> image;
+   req->GetImage(getter_AddRefs(image));
+ 
+   nsIntSize imageIntSize;
+   image->GetWidth(&imageIntSize.width);
+@@ -1556,17 +1678,17 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+ 
+   // relative to aBorderArea
+   nsRect bgOriginRect;
+ 
+   nsIAtom* frameType = aForFrame->GetType();
+   nsIFrame* geometryFrame = aForFrame;
+   if (frameType == nsGkAtoms::inlineFrame ||
+       frameType == nsGkAtoms::positionedInlineFrame) {
+-    switch (aColor.mBackgroundInlinePolicy) {
++    switch (aBackground.mBackgroundInlinePolicy) {
+     case NS_STYLE_BG_INLINE_POLICY_EACH_BOX:
+       bgOriginRect = nsRect(nsPoint(0,0), aBorderArea.Size());
+       break;
+     case NS_STYLE_BG_INLINE_POLICY_BOUNDING_BOX:
+       bgOriginRect = gInlineBGData->GetBoundingRect(aForFrame);
+       break;
+     default:
+       NS_ERROR("Unknown background-inline-policy value!  "
+@@ -1583,81 +1705,35 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+       "|:viewport| pseudo-element in |html.css|.");
+     bgOriginRect = geometryFrame->GetRect();
+   } else {
+     bgOriginRect = nsRect(nsPoint(0,0), aBorderArea.Size());
+   }
+ 
+   // Background images are tiled over the 'background-clip' area
+   // but the origin of the tiling is based on the 'background-origin' area
+-  if (aColor.mBackgroundOrigin != NS_STYLE_BG_ORIGIN_BORDER) {
++  if (aLayer.mOrigin != NS_STYLE_BG_ORIGIN_BORDER) {
+     nsMargin border = geometryFrame->GetUsedBorder();
+     geometryFrame->ApplySkipSides(border);
+     bgOriginRect.Deflate(border);
+-    if (aColor.mBackgroundOrigin != NS_STYLE_BG_ORIGIN_PADDING) {
++    if (aLayer.mOrigin != NS_STYLE_BG_ORIGIN_PADDING) {
+       nsMargin padding = geometryFrame->GetUsedPadding();
+       geometryFrame->ApplySkipSides(padding);
+       bgOriginRect.Deflate(padding);
+-      NS_ASSERTION(aColor.mBackgroundOrigin == NS_STYLE_BG_ORIGIN_CONTENT,
++      NS_ASSERTION(aLayer.mOrigin == NS_STYLE_BG_ORIGIN_CONTENT,
+                    "unknown background-origin value");
+     }
+   }
+ 
+-  PRIntn  repeat = aColor.mBackgroundRepeat;
+-  switch (repeat) {
+-    case NS_STYLE_BG_REPEAT_X:
+-      break;
+-    case NS_STYLE_BG_REPEAT_Y:
+-      break;
+-    case NS_STYLE_BG_REPEAT_XY:
+-      if (drawBackgroundColor) {
+-        // If the image is completely opaque, we may not need to paint
+-        // the background color.
+-        nsCOMPtr<gfxIImageFrame> gfxImgFrame;
+-        image->GetCurrentFrame(getter_AddRefs(gfxImgFrame));
+-        if (gfxImgFrame) {
+-          gfxImgFrame->GetNeedsBackground(&drawBackgroundColor);
+-          if (!drawBackgroundColor) {
+-            // If the current frame is smaller than its container, we
+-            // need to paint the background color even if the frame
+-            // itself is opaque.
+-            nsIntSize iSize;
+-            image->GetWidth(&iSize.width);
+-            image->GetHeight(&iSize.height);
+-            nsIntRect iframeRect;
+-            gfxImgFrame->GetRect(iframeRect);
+-            if (iSize.width != iframeRect.width ||
+-                iSize.height != iframeRect.height) {
+-              drawBackgroundColor = PR_TRUE;
+-            }
+-          }
+-        }
+-      }
+-      break;
+-    case NS_STYLE_BG_REPEAT_OFF:
+-    default:
+-      NS_ASSERTION(repeat == NS_STYLE_BG_REPEAT_OFF,
+-                   "unknown background-repeat value");
+-      break;
+-  }
+-
+-  // The background color is rendered over the entire dirty area,
+-  // even if the image isn't.
+-  if (drawBackgroundColor) {
+-    ctx->NewPath();
+-    ctx->Rectangle(dirtyRectGfx, PR_TRUE);
+-    ctx->Fill();
+-  }
+-
+   // Compute the anchor point.
+   //
+   // relative to aBorderArea.TopLeft() (which is where the top-left
+   // of aForFrame's border-box will be rendered)
+   nsPoint imageTopLeft, anchor;
+-  if (NS_STYLE_BG_ATTACHMENT_FIXED == aColor.mBackgroundAttachment) {
++  if (NS_STYLE_BG_ATTACHMENT_FIXED == aLayer.mAttachment) {
+     // If it's a fixed background attachment, then the image is placed
+     // relative to the viewport, which is the area of the root frame
+     // in a screen context or the page content frame in a print context.
+ 
+     // Remember that we've drawn position-varying content in this prescontext
+     aPresContext->SetRenderedPositionVaryingContent();
+ 
+     nsIFrame* topFrame =
+@@ -1681,45 +1757,46 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+         aPresContext->PresShell()->GetRootScrollFrameAsScrollable();
+       if (scrollableFrame) {
+         nsMargin scrollbars = scrollableFrame->GetActualScrollbarSizes();
+         viewportArea.Deflate(scrollbars);
+       }
+     }
+      
+     // Get the anchor point, relative to the viewport.
+-    ComputeBackgroundAnchorPoint(aColor, viewportArea.Size(), imageSize,
++    ComputeBackgroundAnchorPoint(aLayer, viewportArea.Size(), imageSize,
+                                  &imageTopLeft, &anchor);
+ 
+     // Convert the anchor point from viewport coordinates to aForFrame
+     // coordinates.
+     nsPoint offset = viewportArea.TopLeft() - aForFrame->GetOffsetTo(topFrame);
+     imageTopLeft += offset;
+     anchor += offset;
+   } else {
+-    ComputeBackgroundAnchorPoint(aColor, bgOriginRect.Size(), imageSize,
++    ComputeBackgroundAnchorPoint(aLayer, bgOriginRect.Size(), imageSize,
+                                  &imageTopLeft, &anchor);
+     imageTopLeft += bgOriginRect.TopLeft();
+     anchor += bgOriginRect.TopLeft();
+   }
+ 
+   nsRect destArea(imageTopLeft + aBorderArea.TopLeft(), imageSize);
+   nsRect fillArea = destArea;
++  PRIntn repeat = aLayer.mRepeat;
+   if (repeat & NS_STYLE_BG_REPEAT_X) {
+-    fillArea.x = bgClipArea.x;
+-    fillArea.width = bgClipArea.width;
++    fillArea.x = aBGClipRect.x;
++    fillArea.width = aBGClipRect.width;
+   }
+   if (repeat & NS_STYLE_BG_REPEAT_Y) {
+-    fillArea.y = bgClipArea.y;
+-    fillArea.height = bgClipArea.height;
++    fillArea.y = aBGClipRect.y;
++    fillArea.height = aBGClipRect.height;
+   }
+-  fillArea.IntersectRect(fillArea, bgClipArea);
++  fillArea.IntersectRect(fillArea, aBGClipRect);
+ 
+   nsLayoutUtils::DrawImage(&aRenderingContext, image,
+-      destArea, fillArea, anchor + aBorderArea.TopLeft(), dirtyRect);
++      destArea, fillArea, anchor + aBorderArea.TopLeft(), aDirtyRect);
+ }
+ 
+ static void
+ DrawBorderImage(nsPresContext*       aPresContext,
+                 nsIRenderingContext& aRenderingContext,
+                 nsIFrame*            aForFrame,
+                 const nsRect&        aBorderArea,
+                 const nsStyleBorder& aBorderStyle,
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -492,35 +492,37 @@ nsDisplayBackground::IsOpaque(nsDisplayL
+   if (mIsThemed)
+     return PR_FALSE;
+ 
+   const nsStyleBackground* bg;
+   PRBool hasBG =
+     nsCSSRendering::FindBackground(mFrame->PresContext(), mFrame, &bg);
+ 
+   return (hasBG && NS_GET_A(bg->mBackgroundColor) == 255 &&
+-          bg->mBackgroundClip == NS_STYLE_BG_CLIP_BORDER &&
++          // bottom layer's clip is used for the color
++          bg->BottomLayer().mClip == NS_STYLE_BG_CLIP_BORDER &&
+           !nsLayoutUtils::HasNonZeroCorner(mFrame->GetStyleBorder()->
+                                          mBorderRadius));
+ }
+ 
+ PRBool
+ nsDisplayBackground::IsUniform(nsDisplayListBuilder* aBuilder) {
+   // theme background overrides any other background
+   if (mIsThemed)
+     return PR_FALSE;
+ 
+   const nsStyleBackground* bg;
+   PRBool hasBG =
+     nsCSSRendering::FindBackground(mFrame->PresContext(), mFrame, &bg);
+   if (!hasBG)
+     return PR_TRUE;
+-  if ((bg->mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) &&
++  if (!bg->BottomLayer().mImage.mRequest &&
++      bg->mImageCount == 1 &&
+       !nsLayoutUtils::HasNonZeroCorner(mFrame->GetStyleBorder()->mBorderRadius) &&
+-      bg->mBackgroundClip == NS_STYLE_BG_CLIP_BORDER)
++      bg->BottomLayer().mClip == NS_STYLE_BG_CLIP_BORDER)
+     return PR_TRUE;
+   return PR_FALSE;
+ }
+ 
+ PRBool
+ nsDisplayBackground::IsVaryingRelativeToMovingFrame(nsDisplayListBuilder* aBuilder)
+ {
+   NS_ASSERTION(aBuilder->IsMovingFrame(mFrame),
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -3064,19 +3064,20 @@ nsLayoutUtils::GetFrameTransparency(nsIF
+   if (aFrame->GetType() == nsGkAtoms::viewportFrame &&
+       !aFrame->GetFirstChild(nsnull)) {
+     return eTransparencyOpaque;
+   }
+ 
+   const nsStyleBackground* bg;
+   if (!nsCSSRendering::FindBackground(aFrame->PresContext(), aFrame, &bg))
+     return eTransparencyTransparent;
+-  if (NS_GET_A(bg->mBackgroundColor) < 255)
+-    return eTransparencyTransparent;
+-  if (bg->mBackgroundClip != NS_STYLE_BG_CLIP_BORDER)
++  if (NS_GET_A(bg->mBackgroundColor) < 255 ||
++      NS_GET_A(bg->mFallbackBackgroundColor) < 255 ||
++      // bottom layer's clip is used for the color
++      bg->BottomLayer().mClip != NS_STYLE_BG_CLIP_BORDER)
+     return eTransparencyTransparent;
+   return eTransparencyOpaque;
+ }
+ 
+ static PRBool
+ IsNonzeroCoord(const nsStyleCoord& aCoord)
+ {
+   if (eStyleUnit_Coord == aCoord.GetUnit())
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1247,20 +1247,22 @@ nsPresContext::SetImageLoaders(nsIFrame*
+   if (oldLoaders)
+     oldLoaders->Destroy();
+ }
+ 
+ void
+ nsPresContext::SetupBackgroundImageLoaders(nsIFrame* aFrame,
+                                      const nsStyleBackground* aStyleBackground)
+ {
+-  nsRefPtr<nsImageLoader> loader =
+-    nsImageLoader::Create(aFrame, aStyleBackground->mBackgroundImage,
+-                          PR_FALSE, nsnull);
+-  SetImageLoaders(aFrame, BACKGROUND_IMAGE, loader);
++  nsRefPtr<nsImageLoader> loaders;
++  NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, aStyleBackground) {
++    imgIRequest *image = aStyleBackground->mLayers[i].mImage.mRequest;
++    loaders = nsImageLoader::Create(aFrame, image, PR_FALSE, loaders);
++  }
++  SetImageLoaders(aFrame, BACKGROUND_IMAGE, loaders);
+ }
+ 
+ void
+ nsPresContext::SetupBorderImageLoaders(nsIFrame* aFrame,
+                                        const nsStyleBorder* aStyleBorder)
+ {
+   nsRefPtr<nsImageLoader> loader =
+     nsImageLoader::Create(aFrame, aStyleBorder->GetBorderImage(),
+diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
+--- a/layout/base/nsStyleConsts.h
++++ b/layout/base/nsStyleConsts.h
+@@ -238,37 +238,33 @@
+ 
+ // See nsStyleColor
+ #define NS_COLOR_MOZ_HYPERLINKTEXT              -1
+ #define NS_COLOR_MOZ_VISITEDHYPERLINKTEXT       -2
+ #define NS_COLOR_MOZ_ACTIVEHYPERLINKTEXT        -3
+ #define NS_COLOR_CURRENTCOLOR                   -4
+ 
+ // See nsStyleBackground
+-// 0x01 was background-color:transparent
+-#define NS_STYLE_BG_IMAGE_NONE                  0x02
+-#define NS_STYLE_BG_X_POSITION_PERCENT          0x04
+-#define NS_STYLE_BG_X_POSITION_LENGTH           0x08
+-#define NS_STYLE_BG_Y_POSITION_PERCENT          0x10
+-#define NS_STYLE_BG_Y_POSITION_LENGTH           0x20
+-
+-// See nsStyleBackground
+ #define NS_STYLE_BG_ATTACHMENT_SCROLL     0
+ #define NS_STYLE_BG_ATTACHMENT_FIXED      1
+ 
+ // See nsStyleBackground
++// Code depends on these constants having the same values as BG_ORIGIN_*
+ #define NS_STYLE_BG_CLIP_BORDER           0
+ #define NS_STYLE_BG_CLIP_PADDING          1
++// When we add NS_STYLE_BG_CLIP_CONTENT, we should add the PR_STATIC_ASSERTs
++// to the places that assert equality for BORDER and PADDING.
+ 
+ // See nsStyleBackground
+ #define NS_STYLE_BG_INLINE_POLICY_EACH_BOX      0
+ #define NS_STYLE_BG_INLINE_POLICY_CONTINUOUS    1
+ #define NS_STYLE_BG_INLINE_POLICY_BOUNDING_BOX  2
+ 
+ // See nsStyleBackground
++// Code depends on these constants having the same values as BG_CLIP_*
+ #define NS_STYLE_BG_ORIGIN_BORDER         0
+ #define NS_STYLE_BG_ORIGIN_PADDING        1
+ #define NS_STYLE_BG_ORIGIN_CONTENT        2
+ 
+ // See nsStyleBackground
+ // The parser code depends on |ing these values together.
+ #define NS_STYLE_BG_POSITION_CENTER  (1<<0)
+ #define NS_STYLE_BG_POSITION_TOP     (1<<1)
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -542,24 +542,28 @@ nsFrame::DidSetStyleContext(nsStyleConte
+     // If the old context had a background image image and new context
+     // does not have the same image, clear the image load notifier
+     // (which keeps the image loading, if it still is) for the frame.
+     // We want to do this conservatively because some frames paint their
+     // backgrounds from some other frame's style data, and we don't want
+     // to clear those notifiers unless we have to.  (They'll be reset
+     // when we paint, although we could miss a notification in that
+     // interval.)
+-    imgIRequest *oldBackgroundImage =
+-      aOldStyleContext->GetStyleBackground()->mBackgroundImage;
+-    if (oldBackgroundImage &&
+-        !EqualImages(oldBackgroundImage,
+-                     GetStyleBackground()->mBackgroundImage)) {
+-      // stop the image loading for the frame, the image has changed
+-      PresContext()->SetImageLoaders(this,
+-        nsPresContext::BACKGROUND_IMAGE, nsnull);
++    const nsStyleBackground *oldBG = aOldStyleContext->GetStyleBackground();
++    const nsStyleBackground *newBG = GetStyleBackground();
++    NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, oldBG) {
++      imgIRequest *oldImage = oldBG->mLayers[i].mImage.mRequest;
++      imgIRequest *newImage =
++        (i < newBG->mImageCount) ? newBG->mLayers[i].mImage.mRequest : nsnull;
++      if (oldImage && !EqualImages(oldImage, newImage)) {
++        // stop the image loading for the frame, the image has changed
++        PresContext()->SetImageLoaders(this,
++          nsPresContext::BACKGROUND_IMAGE, nsnull);
++        break;
++      }
+     }
+   }
+ 
+   imgIRequest *oldBorderImage = aOldStyleContext
+     ? aOldStyleContext->GetStyleBorder()->GetBorderImage()
+     : nsnull;
+   // For border-images, we can't be as conservative (we need to set the
+   // new loaders if there has been any change) since the CalcDifference
+@@ -4021,21 +4025,24 @@ nsIFrame::CheckInvalidateSizeChange(cons
+     if (border->GetActualBorderWidth(side) != 0) {
+       Invalidate(nsRect(0, 0, aOldRect.width, aOldRect.height));
+       return;
+     }
+   }
+ 
+   // Invalidate the old frame background if the frame has a background
+   // whose position depends on the size of the frame
+-  const nsStyleBackground* background = GetStyleBackground();
+-  if (background->mBackgroundFlags &
+-      (NS_STYLE_BG_X_POSITION_PERCENT | NS_STYLE_BG_Y_POSITION_PERCENT)) {
+-    Invalidate(nsRect(0, 0, aOldRect.width, aOldRect.height));
+-    return;
++  const nsStyleBackground *bg = GetStyleBackground();
++  NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, bg) {
++    const nsStyleBackground::Layer &layer = bg->mLayers[i];
++    if (layer.mImage.mRequest &&
++        (layer.mPosition.mXIsPercent || layer.mPosition.mYIsPercent)) {
++      Invalidate(nsRect(0, 0, aOldRect.width, aOldRect.height));
++      return;
++    }
+   }
+ }
+ 
+ // Define the MAX_FRAME_DEPTH to be the ContentSink's MAX_REFLOW_DEPTH plus
+ // 4 for the frames above the document's frames: 
+ //  the Viewport, GFXScroll, ScrollPort, and Canvas
+ #define MAX_FRAME_DEPTH (MAX_REFLOW_DEPTH+4)
+ 
+diff --git a/layout/reftests/backgrounds/aqua-32x32.png b/layout/reftests/backgrounds/aqua-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7de00c8f79c983562e0c03af031a3a8c348612a4
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)ASWfq{i(!{YjMuMfAm))-CppPSCq=%66L!NSz|;1tuA7$&=W8h2*{^)Pt4`njxg
+HN@xNAzkweE
+
+diff --git a/layout/reftests/backgrounds/blue-32x32.png b/layout/reftests/backgrounds/blue-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..deefd19b2ac53bef91c82ed2f6f4ea5f53a9e34f
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)ASWfq{i(!{YjMuMfAm)=WCN{G4&4gMt7D3sa**K`P_IV~qB%vRdu|^)Pt4`njxg
+HN@xNA-ozi}
+
+diff --git a/layout/reftests/backgrounds/fallback-color-1.xhtml b/layout/reftests/backgrounds/fallback-color-1.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-1.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color only applied when there is an image." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: lime red;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-2.xhtml b/layout/reftests/backgrounds/fallback-color-2.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-2.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color only applied when there is an image." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background-color: lime red;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-3.xhtml b/layout/reftests/backgrounds/fallback-color-3.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-3.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color not applied when background image loads successfully." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(transparent-32x32.png) lime red;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-4.xhtml b/layout/reftests/backgrounds/fallback-color-4.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-4.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color applied when background image corrupted." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(malformed.png) red lime;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-5.xhtml b/layout/reftests/backgrounds/fallback-color-5.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-5.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color applied when background image missing." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(404.png) red lime;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-6.xhtml b/layout/reftests/backgrounds/fallback-color-6.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-6.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color is based on whether the *bottom-most* image is corrupted." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(transparent-32x32.png), url(malformed.png) red lime;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-7.xhtml b/layout/reftests/backgrounds/fallback-color-7.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-7.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color is based on whether the *bottom-most* image is corrupted." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(malformed.png), url(transparent-32x32.png) lime red;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-8.xhtml b/layout/reftests/backgrounds/fallback-color-8.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-8.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color is based on whether the *bottom-most* image is missing." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(transparent-32x32.png), url(404.png) red lime;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-9.xhtml b/layout/reftests/backgrounds/fallback-color-9.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-9.xhtml
+@@ -0,0 +1,25 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<meta name="assert" content="Fallback color is based on whether the *bottom-most* image is missing." />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(404.png), url(transparent-32x32.png) lime red;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fallback-color-ref.xhtml b/layout/reftests/backgrounds/fallback-color-ref.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/fallback-color-ref.xhtml
+@@ -0,0 +1,24 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: fallback colors</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#background-color" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div {
++			width: 100px;
++			height: 100px;
++			background: url(lime-32x32.png);
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/fuchsia-32x32.png b/layout/reftests/backgrounds/fuchsia-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7902bc31e09b58fbe224fb8047e84332eb132cce
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)ASWfq{i(!{YjMuMfAm)~HSPpPSCq=%66L!NSz|;1tu=XeK+WW4m;KdKf%i{an^L
+HB{Ts5wL2bP
+
+diff --git a/layout/reftests/backgrounds/layers-layer-count-1-ref.xhtml b/layout/reftests/backgrounds/layers-layer-count-1-ref.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-1-ref.xhtml
+@@ -0,0 +1,35 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div {
++			position: relative; height: 100px; width: 100px;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div>
++		<img style="position: absolute; left: 10px; top: 10px" src="aqua-32x32.png" />
++	</div>
++	<div>
++		<img style="position: absolute; left: 15px; top: 15px" src="fuchsia-32x32.png" />
++		<img style="position: absolute; left: 20px; top: 20px" src="blue-32x32.png" />
++		<img style="position: absolute; left:  5px; top:  5px" src="aqua-32x32.png" />
++		<img style="position: absolute; left: 10px; top: 10px" src="yellow-32x32.png" />
++	</div>
++	<div>
++		<img style="position: absolute; left: 20px; top: 20px" src="fuchsia-32x32.png" />
++		<img style="position: absolute; left:  5px; top:  5px" src="yellow-32x32.png" />
++		<img style="position: absolute; left: 10px; top: 10px" src="blue-32x32.png" />
++	</div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-layer-count-2-ref.xhtml b/layout/reftests/backgrounds/layers-layer-count-2-ref.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-2-ref.xhtml
+@@ -0,0 +1,35 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div {
++			position: relative; height: 100px; width: 100px;
++		}
++
++		]]></style>
++	</head>
++	<body>
++
++	<div>
++		<img style="position: absolute; left: 10px; top: 10px" src="yellow-32x32.png" />
++	</div>
++	<div>
++		<img style="position: absolute; left: 15px; top: 15px" src="fuchsia-32x32.png" />
++		<img style="position: absolute; left: 20px; top: 20px" src="blue-32x32.png" />
++		<img style="position: absolute; left:  0px; top:  0px" src="aqua-32x32.png" />
++		<img style="position: absolute; left:  5px; top:  5px" src="yellow-32x32.png" />
++	</div>
++	<div>
++		<img style="position: absolute; left: 20px; top: 20px" src="blue-32x32.png" />
++		<img style="position: absolute; left:  5px; top:  5px" src="aqua-32x32.png" />
++		<img style="position: absolute; left: 10px; top: 10px" src="yellow-32x32.png" />
++	</div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-layer-count-cascade-1.xhtml b/layout/reftests/backgrounds/layers-layer-count-cascade-1.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-cascade-1.xhtml
+@@ -0,0 +1,36 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div {
++			position: relative; height: 100px; width: 100px;
++			background-repeat: no-repeat;
++			background-position: 10px 10px, 5px 5px, 20px 20px, 15px 15px;
++			background-image: url(aqua-32x32.png);
++		}
++
++		div.withclass {
++			background-image: url(yellow-32x32.png), url(aqua-32x32.png), url(blue-32x32.png), url(fuchsia-32x32.png), url(red-32x32.png);
++		}
++
++		div#withid {
++			background-image: url(blue-32x32.png), url(yellow-32x32.png), url(fuchsia-32x32.png);
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++	<div class="withclass"></div>
++	<div class="withclass" id="withid"></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-layer-count-cascade-2.xhtml b/layout/reftests/backgrounds/layers-layer-count-cascade-2.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-cascade-2.xhtml
+@@ -0,0 +1,36 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div {
++			position: relative; height: 100px; width: 100px;
++			background-repeat: no-repeat;
++			background-position: 10px 10px;
++			background-image: url(yellow-32x32.png), url(aqua-32x32.png), url(blue-32x32.png), url(fuchsia-32x32.png), url(red-32x32.png);
++		}
++
++		div.withclass {
++			background-position: 5px 5px, 0px 0px, 20px 20px, 15px 15px;
++		}
++
++		div#withid {
++			background-position: 10px 10px, 5px 5px, 20px 20px;
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div></div>
++	<div class="withclass"></div>
++	<div class="withclass" id="withid"></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-layer-count-inheritance-1.xhtml b/layout/reftests/backgrounds/layers-layer-count-inheritance-1.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-inheritance-1.xhtml
+@@ -0,0 +1,39 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		body > div {
++			position: relative; height: 300px; width: 100px;
++			background-repeat: no-repeat;
++			background-position: 10px 10px, 5px 5px, 20px 20px, 15px 15px;
++			background-image: url(aqua-32x32.png);
++		}
++
++		body > div > div {
++			position: absolute; height: 200px; width: 100px; top: 100px; left: 0;
++			background-repeat: no-repeat;
++			background-position: inherit;
++			background-image: url(yellow-32x32.png), url(aqua-32x32.png), url(blue-32x32.png), url(fuchsia-32x32.png), url(red-32x32.png);
++		}
++
++		body > div > div > div {
++			position: absolute; height: 100px; width: 100px; top: 100px; left: 0;
++			background: inherit;
++			background-image: url(blue-32x32.png), url(yellow-32x32.png), url(fuchsia-32x32.png);
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div><div><div></div></div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-layer-count-inheritance-2.xhtml b/layout/reftests/backgrounds/layers-layer-count-inheritance-2.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-layer-count-inheritance-2.xhtml
+@@ -0,0 +1,39 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: number of background layers determined by background-image</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		body > div {
++			position: relative; height: 300px; width: 100px;
++			background-repeat: no-repeat;
++			background-position: 10px 10px;
++			background-image: url(yellow-32x32.png), url(aqua-32x32.png), url(blue-32x32.png), url(fuchsia-32x32.png), url(red-32x32.png);
++		}
++
++		body > div > div {
++			position: absolute; height: 200px; width: 100px; top: 100px; left: 0;
++			background: inherit;
++			background-position: 5px 5px, 0px 0px, 20px 20px, 15px 15px;
++		}
++
++		body > div > div > div {
++			position: absolute; height: 100px; width: 100px; top: 100px; left: 0;
++			background-image: inherit;
++			background-repeat: inherit;
++			background-position: 10px 10px, 5px 5px, 20px 20px;
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div><div><div></div></div></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-stacking-order-ref.xhtml b/layout/reftests/backgrounds/layers-stacking-order-ref.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-stacking-order-ref.xhtml
+@@ -0,0 +1,28 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: stacking order of layers</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div#test {
++			position: relative; height: 100px; width: 100px;
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div id="test">
++		<img src="aqua-32x32.png" style="position: absolute; left: 20px; top: 20px" />
++		<img src="fuchsia-32x32.png" style="position: absolute; left: 10px; top: 10px" />
++		<img src="yellow-32x32.png" style="position: absolute; left: 15px; top: 15px" />
++		<img src="blue-32x32.png" style="position: absolute; left: 5px; top: 5px" />
++	</div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/layers-stacking-order.xhtml b/layout/reftests/backgrounds/layers-stacking-order.xhtml
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/layers-stacking-order.xhtml
+@@ -0,0 +1,27 @@
++<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
++<html xmlns="http://www.w3.org/1999/xhtml">
++	<head>
++		<title>css3-background: stacking order of layers</title>
++		<link rel="author" title="L. David Baron" href="http://dbaron.org/" />
++		<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
++		<link rel="help" href="http://dev.w3.org/csswg/css3-background/#layering" />
++		<meta name="flags" content="" />
++		<style type="text/css"><![CDATA[
++
++		div#test {
++			position: relative; height: 100px; width: 100px;
++			background: url(blue-32x32.png) 5px 5px no-repeat,
++			            url(yellow-32x32.png) 15px 15px no-repeat,
++			            url(fuchsia-32x32.png) 10px 10px no-repeat,
++			            url(aqua-32x32.png) 20px 20px no-repeat;
++		}
++
++
++		]]></style>
++	</head>
++	<body>
++
++	<div id="test"></div>
++
++	</body>
++</html>
+diff --git a/layout/reftests/backgrounds/lime-32x32.png b/layout/reftests/backgrounds/lime-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c85b56ca8e2fd27b73d5e0ea3cacad5ed093643a
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)AScfq{c%!R3E*O<VcRH5^ilRtYycC<t({Ff}@SP>xu1l+ixz#hVnM9tKZWKbLh*
+G2~7Z|vmSK-
+
+diff --git a/layout/reftests/backgrounds/malformed.png b/layout/reftests/backgrounds/malformed.png
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/malformed.png
+@@ -0,0 +1,1 @@
++This is not a PNG file.
+diff --git a/layout/reftests/backgrounds/red-32x32.png b/layout/reftests/backgrounds/red-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..191e13ea11d03f0446f6f3bc185d7ef2ab2946be
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)AScfq{c%!R3E*O<VcRH5`2NN?Dj19TWsOSeOn@PGDSogwZ}i_Psh#4}+(xpUXO@
+GgeCxfn;eY*
+
+diff --git a/layout/reftests/backgrounds/reftest.list b/layout/reftests/backgrounds/reftest.list
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/backgrounds/reftest.list
+@@ -0,0 +1,15 @@
++== fallback-color-1.xhtml fallback-color-ref.xhtml
++== fallback-color-2.xhtml fallback-color-ref.xhtml
++== fallback-color-3.xhtml fallback-color-ref.xhtml
++== fallback-color-4.xhtml fallback-color-ref.xhtml
++== fallback-color-5.xhtml fallback-color-ref.xhtml
++== fallback-color-6.xhtml fallback-color-ref.xhtml
++== fallback-color-7.xhtml fallback-color-ref.xhtml
++== fallback-color-8.xhtml fallback-color-ref.xhtml
++== fallback-color-9.xhtml fallback-color-ref.xhtml
++!= fallback-color-ref.xhtml about:blank
++== layers-stacking-order.xhtml layers-stacking-order-ref.xhtml
++== layers-layer-count-cascade-1.xhtml layers-layer-count-1-ref.xhtml
++== layers-layer-count-inheritance-1.xhtml layers-layer-count-1-ref.xhtml
++== layers-layer-count-cascade-2.xhtml layers-layer-count-2-ref.xhtml
++== layers-layer-count-inheritance-2.xhtml layers-layer-count-2-ref.xhtml
+diff --git a/layout/reftests/backgrounds/transparent-32x32.png b/layout/reftests/backgrounds/transparent-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..62b1906cc970f5d2fe3d04af22c0098da2e8f55e
+GIT binary patch
+literal 96
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1|*BCs=fdz#^NA%Cx&(BWL^R}Ql2i3ArXh)
+o9%N($@|qO>ug~*v05RXQ2`DfyPX8W$9mrwuboFyt=akR{0M@M+c>n+a
+
+diff --git a/layout/reftests/backgrounds/yellow-32x32.png b/layout/reftests/backgrounds/yellow-32x32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a45f8111b446ceaea47b2ef50c46742333c177b1
+GIT binary patch
+literal 110
+zc%17D@N?(olHy`uVBq!ia0vp^3LwnE1SJ1Ryj={W7>k44ofy`glX(f`Xn49fhIkx*
+zd)AScfq{c%!R3E*O<VcRH5|@92~lTibWjlBU}0)};J#s76qB9EHn-0}Jq(_%elF{r
+G5}E+5avn(l
+
+diff --git a/layout/reftests/reftest.list b/layout/reftests/reftest.list
+--- a/layout/reftests/reftest.list
++++ b/layout/reftests/reftest.list
+@@ -6,16 +6,19 @@
+ # for something to not be in order.
+ 
+ # verify the tests work
+ include reftest-sanity/reftest.list
+ 
+ # images (if libpr0n is busted, could result in weird failures in other tests)
+ include ../../modules/libpr0n/test/reftest/reftest.list
+ 
++# backgrounds/
++include backgrounds/reftest.list
++
+ # bidi/
+ include bidi/reftest.list
+ 
+ # border-image
+ include border-image/reftest.list
+ 
+ # border-radius/
+ include border-radius/reftest.list
+diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
+--- a/layout/style/nsCSSDataBlock.cpp
++++ b/layout/style/nsCSSDataBlock.cpp
+@@ -191,18 +191,17 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+             void *prop =
+                 nsCSSExpandedDataBlock::RuleDataPropertyAt(aRuleData, iProp);
+             switch (nsCSSProps::kTypeTable[iProp]) {
+                 case eCSSType_Value: {
+                     nsCSSValue* target = static_cast<nsCSSValue*>(prop);
+                     if (target->GetUnit() == eCSSUnit_Null) {
+                         const nsCSSValue *val = ValueAtCursor(cursor);
+                         NS_ASSERTION(val->GetUnit() != eCSSUnit_Null, "oops");
+-                        if (iProp == eCSSProperty_background_image ||
+-                            iProp == eCSSProperty_list_style_image) {
++                        if (iProp == eCSSProperty_list_style_image) {
+                             if (val->GetUnit() == eCSSUnit_URL) {
+                                 val->StartImageLoad(
+                                     aRuleData->mPresContext->Document());
+                             }
+                         } else if (iProp == eCSSProperty_border_image) {
+                             if (val->GetUnit() == eCSSUnit_Array) {
+                                 nsCSSValue::Array *array = val->GetArrayValue();
+                                 if (array->Item(0).GetUnit() == eCSSUnit_URL) {
+@@ -212,55 +211,29 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+                             }
+                         }
+                         *target = *val;
+                         if (iProp == eCSSProperty_font_family) {
+                             // XXX Are there other things like this?
+                             aRuleData->mFontData->mFamilyFromHTML = PR_FALSE;
+                         }
+                         else if (iProp == eCSSProperty_color ||
+-                                 iProp == eCSSProperty_background_color ||
+-                                 iProp == eCSSProperty_background_image ||
+                                  iProp == eCSSProperty_border_top_color ||
+                                  iProp == eCSSProperty_border_right_color_value ||
+                                  iProp == eCSSProperty_border_right_color_ltr_source ||
+                                  iProp == eCSSProperty_border_right_color_rtl_source ||
+                                  iProp == eCSSProperty_border_bottom_color ||
+                                  iProp == eCSSProperty_border_left_color_value ||
+                                  iProp == eCSSProperty_border_left_color_ltr_source ||
+                                  iProp == eCSSProperty_border_left_color_rtl_source ||
+                                  iProp == eCSSProperty__moz_column_rule_color ||
+                                  iProp == eCSSProperty_outline_color) {
+                             if (ShouldIgnoreColors(aRuleData)) {
+-                                if (iProp == eCSSProperty_background_color) {
+-                                    // Force non-'transparent' background
+-                                    // colors to the user's default.
+-                                    // We have the value in the form it was
+-                                    // specified at this point, so we have to
+-                                    // look for both the keyword 'transparent'
+-                                    // and its equivalent in rgba notation.
+-                                    nsCSSUnit u = target->GetUnit();
+-                                    nsDependentString buf;
+-                                    
+-                                    if ((u == eCSSUnit_Color &&
+-                                         NS_GET_A(target->GetColorValue())
+-                                         > 0) ||
+-                                        (u == eCSSUnit_String &&
+-                                         !nsGkAtoms::transparent->
+-                                         Equals(target->GetStringValue(buf))) ||
+-                                        (u == eCSSUnit_EnumColor)) {
+-                                        target->SetColorValue(aRuleData->
+-                                            mPresContext->
+-                                            DefaultBackgroundColor());
+-                                    }
+-                                } else {
+-                                    // Ignore 'color', 'border-*-color', and
+-                                    // 'background-image'
+-                                    *target = nsCSSValue();
+-                                }
++                                // Ignore 'color', 'border-*-color', etc.
++                                *target = nsCSSValue();
+                             }
+                         }
+                     }
+                     cursor += CDBValueStorage_advance;
+                 } break;
+ 
+                 case eCSSType_Rect: {
+                     const nsCSSRect* val = RectAtCursor(cursor);
+@@ -277,25 +250,60 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+                     cursor += CDBRectStorage_advance;
+                 } break;
+ 
+                 case eCSSType_ValuePair: {
+                     const nsCSSValuePair* val = ValuePairAtCursor(cursor);
+                     NS_ASSERTION(val->mXValue.GetUnit() != eCSSUnit_Null ||
+                                  val->mYValue.GetUnit() != eCSSUnit_Null, "oops");
+                     nsCSSValuePair* target = static_cast<nsCSSValuePair*>(prop);
+-                    if (target->mXValue.GetUnit() == eCSSUnit_Null)
++                    NS_ASSERTION((target->mXValue.GetUnit() == eCSSUnit_Null)
++                              == (target->mYValue.GetUnit() == eCSSUnit_Null),
++                                 "half a property?");
++                    if (target->mXValue.GetUnit() == eCSSUnit_Null) {
+                         target->mXValue = val->mXValue;
+-                    if (target->mYValue.GetUnit() == eCSSUnit_Null)
+                         target->mYValue = val->mYValue;
++                        if (iProp == eCSSProperty_background_color &&
++                            ShouldIgnoreColors(aRuleData)) {
++                            // Force non-'transparent' background colors
++                            // to the user's default.  We have the value
++                            // in the form it was specified at this
++                            // point, so we have to look for both the
++                            // keyword 'transparent' and its equivalent
++                            // in rgba notation.
++                            nsCSSValue &colorVal = target->mXValue;
++                            nsCSSUnit u = colorVal.GetUnit();
++                            nsDependentString buf;
++                            
++                            if ((u == eCSSUnit_Color &&
++                                 NS_GET_A(colorVal.GetColorValue())
++                                 > 0) ||
++                                (u == eCSSUnit_String &&
++                                 !nsGkAtoms::transparent->
++                                 Equals(colorVal.GetStringValue(buf))) ||
++                                (u == eCSSUnit_EnumColor)) {
++                                colorVal.SetColorValue(aRuleData->
++                                    mPresContext->
++                                    DefaultBackgroundColor());
++                            }
++                            // We could consider using the fallback
++                            // background color for both values, but it
++                            // might not make sense if the author didn't
++                            // specify an image.  But since we're
++                            // dropping author images, we'll just use
++                            // the non-fallback for both.
++                            target->mYValue = target->mXValue;
++                        }
++                    }
+                     cursor += CDBValuePairStorage_advance;
+                 } break;
+ 
+                 case eCSSType_ValueList:
+-                    if (iProp == eCSSProperty_content) {
++                    if (iProp == eCSSProperty_background_image ||
++                        iProp == eCSSProperty_content) {
+                         for (nsCSSValueList* l = ValueListAtCursor(cursor);
+                              l; l = l->mNext)
+                             if (l->mValue.GetUnit() == eCSSUnit_URL)
+                                 l->mValue.StartImageLoad(
+                                     aRuleData->mPresContext->Document());
+                     } else if (iProp == eCSSProperty_cursor) {
+                         for (nsCSSValueList* l = ValueListAtCursor(cursor);
+                              l; l = l->mNext)
+@@ -312,17 +320,18 @@ nsCSSCompressedDataBlock::MapRuleInfoInt
+                 // fall through
+                 case eCSSType_ValuePairList: {
+                     void** target = static_cast<void**>(prop);
+                     if (!*target) {
+                         void* val = PointerAtCursor(cursor);
+                         NS_ASSERTION(val, "oops");
+                         *target = val;
+ 
+-                        if (iProp == eCSSProperty_border_top_colors ||
++                        if (iProp == eCSSProperty_background_image ||
++                            iProp == eCSSProperty_border_top_colors ||
+                             iProp == eCSSProperty_border_right_colors ||
+                             iProp == eCSSProperty_border_bottom_colors ||
+                             iProp == eCSSProperty_border_left_colors) {
+                             if (ShouldIgnoreColors(aRuleData)) {
+                                 *target = nsnull;
+                             }
+                         }
+                     }
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -204,22 +204,27 @@ PRBool nsCSSDeclaration::AppendValueToSt
+       } break;
+       case eCSSType_ValuePairList: {
+         const nsCSSValuePairList* item =
+             *static_cast<nsCSSValuePairList*const*>(storage);
+         do {
+           NS_ASSERTION(item->mXValue.GetUnit() != eCSSUnit_Null,
+                        "unexpected null unit");
+           AppendCSSValueToString(aProperty, item->mXValue, aResult);
+-          if (item->mYValue.GetUnit() != eCSSUnit_Null) {
++          if (item->mXValue.GetUnit() != eCSSUnit_Inherit &&
++              item->mXValue.GetUnit() != eCSSUnit_Initial &&
++              item->mYValue.GetUnit() != eCSSUnit_Null) {
+             aResult.Append(PRUnichar(' '));
+             AppendCSSValueToString(aProperty, item->mYValue, aResult);
+           }
+           item = item->mNext;
+           if (item) {
++            if (nsCSSProps::PropHasFlags(aProperty,
++                                         CSS_PROPERTY_VALUE_LIST_USES_COMMAS))
++              aResult.Append(PRUnichar(','));
+             aResult.Append(PRUnichar(' '));
+           }
+         } while (item);
+       } break;
+     }
+   }
+   return storage != nsnull;
+ }
+@@ -756,60 +761,107 @@ nsCSSDeclaration::GetValue(nsCSSProperty
+       const nsCSSProperty* subprops =
+         nsCSSProps::SubpropertyEntryFor(aProperty);
+       NS_ASSERTION(subprops[3] == eCSSProperty_UNKNOWN,
+                    "not box property with physical vs. logical cascading");
+       AppendValueToString(subprops[0], aValue);
+       break;
+     }
+     case eCSSProperty_background: {
+-      // The -moz-background-clip, -moz-background-origin, and
+-      // -moz-background-inline-policy properties are reset by this
+-      // shorthand property to their initial values, but can't be
+-      // represented in its syntax.
+-      const nsCSSValue *clipValue = static_cast<const nsCSSValue*>(
+-        data->StorageFor(eCSSProperty__moz_background_clip));
+-      const nsCSSValue *originValue = static_cast<const nsCSSValue*>(
+-        data->StorageFor(eCSSProperty__moz_background_origin));
+-      const nsCSSValue *inlinePolicyValue = static_cast<const nsCSSValue*>(
+-        data->StorageFor(eCSSProperty__moz_background_inline_policy));
+-      if (*clipValue !=
+-            nsCSSValue(NS_STYLE_BG_CLIP_BORDER, eCSSUnit_Enumerated) ||
+-          *originValue !=
+-            nsCSSValue(NS_STYLE_BG_ORIGIN_PADDING, eCSSUnit_Enumerated) ||
+-          *inlinePolicyValue !=
+-            nsCSSValue(NS_STYLE_BG_INLINE_POLICY_CONTINUOUS,
+-                       eCSSUnit_Enumerated)) {
+-        return NS_OK;
+-      }
+-      
+-      PRBool appendedSomething = PR_FALSE;
+-      if (AppendValueToString(eCSSProperty_background_color, aValue)) {
+-        appendedSomething = PR_TRUE;
++      // We know from above that all subproperties were specified.
++      // However, we still can't represent that in the shorthand unless
++      // they're all lists of the same length.  So if they're different
++      // lengths, we need to bail out.
++      // We also need to bail out if an item has background-clip and
++      // background-origin that are different and not the default
++      // values.  (We omit them if they're both default.)
++      const nsCSSValueList *image =
++        * data->ValueListStorageFor(eCSSProperty_background_image);
++      const nsCSSValueList *repeat =
++        * data->ValueListStorageFor(eCSSProperty_background_repeat);
++      const nsCSSValueList *attachment =
++        * data->ValueListStorageFor(eCSSProperty_background_attachment);
++      const nsCSSValuePairList *position =
++        * data->ValuePairListStorageFor(eCSSProperty_background_position);
++      const nsCSSValueList *clip =
++        * data->ValueListStorageFor(eCSSProperty__moz_background_clip);
++      const nsCSSValueList *origin =
++        * data->ValueListStorageFor(eCSSProperty__moz_background_origin);
++      for (;;) {
++        AppendCSSValueToString(eCSSProperty_background_image,
++                               image->mValue, aValue);
++        aValue.Append(PRUnichar(' '));
++        AppendCSSValueToString(eCSSProperty_background_repeat,
++                               repeat->mValue, aValue);
++        aValue.Append(PRUnichar(' '));
++        AppendCSSValueToString(eCSSProperty_background_attachment,
++                               attachment->mValue, aValue);
++        aValue.Append(PRUnichar(' '));
++        AppendCSSValueToString(eCSSProperty_background_position,
++                               position->mXValue, aValue);
++        aValue.Append(PRUnichar(' '));
++        AppendCSSValueToString(eCSSProperty_background_position,
++                               position->mYValue, aValue);
++        NS_ASSERTION(clip->mValue.GetUnit() == eCSSUnit_Enumerated &&
++                     origin->mValue.GetUnit() == eCSSUnit_Enumerated,
++                     "should not be inherit/initial within list and "
++                     "should have returned early for real inherit/initial");
++        if (clip->mValue.GetIntValue() != NS_STYLE_BG_CLIP_BORDER ||
++            origin->mValue.GetIntValue() != NS_STYLE_BG_ORIGIN_PADDING) {
++#if 0
++    // This is commented out for now until we change
++    // -moz-background-clip to background-clip, -moz-background-origin
++    // to background-origin, change their value names to *-box, and add
++    // support for content-box on background-clip.
++          PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_BORDER ==
++                           NS_STYLE_BG_ORIGIN_BORDER);
++          PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_PADDING == 
++                           NS_STYLE_BG_ORIGIN_PADDING);
++          // PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_CONTENT == /* does not exist */
++          //                  NS_STYLE_BG_ORIGIN_CONTENT);
++          if (clip->mValue != origin->mValue) {
++            aValue.Truncate();
++            return NS_OK;
++          }
++
++          aValue.Append(PRUnichar(' '));
++          AppendCSSValueToString(eCSSProperty__moz_background_clip,
++                                 clip->mValue, aValue);
++#else
++          aValue.Truncate();
++          return NS_OK;
++#endif
++        }
++
++        image = image->mNext;
++        repeat = repeat->mNext;
++        attachment = attachment->mNext;
++        position = position->mNext;
++        clip = clip->mNext;
++        origin = origin->mNext;
++
++        if (!image) {
++          if (repeat || attachment || position || clip || origin) {
++            // Uneven length lists, so can't be serialized as shorthand.
++            aValue.Truncate();
++            return NS_OK;
++          }
++          break;
++        }
++        if (!repeat || !attachment || !position || !clip || !origin) {
++          // Uneven length lists, so can't be serialized as shorthand.
++          aValue.Truncate();
++          return NS_OK;
++        }
++        aValue.Append(PRUnichar(','));
+         aValue.Append(PRUnichar(' '));
+       }
+-      if (AppendValueToString(eCSSProperty_background_image, aValue)) {
+-        aValue.Append(PRUnichar(' '));
+-        appendedSomething = PR_TRUE;
+-      }
+-      if (AppendValueToString(eCSSProperty_background_repeat, aValue)) {
+-        aValue.Append(PRUnichar(' '));
+-        appendedSomething = PR_TRUE;
+-      }
+-      if (AppendValueToString(eCSSProperty_background_attachment, aValue)) {
+-        aValue.Append(PRUnichar(' '));
+-        appendedSomething = PR_TRUE;
+-      }
+-      if (!AppendValueToString(eCSSProperty_background_position, aValue) &&
+-          appendedSomething) {
+-        NS_ASSERTION(!aValue.IsEmpty() && aValue.Last() == PRUnichar(' '),
+-                     "We appended a space before!");
+-        // We appended an extra space.  Let's get rid of it
+-        aValue.Truncate(aValue.Length() - 1);
+-      }
++
++      aValue.Append(PRUnichar(' '));
++      AppendValueToString(eCSSProperty_background_color, aValue);
+       break;
+     }
+     case eCSSProperty_cue: {
+       if (AppendValueToString(eCSSProperty_cue_before, aValue)) {
+         aValue.Append(PRUnichar(' '));
+         if (!AppendValueToString(eCSSProperty_cue_after, aValue))
+           aValue.Truncate();
+       }
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -79,16 +79,17 @@
+ #include "nsStyleUtil.h"
+ #include "nsIPrincipal.h"
+ #include "prprf.h"
+ #include "math.h"
+ #include "nsContentUtils.h"
+ #include "nsDOMError.h"
+ #include "nsAutoPtr.h"
+ #include "nsTArray.h"
++#include "prlog.h"
+ 
+ // Flags for ParseVariant method
+ #define VARIANT_KEYWORD         0x000001  // K
+ #define VARIANT_LENGTH          0x000002  // L
+ #define VARIANT_PERCENT         0x000004  // P
+ #define VARIANT_COLOR           0x000008  // C eCSSUnit_Color, eCSSUnit_String (e.g.  "red")
+ #define VARIANT_URL             0x000010  // U
+ #define VARIANT_NUMBER          0x000020  // N
+@@ -385,19 +386,40 @@ protected:
+   PRBool ParseTreePseudoElement(nsCSSSelector& aSelector);
+ #endif
+ 
+   void InitBoxPropsAsPhysical(const nsCSSProperty *aSourceProperties);
+ 
+   // Property specific parsing routines
+   PRBool ParseAzimuth(nsCSSValue& aValue);
+   PRBool ParseBackground();
++
++  struct BackgroundItem;
++  friend struct BackgroundItem;
++  struct BackgroundItem {
++    nsCSSValue mImage;
++    nsCSSValue mRepeat;
++    nsCSSValue mAttachment;
++    nsCSSValuePair mPosition;
++    nsCSSValue mClip;
++    nsCSSValue mOrigin;
++    // The background-color is set as a side-effect, and if so, mLastItem
++    // is set to true.
++    PRBool mLastItem;
++  };
++  struct BackgroundItemSimpleValueInfo {
++    nsCSSValue BackgroundItem::*member;
++    nsCSSProperty propID;
++  };
++
++  PRBool ParseBackgroundItem(BackgroundItem& aItem, PRBool aFirstItem);
++
++  PRBool ParseBackgroundList(nsCSSProperty aPropID); // a single value prop-id
++  PRBool ParseBackgroundColor(PRBool aInShorthand);
+   PRBool ParseBackgroundPosition();
+-  PRBool ParseBackgroundPositionValues();
+-  PRBool ParseBoxPosition(nsCSSValuePair& aOut);
+   PRBool ParseBoxPositionValues(nsCSSValuePair& aOut);
+   PRBool ParseBorderColor();
+   PRBool ParseBorderColors(nsCSSValueList** aResult,
+                            nsCSSProperty aProperty);
+   PRBool ParseBorderImage();
+   PRBool ParseBorderSpacing();
+   PRBool ParseBorderSide(const nsCSSProperty aPropIDs[],
+                          PRBool aSetAllSides);
+@@ -4935,18 +4957,26 @@ static const nsCSSProperty kOutlineRadiu
+ PRBool
+ CSSParserImpl::ParseProperty(nsCSSProperty aPropID)
+ {
+   NS_ASSERTION(aPropID < eCSSProperty_COUNT, "index out of range");
+ 
+   switch (aPropID) {  // handle shorthand or multiple properties
+   case eCSSProperty_background:
+     return ParseBackground();
++  case eCSSProperty_background_color:
++    return ParseBackgroundColor(PR_FALSE);
+   case eCSSProperty_background_position:
+     return ParseBackgroundPosition();
++  case eCSSProperty_background_attachment:
++  case eCSSProperty__moz_background_clip:
++  case eCSSProperty_background_image:
++  case eCSSProperty__moz_background_origin:
++  case eCSSProperty_background_repeat:
++    return ParseBackgroundList(aPropID);
+   case eCSSProperty_border:
+     return ParseBorderSide(kBorderTopIDs, PR_TRUE);
+   case eCSSProperty_border_color:
+     return ParseBorderColor();
+   case eCSSProperty_border_spacing:
+     return ParseBorderSpacing();
+   case eCSSProperty_border_style:
+     return ParseBorderStyle();
+@@ -5188,16 +5218,17 @@ CSSParserImpl::ParseProperty(nsCSSProper
+ 
+ PRBool
+ CSSParserImpl::ParseSingleValueProperty(nsCSSValue& aValue,
+                                         nsCSSProperty aPropID)
+ {
+   switch (aPropID) {
+   case eCSSProperty_UNKNOWN:
+   case eCSSProperty_background:
++  case eCSSProperty_background_color:
+   case eCSSProperty_background_position:
+   case eCSSProperty_border:
+   case eCSSProperty_border_color:
+   case eCSSProperty_border_bottom_colors:
+   case eCSSProperty_border_image:
+   case eCSSProperty_border_left_colors:
+   case eCSSProperty_border_right_colors:
+   case eCSSProperty_border_end_color:
+@@ -5300,32 +5331,35 @@ CSSParserImpl::ParseSingleValueProperty(
+     return PR_FALSE;
+ 
+   case eCSSProperty_appearance:
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kAppearanceKTable);
+   case eCSSProperty_azimuth:
+     return ParseAzimuth(aValue);
+   case eCSSProperty_background_attachment:
++    // Used only internally.
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBackgroundAttachmentKTable);
+   case eCSSProperty__moz_background_clip:
++    // Used only internally.
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBackgroundClipKTable);
+-  case eCSSProperty_background_color:
+-    return ParseVariant(aValue, VARIANT_HC, nsnull);
+   case eCSSProperty_background_image:
++    // Used only internally.
+     return ParseVariant(aValue, VARIANT_HUO, nsnull);
+   case eCSSProperty__moz_background_inline_policy:
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBackgroundInlinePolicyKTable);
+   case eCSSProperty__moz_background_origin:
++    // Used only internally.
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBackgroundOriginKTable);
+   case eCSSProperty_background_repeat:
++    // Used only internally.
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBackgroundRepeatKTable);
+   case eCSSProperty_binding:
+     return ParseVariant(aValue, VARIANT_HUO, nsnull);
+   case eCSSProperty_border_collapse:
+     return ParseVariant(aValue, VARIANT_HK,
+                         nsCSSProps::kBorderCollapseKTable);
+   case eCSSProperty_border_bottom_color:
+@@ -5853,196 +5887,380 @@ BoxPositionMaskToCSSValue(PRInt32 aMask,
+   return nsCSSValue(val, eCSSUnit_Enumerated);
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseBackground()
+ {
+   nsAutoParseCompoundProperty compound(this);
+ 
++  // These two are set through side-effects of ParseBackgroundItem.
++  mTempData.mColor.mBackColor.mXValue.SetColorValue(NS_RGBA(0, 0, 0, 0));
++  mTempData.mColor.mBackColor.mYValue.SetColorValue(NS_RGBA(0, 0, 0, 0));
++
++  BackgroundItem bgitem;
++  nsCSSValuePairList *positionHead = nsnull, **positionTail = &positionHead;
++  static const BackgroundItemSimpleValueInfo simpleValues[] = {
++    { &BackgroundItem::mImage,      eCSSProperty_background_image },
++    { &BackgroundItem::mRepeat,     eCSSProperty_background_repeat },
++    { &BackgroundItem::mAttachment, eCSSProperty_background_attachment },
++    { &BackgroundItem::mClip,       eCSSProperty__moz_background_clip },
++    { &BackgroundItem::mOrigin,     eCSSProperty__moz_background_origin }
++  };
++  nsCSSValueList *simpleHeads[NS_ARRAY_LENGTH(simpleValues)];
++  nsCSSValueList **simpleTails[NS_ARRAY_LENGTH(simpleValues)];
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++    simpleHeads[i] = nsnull;
++    simpleTails[i] = &simpleHeads[i];
++  }
++  for (;;) {
++    if (!ParseBackgroundItem(bgitem, !positionHead)) {
++      break;
++    }
++    nsCSSValuePairList *positionItem = new nsCSSValuePairList;
++    if (!positionItem) {
++      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      break;
++    }
++    positionItem->mXValue = bgitem.mPosition.mXValue;
++    positionItem->mYValue = bgitem.mPosition.mYValue;
++    *positionTail = positionItem;
++    positionTail = &positionItem->mNext;
++
++    PRBool fail = PR_FALSE;
++    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++      nsCSSValueList *item = new nsCSSValueList;
++      if (!item) {
++        mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++        fail = PR_TRUE;
++        break;
++      }
++      item->mValue = bgitem.*(simpleValues[i].member);
++      *simpleTails[i] = item;
++      simpleTails[i] = &item->mNext;
++    }
++    if (fail) {
++      break;
++    }
++
++    if (!bgitem.mLastItem && ExpectSymbol(',', PR_TRUE)) {
++      continue;
++    }
++    if (!ExpectEndProperty()) {
++      break;
++    }
++
++    mTempData.mColor.mBackPosition = positionHead;
++    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++      nsCSSValueList **source = static_cast<nsCSSValueList**>(
++        mTempData.PropertyAt(simpleValues[i].propID));
++      *source = simpleHeads[i];
++    }
++
++    mTempData.SetPropertyBit(eCSSProperty_background_color);
++    mTempData.SetPropertyBit(eCSSProperty_background_image);
++    mTempData.SetPropertyBit(eCSSProperty_background_repeat);
++    mTempData.SetPropertyBit(eCSSProperty_background_attachment);
++    mTempData.SetPropertyBit(eCSSProperty_background_position);
++    mTempData.SetPropertyBit(eCSSProperty__moz_background_clip);
++    mTempData.SetPropertyBit(eCSSProperty__moz_background_origin);
++    return PR_TRUE;
++  }
++  delete positionHead;
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(simpleValues); ++i) {
++    delete simpleHeads[i];
++  }
++  return PR_FALSE;
++}
++
++// Parse one item of the background shorthand property.
++PRBool
++CSSParserImpl::ParseBackgroundItem(CSSParserImpl::BackgroundItem& aItem,
++                                   PRBool aFirstItem)
++{
+   // Fill in the values that the shorthand will set if we don't find
+   // other values.
+-  mTempData.mColor.mBackColor.SetColorValue(NS_RGBA(0, 0, 0, 0));
+-  mTempData.SetPropertyBit(eCSSProperty_background_color);
+-  mTempData.mColor.mBackImage.SetNoneValue();
+-  mTempData.SetPropertyBit(eCSSProperty_background_image);
+-  mTempData.mColor.mBackRepeat.SetIntValue(NS_STYLE_BG_REPEAT_XY,
+-                                           eCSSUnit_Enumerated);
+-  mTempData.SetPropertyBit(eCSSProperty_background_repeat);
+-  mTempData.mColor.mBackAttachment.SetIntValue(NS_STYLE_BG_ATTACHMENT_SCROLL,
+-                                               eCSSUnit_Enumerated);
+-  mTempData.SetPropertyBit(eCSSProperty_background_attachment);
+-  mTempData.mColor.mBackPosition.mXValue.SetPercentValue(0.0f);
+-  mTempData.mColor.mBackPosition.mYValue.SetPercentValue(0.0f);
+-  mTempData.SetPropertyBit(eCSSProperty_background_position);
+-  // including the ones that we can't set from the shorthand.
+-  mTempData.mColor.mBackClip.SetIntValue(NS_STYLE_BG_CLIP_BORDER,
+-                                         eCSSUnit_Enumerated);
+-  mTempData.SetPropertyBit(eCSSProperty__moz_background_clip);
+-  mTempData.mColor.mBackOrigin.SetIntValue(NS_STYLE_BG_ORIGIN_PADDING,
+-                                           eCSSUnit_Enumerated);
+-  mTempData.SetPropertyBit(eCSSProperty__moz_background_origin);
+-  mTempData.mColor.mBackInlinePolicy.SetIntValue(
+-    NS_STYLE_BG_INLINE_POLICY_CONTINUOUS, eCSSUnit_Enumerated);
+-  mTempData.SetPropertyBit(eCSSProperty__moz_background_inline_policy);
+-
+-  // XXX If ParseSingleValueProperty were table-driven (bug 376079) and
+-  // automatically filled in the right field of mTempData, we could move
+-  // ParseBackgroundPosition to it (as a special case) and switch back
+-  // to using ParseChoice here.
++  aItem.mImage.SetNoneValue();
++  aItem.mRepeat.SetIntValue(NS_STYLE_BG_REPEAT_XY, eCSSUnit_Enumerated);
++  aItem.mAttachment.SetIntValue(NS_STYLE_BG_ATTACHMENT_SCROLL,
++                                eCSSUnit_Enumerated);
++  aItem.mPosition.mXValue.SetPercentValue(0.0f);
++  aItem.mPosition.mYValue.SetPercentValue(0.0f);
++  aItem.mClip.SetIntValue(NS_STYLE_BG_CLIP_BORDER, eCSSUnit_Enumerated);
++  aItem.mOrigin.SetIntValue(NS_STYLE_BG_ORIGIN_PADDING, eCSSUnit_Enumerated);
++  aItem.mLastItem = PR_FALSE;
+ 
+   PRBool haveColor = PR_FALSE,
+          haveImage = PR_FALSE,
+          haveRepeat = PR_FALSE,
+          haveAttach = PR_FALSE,
+-         havePosition = PR_FALSE;
++         havePosition = PR_FALSE,
++         haveSomething = PR_FALSE;
+   while (GetToken(PR_TRUE)) {
+     nsCSSTokenType tt = mToken.mType;
+     UngetToken(); // ...but we'll still cheat and use mToken
+     if (tt == eCSSToken_Symbol) {
+       // ExpectEndProperty only looks for symbols, and nothing else will
+       // show up as one.
+       break;
+     }
+ 
+     if (tt == eCSSToken_Ident) {
+       nsCSSKeyword keyword = nsCSSKeywords::LookupKeyword(mToken.mIdent);
+       PRInt32 dummy;
+       if (keyword == eCSSKeyword_inherit ||
+           keyword == eCSSKeyword__moz_initial) {
+-        if (haveColor || haveImage || haveRepeat || haveAttach || havePosition)
++        if (haveSomething || !aFirstItem)
+           return PR_FALSE;
+         haveColor = haveImage = haveRepeat = haveAttach = havePosition =
+           PR_TRUE;
+         GetToken(PR_TRUE); // undo the UngetToken above
+         nsCSSValue val;
+         if (keyword == eCSSKeyword_inherit) {
+           val.SetInheritValue();
+         } else {
+           val.SetInitialValue();
+         }
+-        mTempData.mColor.mBackColor = val;
+-        mTempData.mColor.mBackImage = val;
+-        mTempData.mColor.mBackRepeat = val;
+-        mTempData.mColor.mBackAttachment = val;
+-        mTempData.mColor.mBackPosition.mXValue = val;
+-        mTempData.mColor.mBackPosition.mYValue = val;
+-        // Reset (for 'inherit') the 3 properties that can't be
+-        // specified, although it's not entirely clear in the spec:
+-        // http://lists.w3.org/Archives/Public/www-style/2007Mar/0110
+-        mTempData.mColor.mBackClip = val;
+-        mTempData.mColor.mBackOrigin = val;
+-        mTempData.mColor.mBackInlinePolicy = val;
++        mTempData.mColor.mBackColor.SetBothValuesTo(val);
++        aItem.mImage = val;
++        aItem.mRepeat = val;
++        aItem.mAttachment = val;
++        aItem.mPosition.SetBothValuesTo(val);
++        aItem.mClip = val;
++        aItem.mOrigin = val;
++        aItem.mLastItem = PR_TRUE;
++        haveSomething = PR_TRUE;
+         break;
+       } else if (keyword == eCSSKeyword_none) {
+         if (haveImage)
+           return PR_FALSE;
+         haveImage = PR_TRUE;
+-        if (!ParseSingleValueProperty(mTempData.mColor.mBackImage,
++        if (!ParseSingleValueProperty(aItem.mImage,
+                                       eCSSProperty_background_image)) {
+           NS_NOTREACHED("should be able to parse");
+           return PR_FALSE;
+         }
+       } else if (nsCSSProps::FindKeyword(keyword,
+                    nsCSSProps::kBackgroundAttachmentKTable, dummy)) {
+         if (haveAttach)
+           return PR_FALSE;
+         haveAttach = PR_TRUE;
+-        if (!ParseSingleValueProperty(mTempData.mColor.mBackAttachment,
++        if (!ParseSingleValueProperty(aItem.mAttachment,
+                                       eCSSProperty_background_attachment)) {
+           NS_NOTREACHED("should be able to parse");
+           return PR_FALSE;
+         }
+       } else if (nsCSSProps::FindKeyword(keyword,
+                    nsCSSProps::kBackgroundRepeatKTable, dummy)) {
+         if (haveRepeat)
+           return PR_FALSE;
+         haveRepeat = PR_TRUE;
+-        if (!ParseSingleValueProperty(mTempData.mColor.mBackRepeat,
++        if (!ParseSingleValueProperty(aItem.mRepeat,
+                                       eCSSProperty_background_repeat)) {
+           NS_NOTREACHED("should be able to parse");
+           return PR_FALSE;
+         }
+       } else if (nsCSSProps::FindKeyword(keyword,
+                    nsCSSProps::kBackgroundPositionKTable, dummy)) {
+         if (havePosition)
+           return PR_FALSE;
+         havePosition = PR_TRUE;
+-        if (!ParseBackgroundPositionValues()) {
+-          return PR_FALSE;
+-        }
++        if (!ParseBoxPositionValues(aItem.mPosition)) {
++          return PR_FALSE;
++        }
++#if 0
++    // This is commented out for now until we change
++    // -moz-background-clip to background-clip, -moz-background-origin
++    // to background-origin, change their value names to *-box, and add
++    // support for content-box on background-clip.
++      } else if (nsCSSProps::FindKeyword(keyword,
++                   nsCSSProps::kBackgroundClipKTable, dummy)) {
++        // For now, we use the background-clip table, because we don't
++        // support 'content' on background-clip.  But that's dangerous
++        // if we eventually support no-clip.
++        NS_ASSERTION(
++          nsCSSProps::kBackgroundClipKTable[0] == eCSSKeyword_border &&
++          nsCSSProps::kBackgroundClipKTable[2] == eCSSKeyword_padding &&
++          nsCSSProps::kBackgroundClipKTable[4] == eCSSKeyword_UNKNOWN,
++          "need to rewrite this code");
++        if (haveOrigin)
++          return PR_FALSE;
++        haveOrigin = PR_TRUE;
++        if (!ParseSingleValueProperty(aItem.mOrigin,
++                                      eCSSProperty__moz_background_origin)) {
++          NS_NOTREACHED("should be able to parse");
++          return PR_FALSE;
++        }
++        PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_BORDER ==
++                         NS_STYLE_BG_ORIGIN_BORDER);
++        PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_PADDING ==
++                         NS_STYLE_BG_ORIGIN_PADDING);
++        // PR_STATIC_ASSERT(NS_STYLE_BG_CLIP_CONTENT == /* does not exist */
++        //                  NS_STYLE_BG_ORIGIN_CONTENT);
++        // When we support 'no-clip', this needs to be conditional on haveClip:
++        aItem.mClip = aItem.mOrigin;
++      // We'd support 'no-clip' as an additional |else| here.
++#endif
+       } else {
+         if (haveColor)
+           return PR_FALSE;
+         haveColor = PR_TRUE;
+-        if (!ParseSingleValueProperty(mTempData.mColor.mBackColor,
+-                                      eCSSProperty_background_color)) {
+-          return PR_FALSE;
+-        }
++        if (!ParseBackgroundColor(PR_TRUE)) {
++          return PR_FALSE;
++        }
++        aItem.mLastItem = PR_TRUE;
+       }
+     } else if (eCSSToken_Function == tt &&
+                mToken.mIdent.LowerCaseEqualsLiteral("url")) {
+       if (haveImage)
+         return PR_FALSE;
+       haveImage = PR_TRUE;
+-      if (!ParseSingleValueProperty(mTempData.mColor.mBackImage,
++      if (!ParseSingleValueProperty(aItem.mImage,
+                                     eCSSProperty_background_image)) {
+         return PR_FALSE;
+       }
+     } else if (mToken.IsDimension() || tt == eCSSToken_Percentage) {
+       if (havePosition)
+         return PR_FALSE;
+       havePosition = PR_TRUE;
+-      if (!ParseBackgroundPositionValues()) {
++      if (!ParseBoxPositionValues(aItem.mPosition)) {
+         return PR_FALSE;
+       }
+     } else {
+       if (haveColor)
+         return PR_FALSE;
+       haveColor = PR_TRUE;
+-      if (!ParseSingleValueProperty(mTempData.mColor.mBackColor,
+-                                    eCSSProperty_background_color)) {
+-        return PR_FALSE;
+-      }
+-    }
+-  }
+-
+-  return ExpectEndProperty() &&
+-         (haveColor || haveImage || haveRepeat || haveAttach || havePosition);
+-}
+-
++      // Note: ParseBackgroundColor parses 'inherit' and 'initial', but
++      // we've already checked for them, so it's ok.
++      if (!ParseBackgroundColor(PR_TRUE)) {
++        return PR_FALSE;
++      }
++      aItem.mLastItem = PR_TRUE;
++    }
++    haveSomething = PR_TRUE;
++  }
++
++  return haveSomething;
++}
++
++// This function is very similar to ParseBackgroundPosition.
++PRBool
++CSSParserImpl::ParseBackgroundList(nsCSSProperty aPropID)
++{
++  // aPropID is a single value prop-id
++  nsCSSValue value;
++  nsCSSValueList *head = nsnull, **tail = &head;
++  for (;;) {
++    if (!ParseSingleValueProperty(value, aPropID)) {
++      break;
++    }
++    PRBool inheritOrInitial = value.GetUnit() == eCSSUnit_Inherit ||
++                              value.GetUnit() == eCSSUnit_Initial;
++    if (inheritOrInitial && head) {
++      // inherit and initial are only allowed on their own
++      break;
++    }
++    nsCSSValueList *item = new nsCSSValueList;
++    if (!item) {
++      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      break;
++    }
++    item->mValue = value;
++    *tail = item;
++    tail = &item->mNext;
++    if (!inheritOrInitial && ExpectSymbol(',', PR_TRUE)) {
++      continue;
++    }
++    if (!ExpectEndProperty()) {
++      break;
++    }
++    nsCSSValueList **source =
++      static_cast<nsCSSValueList**>(mTempData.PropertyAt(aPropID));
++    *source = head;
++    mTempData.SetPropertyBit(aPropID);
++    return PR_TRUE;
++  }
++  delete head;
++  return PR_FALSE;
++}
++
++PRBool
++CSSParserImpl::ParseBackgroundColor(PRBool aInShorthand)
++{
++  nsCSSValuePair &backColor = mTempData.mColor.mBackColor;
++  mTempData.SetPropertyBit(eCSSProperty_background_color);
++  if (!ParseVariant(backColor.mXValue,
++                    aInShorthand ? VARIANT_COLOR : VARIANT_HC, nsnull)) {
++    return PR_FALSE;
++  }
++  backColor.mYValue = backColor.mXValue;
++  switch (backColor.mXValue.GetUnit()) {
++    case eCSSUnit_Inherit:
++    case eCSSUnit_Initial:
++      NS_ASSERTION(!aInShorthand,
++                   "should not get inherit or initial in shorthand");
++      return ExpectEndProperty(); // we're done
++    default:
++      break;
++  }
++
++  // Ignore success, since the value is optional.
++  ParseVariant(backColor.mYValue, VARIANT_COLOR, nsnull);
++
++  return aInShorthand || ExpectEndProperty();
++}
++
++// This function is very similar to ParseBackgroundList.
+ PRBool
+ CSSParserImpl::ParseBackgroundPosition()
+ {
+-  if (!ParseBoxPosition(mTempData.mColor.mBackPosition))
+-    return PR_FALSE;
+-  mTempData.SetPropertyBit(eCSSProperty_background_position);
+-  return PR_TRUE;
+-}
+-
+-PRBool
+-CSSParserImpl::ParseBackgroundPositionValues()
+-{
+-  return ParseBoxPositionValues(mTempData.mColor.mBackPosition);
++  // aPropID is a single value prop-id
++  nsCSSValuePair valuePair;
++  nsCSSValuePairList *head = nsnull, **tail = &head;
++  for (;;) {
++    if (!ParseBoxPositionValues(valuePair)) {
++      break;
++    }
++    PRBool inheritOrInitial = valuePair.mXValue.GetUnit() == eCSSUnit_Inherit ||
++                              valuePair.mXValue.GetUnit() == eCSSUnit_Initial;
++    if (inheritOrInitial && head) {
++      // inherit and initial are only allowed on their own
++      break;
++    }
++    nsCSSValuePairList *item = new nsCSSValuePairList;
++    if (!item) {
++      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      break;
++    }
++    item->mXValue = valuePair.mXValue;
++    item->mYValue = valuePair.mYValue;
++    *tail = item;
++    tail = &item->mNext;
++    if (!inheritOrInitial && ExpectSymbol(',', PR_TRUE)) {
++      continue;
++    }
++    if (!ExpectEndProperty()) {
++      break;
++    }
++    mTempData.mColor.mBackPosition = head;
++    mTempData.SetPropertyBit(eCSSProperty_background_position);
++    return PR_TRUE;
++  }
++  delete head;
++  return PR_FALSE;
+ }
+ 
+ /**
+  * Parses two values that correspond to positions in a box.  These can be
+  * values corresponding to percentages of the box, raw offsets, or keywords
+  * like "top," "left center," etc.
+  *
+  * @param aOut The nsCSSValuePair where to place the result.
+  * @return Whether or not the operation succeeded.
+  */
+-PRBool CSSParserImpl::ParseBoxPosition(nsCSSValuePair &aOut)
+-{
+-  // Need to read the box positions and the end of the property.
+-  return ParseBoxPositionValues(aOut) && ExpectEndProperty();
+-}
+-
+ PRBool CSSParserImpl::ParseBoxPositionValues(nsCSSValuePair &aOut)
+ {
+   // First try a percentage or a length value
+   nsCSSValue &xValue = aOut.mXValue,
+              &yValue = aOut.mYValue;
+   if (ParseVariant(xValue, VARIANT_HLP, nsnull)) {
+     if (eCSSUnit_Inherit == xValue.GetUnit() ||
+         eCSSUnit_Initial == xValue.GetUnit()) {  // both are inherited or both are set to initial
+@@ -7209,17 +7427,18 @@ PRBool CSSParserImpl::ParseMozTransform(
+   mTempData.mDisplay.mTransform = transformList;
+ 
+   return PR_TRUE;
+ }
+ 
+ PRBool CSSParserImpl::ParseMozTransformOrigin()
+ {
+   /* Read in a box position, fail if we can't. */
+-  if (!ParseBoxPosition(mTempData.mDisplay.mTransformOrigin))
++  if (!ParseBoxPositionValues(mTempData.mDisplay.mTransformOrigin) ||
++      !ExpectEndProperty())
+     return PR_FALSE;
+ 
+   /* Set the property bit and return. */
+   mTempData.SetPropertyBit(eCSSProperty__moz_transform_origin);
+   return PR_TRUE;
+ }
+ 
+ PRBool
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -292,24 +292,24 @@ CSS_PROP_OUTLINE(-moz-outline-radius-top
+ CSS_PROP_OUTLINE(-moz-outline-radius-topright, _moz_outline_radius_topRight, MozOutlineRadiusTopright, 0, Margin, mOutlineRadius.mTopRight, eCSSType_ValuePair, nsnull)
+ CSS_PROP_OUTLINE(-moz-outline-radius-bottomright, _moz_outline_radius_bottomRight, MozOutlineRadiusBottomright, 0, Margin, mOutlineRadius.mBottomRight, eCSSType_ValuePair, nsnull)
+ CSS_PROP_OUTLINE(-moz-outline-radius-bottomleft, _moz_outline_radius_bottomLeft, MozOutlineRadiusBottomleft, 0, Margin, mOutlineRadius.mBottomLeft, eCSSType_ValuePair, nsnull)
+ #ifndef CSS_PROP_LIST_EXCLUDE_INTERNAL
+ CSS_PROP_FONT(-x-system-font, _x_system_font, X, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Font, mSystemFont, eCSSType_Value, kFontKTable)
+ #endif
+ CSS_PROP_BACKENDONLY(azimuth, azimuth, Azimuth, 0, Aural, mAzimuth, eCSSType_Value, kAzimuthKTable)
+ CSS_PROP_SHORTHAND(background, background, Background, 0)
+-CSS_PROP_BACKGROUND(background-attachment, background_attachment, BackgroundAttachment, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackAttachment, eCSSType_Value, kBackgroundAttachmentKTable)
+-CSS_PROP_BACKGROUND(-moz-background-clip, _moz_background_clip, MozBackgroundClip, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackClip, eCSSType_Value, kBackgroundClipKTable)
+-CSS_PROP_BACKGROUND(background-color, background_color, BackgroundColor, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackColor, eCSSType_Value, nsnull)
+-CSS_PROP_BACKGROUND(background-image, background_image, BackgroundImage, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackImage, eCSSType_Value, nsnull)
++CSS_PROP_BACKGROUND(background-attachment, background_attachment, BackgroundAttachment, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackAttachment, eCSSType_ValueList, kBackgroundAttachmentKTable)
++CSS_PROP_BACKGROUND(-moz-background-clip, _moz_background_clip, MozBackgroundClip, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackClip, eCSSType_ValueList, kBackgroundClipKTable)
++CSS_PROP_BACKGROUND(background-color, background_color, BackgroundColor, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackColor, eCSSType_ValuePair, nsnull)
++CSS_PROP_BACKGROUND(background-image, background_image, BackgroundImage, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackImage, eCSSType_ValueList, nsnull)
+ CSS_PROP_BACKGROUND(-moz-background-inline-policy, _moz_background_inline_policy, MozBackgroundInlinePolicy, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackInlinePolicy, eCSSType_Value, kBackgroundInlinePolicyKTable)
+-CSS_PROP_BACKGROUND(-moz-background-origin, _moz_background_origin, MozBackgroundOrigin, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackOrigin, eCSSType_Value, kBackgroundOriginKTable)
+-CSS_PROP_BACKGROUND(background-position, background_position, BackgroundPosition, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackPosition, eCSSType_ValuePair, kBackgroundPositionKTable)
+-CSS_PROP_BACKGROUND(background-repeat, background_repeat, BackgroundRepeat, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE, Color, mBackRepeat, eCSSType_Value, kBackgroundRepeatKTable)
++CSS_PROP_BACKGROUND(-moz-background-origin, _moz_background_origin, MozBackgroundOrigin, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackOrigin, eCSSType_ValueList, kBackgroundOriginKTable)
++CSS_PROP_BACKGROUND(background-position, background_position, BackgroundPosition, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackPosition, eCSSType_ValuePairList, kBackgroundPositionKTable)
++CSS_PROP_BACKGROUND(background-repeat, background_repeat, BackgroundRepeat, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE | CSS_PROPERTY_VALUE_LIST_USES_COMMAS, Color, mBackRepeat, eCSSType_ValueList, kBackgroundRepeatKTable)
+ CSS_PROP_DISPLAY(-moz-binding, binding, MozBinding, 0, Display, mBinding, eCSSType_Value, nsnull) // XXX bug 3935
+ CSS_PROP_SHORTHAND(border, border, Border, 0)
+ CSS_PROP_SHORTHAND(border-bottom, border_bottom, BorderBottom, 0)
+ CSS_PROP_BORDER(border-bottom-color, border_bottom_color, BorderBottomColor, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER, Margin, mBorderColor.mBottom, eCSSType_Value, kBorderColorKTable)
+ CSS_PROP_BORDER(-moz-border-bottom-colors, border_bottom_colors, MozBorderBottomColors, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER, Margin, mBorderColors.mBottom, eCSSType_ValueList, nsnull)
+ CSS_PROP_BORDER(border-bottom-style, border_bottom_style, BorderBottomStyle, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER, Margin, mBorderStyle.mBottom, eCSSType_Value, kBorderStyleKTable)  // on/off will need reflow
+ CSS_PROP_BORDER(border-bottom-width, border_bottom_width, BorderBottomWidth, CSS_PROPERTY_APPLIES_TO_FIRST_LETTER, Margin, mBorderWidth.mBottom, eCSSType_Value, kBorderWidthKTable)
+ CSS_PROP_TABLEBORDER(border-collapse, border_collapse, BorderCollapse, 0, Table, mBorderCollapse, eCSSType_Value, kBorderCollapseKTable)
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -1484,19 +1484,18 @@ static const nsCSSProperty gMozOutlineRa
+ };
+ 
+ static const nsCSSProperty gBackgroundSubpropTable[] = {
+   eCSSProperty_background_color,
+   eCSSProperty_background_image,
+   eCSSProperty_background_repeat,
+   eCSSProperty_background_attachment,
+   eCSSProperty_background_position,
+-  eCSSProperty__moz_background_clip, // XXX Added LDB.
+-  eCSSProperty__moz_background_origin, // XXX Added LDB.
+-  eCSSProperty__moz_background_inline_policy, // XXX Added LDB.
++  eCSSProperty__moz_background_clip,
++  eCSSProperty__moz_background_origin,
+   eCSSProperty_UNKNOWN
+ };
+ 
+ static const nsCSSProperty gBorderSubpropTable[] = {
+   eCSSProperty_border_top_width,
+   eCSSProperty_border_right_width_value,
+   eCSSProperty_border_right_width_ltr_source,
+   eCSSProperty_border_right_width_rtl_source,
+diff --git a/layout/style/nsCSSStruct.cpp b/layout/style/nsCSSStruct.cpp
+--- a/layout/style/nsCSSStruct.cpp
++++ b/layout/style/nsCSSStruct.cpp
+@@ -101,23 +101,36 @@ nsCSSValueList::Equal(nsCSSValueList* aL
+       return PR_FALSE;
+   }
+   return !p1 && !p2; // true if same length, false otherwise
+ }
+ 
+ // --- nsCSSColor -----------------
+ 
+ nsCSSColor::nsCSSColor(void)
++  : mBackImage(nsnull)
++  , mBackRepeat(nsnull)
++  , mBackAttachment(nsnull)
++  , mBackPosition(nsnull)
++  , mBackClip(nsnull)
++  , mBackOrigin(nsnull)
+ {
+   MOZ_COUNT_CTOR(nsCSSColor);
+ }
+ 
+ nsCSSColor::~nsCSSColor(void)
+ {
+   MOZ_COUNT_DTOR(nsCSSColor);
++
++  delete mBackImage;
++  delete mBackRepeat;
++  delete mBackAttachment;
++  delete mBackPosition;
++  delete mBackClip;
++  delete mBackOrigin;
+ }
+ 
+ // --- nsCSSText -----------------
+ 
+ nsCSSText::nsCSSText(void)
+   : mTextShadow(nsnull)
+ {
+   MOZ_COUNT_CTOR(nsCSSText);
+diff --git a/layout/style/nsCSSStruct.h b/layout/style/nsCSSStruct.h
+--- a/layout/style/nsCSSStruct.h
++++ b/layout/style/nsCSSStruct.h
+@@ -302,30 +302,35 @@ private:
+   nsRuleDataFont(const nsRuleDataFont& aOther); // NOT IMPLEMENTED
+ };
+ 
+ struct nsCSSColor : public nsCSSStruct  {
+   nsCSSColor(void);
+   ~nsCSSColor(void);
+ 
+   nsCSSValue      mColor;
+-  nsCSSValue      mBackColor;
+-  nsCSSValue      mBackImage;
+-  nsCSSValue      mBackRepeat;
+-  nsCSSValue      mBackAttachment;
+-  nsCSSValuePair  mBackPosition;
+-  nsCSSValue      mBackClip;
+-  nsCSSValue      mBackOrigin;
++  nsCSSValuePair  mBackColor;
++  nsCSSValueList* mBackImage;
++  nsCSSValueList* mBackRepeat;
++  nsCSSValueList* mBackAttachment;
++  nsCSSValuePairList* mBackPosition;
++  nsCSSValueList* mBackClip;
++  nsCSSValueList* mBackOrigin;
+   nsCSSValue      mBackInlinePolicy;
+ private:
+   nsCSSColor(const nsCSSColor& aOther); // NOT IMPLEMENTED
+ };
+ 
+ struct nsRuleDataColor : public nsCSSColor {
+   nsRuleDataColor() {}
++
++  // A little bit of a hack here:  now that background-image is
++  // represented by a value list, attribute mapping code needs a place
++  // to store one item in a value list in order to map a simple value.
++  nsCSSValueList mTempBackImage;
+ private:
+   nsRuleDataColor(const nsRuleDataColor& aOther); // NOT IMPLEMENTED
+ };
+ 
+ struct nsCSSText : public nsCSSStruct  {
+   nsCSSText(void);
+   ~nsCSSText(void);
+ 
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -1161,78 +1161,126 @@ nsComputedDOMStyle::GetFontVariant(nsIDO
+   } else {
+     val->SetIdent(eCSSKeyword_normal);
+   }
+ 
+   return CallQueryInterface(val, aValue);
+ }
+ 
+ nsresult
++nsComputedDOMStyle::GetBackgroundList(PRUint8 nsStyleBackground::Layer::* aMember,
++                                      PRUint32 nsStyleBackground::* aCount,
++                                      const PRInt32 aTable[],
++                                      nsIDOMCSSValue** aResult)
++{
++  const nsStyleBackground* bg = GetStyleBackground();
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  for (PRUint32 i = 0, i_end = bg->*aCount; i < i_end; ++i) {
++    nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
++    if (!val || !valueList->AppendCSSValue(val)) {
++      delete val;
++      delete valueList;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++    val->SetIdent(nsCSSProps::ValueToKeywordEnum(bg->mLayers[i].*aMember, 
++                                                 aTable));
++  }
++
++  return CallQueryInterface(valueList, aResult);
++}
++
++nsresult
+ nsComputedDOMStyle::GetBackgroundAttachment(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  const nsStyleBackground *background = GetStyleBackground();
+-
+-  val->SetIdent(
+-    nsCSSProps::ValueToKeywordEnum(background->mBackgroundAttachment,
+-                                   nsCSSProps::kBackgroundAttachmentKTable));
+-
+-  return CallQueryInterface(val, aValue);
++  return GetBackgroundList(&nsStyleBackground::Layer::mAttachment,
++                           &nsStyleBackground::mAttachmentCount,
++                           nsCSSProps::kBackgroundAttachmentKTable,
++                           aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundClip(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  val->SetIdent(
+-    nsCSSProps::ValueToKeywordEnum(GetStyleBackground()->mBackgroundClip,
+-                                   nsCSSProps::kBackgroundClipKTable));
+-
+-  return CallQueryInterface(val, aValue);
++  return GetBackgroundList(&nsStyleBackground::Layer::mClip,
++                           &nsStyleBackground::mClipCount,
++                           nsCSSProps::kBackgroundClipKTable,
++                           aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundColor(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  const nsStyleBackground* color = GetStyleBackground();
+-  nsresult rv = SetToRGBAColor(val, color->mBackgroundColor);
+-  if (NS_FAILED(rv)) {
+-    delete val;
+-    return rv;
+-  }
+-
+-  return CallQueryInterface(val, aValue);
++  const nsStyleBackground* bg = GetStyleBackground();
++  nsresult rv;
++
++  if (bg->mBackgroundColor == bg->mFallbackBackgroundColor) {
++    nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
++
++    rv = SetToRGBAColor(val, bg->mBackgroundColor);
++    if (NS_FAILED(rv)) {
++      delete val;
++      return rv;
++    }
++    rv = CallQueryInterface(val, aValue);
++  } else {
++    nsDOMCSSValueList *valueList = GetROCSSValueList(PR_FALSE);
++    NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++    for (PRUint32 i = 0; i < 2; ++i) {
++      nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++      if (!val || !valueList->AppendCSSValue(val)) {
++        delete val;
++        delete valueList;
++        return NS_ERROR_OUT_OF_MEMORY;
++      }
++
++      rv = SetToRGBAColor(val, (i == 0) ? bg->mBackgroundColor
++                                        : bg->mFallbackBackgroundColor);
++      if (NS_FAILED(rv)) {
++        delete valueList;
++        return rv;
++      }
++    }
++    rv = CallQueryInterface(valueList, aValue);
++  }
++
++  return rv;
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundImage(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  const nsStyleBackground* color = GetStyleBackground();
+-
+-  if (color->mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE) {
+-    val->SetIdent(eCSSKeyword_none);
+-  } else {
+-    nsCOMPtr<nsIURI> uri;
+-    if (color->mBackgroundImage) {
+-      color->mBackgroundImage->GetURI(getter_AddRefs(uri));
+-    }
+-    val->SetURI(uri);
+-  }
+-
+-  return CallQueryInterface(val, aValue);
++  const nsStyleBackground* bg = GetStyleBackground();
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  for (PRUint32 i = 0, i_end = bg->mImageCount; i < i_end; ++i) {
++    nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
++    if (!val || !valueList->AppendCSSValue(val)) {
++      delete val;
++      delete valueList;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    imgIRequest *image = bg->mLayers[i].mImage.mRequest;
++    if (!image) {
++      val->SetIdent(eCSSKeyword_none);
++    } else {
++      nsCOMPtr<nsIURI> uri;
++      image->GetURI(getter_AddRefs(uri));
++      val->SetURI(uri);
++    }
++  }
++
++  return CallQueryInterface(valueList, aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundInlinePolicy(nsIDOMCSSValue** aValue)
+ {
+   nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+   NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+ 
+@@ -1241,82 +1289,77 @@ nsComputedDOMStyle::GetBackgroundInlineP
+                   nsCSSProps::kBackgroundInlinePolicyKTable));
+ 
+   return CallQueryInterface(val, aValue);  
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundOrigin(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  val->SetIdent(
+-    nsCSSProps::ValueToKeywordEnum(GetStyleBackground()->mBackgroundOrigin,
+-                                   nsCSSProps::kBackgroundOriginKTable));
+-
+-  return CallQueryInterface(val, aValue);
++  return GetBackgroundList(&nsStyleBackground::Layer::mOrigin,
++                           &nsStyleBackground::mOriginCount,
++                           nsCSSProps::kBackgroundOriginKTable,
++                           aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundPosition(nsIDOMCSSValue** aValue)
+ {
+-  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_FALSE);
+-  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
+-
+-  nsROCSSPrimitiveValue *valX = GetROCSSPrimitiveValue();
+-  if (!valX || !valueList->AppendCSSValue(valX)) {
+-    delete valueList;
+-    delete valX;
+-    return NS_ERROR_OUT_OF_MEMORY;
+-  }
+-
+-  nsROCSSPrimitiveValue *valY = GetROCSSPrimitiveValue();
+-  if (!valY || !valueList->AppendCSSValue(valY)) {
+-    delete valueList;
+-    delete valY;
+-    return NS_ERROR_OUT_OF_MEMORY;
+-  }
+-
+-  const nsStyleBackground *bg = GetStyleBackground();
+-
+-  if (NS_STYLE_BG_X_POSITION_LENGTH & bg->mBackgroundFlags) {
+-    valX->SetAppUnits(bg->mBackgroundXPosition.mCoord);
+-  }
+-  else if (NS_STYLE_BG_X_POSITION_PERCENT & bg->mBackgroundFlags) {
+-    valX->SetPercent(bg->mBackgroundXPosition.mFloat);
+-  }
+-  else {
+-    valX->SetPercent(0.0f);
+-  }
+-
+-  if (NS_STYLE_BG_Y_POSITION_LENGTH & bg->mBackgroundFlags) {
+-    valY->SetAppUnits(bg->mBackgroundYPosition.mCoord);
+-  }
+-  else if (NS_STYLE_BG_Y_POSITION_PERCENT & bg->mBackgroundFlags) {
+-    valY->SetPercent(bg->mBackgroundYPosition.mFloat);
+-  }
+-  else {
+-    valY->SetPercent(0.0f);
++  const nsStyleBackground* bg = GetStyleBackground();
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  for (PRUint32 i = 0, i_end = bg->mPositionCount; i < i_end; ++i) {
++    nsDOMCSSValueList *itemList = GetROCSSValueList(PR_FALSE);
++    if (!itemList || !valueList->AppendCSSValue(itemList)) {
++      delete valueList;
++      delete itemList;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    nsROCSSPrimitiveValue *valX = GetROCSSPrimitiveValue();
++    if (!valX || !itemList->AppendCSSValue(valX)) {
++      delete valueList;
++      delete valX;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    nsROCSSPrimitiveValue *valY = GetROCSSPrimitiveValue();
++    if (!valY || !itemList->AppendCSSValue(valY)) {
++      delete valueList;
++      delete valY;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    const nsStyleBackground::Position &pos = bg->mLayers[i].mPosition;
++
++    if (pos.mXIsPercent) {
++      valX->SetPercent(pos.mXPosition.mFloat);
++    } else {
++      valX->SetAppUnits(pos.mXPosition.mCoord);
++    }
++
++    if (pos.mYIsPercent) {
++      valY->SetPercent(pos.mYPosition.mFloat);
++    } else {
++      valY->SetAppUnits(pos.mYPosition.mCoord);
++    }
+   }
+ 
+   return CallQueryInterface(valueList, aValue);  
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetBackgroundRepeat(nsIDOMCSSValue** aValue)
+ {
+-  nsROCSSPrimitiveValue *val = GetROCSSPrimitiveValue();
+-  NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
+-
+-  val->SetIdent(
+-    nsCSSProps::ValueToKeywordEnum(GetStyleBackground()->mBackgroundRepeat,
+-                                   nsCSSProps::kBackgroundRepeatKTable));
+-
+-  return CallQueryInterface(val, aValue);
++  return GetBackgroundList(&nsStyleBackground::Layer::mRepeat,
++                           &nsStyleBackground::mRepeatCount,
++                           nsCSSProps::kBackgroundRepeatKTable,
++                           aValue);
+ }
+ 
+ nsresult
+ nsComputedDOMStyle::GetPadding(nsIDOMCSSValue** aValue)
+ {
+   // return null per spec.
+   aValue = nsnull;
+ 
+@@ -1826,17 +1869,17 @@ nsComputedDOMStyle::GetCSSShadowArray(ns
+     shadowValues = shadowValuesNoSpread;
+     shadowValuesLength = NS_ARRAY_LENGTH(shadowValuesNoSpread);
+   }
+ 
+   nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
+   NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
+ 
+   for (nsCSSShadowItem *item = aArray->ShadowAt(0),
+-                    *item_end = item + aArray->Length();
++                   *item_end = item + aArray->Length();
+        item < item_end; ++item) {
+     nsDOMCSSValueList *itemList = GetROCSSValueList(PR_FALSE);
+     if (!itemList || !valueList->AppendCSSValue(itemList)) {
+       delete itemList;
+       delete valueList;
+       return NS_ERROR_OUT_OF_MEMORY;
+     }
+ 
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -50,16 +50,17 @@
+ #include "nsCSSProps.h"
+ 
+ #include "nsIPresShell.h"
+ #include "nsIContent.h"
+ #include "nsIFrame.h"
+ #include "nsCOMPtr.h"
+ #include "nsWeakReference.h"
+ #include "nsAutoPtr.h"
++#include "nsStyleStruct.h"
+ 
+ class nsComputedDOMStyle : public nsIComputedDOMStyle
+ {
+ public:
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   NS_DECL_CYCLE_COLLECTION_CLASS(nsComputedDOMStyle)
+ 
+   NS_IMETHOD Init(nsIDOMElement *aElement,
+@@ -111,16 +112,21 @@ private:
+ 
+   PRBool GetLineHeightCoord(nscoord& aCoord);
+ 
+   nsresult GetCSSShadowArray(nsCSSShadowArray* aArray,
+                              const nscolor& aDefaultColor,
+                              PRBool aIsBoxShadow,
+                              nsIDOMCSSValue** aValue);
+ 
++  nsresult GetBackgroundList(PRUint8 nsStyleBackground::Layer::* aMember,
++                             PRUint32 nsStyleBackground::* aCount,
++                             const PRInt32 aTable[],
++                             nsIDOMCSSValue** aResult);
++
+   /* Properties Queryable as CSSValues */
+ 
+   nsresult GetAppearance(nsIDOMCSSValue** aValue);
+ 
+   /* Box properties */
+   nsresult GetBoxAlign(nsIDOMCSSValue** aValue);
+   nsresult GetBoxDirection(nsIDOMCSSValue** aValue);
+   nsresult GetBoxFlex(nsIDOMCSSValue** aValue);
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -1415,18 +1415,17 @@ nsRuleNode::GetUserInterfaceData(nsStyle
+ 
+ const void*
+ nsRuleNode::GetUIResetData(nsStyleContext* aContext)
+ {
+   nsRuleDataUserInterface uiData; // Declare a struct with null CSS values.
+   nsRuleData ruleData(NS_STYLE_INHERIT_BIT(UIReset), mPresContext, aContext);
+   ruleData.mUserInterfaceData = &uiData;
+ 
+-  const void* res = WalkRuleTree(eStyleStruct_UIReset, aContext, &ruleData, &uiData);
+-  return res;
++  return WalkRuleTree(eStyleStruct_UIReset, aContext, &ruleData, &uiData);
+ }
+ 
+ const void*
+ nsRuleNode::GetFontData(nsStyleContext* aContext)
+ {
+   nsRuleDataFont fontData; // Declare a struct with null CSS values.
+   nsRuleData ruleData(NS_STYLE_INHERIT_BIT(Font), mPresContext, aContext);
+   ruleData.mFontData = &fontData;
+@@ -1450,17 +1449,27 @@ nsRuleNode::GetBackgroundData(nsStyleCon
+   nsRuleDataColor colorData; // Declare a struct with null CSS values.
+   nsRuleData ruleData(NS_STYLE_INHERIT_BIT(Background), mPresContext, aContext);
+   ruleData.mColorData = &colorData;
+ 
+   // If any members need to be set to null here, they must also be set to
+   // null in HasAuthorSpecifiedRules (look at mBoxShadow in GetBorderData
+   // and HasAuthorSpecifiedRules).
+ 
+-  return WalkRuleTree(eStyleStruct_Background, aContext, &ruleData, &colorData);
++  const void *res = WalkRuleTree(eStyleStruct_Background, aContext, &ruleData, &colorData);
++
++  // We are sharing with some style rule.  It really owns the data.
++  colorData.mBackImage = nsnull;
++  colorData.mBackRepeat = nsnull;
++  colorData.mBackAttachment = nsnull;
++  colorData.mBackPosition = nsnull;
++  colorData.mBackClip = nsnull;
++  colorData.mBackOrigin = nsnull;
++
++  return res;
+ }
+ 
+ const void*
+ nsRuleNode::GetMarginData(nsStyleContext* aContext)
+ {
+   nsRuleDataMargin marginData; // Declare a struct with null CSS values.
+   nsRuleData ruleData(NS_STYLE_INHERIT_BIT(Margin), mPresContext, aContext);
+   ruleData.mMarginData = &marginData;
+@@ -3766,139 +3775,299 @@ nsRuleNode::ComputeColorData(void* aStar
+   else {
+     SetColor(colorData.mColor, parentColor->mColor, mPresContext, aContext,
+              color->mColor, canStoreInRuleTree);
+   }
+ 
+   COMPUTE_END_INHERITED(Color, color)
+ }
+ 
++// information about how to compute values for background-* properties
++template <class SpecifiedValueItem>
++struct InitialInheritLocationFor {
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct InitialInheritLocationFor<nsCSSValueList> {
++  static nsCSSValue nsCSSValueList::* Location() {
++    return &nsCSSValueList::mValue;
++  }
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct InitialInheritLocationFor<nsCSSValuePairList> {
++  static nsCSSValue nsCSSValuePairList::* Location() {
++    return &nsCSSValuePairList::mXValue;
++  }
++};
++
++template <class SpecifiedValueItem, class ComputedValueItem>
++struct BackgroundItemComputer {
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct BackgroundItemComputer<nsCSSValueList, PRUint8>
++{
++  static void ComputeValue(nsStyleContext* aStyleContext,
++                           const nsCSSValueList* aSpecifiedValue,
++                           PRUint8& aComputedValue,
++                           PRBool& aCanStoreInRuleTree)
++  {
++    SetDiscrete(aSpecifiedValue->mValue, aComputedValue, aCanStoreInRuleTree,
++                SETDSC_ENUMERATED, PRUint8(0), 0, 0, 0, 0, 0);
++  }
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct BackgroundItemComputer<nsCSSValueList, nsStyleBackground::Image>
++{
++  static void ComputeValue(nsStyleContext* aStyleContext,
++                           const nsCSSValueList* aSpecifiedValue,
++                           nsStyleBackground::Image& aComputedValue,
++                           PRBool& aCanStoreInRuleTree)
++  {
++    const nsCSSValue &value = aSpecifiedValue->mValue;
++    if (eCSSUnit_Image == value.GetUnit()) {
++      aComputedValue.mRequest = value.GetImageValue();
++      aComputedValue.mSpecified = PR_TRUE;
++    }
++    else {
++      NS_ASSERTION(eCSSUnit_None == value.GetUnit(), "unexpected unit");
++      aComputedValue.mRequest = nsnull;
++      aComputedValue.mSpecified = PR_FALSE;
++    }
++  }
++};
++
++struct BackgroundPositionAxis {
++  nsCSSValue nsCSSValuePairList::*specified;
++  nsStyleBackground::Position::PositionCoord
++    nsStyleBackground::Position::*result;
++  PRPackedBool nsStyleBackground::Position::*isPercent;
++};
++
++static const BackgroundPositionAxis gBGPosAxes[] = {
++  { &nsCSSValuePairList::mXValue,
++    &nsStyleBackground::Position::mXPosition,
++    &nsStyleBackground::Position::mXIsPercent },
++  { &nsCSSValuePairList::mYValue,
++    &nsStyleBackground::Position::mYPosition,
++    &nsStyleBackground::Position::mYIsPercent }
++};
++
++NS_SPECIALIZE_TEMPLATE
++struct BackgroundItemComputer<nsCSSValuePairList, nsStyleBackground::Position>
++{
++  static void ComputeValue(nsStyleContext* aStyleContext,
++                           const nsCSSValuePairList* aSpecifiedValue,
++                           nsStyleBackground::Position& aComputedValue,
++                           PRBool& aCanStoreInRuleTree)
++  {
++    nsStyleBackground::Position &position = aComputedValue;
++    for (const BackgroundPositionAxis *axis = gBGPosAxes,
++                        *axis_end = gBGPosAxes + NS_ARRAY_LENGTH(gBGPosAxes);
++         axis != axis_end; ++axis) {
++      const nsCSSValue &specified = aSpecifiedValue->*(axis->specified);
++      if (eCSSUnit_Percent == specified.GetUnit()) {
++        (position.*(axis->result)).mFloat = specified.GetPercentValue();
++        position.*(axis->isPercent) = PR_TRUE;
++      }
++      else if (specified.IsLengthUnit()) {
++        (position.*(axis->result)).mCoord =
++          CalcLength(specified, aStyleContext, aStyleContext->PresContext(),
++                     aCanStoreInRuleTree);
++        position.*(axis->isPercent) = PR_FALSE;
++      }
++      else if (eCSSUnit_Enumerated == specified.GetUnit()) {
++        (position.*(axis->result)).mFloat =
++          GetFloatFromBoxPosition(specified.GetIntValue());
++        position.*(axis->isPercent) = PR_TRUE;
++      } else {
++        NS_NOTREACHED("unexpected unit");
++      }
++    }
++  }
++};
++
++
++template <class SpecifiedValueItem, class ComputedValueItem>
++static void
++SetBackgroundList(nsStyleContext* aStyleContext,
++                  const SpecifiedValueItem* aValueList,
++                  nsAutoTArray< nsStyleBackground::Layer, 1> &aLayers,
++                  const nsAutoTArray<nsStyleBackground::Layer, 1>
++                                                                 &aParentLayers,
++                  ComputedValueItem nsStyleBackground::Layer::* aResultLocation,
++                  ComputedValueItem aInitialValue,
++                  PRUint32 aParentItemCount,
++                  PRUint32& aItemCount,
++                  PRUint32& aMaxItemCount,
++                  PRBool& aRebuild,
++                  PRBool& aCanStoreInRuleTree)
++{
++  if (aValueList) {
++    aRebuild = PR_TRUE;
++    nsCSSValue SpecifiedValueItem::* initialInherit =
++      InitialInheritLocationFor<SpecifiedValueItem>::Location();
++    if (eCSSUnit_Inherit == (aValueList->*initialInherit).GetUnit()) {
++      NS_ASSERTION(!aValueList->mNext, "should have only one value");
++      aCanStoreInRuleTree = PR_FALSE;
++      if (!aLayers.EnsureLengthAtLeast(aParentItemCount)) {
++        NS_WARNING("out of memory");
++        aParentItemCount = aLayers.Length();
++      }
++      aItemCount = aParentItemCount;
++      for (PRUint32 i = 0; i < aParentItemCount; ++i) {
++        aLayers[i].*aResultLocation = aParentLayers[i].*aResultLocation;
++      }
++    } else if (eCSSUnit_Initial == (aValueList->*initialInherit).GetUnit()) {
++      NS_ASSERTION(!aValueList->mNext, "should have only one value");
++      aItemCount = 1;
++      aLayers[0].*aResultLocation = aInitialValue;
++    } else {
++      const SpecifiedValueItem *item = aValueList;
++      aItemCount = 0;
++      do {
++        NS_ASSERTION((item->*initialInherit).GetUnit() != eCSSUnit_Inherit &&
++                     (item->*initialInherit).GetUnit() != eCSSUnit_Initial,
++                     "unexpected unit");
++        ++aItemCount;
++        if (!aLayers.EnsureLengthAtLeast(aItemCount)) {
++          NS_WARNING("out of memory");
++          --aItemCount;
++          break;
++        }
++        BackgroundItemComputer<SpecifiedValueItem, ComputedValueItem>
++          ::ComputeValue(aStyleContext, item,
++                         aLayers[aItemCount-1].*aResultLocation,
++                         aCanStoreInRuleTree);
++        item = item->mNext;
++      } while (item);
++    }
++  }
++
++  if (aItemCount > aMaxItemCount)
++    aMaxItemCount = aItemCount;
++}
++
++template <class ComputedValueItem>
++static void
++FillBackgroundList(nsAutoTArray< nsStyleBackground::Layer, 1> &aLayers,
++    ComputedValueItem nsStyleBackground::Layer::* aResultLocation,
++    PRUint32 aItemCount, PRUint32 aFillCount)
++{
++  NS_PRECONDITION(aFillCount <= aLayers.Length(), "unexpected array length");
++  for (PRUint32 sourceLayer = 0, destLayer = aItemCount;
++       destLayer < aFillCount;
++       ++sourceLayer, ++destLayer) {
++    aLayers[destLayer].*aResultLocation =
++      aLayers[sourceLayer].*aResultLocation;
++  }
++}
++
+ const void*
+ nsRuleNode::ComputeBackgroundData(void* aStartStruct,
+                                   const nsRuleDataStruct& aData, 
+                                   nsStyleContext* aContext, 
+                                   nsRuleNode* aHighestNode,
+                                   const RuleDetail aRuleDetail,
+                                   const PRBool aCanStoreInRuleTree)
+ {
+   COMPUTE_START_RESET(Background, (), bg, parentBG, Color, colorData)
+ 
+-  // save parentFlags in case bg == parentBG and we clobber them later
+-  PRUint8 parentFlags = parentBG->mBackgroundFlags;
+-
+-  // background-color: color, string, inherit
+-  if (eCSSUnit_Initial == colorData.mBackColor.GetUnit()) {
++  // background-color: color, string, inherit [pair]
++  if (eCSSUnit_Initial == colorData.mBackColor.mXValue.GetUnit()) {
+     bg->mBackgroundColor = NS_RGBA(0, 0, 0, 0);
+-  } else if (!SetColor(colorData.mBackColor, parentBG->mBackgroundColor,
+-                       mPresContext, aContext, bg->mBackgroundColor,
++  } else if (!SetColor(colorData.mBackColor.mXValue,
++                       parentBG->mBackgroundColor, mPresContext,
++                       aContext, bg->mBackgroundColor, canStoreInRuleTree)) {
++    NS_ASSERTION(eCSSUnit_Null == colorData.mBackColor.mXValue.GetUnit(),
++                 "unexpected color unit");
++  }
++
++  if (eCSSUnit_Initial == colorData.mBackColor.mYValue.GetUnit()) {
++    bg->mFallbackBackgroundColor = NS_RGBA(0, 0, 0, 0);
++  } else if (!SetColor(colorData.mBackColor.mYValue,
++                       parentBG->mFallbackBackgroundColor, mPresContext,
++                       aContext, bg->mFallbackBackgroundColor,
+                        canStoreInRuleTree)) {
+-    NS_ASSERTION(eCSSUnit_Null == colorData.mBackColor.GetUnit(),
++    NS_ASSERTION(eCSSUnit_Null == colorData.mBackColor.mYValue.GetUnit(),
+                  "unexpected color unit");
+   }
+ 
+-  // background-image: url (stored as image), none, inherit
+-  if (eCSSUnit_Image == colorData.mBackImage.GetUnit()) {
+-    bg->mBackgroundImage = colorData.mBackImage.GetImageValue();
+-  }
+-  else if (eCSSUnit_None == colorData.mBackImage.GetUnit() ||
+-           eCSSUnit_Initial == colorData.mBackImage.GetUnit()) {
+-    bg->mBackgroundImage = nsnull;
+-  }
+-  else if (eCSSUnit_Inherit == colorData.mBackImage.GetUnit()) {
+-    canStoreInRuleTree = PR_FALSE;
+-    bg->mBackgroundImage = parentBG->mBackgroundImage;
+-  }
+-
+-  if (bg->mBackgroundImage) {
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_IMAGE_NONE;
+-  } else {
+-    bg->mBackgroundFlags |= NS_STYLE_BG_IMAGE_NONE;
+-  }
+-
+-  // background-repeat: enum, inherit, initial
+-  SetDiscrete(colorData.mBackRepeat, bg->mBackgroundRepeat, canStoreInRuleTree,
+-              SETDSC_ENUMERATED, parentBG->mBackgroundRepeat,
+-              NS_STYLE_BG_REPEAT_XY, 0, 0, 0, 0);
+-
+-  // background-attachment: enum, inherit, initial
+-  SetDiscrete(colorData.mBackAttachment, bg->mBackgroundAttachment, canStoreInRuleTree,
+-              SETDSC_ENUMERATED, parentBG->mBackgroundAttachment,
+-              NS_STYLE_BG_ATTACHMENT_SCROLL, 0, 0, 0, 0);
+-
+-  // background-clip: enum, inherit, initial
+-  SetDiscrete(colorData.mBackClip, bg->mBackgroundClip, canStoreInRuleTree,
+-              SETDSC_ENUMERATED, parentBG->mBackgroundClip,
+-              NS_STYLE_BG_CLIP_BORDER, 0, 0, 0, 0);
++  PRUint32 maxItemCount = 1;
++  PRBool rebuild = PR_FALSE;
++
++  // background-image: url (stored as image), none, inherit [list]
++  SetBackgroundList(aContext, colorData.mBackImage, bg->mLayers,
++                    parentBG->mLayers, &nsStyleBackground::Layer::mImage,
++                    nsStyleBackground::Image(), parentBG->mImageCount,
++                    bg->mImageCount, maxItemCount, rebuild, canStoreInRuleTree);
++
++  // background-repeat: enum, inherit, initial [list]
++  SetBackgroundList(aContext, colorData.mBackRepeat, bg->mLayers,
++                    parentBG->mLayers, &nsStyleBackground::Layer::mRepeat,
++                    PRUint8(NS_STYLE_BG_REPEAT_XY), parentBG->mRepeatCount,
++                    bg->mRepeatCount, maxItemCount, rebuild, canStoreInRuleTree);
++
++  // background-attachment: enum, inherit, initial [list]
++  SetBackgroundList(aContext, colorData.mBackAttachment, bg->mLayers,
++                    parentBG->mLayers,
++                    &nsStyleBackground::Layer::mAttachment,
++                    PRUint8(NS_STYLE_BG_ATTACHMENT_SCROLL),
++                    parentBG->mAttachmentCount,
++                    bg->mAttachmentCount, maxItemCount, rebuild,
++                    canStoreInRuleTree);
++
++  // background-clip: enum, inherit, initial [list]
++  SetBackgroundList(aContext, colorData.mBackClip, bg->mLayers,
++                    parentBG->mLayers, &nsStyleBackground::Layer::mClip,
++                    PRUint8(NS_STYLE_BG_CLIP_BORDER), parentBG->mClipCount,
++                    bg->mClipCount, maxItemCount, rebuild, canStoreInRuleTree);
+ 
+   // background-inline-policy: enum, inherit, initial
+   SetDiscrete(colorData.mBackInlinePolicy, bg->mBackgroundInlinePolicy,
+               canStoreInRuleTree, SETDSC_ENUMERATED,
+               parentBG->mBackgroundInlinePolicy,
+               NS_STYLE_BG_INLINE_POLICY_CONTINUOUS, 0, 0, 0, 0);
+ 
+-  // background-origin: enum, inherit, initial
+-  SetDiscrete(colorData.mBackOrigin, bg->mBackgroundOrigin, canStoreInRuleTree,
+-              SETDSC_ENUMERATED, parentBG->mBackgroundOrigin,
+-              NS_STYLE_BG_ORIGIN_PADDING, 0, 0, 0, 0);
+-
+-  // background-position: enum, length, percent (flags), inherit
+-  if (eCSSUnit_Percent == colorData.mBackPosition.mXValue.GetUnit()) {
+-    bg->mBackgroundXPosition.mFloat = colorData.mBackPosition.mXValue.GetPercentValue();
+-    bg->mBackgroundFlags |= NS_STYLE_BG_X_POSITION_PERCENT;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_X_POSITION_LENGTH;
+-  }
+-  else if (colorData.mBackPosition.mXValue.IsLengthUnit()) {
+-    bg->mBackgroundXPosition.mCoord = CalcLength(colorData.mBackPosition.mXValue, 
+-                                                 aContext, mPresContext, canStoreInRuleTree);
+-    bg->mBackgroundFlags |= NS_STYLE_BG_X_POSITION_LENGTH;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_X_POSITION_PERCENT;
+-  }
+-  else if (eCSSUnit_Enumerated == colorData.mBackPosition.mXValue.GetUnit()) {
+-    bg->mBackgroundXPosition.mFloat =
+-      GetFloatFromBoxPosition(colorData.mBackPosition.mXValue.GetIntValue());
+-
+-    bg->mBackgroundFlags |= NS_STYLE_BG_X_POSITION_PERCENT;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_X_POSITION_LENGTH;
+-  }
+-  else if (eCSSUnit_Inherit == colorData.mBackPosition.mXValue.GetUnit()) {
+-    canStoreInRuleTree = PR_FALSE;
+-    bg->mBackgroundXPosition = parentBG->mBackgroundXPosition;
+-    bg->mBackgroundFlags &= ~(NS_STYLE_BG_X_POSITION_LENGTH | NS_STYLE_BG_X_POSITION_PERCENT);
+-    bg->mBackgroundFlags |= (parentFlags & (NS_STYLE_BG_X_POSITION_LENGTH | NS_STYLE_BG_X_POSITION_PERCENT));
+-  }
+-  else if (eCSSUnit_Initial == colorData.mBackPosition.mXValue.GetUnit()) {
+-    bg->mBackgroundFlags &= ~(NS_STYLE_BG_X_POSITION_LENGTH | NS_STYLE_BG_X_POSITION_PERCENT);
+-  }
+-
+-  if (eCSSUnit_Percent == colorData.mBackPosition.mYValue.GetUnit()) {
+-    bg->mBackgroundYPosition.mFloat = colorData.mBackPosition.mYValue.GetPercentValue();
+-    bg->mBackgroundFlags |= NS_STYLE_BG_Y_POSITION_PERCENT;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_Y_POSITION_LENGTH;
+-  }
+-  else if (colorData.mBackPosition.mYValue.IsLengthUnit()) {
+-    bg->mBackgroundYPosition.mCoord = CalcLength(colorData.mBackPosition.mYValue,
+-                                                 aContext, mPresContext, canStoreInRuleTree);
+-    bg->mBackgroundFlags |= NS_STYLE_BG_Y_POSITION_LENGTH;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_Y_POSITION_PERCENT;
+-  }
+-  else if (eCSSUnit_Enumerated == colorData.mBackPosition.mYValue.GetUnit()) {
+-    bg->mBackgroundYPosition.mFloat =
+-      GetFloatFromBoxPosition(colorData.mBackPosition.mYValue.GetIntValue());
+-
+-    bg->mBackgroundFlags |= NS_STYLE_BG_Y_POSITION_PERCENT;
+-    bg->mBackgroundFlags &= ~NS_STYLE_BG_Y_POSITION_LENGTH;
+-  }
+-  else if (eCSSUnit_Inherit == colorData.mBackPosition.mYValue.GetUnit()) {
+-    canStoreInRuleTree = PR_FALSE;
+-    bg->mBackgroundYPosition = parentBG->mBackgroundYPosition;
+-    bg->mBackgroundFlags &= ~(NS_STYLE_BG_Y_POSITION_LENGTH | NS_STYLE_BG_Y_POSITION_PERCENT);
+-    bg->mBackgroundFlags |= (parentFlags & (NS_STYLE_BG_Y_POSITION_LENGTH | NS_STYLE_BG_Y_POSITION_PERCENT));
+-  }
+-  else if (eCSSUnit_Initial == colorData.mBackPosition.mYValue.GetUnit()) {
+-    bg->mBackgroundFlags &= ~(NS_STYLE_BG_Y_POSITION_LENGTH | NS_STYLE_BG_Y_POSITION_PERCENT);
++  // background-origin: enum, inherit, initial [list]
++  SetBackgroundList(aContext, colorData.mBackOrigin, bg->mLayers,
++                    parentBG->mLayers, &nsStyleBackground::Layer::mOrigin,
++                    PRUint8(NS_STYLE_BG_ORIGIN_PADDING), parentBG->mOriginCount,
++                    bg->mOriginCount, maxItemCount, rebuild,
++                    canStoreInRuleTree);
++
++  // background-position: enum, length, percent (flags), inherit [pair list]
++  nsStyleBackground::Position initialPosition;
++  initialPosition.SetInitialValues();
++  SetBackgroundList(aContext, colorData.mBackPosition, bg->mLayers,
++                    parentBG->mLayers, &nsStyleBackground::Layer::mPosition,
++                    initialPosition, parentBG->mPositionCount,
++                    bg->mPositionCount, maxItemCount, rebuild,
++                    canStoreInRuleTree);
++
++  if (rebuild) {
++    // Delete any extra items.  We need to keep layers in which any
++    // property was specified.
++    bg->mLayers.TruncateLength(maxItemCount);
++
++    PRUint32 fillCount = bg->mImageCount;
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mImage,
++                       bg->mImageCount, fillCount);
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mRepeat,
++                       bg->mRepeatCount, fillCount);
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mAttachment,
++                       bg->mAttachmentCount, fillCount);
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mClip,
++                       bg->mClipCount, fillCount);
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mOrigin,
++                       bg->mOriginCount, fillCount);
++    FillBackgroundList(bg->mLayers, &nsStyleBackground::Layer::mPosition,
++                       bg->mPositionCount, fillCount);
+   }
+ 
+   COMPUTE_END_RESET(Background, bg)
+ }
+ 
+ const void*
+ nsRuleNode::ComputeMarginData(void* aStartStruct,
+                               const nsRuleDataStruct& aData, 
+@@ -5494,16 +5663,17 @@ nsRuleNode::Sweep()
+ }
+ 
+ /* static */ PRBool
+ nsRuleNode::HasAuthorSpecifiedRules(nsStyleContext* aStyleContext,
+                                     PRUint32 ruleTypeMask)
+ {
+   nsRuleDataColor colorData;
+   nsRuleDataMargin marginData;
++  nsCSSValue firstBackgroundImage;
+   PRUint32 nValues = 0;
+ 
+   PRUint32 inheritBits = 0;
+   if (ruleTypeMask & NS_AUTHOR_SPECIFIED_BACKGROUND)
+     inheritBits |= NS_STYLE_INHERIT_BIT(Background);
+ 
+   if (ruleTypeMask & NS_AUTHOR_SPECIFIED_BORDER)
+     inheritBits |= NS_STYLE_INHERIT_BIT(Border);
+@@ -5513,18 +5683,19 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
+ 
+   /* We're relying on the use of |aStyleContext| not mutating it! */
+   nsRuleData ruleData(inheritBits,
+                       aStyleContext->PresContext(), aStyleContext);
+   ruleData.mColorData = &colorData;
+   ruleData.mMarginData = &marginData;
+ 
+   nsCSSValue* backgroundValues[] = {
+-    &colorData.mBackColor,
+-    &colorData.mBackImage
++    &colorData.mBackColor.mXValue,
++    &colorData.mBackColor.mYValue,
++    &firstBackgroundImage
+   };
+ 
+   nsCSSValue* borderValues[] = {
+     &marginData.mBorderColor.mTop,
+     &marginData.mBorderStyle.mTop,
+     &marginData.mBorderWidth.mTop,
+     &marginData.mBorderColor.mRight,
+     &marginData.mBorderStyle.mRight,
+@@ -5578,21 +5749,35 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
+   do {
+     haveExplicitUAInherit = PR_FALSE;
+     for (nsRuleNode* ruleNode = styleContext->GetRuleNode(); ruleNode;
+          ruleNode = ruleNode->GetParent()) {
+       nsIStyleRule *rule = ruleNode->GetRule();
+       if (rule) {
+         ruleData.mLevel = ruleNode->GetLevel();
+         ruleData.mIsImportantRule = ruleNode->IsImportantRule();
++
+         rule->MapRuleInfoInto(&ruleData);
++
++        if ((ruleTypeMask & NS_AUTHOR_SPECIFIED_BACKGROUND) &&
++            colorData.mBackImage &&
++            firstBackgroundImage.GetUnit() == eCSSUnit_Null) {
++          // Handle background-image being a value list
++          firstBackgroundImage = colorData.mBackImage->mValue;
++        }
+         // Do the same nulling out as in GetBorderData, GetBackgroundData
+         // or GetPaddingData.
+         // We are sharing with some style rule.  It really owns the data.
+         marginData.mBoxShadow = nsnull;
++        colorData.mBackImage = nsnull;
++        colorData.mBackRepeat = nsnull;
++        colorData.mBackAttachment = nsnull;
++        colorData.mBackPosition = nsnull;
++        colorData.mBackClip = nsnull;
++        colorData.mBackOrigin = nsnull;
+ 
+         if (ruleData.mLevel == nsStyleSet::eAgentSheet ||
+             ruleData.mLevel == nsStyleSet::eUserSheet) {
+           // This is a rule whose effect we want to ignore, so if any of
+           // the properties we care about were set, set them to the dummy
+           // value that they'll never otherwise get.
+           for (PRUint32 i = 0; i < nValues; ++i) {
+             nsCSSUnit unit = values[i]->GetUnit();
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1202,78 +1202,163 @@ nsChangeHint nsStyleColor::MaxDifference
+ }
+ #endif
+ 
+ // --------------------
+ // nsStyleBackground
+ //
+ 
+ nsStyleBackground::nsStyleBackground()
+-  : mBackgroundFlags(NS_STYLE_BG_IMAGE_NONE),
+-    mBackgroundAttachment(NS_STYLE_BG_ATTACHMENT_SCROLL),
+-    mBackgroundClip(NS_STYLE_BG_CLIP_BORDER),
+-    mBackgroundInlinePolicy(NS_STYLE_BG_INLINE_POLICY_CONTINUOUS),
+-    mBackgroundOrigin(NS_STYLE_BG_ORIGIN_PADDING),
+-    mBackgroundRepeat(NS_STYLE_BG_REPEAT_XY),
+-    mBackgroundColor(NS_RGBA(0, 0, 0, 0))
++  : mAttachmentCount(1)
++  , mClipCount(1)
++  , mOriginCount(1)
++  , mRepeatCount(1)
++  , mPositionCount(1)
++  , mImageCount(1)
++  , mBackgroundColor(NS_RGBA(0, 0, 0, 0))
++  , mFallbackBackgroundColor(NS_RGBA(0, 0, 0, 0))
++  , mBackgroundInlinePolicy(NS_STYLE_BG_INLINE_POLICY_CONTINUOUS)
+ {
++  Layer *onlyLayer = mLayers.AppendElement();
++  NS_ASSERTION(onlyLayer, "auto array must have room for 1 element");
++  onlyLayer->SetInitialValues();
+ }
+ 
+ nsStyleBackground::nsStyleBackground(const nsStyleBackground& aSource)
+-  : mBackgroundFlags(aSource.mBackgroundFlags),
+-    mBackgroundAttachment(aSource.mBackgroundAttachment),
+-    mBackgroundClip(aSource.mBackgroundClip),
+-    mBackgroundInlinePolicy(aSource.mBackgroundInlinePolicy),
+-    mBackgroundOrigin(aSource.mBackgroundOrigin),
+-    mBackgroundRepeat(aSource.mBackgroundRepeat),
+-    mBackgroundXPosition(aSource.mBackgroundXPosition),
+-    mBackgroundYPosition(aSource.mBackgroundYPosition),
+-    mBackgroundColor(aSource.mBackgroundColor),
+-    mBackgroundImage(aSource.mBackgroundImage)
++  : mAttachmentCount(aSource.mAttachmentCount)
++  , mClipCount(aSource.mClipCount)
++  , mOriginCount(aSource.mOriginCount)
++  , mRepeatCount(aSource.mRepeatCount)
++  , mPositionCount(aSource.mPositionCount)
++  , mImageCount(aSource.mImageCount)
++  , mLayers(aSource.mLayers) // deep copy
++  , mBackgroundColor(aSource.mBackgroundColor)
++  , mFallbackBackgroundColor(aSource.mFallbackBackgroundColor)
++  , mBackgroundInlinePolicy(aSource.mBackgroundInlinePolicy)
+ {
++  // If the deep copy of mLayers failed, truncate the counts.
++  PRUint32 count = mLayers.Length();
++  if (count != aSource.mLayers.Length()) {
++    NS_WARNING("truncating counts due to out-of-memory");
++    mAttachmentCount = PR_MAX(mAttachmentCount, count);
++    mClipCount = PR_MAX(mClipCount, count);
++    mOriginCount = PR_MAX(mOriginCount, count);
++    mRepeatCount = PR_MAX(mRepeatCount, count);
++    mPositionCount = PR_MAX(mPositionCount, count);
++    mImageCount = PR_MAX(mImageCount, count);
++  }
+ }
+ 
+ nsStyleBackground::~nsStyleBackground()
+ {
+ }
+ 
+ nsChangeHint nsStyleBackground::CalcDifference(const nsStyleBackground& aOther) const
+ {
+-  if ((mBackgroundAttachment == aOther.mBackgroundAttachment) &&
+-      (mBackgroundFlags == aOther.mBackgroundFlags) &&
+-      (mBackgroundRepeat == aOther.mBackgroundRepeat) &&
+-      (mBackgroundColor == aOther.mBackgroundColor) &&
+-      (mBackgroundClip == aOther.mBackgroundClip) &&
+-      (mBackgroundInlinePolicy == aOther.mBackgroundInlinePolicy) &&
+-      (mBackgroundOrigin == aOther.mBackgroundOrigin) &&
+-      EqualImages(mBackgroundImage, aOther.mBackgroundImage) &&
+-      ((!(mBackgroundFlags & NS_STYLE_BG_X_POSITION_PERCENT) ||
+-       (mBackgroundXPosition.mFloat == aOther.mBackgroundXPosition.mFloat)) &&
+-       (!(mBackgroundFlags & NS_STYLE_BG_X_POSITION_LENGTH) ||
+-        (mBackgroundXPosition.mCoord == aOther.mBackgroundXPosition.mCoord))) &&
+-      ((!(mBackgroundFlags & NS_STYLE_BG_Y_POSITION_PERCENT) ||
+-       (mBackgroundYPosition.mFloat == aOther.mBackgroundYPosition.mFloat)) &&
+-       (!(mBackgroundFlags & NS_STYLE_BG_Y_POSITION_LENGTH) ||
+-        (mBackgroundYPosition.mCoord == aOther.mBackgroundYPosition.mCoord))))
+-    return NS_STYLE_HINT_NONE;
+-  return NS_STYLE_HINT_VISUAL;
++  if (mBackgroundColor != aOther.mBackgroundColor ||
++      mFallbackBackgroundColor != aOther.mFallbackBackgroundColor ||
++      mBackgroundInlinePolicy != aOther.mBackgroundInlinePolicy ||
++      mImageCount != aOther.mImageCount)
++    return NS_STYLE_HINT_VISUAL;
++
++  // We checked the image count above.
++  NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, this) {
++    if (mLayers[i] != aOther.mLayers[i])
++      return NS_STYLE_HINT_VISUAL;
++  }
++
++  return NS_STYLE_HINT_NONE;
+ }
+ 
+ #ifdef DEBUG
+ /* static */
+ nsChangeHint nsStyleBackground::MaxDifference()
+ {
+   return NS_STYLE_HINT_VISUAL;
+ }
+ #endif
+ 
+ PRBool nsStyleBackground::HasFixedBackground() const
+ {
+-  return mBackgroundAttachment == NS_STYLE_BG_ATTACHMENT_FIXED &&
+-         mBackgroundImage;
++  NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, this) {
++    const Layer &layer = mLayers[i];
++    if (layer.mAttachment == NS_STYLE_BG_ATTACHMENT_FIXED &&
++        layer.mImage.mRequest) {
++      return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
++PRBool nsStyleBackground::IsTransparent() const
++{
++  return !BottomLayer().mImage.mRequest && mImageCount == 1 &&
++         NS_GET_A(mBackgroundColor) == 0;
++}
++
++void
++nsStyleBackground::Position::SetInitialValues()
++{
++  mXPosition.mFloat = 0.0f;
++  mYPosition.mFloat = 0.0f;
++  mXIsPercent = PR_TRUE;
++  mYIsPercent = PR_TRUE;
++}
++
++// Initialize to initial values
++nsStyleBackground::Image::Image()
++{
++  SetInitialValues();
++}
++
++nsStyleBackground::Image::~Image()
++{
++}
++
++void nsStyleBackground::Image::SetInitialValues()
++{
++  mRequest = nsnull;
++  mSpecified = PR_FALSE;
++}
++
++PRBool nsStyleBackground::Image::operator==(const Image& aOther) const
++{
++  return mSpecified == aOther.mSpecified &&
++         EqualImages(mRequest, aOther.mRequest);
++}
++
++nsStyleBackground::Layer::Layer()
++{
++  MOZ_COUNT_CTOR(nsStyleBackground::Layer);
++}
++
++nsStyleBackground::Layer::~Layer()
++{
++  MOZ_COUNT_DTOR(nsStyleBackground::Layer);
++}
++
++void
++nsStyleBackground::Layer::SetInitialValues()
++{
++  mAttachment = NS_STYLE_BG_ATTACHMENT_SCROLL;
++  mClip = NS_STYLE_BG_CLIP_BORDER;
++  mOrigin = NS_STYLE_BG_ORIGIN_PADDING;
++  mRepeat = NS_STYLE_BG_REPEAT_XY;
++  mPosition.SetInitialValues();
++  mImage.SetInitialValues();
++}
++
++PRBool nsStyleBackground::Layer::operator==(const Layer& aOther) const
++{
++  return mAttachment == aOther.mAttachment &&
++         mClip == aOther.mClip &&
++         mOrigin == aOther.mOrigin &&
++         mRepeat == aOther.mRepeat &&
++         mPosition == aOther.mPosition &&
++         mImage == aOther.mImage;
+ }
+ 
+ // --------------------
+ // nsStyleDisplay
+ //
+ 
+ nsStyleDisplay::nsStyleDisplay()
+ {
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -53,16 +53,17 @@
+ #include "nsFont.h"
+ #include "nsStyleCoord.h"
+ #include "nsStyleConsts.h"
+ #include "nsChangeHint.h"
+ #include "nsPresContext.h"
+ #include "nsIPresShell.h"
+ #include "nsCOMPtr.h"
+ #include "nsCOMArray.h"
++#include "nsTArray.h"
+ #include "nsIAtom.h"
+ #include "nsIURI.h"
+ #include "nsCSSValue.h"
+ #include "nsStyleTransformMatrix.h"
+ 
+ class nsIFrame;
+ class imgIRequest;
+ 
+@@ -159,40 +160,132 @@ struct nsStyleBackground {
+     aContext->FreeToShell(sizeof(nsStyleBackground), this);
+   }
+ 
+   nsChangeHint CalcDifference(const nsStyleBackground& aOther) const;
+ #ifdef DEBUG
+   static nsChangeHint MaxDifference();
+ #endif
+ 
+-  PRUint8 mBackgroundFlags;        // [reset] See nsStyleConsts.h
+-  PRUint8 mBackgroundAttachment;   // [reset] See nsStyleConsts.h
+-  PRUint8 mBackgroundClip;         // [reset] See nsStyleConsts.h
+-  PRUint8 mBackgroundInlinePolicy; // [reset] See nsStyleConsts.h
+-  PRUint8 mBackgroundOrigin;       // [reset] See nsStyleConsts.h
+-  PRUint8 mBackgroundRepeat;       // [reset] See nsStyleConsts.h
++  struct Position;
++  friend struct Position;
++  struct Position {
++    typedef union {
++      nscoord mCoord; // for lengths
++      float   mFloat; // for percents
++    } PositionCoord;
++    PositionCoord mXPosition, mYPosition;
++    PRPackedBool mXIsPercent, mYIsPercent;
+ 
+-  // Note: a member of this union is valid IFF the appropriate bit flag
+-  // is set in mBackgroundFlags.
+-  union {
+-    nscoord mCoord;
+-    float   mFloat;
+-  } mBackgroundXPosition,         // [reset]
+-    mBackgroundYPosition;         // [reset]
++    // Initialize nothing
++    Position() {}
++
++    // Initialize to initial values
++    void SetInitialValues();
++
++    PRBool operator==(const Position& aOther) const {
++      return mXIsPercent == aOther.mXIsPercent &&
++             (mXIsPercent ? (mXPosition.mFloat == aOther.mXPosition.mFloat)
++                          : (mXPosition.mCoord == aOther.mXPosition.mCoord)) &&
++             mYIsPercent == aOther.mYIsPercent &&
++             (mYIsPercent ? (mYPosition.mFloat == aOther.mYPosition.mFloat)
++                          : (mYPosition.mCoord == aOther.mYPosition.mCoord));
++    }
++    PRBool operator!=(const Position& aOther) const {
++      return !(*this == aOther);
++    }
++  };
++
++  /**
++   * We represent images as as struct because we need to distinguish the
++   * case where the imgIRequest is null because the winning
++   * background-image declaration specified no image from the case where
++   * the imgIRequest is null because the image that was specified was
++   * blocked or missing (e.g., missing file).
++   */
++  struct Image;
++  friend struct Image;
++  struct Image {
++    nsCOMPtr<imgIRequest> mRequest;
++    PRBool mSpecified; // if false, mRequest is guaranteed to be null
++
++    // These are not inline so that we can avoid #include "imgIRequest.h"
++
++    // Initialize to initial values
++    Image();
++    ~Image();
++    void SetInitialValues();
++
++    // An equality operator that compares the images using URL-equality
++    // rather than pointer-equality.
++    PRBool operator==(const Image& aOther) const;
++    PRBool operator!=(const Image& aOther) const {
++      return !(*this == aOther);
++    }
++  };
++
++  struct Layer;
++  friend struct Layer;
++  struct Layer {
++    PRUint8 mAttachment;                // [reset] See nsStyleConsts.h
++    PRUint8 mClip;                      // [reset] See nsStyleConsts.h
++    PRUint8 mOrigin;                    // [reset] See nsStyleConsts.h
++    PRUint8 mRepeat;                    // [reset] See nsStyleConsts.h
++    Position mPosition;                 // [reset]
++    Image mImage;                       // [reset]
++
++    // Initializes only mImage
++    Layer();
++    ~Layer();
++
++    void SetInitialValues();
++
++    // An equality operator that compares the images using URL-equality
++    // rather than pointer-equality.
++    PRBool operator==(const Layer& aOther) const;
++    PRBool operator!=(const Layer& aOther) const {
++      return !(*this == aOther);
++    }
++  };
++
++  // The (positive) number of computed values of each property, since
++  // the lengths of the lists are independent.
++  PRUint32 mAttachmentCount,
++           mClipCount,
++           mOriginCount,
++           mRepeatCount,
++           mPositionCount,
++           mImageCount;
++  // Layers are stored in an array, matching the top-to-bottom order in
++  // which they are specified in CSS.  The number of layers to be used
++  // should come from the background-image property.  We create
++  // additional |Layer| objects for *any* property, not just
++  // background-image.  This means that the bottommost layer that
++  // callers in layout care about (which is also the one whose
++  // background-clip applies to the background-color) may not be last
++  // layer.  In layers below the bottom layer, properties will be
++  // unitialized unless their count, above, indicates that they are
++  // present.
++  nsAutoTArray<Layer, 1> mLayers;
++
++  const Layer& BottomLayer() const { return mLayers[mImageCount - 1]; }
++
++  #define NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(var_, stylebg_) \
++    for (PRUint32 var_ = (stylebg_)->mImageCount; var_-- != 0; )
+ 
+   nscolor mBackgroundColor;       // [reset]
+-  nsCOMPtr<imgIRequest> mBackgroundImage; // [reset]
++  nscolor mFallbackBackgroundColor; // [reset]
++
++  // FIXME: This (now background-break in css3-background) should
++  // probably move into a different struct so that everything in
++  // nsStyleBackground is set by the background shorthand.
++  PRUint8 mBackgroundInlinePolicy; // [reset] See nsStyleConsts.h
+ 
+   // True if this background is completely transparent.
+-  PRBool IsTransparent() const
+-  {
+-    return (NS_GET_A(mBackgroundColor) == 0 &&
+-            (mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE));
+-  }
++  PRBool IsTransparent() const;
+ 
+   // We have to take slower codepaths for fixed background attachment,
+   // but we don't want to do that when there's no image.
+   // Not inline because it uses an nsCOMPtr<imgIRequest>
+   // FIXME: Should be in nsStyleStructInlines.h.
+   PRBool HasFixedBackground() const;
+ };
+ 
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -67,38 +67,43 @@ var gCSSProperties = {
+ 		domProp: "MozAppearance",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "radio", "menulist" ],
+ 		invalid_values: []
+ 	},
+ 	"-moz-background-clip": {
++		/*
++		 * When we rename this to 'background-clip', we also
++		 * need to rename the values to match the spec.
++		 */
+ 		domProp: "MozBackgroundClip",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
++		/* XXX Need to add support for "content" -- important for symmetry when handling background shorthand */
+ 		initial_values: [ "border" ],
+-		other_values: [ "padding" ],
+-		invalid_values: [ "content", "margin" ]
++		other_values: [ "padding", "border, padding", "padding, padding, padding", "border, border" ],
++		invalid_values: [ "content", "margin", "border border" ]
+ 	},
+ 	"-moz-background-inline-policy": {
+ 		domProp: "MozBackgroundInlinePolicy",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "continuous" ],
+ 		other_values: ["bounding-box", "each-box" ],
+ 		invalid_values: []
+ 	},
+ 	"-moz-background-origin": {
+ 		domProp: "MozBackgroundOrigin",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "padding" ],
+-		other_values: [ "border", "content" ],
+-		invalid_values: [ "margin" ]
++		other_values: [ "border", "content", "border, padding", "padding, padding, padding", "border, border" ],
++		invalid_values: [ "margin", "padding padding" ]
+ 	},
+ 	"-moz-binding": {
+ 		domProp: "MozBinding",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+ 		other_values: [ "url(foo.xml)" ],
+ 		invalid_values: []
+@@ -603,65 +608,108 @@ var gCSSProperties = {
+ 		initial_values: [ "center", "0deg" ],
+ 		other_values: [ "center behind", "behind far-right", "left-side", "73deg", "90.1deg", "0.1deg" ],
+ 		invalid_values: [ "0deg behind", "behind 0deg", "90deg behind", "behind 90deg" ]
+ 	},
+ 	"background": {
+ 		domProp: "background",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+-		subproperties: [ "background-attachment", "background-color", "background-image", "background-position", "background-repeat", "-moz-background-clip", "-moz-background-inline-policy", "-moz-background-origin" ],
++		subproperties: [ "background-attachment", "background-color", "background-image", "background-position", "background-repeat", "-moz-background-clip", "-moz-background-origin" ],
+ 		initial_values: [ "transparent", "none", "repeat", "scroll", "0% 0%", "top left", "left top", "transparent none", "top left none", "left top none", "none left top", "none top left", "none 0% 0%", "transparent none repeat scroll top left", "left top repeat none scroll transparent"],
+-		other_values: [ "green", "none green repeat scroll left top", "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==)", "repeat url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==') transparent left top scroll", "repeat-x", "repeat-y", "no-repeat", "none repeat-y transparent scroll 0% 0%", "fixed", "0% top transparent fixed repeat none", "top", "left", "50% 50%", "center", "bottom right scroll none transparent repeat", "50% transparent", "transparent 50%", "50%" ],
++		other_values: [
++		        /* without multiple backgrounds */
++		        "green", "none green repeat scroll left top", "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==)", "repeat url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==') transparent left top scroll", "repeat-x", "repeat-y", "no-repeat", "none repeat-y transparent scroll 0% 0%", "fixed", "0% top transparent fixed repeat none", "top", "left", "50% 50%", "center", "bottom right scroll none transparent repeat", "50% transparent", "transparent 50%", "50%",
++		        /* multiple backgrounds */
++		        "url(404.png), url(404.png)",
++		        "url(404.png), url(404.png) transparent",
++		        "url(404.png), url(404.png) transparent red",
++		        "repeat-x, fixed, none",
++		        "0% top url(404.png), url(404.png) 0% top",
++		        "fixed repeat-y top left url(404.png), repeat-x green",
++		        /* test cases with clip+origin in the shorthand */
++    // This is commented out for now until we change
++    // -moz-background-clip to background-clip, -moz-background-origin
++    // to background-origin, change their value names to *-box, and add
++    // support for content-box on background-clip.
++    /*
++		        "url(404.png) green padding-box",
++		        "url(404.png) border-box transparent",
++		        "content-box url(404.png) blue",
++    */
++		],
+  		invalid_values: [
+  			/* mixes with keywords have to be in correct order */
+  			"50% left", "top 50%",
+  			/* bug 258080: don't accept background-position separated */
+- 			"left url(404.png) top", "top url(404.png) left"
++ 			"left url(404.png) top", "top url(404.png) left",
++ 			/* not allowed to have color in non-bottom layer */
++ 			"url(404.png) transparent, url(404.png)",
++ 			"url(404.png) red, url(404.png)",
++ 			"url(404.png) transparent, url(404.png) transparent",
++ 			"url(404.png) transparent red, url(404.png) transparent red",
++ 			"url(404.png) red, url(404.png) red",
++ 			"url(404.png) rgba(0, 0, 0, 0), url(404.png)",
++ 			"url(404.png) rgb(255, 0, 0), url(404.png)",
++ 			"url(404.png) rgba(0, 0, 0, 0), url(404.png) rgba(0, 0, 0, 0)",
++ 			"url(404.png) rgba(0, 0, 0, 0) rgb(255, 0, 0), url(404.png) rgba(0, 0, 0, 0) rgb(255, 0, 0)",
++ 			"url(404.png) rgb(255, 0, 0), url(404.png) rgb(255, 0, 0)",
+  		]
+ 	},
+ 	"background-attachment": {
+ 		domProp: "backgroundAttachment",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "scroll" ],
+-		other_values: [ "fixed" ],
++		other_values: [ "fixed", "scroll,scroll", "fixed, scroll", "scroll, fixed, scroll", "fixed, fixed" ],
+ 		invalid_values: []
+ 	},
+ 	"background-color": {
+ 		domProp: "backgroundColor",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+-		initial_values: [ "transparent", "rgba(255, 127, 15, 0)", "hsla(240, 97%, 50%, 0.0)", "rgba(0, 0, 0, 0)", "rgba(255,255,255,-3.7)" ],
+-		other_values: [ "green", "rgb(255, 0, 128)", "#fc2", "#96ed2a", "black", "rgba(255,255,0,3)" ],
++		initial_values: [ "transparent", "transparent transparent", "rgba(255, 127, 15, 0)", "hsla(240, 97%, 50%, 0.0)", "rgba(0, 0, 0, 0)", "rgba(255,255,255,-3.7)" ],
++		other_values: [ "green", "rgb(255, 0, 128)", "#fc2", "#96ed2a", "black", "rgba(255,255,0,3)", "transparent green", "green transparent", "blue fuchsia", "rgb(3,4,5) hsl(240, 50%, 50%)" ],
+ 		invalid_values: [ "#0", "#00", "#0000", "#00000", "#0000000", "#00000000", "#000000000", "rgb(255.0,0.387,3489)" ]
+ 	},
+ 	"background-image": {
+ 		domProp: "backgroundImage",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+-		other_values: [ "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==)", "url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==')", 'url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==")', ],
++		other_values: [ "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==)", "url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==')", 'url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==")',
++			"none, none",
++			"none, none, none, none, none",
++			"url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==), none",
++			"none, url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==), none",
++			"url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==), url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR42u3NQQ0AAAgEoNP+nTWFDzcoQE1udQQCgUAgEAgEAsGTYAGjxAE/G/Q2tQAAAABJRU5ErkJggg==)"
++		],
+ 		invalid_values: []
+ 	},
+ 	"background-position": {
+ 		domProp: "backgroundPosition",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
++		/* is "0px 0px" an initial value or not? */
+ 		initial_values: [ "top left", "left top", "0% 0%", "0% top", "left 0%" ],
+-		other_values: [ "top", "left", "right", "bottom", "center", "center bottom", "bottom center", "center right", "right center", "center top", "top center", "center left", "left center", "right bottom", "bottom right", "50%" ],
++		other_values: [ "top", "left", "right", "bottom", "center", "center bottom", "bottom center", "center right", "right center", "center top", "top center", "center left", "left center", "right bottom", "bottom right", "50%", "top left, top left", "top left, top right", "top right, top left", "left top, 0% 0%", "10% 20%, 30%, 40%", "top left, bottom right", "right bottom, left top", "0%", "0px", "30px", "0%, 10%, 20%, 30%", "top, top, top, top, top" ],
+ 		invalid_values: [ "50% left", "top 50%" ]
+ 	},
+ 	"background-repeat": {
+ 		domProp: "backgroundRepeat",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "repeat" ],
+-		other_values: [ "repeat-x", "repeat-y", "no-repeat" ],
+-		invalid_values: []
++		other_values: [ "repeat-x", "repeat-y", "no-repeat",
++			"repeat-x, repeat-x",
++			"repeat, no-repeat",
++			"repeat-y, no-repeat, repeat-y",
++			"repeat, repeat, repeat"
++		],
++		invalid_values: [ "repeat repeat" ]
+ 	},
+ 	"border": {
+ 		domProp: "border",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "border-bottom-color", "border-bottom-style", "border-bottom-width", "border-left-color", "border-left-style", "border-left-width", "border-right-color", "border-right-style", "border-right-width", "border-top-color", "border-top-style", "border-top-width" ],
+ 		initial_values: [ "none", "medium", "currentColor", "thin", "none medium currentcolor" ],
+ 		other_values: [ "solid", "medium solid", "green solid", "10px solid", "thick solid" ],
+diff --git a/layout/style/test/test_shorthand_property_getters.html b/layout/style/test/test_shorthand_property_getters.html
+--- a/layout/style/test/test_shorthand_property_getters.html
++++ b/layout/style/test/test_shorthand_property_getters.html
+@@ -101,21 +101,31 @@ is(e.style.cssText, "border-style: ridge
+ // shorthand syntax are present.
+ e.setAttribute("style", "font: medium serif");
+ isnot(e.style.font, "", "should have font shorthand");
+ e.setAttribute("style", "font: medium serif; font-size-adjust: 0.45");
+ is(e.style.font, "", "should not have font shorthand");
+ e.setAttribute("style", "font: medium serif; font-stretch: condensed");
+ is(e.style.font, "", "should not have font shorthand");
+ 
++// For background, we can only express the value as a shorthand if
++// origin and clip are both their default, or if they're both the same.
++// ... or at least we will once we support them in the shorthand.
+ e.setAttribute("style", "background: red");
+ isnot(e.style.background, "", "should have background shorthand");
+ e.setAttribute("style", "background: red; -moz-background-origin: border");
+-is(e.style.background, "", "should not have background shorthand");
++is(e.style.background, "", "should not have background shorthand (origin:border)");
+ e.setAttribute("style", "background: red; -moz-background-clip: padding");
+-is(e.style.background, "", "should not have background shorthand");
++is(e.style.background, "", "should not have background shorthand (clip:padding)");
++e.setAttribute("style", "background: red; -moz-background-origin: content");
++is(e.style.background, "", "should not have background shorthand (origin:content)");
++// -moz-background-clip:content not yet supported
++//e.setAttribute("style", "background: red; -moz-background-clip: content");
++//is(e.style.background, "", "should not have background shorthand (clip:content)");
++//e.setAttribute("style", "background: red; -moz-background-clip: content; -moz-background-origin: content;");
++//isnot(e.style.background, "", "should have background shorthand (clip:content;origin:content)");
+ e.setAttribute("style", "background: red; -moz-background-inline-policy: each-box");
+-is(e.style.background, "", "should not have background shorthand");
++isnot(e.style.background, "", "should have background shorthand (-moz-background-inline-policy not relevant)");
+ 
+ </script>
+ </pre>
+ </body>
+ </html>
+diff --git a/layout/tables/nsTablePainter.cpp b/layout/tables/nsTablePainter.cpp
+--- a/layout/tables/nsTablePainter.cpp
++++ b/layout/tables/nsTablePainter.cpp
+@@ -192,17 +192,25 @@ TableBackgroundPainter::TableBackgroundD
+   SetFrame(aFrame);
+   SetData();
+ }
+ 
+ inline PRBool
+ TableBackgroundPainter::TableBackgroundData::ShouldSetBCBorder()
+ {
+   /* we only need accurate border data when positioning background images*/
+-  return mBackground && !(mBackground->mBackgroundFlags & NS_STYLE_BG_IMAGE_NONE);
++  if (!mBackground) {
++    return PR_FALSE;
++  }
++
++  NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, mBackground) {
++    if (mBackground->mLayers[i].mImage.mRequest)
++      return PR_TRUE;
++  }
++  return PR_FALSE;
+ }
+ 
+ nsresult
+ TableBackgroundPainter::TableBackgroundData::SetBCBorder(nsMargin& aBorder,
+                                                          TableBackgroundPainter* aPainter)
+ {
+   NS_PRECONDITION(aPainter, "null painter");
+   if (!mSynthBorder) {
+diff --git a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+--- a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
++++ b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+@@ -4109,17 +4109,19 @@ nsTreeBodyFrame::ScrollInternal(const Sc
+       return NS_OK;
+   }
+ 
+   mTopRowIndex += delta;
+ 
+   // See if we have a transparent background or a background image.  
+   // If we do, then we cannot blit.
+   const nsStyleBackground* background = GetStyleBackground();
+-  if (background->mBackgroundImage || background->IsTransparent() || 
++  if (background->BottomLayer().mImage.mRequest ||
++      background->mImageCount > 1 ||
++      NS_GET_A(background->mBackgroundColor) < 255 ||
+       PR_ABS(delta)*mRowHeight >= mRect.height) {
+     Invalidate();
+   } else {
+     nsIWidget* widget = nsLeafBoxFrame::GetView()->GetWidget();
+     if (widget) {
+       nscoord rowHeightAsPixels =
+         PresContext()->AppUnitsToDevPixels(mRowHeight);
+       widget->Scroll(0, -delta*rowHeightAsPixels, nsnull);
+@@ -4144,19 +4146,22 @@ nsTreeBodyFrame::ScrollHorzInternal(cons
+ 
+   nsRect bounds = aParts.mColumnsFrame->GetRect();
+   if (aPosition > (mHorzWidth - bounds.width)) 
+     aPosition = mHorzWidth - bounds.width;
+ 
+   PRInt32 delta = aPosition - mHorzPosition;
+   mHorzPosition = aPosition;
+ 
+-  // See if we have a background image.  If we do, then we cannot blit.
++  // See if we have a transparent background or a background image.  
++  // If we do, then we cannot blit.
+   const nsStyleBackground* background = GetStyleBackground();
+-  if (background->mBackgroundImage || background->IsTransparent() || 
++  if (background->BottomLayer().mImage.mRequest ||
++      background->mImageCount > 1 ||
++      NS_GET_A(background->mBackgroundColor) < 255 ||
+       PR_ABS(delta) >= mRect.width) {
+     Invalidate();
+   } else {
+     nsIWidget* widget = nsLeafBoxFrame::GetView()->GetWidget();
+     if (widget) {
+       widget->Scroll(PresContext()->AppUnitsToDevPixels(-delta), 0, nsnull);
+     }
+   }
+diff --git a/xpcom/glue/nsTArray.h b/xpcom/glue/nsTArray.h
+--- a/xpcom/glue/nsTArray.h
++++ b/xpcom/glue/nsTArray.h
+@@ -680,16 +680,29 @@ class nsTArray : public nsTArray_base {
+     // @param newLen  The desired length of this array.
+     void TruncateLength(size_type newLen) {
+       size_type oldLen = Length();
+       NS_ABORT_IF_FALSE(newLen <= oldLen,
+                         "caller should use SetLength instead");
+       RemoveElementsAt(newLen, oldLen - newLen);
+     }
+ 
++    // This method ensures that the array has length at least the given
++    // length.  If the current length is shorter than the given length,
++    // then new elements will be constructed using elem_type's default
++    // constructor.
++    // @param minLen  The desired minimum length of this array.
++    // @return        True if the operation succeeded; false otherwise.
++    PRBool EnsureLengthAtLeast(size_type minLen) {
++      size_type oldLen = Length();
++      if (minLen > oldLen) {
++        return InsertElementsAt(oldLen, minLen - oldLen) != nsnull;
++      }
++    }
++
+     // This method inserts elements into the array, constructing
+     // them using elem_type's default constructor.
+     // @param index the place to insert the new elements. This must be no
+     //              greater than the current length of the array.
+     // @param count the number of elements to insert
+     elem_type *InsertElementsAt(index_type index, size_type count) {
+       if (!nsTArray_base::InsertSlotsAt(index, count, sizeof(elem_type))) {
+         return nsnull;
