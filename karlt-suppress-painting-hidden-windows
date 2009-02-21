@@ -1,0 +1,206 @@
+From: Karl Tomlinson <mozbugz@karlt.net>
+
+Suppress painting when windows are not visible (obscured or minimized).  (Bug 478519)
+
+diff --git a/widget/src/gtk2/nsWindow.cpp b/widget/src/gtk2/nsWindow.cpp
+--- a/widget/src/gtk2/nsWindow.cpp
++++ b/widget/src/gtk2/nsWindow.cpp
+@@ -810,24 +810,46 @@ nsWindow::SetModal(PRBool aModal)
+     if (aModal)
+         gtk_window_set_modal(GTK_WINDOW(grabWidget), TRUE);
+     else
+         gtk_window_set_modal(GTK_WINDOW(grabWidget), FALSE);
+ 
+     return NS_OK;
+ }
+ 
+-NS_IMETHODIMP
+-nsWindow::IsVisible(PRBool & aState)
+-{
+-    aState = mIsVisible;
+-    if (mIsTopLevel && mShell) {
+-        aState = GTK_WIDGET_VISIBLE(mShell);
+-    }
+-    return NS_OK;
++// nsIWidget method, which means IsShown.
++NS_IMETHODIMP
++nsWindow::IsVisible(PRBool& aState)
++{
++    aState = mIsShown;
++    return NS_OK;
++}
++
++// Internal method, which returns false when no part of the window can be seen.
++PRBool
++nsWindow::IsVisible()
++{
++    // mIsVisible keeps track of whether any part of the window is unobscured,
++    // but does not get updated when the window is not viewable due to any
++    // ancestor window being unmapped.
++    if (!mIsShown || !mIsVisible)
++        return PR_FALSE;
++
++    GtkWidget *topWidget = nsnull;
++    GetToplevelWidget(&topWidget);
++
++    // If the toplevel widget has been unmapped, then record this in
++    // mIsVisible, which will be updated when the window becomes viewable
++    // again.
++    mIsVisible =
++        topWidget &&
++        !(gdk_window_get_state(topWidget->window) &
++          (GDK_WINDOW_STATE_ICONIFIED|GDK_WINDOW_STATE_WITHDRAWN));
++        
++    return mIsVisible;
+ }
+ 
+ NS_IMETHODIMP
+ nsWindow::ConstrainPosition(PRBool aAllowSlop, PRInt32 *aX, PRInt32 *aY)
+ {
+     if (mIsTopLevel && mShell) {
+         PRInt32 screenWidth = gdk_screen_width();
+         PRInt32 screenHeight = gdk_screen_height();
+@@ -1591,70 +1613,71 @@ nsWindow::Validate()
+         gdk_region_destroy(region);
+ 
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsWindow::Invalidate(PRBool aIsSynchronous)
+ {
++    if (!mDrawingarea || !IsVisible())
++        return NS_OK;
++
+     GdkRectangle rect;
+-
+     rect.x = mBounds.x;
+     rect.y = mBounds.y;
+     rect.width = mBounds.width;
+     rect.height = mBounds.height;
+ 
+     LOGDRAW(("Invalidate (all) [%p]: %d %d %d %d\n", (void *)this,
+              rect.x, rect.y, rect.width, rect.height));
+ 
+-    if (!mDrawingarea)
+-        return NS_OK;
+-
+     gdk_window_invalidate_rect(mDrawingarea->inner_window,
+                                &rect, FALSE);
+     if (aIsSynchronous)
+         gdk_window_process_updates(mDrawingarea->inner_window, FALSE);
+ 
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsWindow::Invalidate(const nsIntRect &aRect,
+                      PRBool           aIsSynchronous)
+ {
++    if (!mDrawingarea || !IsVisible())
++        return NS_OK;
++
+     GdkRectangle rect;
+-
+     rect.x = aRect.x;
+     rect.y = aRect.y;
+     rect.width = aRect.width;
+     rect.height = aRect.height;
+ 
+     LOGDRAW(("Invalidate (rect) [%p]: %d %d %d %d (sync: %d)\n", (void *)this,
+              rect.x, rect.y, rect.width, rect.height, aIsSynchronous));
+ 
+-    if (!mDrawingarea)
+-        return NS_OK;
+-
+     gdk_window_invalidate_rect(mDrawingarea->inner_window,
+                                &rect, FALSE);
+     if (aIsSynchronous)
+         gdk_window_process_updates(mDrawingarea->inner_window, FALSE);
+ 
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsWindow::InvalidateRegion(const nsIRegion* aRegion,
+                            PRBool           aIsSynchronous)
+ {
++    if (!mDrawingarea || !IsVisible())
++        return NS_OK;
++
+     GdkRegion *region = nsnull;
+     aRegion->GetNativeRegion((void *&)region);
+ 
+-    if (region && mDrawingarea) {
++    if (region) {
+         GdkRectangle rect;
+         gdk_region_get_clipbox(region, &rect);
+ 
+         LOGDRAW(("Invalidate (region) [%p]: %d %d %d %d (sync: %d)\n",
+                  (void *)this,
+                  rect.x, rect.y, rect.width, rect.height, aIsSynchronous));
+ 
+         gdk_window_invalidate_region(mDrawingarea->inner_window,
+@@ -4509,19 +4532,17 @@ nsWindow::GrabPointer(void)
+ {
+     LOG(("GrabPointer %d\n", mRetryPointerGrab));
+ 
+     mRetryPointerGrab = PR_FALSE;
+ 
+     // If the window isn't visible, just set the flag to retry the
+     // grab.  When this window becomes visible, the grab will be
+     // retried.
+-    PRBool visibility = PR_TRUE;
+-    IsVisible(visibility);
+-    if (!visibility) {
++    if (!IsVisible()) {
+         LOG(("GrabPointer: window not visible\n"));
+         mRetryPointerGrab = PR_TRUE;
+         return;
+     }
+ 
+     if (!mDrawingarea)
+         return;
+ 
+@@ -4548,19 +4569,17 @@ nsWindow::GrabKeyboard(void)
+ {
+     LOG(("GrabKeyboard %d\n", mRetryKeyboardGrab));
+ 
+     mRetryKeyboardGrab = PR_FALSE;
+ 
+     // If the window isn't visible, just set the flag to retry the
+     // grab.  When this window becomes visible, the grab will be
+     // retried.
+-    PRBool visibility = PR_TRUE;
+-    IsVisible(visibility);
+-    if (!visibility) {
++    if (!IsVisible()) {
+         LOG(("GrabKeyboard: window not visible\n"));
+         mRetryKeyboardGrab = PR_TRUE;
+         return;
+     }
+ 
+     // we need to grab the keyboard on the transient parent so that we
+     // don't end up with any focus events that end up on the parent
+     // window that will cause the popup to go away
+diff --git a/widget/src/gtk2/nsWindow.h b/widget/src/gtk2/nsWindow.h
+--- a/widget/src/gtk2/nsWindow.h
++++ b/widget/src/gtk2/nsWindow.h
+@@ -468,16 +468,17 @@ protected:
+     // shouldn't be automatically set to 0,0 for first show.
+     PRPackedBool        mPlaced;
+ 
+     // Preferred sizes
+     PRUint32            mPreferredWidth;
+     PRUint32            mPreferredHeight;
+ 
+ private:
++    PRBool             IsVisible();
+     void               GetToplevelWidget(GtkWidget **aWidget);
+     GtkWidget         *GetMozContainerWidget();
+     void               GetContainerWindow(nsWindow  **aWindow);
+     void               SetUrgencyHint(GtkWidget *top_window, PRBool state);
+     void              *SetupPluginPort(void);
+     nsresult           SetWindowIconList(const nsTArray<nsCString> &aIconList);
+     void               SetDefaultIcon(void);
+     void               InitButtonEvent(nsMouseEvent &aEvent, GdkEventButton *aGdkEvent);
