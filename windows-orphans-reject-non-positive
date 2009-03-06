@@ -1,0 +1,156 @@
+Reject non-positive values for widows and orphans.
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -496,16 +496,19 @@ protected:
+   PRBool ParseColorOpacity(PRUint8& aOpacity);
+   PRBool ParseEnum(nsCSSValue& aValue, const PRInt32 aKeywordTable[]);
+   PRBool ParseVariant(nsCSSValue& aValue,
+                       PRInt32 aVariantMask,
+                       const PRInt32 aKeywordTable[]);
+   PRBool ParseNonNegativeVariant(nsCSSValue& aValue,
+                                  PRInt32 aVariantMask,
+                                  const PRInt32 aKeywordTable[]);
++  PRBool ParsePositiveNonZeroVariant(nsCSSValue& aValue,
++                                     PRInt32 aVariantMask,
++                                     const PRInt32 aKeywordTable[]);
+   PRBool ParseCounter(nsCSSValue& aValue);
+   PRBool ParseAttr(nsCSSValue& aValue);
+   PRBool ParseURL(nsCSSValue& aValue);
+   PRBool TranslateDimension(nsCSSValue& aValue, PRInt32 aVariantMask,
+                             float aNumber, const nsString& aUnit);
+ 
+   void SetParsingCompoundProperty(PRBool aBool) {
+     NS_ASSERTION(aBool == PR_TRUE || aBool == PR_FALSE, "bad PRBool value");
+@@ -4293,21 +4296,44 @@ CSSParserImpl::TranslateDimension(nsCSSV
+   }
+   if ((type & aVariantMask) != 0) {
+     aValue.SetFloatValue(aNumber, units);
+     return PR_TRUE;
+   }
+   return PR_FALSE;
+ }
+ 
++#define VARIANT_ALL_NONNUMERIC \
++  VARIANT_KEYWORD | \
++  VARIANT_COLOR | \
++  VARIANT_URL | \
++  VARIANT_STRING | \
++  VARIANT_COUNTER | \
++  VARIANT_ATTR | \
++  VARIANT_IDENTIFIER | \
++  VARIANT_AUTO | \
++  VARIANT_INHERIT | \
++  VARIANT_NONE | \
++  VARIANT_NORMAL | \
++  VARIANT_SYSFONT
++
+ PRBool
+ CSSParserImpl::ParseNonNegativeVariant(nsCSSValue& aValue,
+                                        PRInt32 aVariantMask,
+                                        const PRInt32 aKeywordTable[])
+ {
++  // The variant mask must only contain non-numeric variants or the ones
++  // that we specifically handle.
++  NS_ABORT_IF_FALSE((aVariantMask & ~(VARIANT_ALL_NONNUMERIC |
++                                      VARIANT_NUMBER |
++                                      VARIANT_LENGTH |
++                                      VARIANT_PERCENT |
++                                      VARIANT_INTEGER)) == 0,
++                    "need to update code below to handle additional variants");
++
+   if (ParseVariant(aValue, aVariantMask, aKeywordTable)) {
+     if (eCSSUnit_Number == aValue.GetUnit() ||
+         aValue.IsLengthUnit()){
+       if (aValue.GetFloatValue() < 0) {
+         UngetToken();
+         return PR_FALSE;
+       }
+     }
+@@ -4322,16 +4348,39 @@ CSSParserImpl::ParseNonNegativeVariant(n
+         return PR_FALSE;
+       }
+     }
+     return PR_TRUE;
+   }
+   return PR_FALSE;
+ }
+ 
++PRBool
++CSSParserImpl::ParsePositiveNonZeroVariant(nsCSSValue& aValue,
++                                           PRInt32 aVariantMask,
++                                           const PRInt32 aKeywordTable[])
++{
++  // The variant mask must only contain non-numeric variants or the ones
++  // that we specifically handle.
++  NS_ABORT_IF_FALSE((aVariantMask & ~(VARIANT_ALL_NONNUMERIC |
++                                      VARIANT_INTEGER)) == 0,
++                    "need to update code below to handle additional variants");
++
++  if (ParseVariant(aValue, aVariantMask, aKeywordTable)) {
++    if (aValue.GetUnit() == eCSSUnit_Integer) {
++      if (aValue.GetIntValue() <= 0) {
++        UngetToken();
++        return PR_FALSE;
++      }
++    }
++    return PR_TRUE;
++  }
++  return PR_FALSE;
++}
++
+ // Assigns to aValue iff it returns PR_TRUE.
+ PRBool
+ CSSParserImpl::ParseVariant(nsCSSValue& aValue,
+                             PRInt32 aVariantMask,
+                             const PRInt32 aKeywordTable[])
+ {
+   NS_ASSERTION(IsParsingCompoundProperty() ||
+                ((~aVariantMask) & (VARIANT_LENGTH|VARIANT_COLOR)),
+@@ -5381,23 +5430,19 @@ CSSParserImpl::ParseSingleValueProperty(
+   case eCSSProperty_border_left_width_value: // for internal use
+   case eCSSProperty_border_right_width_value: // for internal use
+   case eCSSProperty_border_start_width_value: // for internal use
+   case eCSSProperty_border_top_width:
+   case eCSSProperty__moz_column_rule_width:
+     return ParseNonNegativeVariant(aValue, VARIANT_HKL,
+                                    nsCSSProps::kBorderWidthKTable);
+   case eCSSProperty__moz_column_count:
+-    // Need to reject 0 in addition to negatives, so don't bother with
+-    // ParseNonNegativeVariant.  If we accept 0, we need to change
+-    // NS_STYLE_COLUMN_COUNT_AUTO to something else.
+-    return ParseVariant(aValue, VARIANT_AHI, nsnull) &&
+-           (aValue.GetUnit() != eCSSUnit_Integer ||
+-            aValue.GetIntValue() > 0 ||
+-            (UngetToken(), PR_FALSE));
++    // Need to reject 0 in addition to negatives.  If we accept 0, we
++    // need to change NS_STYLE_COLUMN_COUNT_AUTO to something else.
++    return ParsePositiveNonZeroVariant(aValue, VARIANT_AHI, nsnull);
+   case eCSSProperty__moz_column_width:
+     return ParseNonNegativeVariant(aValue, VARIANT_AHL, nsnull);
+   case eCSSProperty__moz_column_gap:
+     return ParseNonNegativeVariant(aValue, VARIANT_HL | VARIANT_NORMAL, nsnull);
+   case eCSSProperty_bottom:
+   case eCSSProperty_top:
+   case eCSSProperty_left:
+   case eCSSProperty_right:
+@@ -5592,17 +5637,17 @@ CSSParserImpl::ParseSingleValueProperty(
+     return ParseNonNegativeVariant(aValue, VARIANT_HLP, nsnull);
+   case eCSSProperty_min_width:
+     return ParseNonNegativeVariant(aValue, VARIANT_HKLP,
+                                    nsCSSProps::kWidthKTable);
+   case eCSSProperty_opacity:
+     return ParseVariant(aValue, VARIANT_HN, nsnull);
+   case eCSSProperty_orphans:
+   case eCSSProperty_widows:
+-    return ParseVariant(aValue, VARIANT_HI, nsnull);
++    return ParsePositiveNonZeroVariant(aValue, VARIANT_HI, nsnull);
+   case eCSSProperty_outline_color:
+     return ParseVariant(aValue, VARIANT_HCK,
+                         nsCSSProps::kOutlineColorKTable);
+   case eCSSProperty_outline_style:
+     return ParseVariant(aValue, VARIANT_HOK | VARIANT_AUTO,
+                         nsCSSProps::kOutlineStyleKTable);
+   case eCSSProperty_outline_width:
+     return ParseNonNegativeVariant(aValue, VARIANT_HKL,
