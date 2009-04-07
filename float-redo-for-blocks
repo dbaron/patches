@@ -3,7 +3,7 @@ Fix bug 25888 for blocks:  redo block reflow when the height of a block that doe
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -2959,58 +2959,123 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
+@@ -2957,56 +2957,120 @@ nsBlockFrame::ReflowBlockFrame(nsBlockRe
          
          // Note that aState.mY should stay where it is: at the top
          // border-edge of the frame
@@ -18,16 +18,14 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +
      // Here aState.mY is the top border-edge of the block.
      // Compute the available space for the block
-     nsRect floatAvailableSpace;
-     PRBool isImpacted = aState.GetFloatAvailableSpace(floatAvailableSpace);
+     nsFlowAreaRect floatAvailableSpace = aState.GetFloatAvailableSpace();
 -#ifdef REALLY_NOISY_REFLOW
 -    printf("setting line %p isImpacted to %s\n",
--           aLine.get(), isImpacted?"true":"false");
+-           aLine.get(), floatAvailableSpace.mHasFloats?"true":"false");
 -#endif
--    aLine->SetLineIsImpactedByFloat(isImpacted);
+-    aLine->SetLineIsImpactedByFloat(floatAvailableSpace.mHasFloats);
      nsRect availSpace;
-     aState.ComputeBlockAvailSpace(frame, display,
-                                   isImpacted, floatAvailableSpace,
+     aState.ComputeBlockAvailSpace(frame, display, floatAvailableSpace,
                                    replacedBlock != nsnull, availSpace);
 -    
 +
@@ -61,8 +59,9 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 -                         aLine.get(), blockHtmlRS, frameReflowStatus, aState);
 +    nsReflowStatus frameReflowStatus;
 +    do {
-+      if (isImpacted) {
-+        // Set if isImpacted is true for any iteration of the loop.
++      if (floatAvailableSpace.mHasFloats) {
++        // Set if floatAvailableSpace.mHasFloats is true for any
++        // iteration of the loop.
 +        aLine->SetLineIsImpactedByFloat(PR_TRUE);
 +      }
 +      
@@ -91,41 +90,39 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 +        break;
 +      }
 +
-+      nsRect oldFloatAvailableSpace(floatAvailableSpace);
-+      isImpacted = aState.GetFloatAvailableSpaceForHeight(
-+                            aState.mY + topMargin, brc.GetMetrics().height,
-+                            &floatManagerState,
-+                            floatAvailableSpace);
-+      NS_ASSERTION(floatAvailableSpace.y == oldFloatAvailableSpace.y, "yikes");
++      nsRect oldFloatAvailableSpaceRect(floatAvailableSpace.mRect);
++      floatAvailableSpace = aState.GetFloatAvailableSpaceForHeight(
++                              aState.mY + topMargin, brc.GetMetrics().height,
++                              &floatManagerState);
++      NS_ASSERTION(floatAvailableSpace.mRect.y == oldFloatAvailableSpaceRect.y,
++                   "yikes");
 +      // Restore the height to the position of the next band.
-+      floatAvailableSpace.height = oldFloatAvailableSpace.height;
-+      if (!AvailableSpaceShrunk(oldFloatAvailableSpace, floatAvailableSpace)) {
++      floatAvailableSpace.mRect.height = oldFloatAvailableSpaceRect.height;
++      if (!AvailableSpaceShrunk(oldFloatAvailableSpace,
++                                floatAvailableSpace.mRect)) {
 +        break;
 +      }
 +
 +      PRBool advanced = PR_FALSE;
 +      if (!aState.ReplacedBlockFitsInAvailSpace(replacedBlock,
-+                                                floatAvailableSpace,
-+                                                isImpacted)) {
++                                                floatAvailableSpace)) {
 +        // Advance to the next band.
 +        // XXX SHOULD THIS BE TREATED AS CLEARANCE?
 +        nscoord newY = aState.mY;
-+        if (aState.AdvanceToNextBand(floatAvailableSpace, &newY))
++        if (aState.AdvanceToNextBand(floatAvailableSpace.mRect, &newY))
 +          advanced = PR_TRUE;
 +        // ClearFloats might be able to advance us further once we're there.
 +        aState.mY =
 +          aState.ClearFloats(newY, NS_STYLE_CLEAR_NONE, replacedBlock);
 +        // Start over with a new available space rect at the new height.
-+        isImpacted =
++        floatAvailableSpace =
 +          aState.GetFloatAvailableSpaceWithState(aState.mY, PR_FALSE,
-+                                                 &floatManagerState,
-+                                                 floatAvailableSpace);
++                                                 &floatManagerState);
 +      }
 +
 +      nsRect oldAvailSpace(availSpace);
 +      // XXX NEED TO ADJUST mY AROUND OR ALLOW PASSING OF topMargin
-+      aState.ComputeBlockAvailSpace(frame, display,
-+                                    isImpacted, floatAvailableSpace,
++      aState.ComputeBlockAvailSpace(frame, display, floatAvailableSpace.mRect,
 +                                    replacedBlock != nsnull, availSpace);
 +      if (!advanced && availSpace.IsExactEqual(oldAvailSpace)) {
 +        break;
@@ -147,7 +144,7 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
          frame->GetRect().y != passOriginalY) {
        Invalidate(frame->GetOverflowRect() + frame->GetPosition());
      }
-@@ -6889,17 +6954,17 @@ nsBlockFrame::BlockCanIntersectFloats(ns
+@@ -6883,17 +6947,17 @@ nsBlockFrame::BlockCanIntersectFloats(ns
  }
  
  // Note that this width can vary based on the vertical position.
@@ -210,33 +207,33 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
    NS_ASSERTION(aFloatAvailableSpace.x >= 0, "bad avail space rect x");
    NS_ASSERTION(aFloatAvailableSpace.width == 0 ||
                 aFloatAvailableSpace.XMost() <= mContentArea.width,
-@@ -1139,40 +1139,25 @@ nsBlockReflowState::ClearFloats(nscoord 
+@@ -1131,41 +1131,24 @@ nsBlockReflowState::ClearFloats(nscoord 
+   if (aBreakType != NS_STYLE_CLEAR_NONE) {
      newY = bp.top + mFloatManager->ClearFloats(newY - bp.top, aBreakType);
    }
  
    if (aReplacedBlock) {
      for (;;) {
-       nsRect floatAvailableSpace;
-       PRBool bandHasFloats =
-         GetFloatAvailableSpace(newY, PR_FALSE, floatAvailableSpace);
+       nsFlowAreaRect floatAvailableSpace = 
+         GetFloatAvailableSpace(newY, PR_FALSE);
 -      nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
--        nsBlockFrame::WidthToClearPastFloats(*this, floatAvailableSpace,
+-        nsBlockFrame::WidthToClearPastFloats(*this, floatAvailableSpace.mRect,
 -                                             aReplacedBlock);
--      if (!bandHasFloats ||
--          PR_MAX(floatAvailableSpace.x, replacedWidth.marginLeft) +
+-      if (!floatAvailableSpace.mHasFloats ||
+-          PR_MAX(floatAvailableSpace.mRect.x, replacedWidth.marginLeft) +
 -            replacedWidth.borderBoxWidth +
 -            PR_MAX(mContentArea.width -
--                     PR_MIN(mContentArea.width, floatAvailableSpace.XMost()),
+-                     PR_MIN(mContentArea.width,
+-                            floatAvailableSpace.mRect.XMost()),
 -                   replacedWidth.marginRight) <=
 -          mContentArea.width) {
-+      if (ReplacedBlockFitsInAvailSpace(aReplacedBlock, floatAvailableSpace,
-+                                        bandHasFloats)) {
++      if (ReplacedBlockFitsInAvailSpace(aReplacedBlock, floatAvailableSpace)) {
          break;
        }
        // See the analogous code for inlines in nsBlockFrame::DoReflowInlineFrames
--      if (floatAvailableSpace.height > 0) {
+-      if (floatAvailableSpace.mRect.height > 0) {
 -        // See if there's room in the next band.
--        newY += floatAvailableSpace.height;
+-        newY += floatAvailableSpace.mRect.height;
 -      } else {
 -        if (mReflowState.availableHeight != NS_UNCONSTRAINEDSIZE) {
 -          // Stop trying to clear here; we'll just get pushed to the
@@ -245,7 +242,7 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
 -        }
 -        NS_NOTREACHED("avail space rect with zero height!");
 -        newY += 1;
-+      if (!AdvanceToNextBand(floatAvailableSpace, &newY)) {
++      if (!AdvanceToNextBand(floatAvailableSpace.mRect, &newY)) {
 +        // Stop trying to clear here; we'll just get pushed to the
 +        // next column or page and try again there.
 +        break;
@@ -260,7 +257,7 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
 diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
 --- a/layout/generic/nsBlockReflowState.h
 +++ b/layout/generic/nsBlockReflowState.h
-@@ -129,16 +129,48 @@ public:
+@@ -128,16 +128,48 @@ public:
    PRBool PlaceBelowCurrentLineFloats(nsFloatCacheFreeList& aFloats, PRBool aForceFit);
  
    // Returns the first coordinate >= aY that clears the
@@ -287,16 +284,16 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
 +  }
 +
 +  PRBool ReplacedBlockFitsInAvailSpace(nsIFrame* aReplacedBlock,
-+                                       const nsRect& aFloatAvailableSpace,
-+                                       PRBool aBandHasFloats) const {
++                            const nsFlowAreaRect& aFloatAvailableSpace) const {
 +    nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
-+      nsBlockFrame::WidthToClearPastFloats(*this, aFloatAvailableSpace,
++      nsBlockFrame::WidthToClearPastFloats(*this, aFloatAvailableSpace.mRect,
 +                                           aReplacedBlock);
-+    return !aBandHasFloats ||
-+           PR_MAX(aFloatAvailableSpace.x, replacedWidth.marginLeft) +
++    return !aFloatAvailableSpace.mHasFloats ||
++           PR_MAX(aFloatAvailableSpace.mRect.x, replacedWidth.marginLeft) +
 +             replacedWidth.borderBoxWidth +
 +             PR_MAX(mContentArea.width -
-+                      PR_MIN(mContentArea.width, aFloatAvailableSpace.XMost()),
++                      PR_MIN(mContentArea.width,
++                             aFloatAvailableSpace.mRect.XMost()),
 +                    replacedWidth.marginRight) <=
 +           mContentArea.width;
 +  }
@@ -309,7 +306,7 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
    /**
     * Adjusts the border/padding to return 0 for the top if
     * we are not the first in flow.
-@@ -165,17 +197,17 @@ public:
+@@ -164,17 +196,17 @@ public:
    // Caller must have called GetAvailableSpace for the correct position
    // (which need not be the current mY).  Callers need only pass
    // aReplacedWidth for outer table frames.
@@ -324,10 +321,10 @@ diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowS
    // Caller must have called GetAvailableSpace for the current mY
    void ComputeBlockAvailSpace(nsIFrame* aFrame,
                                const nsStyleDisplay* aDisplay,
-                               PRBool aBandHasFloats,
-                               const nsRect& aFloatAvailableSpace,
+                               const nsFlowAreaRect& aFloatAvailableSpace,
                                PRBool aBlockAvoidsFloats,
                                nsRect& aResult);
+ 
 diff --git a/layout/reftests/bugs/25888-1l.html b/layout/reftests/bugs/25888-1l-block.html
 copy from layout/reftests/bugs/25888-1l.html
 copy to layout/reftests/bugs/25888-1l-block.html
