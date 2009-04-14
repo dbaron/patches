@@ -1,0 +1,88 @@
+Reverse the meaning of suspectCurrentCount and rename it to expectedGarbageCount.
+
+diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
+--- a/xpcom/base/nsCycleCollector.cpp
++++ b/xpcom/base/nsCycleCollector.cpp
+@@ -2552,47 +2552,53 @@ nsCycleCollector::ExplainLiveExpectedGar
+     }
+ 
+     mCollectionInProgress = PR_TRUE;
+     mScanInProgress = PR_TRUE;
+ 
+     {
+         GCGraphBuilder builder(mGraph, mRuntimes);
+ 
++        // Instead of adding roots from the purple buffer, we add them
++        // from the list of nodes we were expected to collect.
++        // Put the expected garbage in *before* calling
++        // BeginCycleCollection so that we can separate the expected
++        // garbage from the NoteRoot calls in such a way that something
++        // that's in both is considered expected garbage.
++        mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, &builder);
++
++        PRUint32 expectedGarbageCount = builder.Count();
++
+         for (PRUint32 i = 0; i <= nsIProgrammingLanguage::MAX; ++i) {
+             if (mRuntimes[i])
+                 mRuntimes[i]->BeginCycleCollection(builder);
+         }
+ 
+-        // This might fail to explain expected garbage that's also in
+-        // the set of roots added by the runtimes (what used to be
+-        // called suspectCurrent), but that seems pretty unlikely.
+-        PRUint32 suspectCurrentCount = builder.Count();
+-
+-        // Instead of adding roots from the purple buffer, we add them
+-        // from the list of nodes we were expected to collect.
+-        mExpectedGarbage.EnumerateEntries(&AddExpectedGarbage, &builder);
+-
+         MarkRoots(builder);
+         ScanRoots();
+ 
+         mScanInProgress = PR_FALSE;
+ 
+         PRBool describeExtraRefcounts = PR_FALSE;
+         PRBool findCycleRoots = PR_FALSE;
+         {
+             NodePool::Enumerator queue(mGraph.mNodes);
+             PRUint32 i = 0;
+             while (!queue.IsDone()) {
+                 PtrInfo *pi = queue.GetNext();
+                 if (pi->mColor == white) {
+                     findCycleRoots = PR_TRUE;
+                 }
+ 
+-                if (pi->mInternalRefs != pi->mRefCount && i >= suspectCurrentCount) {
++                if (pi->mInternalRefs != pi->mRefCount &&
++                    (i < expectedGarbageCount || i >= mGraph.mRootCount)) {
++                    // This check isn't particularly useful anymore
++                    // given that we need to enter this part for i >=
++                    // mGraph.mRootCount and there are plenty of
++                    // NoteRoot roots.
+                     describeExtraRefcounts = PR_TRUE;
+                 }
+                 ++i;
+             }
+         }
+ 
+         if ((describeExtraRefcounts || findCycleRoots) &&
+             CreateReversedEdges()) {
+@@ -2610,17 +2616,17 @@ nsCycleCollector::ExplainLiveExpectedGar
+                 PtrInfo *pi = etor_clear.GetNext();
+                 pi->mSCCIndex = INDEX_UNREACHED;
+             }
+ 
+             nsDeque queue; // for breadth-first search
+             NodePool::Enumerator etor_roots(mGraph.mNodes);
+             for (PRUint32 i = 0; i < mGraph.mRootCount; ++i) {
+                 PtrInfo *root_pi = etor_roots.GetNext();
+-                if (i >= suspectCurrentCount) {
++                if (i < expectedGarbageCount) {
+                     root_pi->mSCCIndex = INDEX_REACHED;
+                     root_pi->mShortestPathToExpectedGarbage = root_pi;
+                     queue.Push(root_pi);
+                 }
+             }
+ 
+             while (queue.GetSize() > 0) {
+                 PtrInfo *pi = (PtrInfo*)queue.PopFront();
