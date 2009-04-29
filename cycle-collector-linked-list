@@ -2,6 +2,302 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Implement cycle collector's purple buffer using a linked list rather than a hash table.  (Bug 490695)
 
+diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
+--- a/xpcom/base/nsCycleCollector.cpp
++++ b/xpcom/base/nsCycleCollector.cpp
+@@ -234,17 +234,16 @@ struct nsCycleCollectorStats
+     PRUint32 mSetColorWhite;
+ 
+     PRUint32 mFailedUnlink;
+     PRUint32 mCollectedNode;
+     PRUint32 mBumpGeneration;
+     PRUint32 mZeroGeneration;
+ 
+     PRUint32 mSuspectNode;
+-    PRUint32 mSpills;    
+     PRUint32 mForgetNode;
+     PRUint32 mFreedWhilePurple;
+   
+     PRUint32 mCollection;
+ 
+     nsCycleCollectorStats()
+     {
+         memset(this, 0, sizeof(nsCycleCollectorStats));
+@@ -268,17 +267,16 @@ struct nsCycleCollectorStats
+         DUMP(mSetColorWhite);
+     
+         DUMP(mFailedUnlink);
+         DUMP(mCollectedNode);
+         DUMP(mBumpGeneration);
+         DUMP(mZeroGeneration);
+     
+         DUMP(mSuspectNode);
+-        DUMP(mSpills);
+         DUMP(mForgetNode);
+         DUMP(mFreedWhilePurple);
+     
+         DUMP(mCollection);
+ #undef DUMP
+     }
+ };
+ #endif
+@@ -656,84 +654,54 @@ struct GCGraph
+     }
+     ~GCGraph() { 
+     }
+ };
+ 
+ // XXX Would be nice to have an nsHashSet<KeyType> API that has
+ // Add/Remove/Has rather than PutEntry/RemoveEntry/GetEntry.
+ typedef nsTHashtable<nsVoidPtrHashKey> PointerSet;
+-typedef nsBaseHashtable<nsVoidPtrHashKey, PRUint32, PRUint32>
+-    PointerSetWithGeneration;
+ 
+ #ifdef DEBUG_CC
+ static void
+ WriteGraph(FILE *stream, GCGraph &graph, const void *redPtr);
+ #endif
+ 
+ struct nsPurpleBuffer
+ {
+-
+-#define ASSOCIATIVITY 2
+-#define INDEX_LOW_BIT 6
+-#define N_INDEX_BITS 13
+-
+-#define N_ENTRIES (1 << N_INDEX_BITS)
+-#define N_POINTERS (N_ENTRIES * ASSOCIATIVITY)
+-#define TOTAL_BYTES (N_POINTERS * PR_BYTES_PER_WORD)
+-#define INDEX_MASK PR_BITMASK(N_INDEX_BITS)
+-#define POINTER_INDEX(P) ((((PRUword)P) >> INDEX_LOW_BIT) & (INDEX_MASK))
+-
+-#if (INDEX_LOW_BIT + N_INDEX_BITS > (8 * PR_BYTES_PER_WORD))
+-#error "index bit overflow"
+-#endif
+-
+     // This class serves as a generational wrapper around a pldhash
+     // table: a subset of generation zero lives in mCache, the
+     // remainder spill into the mBackingStore hashtable. The idea is
+     // to get a higher hit rate and greater locality of reference for
+     // generation zero, in which the vast majority of suspect/forget
+     // calls annihilate one another.
+ 
+     nsCycleCollectorParams &mParams;
+ #ifdef DEBUG_CC
+     nsCycleCollectorStats &mStats;
+ #endif
+-    void* mCache[N_POINTERS];
+-    PRUint32 mCurrGen;    
+-    PointerSetWithGeneration mBackingStore;
+     
+ #ifdef DEBUG_CC
+     nsPurpleBuffer(nsCycleCollectorParams &params,
+                    nsCycleCollectorStats &stats) 
+         : mParams(params),
+-          mStats(stats),
+-          mCurrGen(0)
++          mStats(stats)
+     {
+         Init();
+     }
+ #else
+     nsPurpleBuffer(nsCycleCollectorParams &params) 
+-        : mParams(params),
+-          mCurrGen(0)
++        : mParams(params)
+     {
+         Init();
+     }
+ #endif
+ 
+-    ~nsPurpleBuffer()
+-    {
+-        memset(mCache, 0, sizeof(mCache));
+-        mBackingStore.Clear();
+-    }
+-
+     void Init()
+     {
+-        memset(mCache, 0, sizeof(mCache));
+-        mBackingStore.Init();
+     }
+ 
+     void BumpGeneration();
+     void SelectAgedPointers(GCGraphBuilder &builder);
+ 
+ #ifdef DEBUG_CC
+     void NoteAll(GCGraphBuilder &builder);
+ #endif
+@@ -753,19 +721,16 @@ struct nsPurpleBuffer
+     {
+         PRUint32 idx = POINTER_INDEX(p);
+         for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
+             if (!mCache[idx+i]) {
+                 mCache[idx+i] = p;
+                 return;
+             }
+         }
+-#ifdef DEBUG_CC
+-        mStats.mSpills++;
+-#endif
+         SpillOne(p);
+     }
+ 
+     void Remove(void *p)     
+     {
+         PRUint32 idx = POINTER_INDEX(p);
+         for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
+             if (mCache[idx+i] == p) {
+@@ -927,18 +892,18 @@ struct nsCycleCollector
+     void MarkRoots(GCGraphBuilder &builder);
+     void ScanRoots();
+     void RootWhite();
+     PRBool CollectWhite(); // returns whether anything was collected
+ 
+     nsCycleCollector();
+     ~nsCycleCollector();
+ 
+-    PRBool Suspect(nsISupports *n);
+-    PRBool Forget(nsISupports *n);
++    nsPurpleBufferEntry* Suspect(nsISupports *n);
++    PRBool Forget(nsPurpleBufferEntry *e);
+     PRUint32 Collect(PRUint32 aTryCollections = 1);
+     PRBool BeginCollection();
+     PRBool FinishCollection();
+     PRUint32 SuspectedCount();
+     void Shutdown();
+ 
+     void ClearGraph()
+     {
+@@ -2129,87 +2094,86 @@ nsCycleCollector_isScanSafe(nsISupports 
+ 
+     nsXPCOMCycleCollectionParticipant *cp;
+     ToParticipant(s, &cp);
+ 
+     return cp != nsnull;
+ }
+ #endif
+ 
+-PRBool
++nsPurpleBufferEntry*
+ nsCycleCollector::Suspect(nsISupports *n)
+ {
+     // Re-entering ::Suspect during collection used to be a fault, but
+     // we are canonicalizing nsISupports pointers using QI, so we will
+     // see some spurious refcount traffic here. 
+ 
+     if (mScanInProgress)
+-        return PR_FALSE;
++        return nsnull;
+ 
+     NS_ASSERTION(nsCycleCollector_isScanSafe(n),
+                  "suspected a non-scansafe pointer");
+     NS_ASSERTION(NS_IsMainThread(), "trying to suspect from non-main thread");
+ 
+     if (mParams.mDoNothing)
+-        return PR_FALSE;
++        return nsnull;
+ 
+ #ifdef DEBUG_CC
+     mStats.mSuspectNode++;
+ 
+     if (nsCycleCollector_shouldSuppress(n))
+-        return PR_FALSE;
++        return nsnull;
+ 
+ #ifndef __MINGW32__
+     if (mParams.mHookMalloc)
+         InitMemHook();
+ #endif
+ 
+     if (mParams.mLogPointers) {
+         if (!mPtrLog)
+             mPtrLog = fopen("pointer_log", "w");
+         fprintf(mPtrLog, "S %p\n", static_cast<void*>(n));
+     }
+ #endif
+ 
+     mPurpleBuf.Put(n);
+ 
++    // XXX WRITE ME!
+     return PR_TRUE;
+ }
+ 
+ 
+ PRBool
+-nsCycleCollector::Forget(nsISupports *n)
++nsCycleCollector::Forget(nsPurpleBufferEntry *e)
+ {
+     // Re-entering ::Forget during collection used to be a fault, but
+     // we are canonicalizing nsISupports pointers using QI, so we will
+     // see some spurious refcount traffic here. 
+ 
+     if (mScanInProgress)
+         return PR_FALSE;
+ 
+     NS_ASSERTION(NS_IsMainThread(), "trying to forget from non-main thread");
+     
+-    if (mParams.mDoNothing)
+-        return PR_TRUE; // it's as good as forgotten
+-
+ #ifdef DEBUG_CC
+     mStats.mForgetNode++;
+ 
+ #ifndef __MINGW32__
+     if (mParams.mHookMalloc)
+         InitMemHook();
+ #endif
+ 
+     if (mParams.mLogPointers) {
+         if (!mPtrLog)
+             mPtrLog = fopen("pointer_log", "w");
+         fprintf(mPtrLog, "F %p\n", static_cast<void*>(n));
+     }
+ #endif
+ 
++    // XXX WRITE ME!
+     mPurpleBuf.Remove(n);
+     return PR_TRUE;
+ }
+ 
+ #ifdef DEBUG_CC
+ void 
+ nsCycleCollector::Allocated(void *n, size_t sz)
+ {
+@@ -2921,29 +2885,28 @@ nsCycleCollector_registerRuntime(PRUint3
+ void 
+ nsCycleCollector_forgetRuntime(PRUint32 langID)
+ {
+     if (sCollector)
+         sCollector->ForgetRuntime(langID);
+ }
+ 
+ 
+-PRBool
++nsPurpleBufferEntry*
+ NS_CycleCollectorSuspect(nsISupports *n)
+ {
+     if (sCollector)
+         return sCollector->Suspect(n);
+-    return PR_FALSE;
++    return nsnull;
+ }
+ 
+-
+ PRBool
+-NS_CycleCollectorForget(nsISupports *n)
++NS_CycleCollectorForget(nsPurpleBufferEntry *e)
+ {
+-    return sCollector ? sCollector->Forget(n) : PR_TRUE;
++    return sCollector ? sCollector->Forget(e) : PR_TRUE;
+ }
+ 
+ 
+ PRUint32
+ nsCycleCollector_collect()
+ {
+     fprintf(stderr, "Starting nsCycleCollector_collect\n");
+     PRIntervalTime start = PR_IntervalNow();
 diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
 --- a/xpcom/build/nsXPCOM.h
 +++ b/xpcom/build/nsXPCOM.h
