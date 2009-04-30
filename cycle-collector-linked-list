@@ -2,6 +2,78 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Implement cycle collector's purple buffer using a linked list rather than a hash table.  (Bug 490695)
 
+diff --git a/js/src/xpconnect/src/xpcprivate.h b/js/src/xpconnect/src/xpcprivate.h
+--- a/js/src/xpconnect/src/xpcprivate.h
++++ b/js/src/xpconnect/src/xpcprivate.h
+@@ -2143,19 +2143,20 @@ public:
+     class NS_CYCLE_COLLECTION_INNERCLASS
+      : public nsXPCOMCycleCollectionParticipant
+     {
+       NS_DECL_CYCLE_COLLECTION_CLASS_BODY_NO_UNLINK(XPCWrappedNative,
+                                                     XPCWrappedNative)
+       NS_IMETHOD RootAndUnlinkJSObjects(void *p);
+       NS_IMETHOD Unlink(void *p) { return NS_OK; }
+       NS_IMETHOD Unroot(void *p) { return NS_OK; }
++      NS_IMETHOD_(nsCycleCollectingAutoRefCnt*) AutoRefCnt(nsISupports *p)
++        { return nsnull; }
+     };
+     NS_CYCLE_COLLECTION_PARTICIPANT_INSTANCE
+-    NS_DECL_CYCLE_COLLECTION_UNMARK_PURPLE_STUB(XPCWrappedNative)
+ 
+ #ifndef XPCONNECT_STANDALONE
+     virtual nsIPrincipal* GetObjectPrincipal() const;
+ #endif
+ 
+     JSBool
+     IsValid() const {return nsnull != mFlatJSObject;}
+ 
+@@ -2611,19 +2612,20 @@ public:
+     NS_DECL_NSISUPPORTSWEAKREFERENCE
+     NS_DECL_NSIPROPERTYBAG
+ 
+     class NS_CYCLE_COLLECTION_INNERCLASS
+      : public nsXPCOMCycleCollectionParticipant
+     {
+       NS_IMETHOD RootAndUnlinkJSObjects(void *p);
+       NS_DECL_CYCLE_COLLECTION_CLASS_BODY(nsXPCWrappedJS, nsIXPConnectWrappedJS)
++      NS_IMETHOD_(nsCycleCollectingAutoRefCnt*) AutoRefCnt(nsISupports *p)
++        { return nsnull; }
+     };
+     NS_CYCLE_COLLECTION_PARTICIPANT_INSTANCE
+-    NS_DECL_CYCLE_COLLECTION_UNMARK_PURPLE_STUB(nsXPCWrappedJS)
+ 
+     NS_IMETHOD CallMethod(PRUint16 methodIndex,
+                           const XPTMethodDescriptor *info,
+                           nsXPTCMiniVariant* params);
+ 
+     /*
+     * This is rarely called directly. Instead one usually calls
+     * XPCConvert::JSObject2NativeInterface which will handles cases where the
+diff --git a/xpcom/base/nsAgg.h b/xpcom/base/nsAgg.h
+--- a/xpcom/base/nsAgg.h
++++ b/xpcom/base/nsAgg.h
+@@ -102,19 +102,19 @@ public:                                 
+ #define NS_DECL_AGGREGATED_CYCLE_COLLECTION_CLASS(_class)                   \
+ class NS_CYCLE_COLLECTION_INNERCLASS                                        \
+  : public nsXPCOMCycleCollectionParticipant                                 \
+ {                                                                           \
+ public:                                                                     \
+   NS_IMETHOD Unlink(void *p);                                               \
+   NS_IMETHOD Traverse(void *p,                                              \
+                       nsCycleCollectionTraversalCallback &cb);              \
+-  NS_IMETHOD_(void) UnmarkPurple(nsISupports *p)                            \
++  NS_IMETHOD_(nsCycleCollectingAutoRefCnt*) AutoRefCnt(nsISupports *p)      \
+   {                                                                         \
+-    Downcast(p)->UnmarkPurple();                                            \
++    return Downcast(p)->AutoRefCnt();                                       \
+   }                                                                         \
+   static _class* Downcast(nsISupports* s)                                   \
+   {                                                                         \
+     return (_class*)((char*)(s) - offsetof(_class, fAggregated));           \
+   }                                                                         \
+   static nsISupports* Upcast(_class *p)                                     \
+   {                                                                         \
+     return p->InnerObject();                                                \
 diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp
 +++ b/xpcom/base/nsCycleCollector.cpp
@@ -169,6 +241,25 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      void ClearGraph()
      {
+@@ -1495,17 +1460,17 @@ AddPurpleRoot(GCGraphBuilder &builder, n
+     ToParticipant(root, &cp);
+ 
+     PtrInfo *pinfo = builder.AddNode(root, cp,
+                                      nsIProgrammingLanguage::CPLUSPLUS);
+     if (!pinfo) {
+         return PR_FALSE;
+     }
+ 
+-    cp->UnmarkPurple(root);
++    cp->AutoRefCnt(root)->unmarkPurple();
+ 
+     return PR_TRUE;
+ }
+ 
+ #ifdef DEBUG_CC
+ static PLDHashOperator
+ noteAllCallback(const void* ptr, PRUint32& generation, void* userArg)
+ {
 @@ -2129,87 +2094,86 @@ nsCycleCollector_isScanSafe(nsISupports 
  
      nsXPCOMCycleCollectionParticipant *cp;
@@ -327,6 +418,104 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
  /**
   * A category which is read after component registration but before
   * the "xpcom-startup" notifications. Each category entry is treated
+diff --git a/xpcom/glue/nsCycleCollectionParticipant.cpp b/xpcom/glue/nsCycleCollectionParticipant.cpp
+--- a/xpcom/glue/nsCycleCollectionParticipant.cpp
++++ b/xpcom/glue/nsCycleCollectionParticipant.cpp
+@@ -77,21 +77,16 @@ nsXPCOMCycleCollectionParticipant::Unroo
+ 
+ nsresult
+ nsXPCOMCycleCollectionParticipant::Traverse
+     (void *p, nsCycleCollectionTraversalCallback &cb)
+ {
+   return NS_OK;
+ }
+ 
+-void
+-nsXPCOMCycleCollectionParticipant::UnmarkPurple(nsISupports *n)
+-{
+-}
+-
+ NS_IMETHODIMP_(void)
+ nsXPCOMCycleCollectionParticipant::Trace(void *p, TraceCallback cb,
+                                          void *closure)
+ {
+ }
+ 
+ PRBool
+ nsXPCOMCycleCollectionParticipant::CheckForRightISupports(nsISupports *s)
+diff --git a/xpcom/glue/nsCycleCollectionParticipant.h b/xpcom/glue/nsCycleCollectionParticipant.h
+--- a/xpcom/glue/nsCycleCollectionParticipant.h
++++ b/xpcom/glue/nsCycleCollectionParticipant.h
+@@ -156,17 +156,18 @@ public:
+     NS_IMETHOD Traverse(void *p, nsCycleCollectionTraversalCallback &cb);
+ 
+     NS_IMETHOD RootAndUnlinkJSObjects(void *p);
+     NS_IMETHOD Unlink(void *p);
+     NS_IMETHOD Unroot(void *p);
+ 
+     NS_IMETHOD_(void) Trace(void *p, TraceCallback cb, void *closure);
+ 
+-    NS_IMETHOD_(void) UnmarkPurple(nsISupports *p);
++    // Must return non-null for any object that could be in the purple buffer.
++    NS_IMETHOD_(nsCycleCollectingAutoRefCnt*) AutoRefCnt(nsISupports *p) = 0;
+ 
+     PRBool CheckForRightISupports(nsISupports *s);
+ };
+ 
+ #undef IMETHOD_VISIBILITY
+ #define IMETHOD_VISIBILITY NS_VISIBILITY_HIDDEN
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -484,19 +485,19 @@ public:
+ 
+ #define NS_CYCLE_COLLECTION_PARTICIPANT_INSTANCE                               \
+   static NS_CYCLE_COLLECTION_INNERCLASS NS_CYCLE_COLLECTION_INNERNAME;
+ 
+ #define NS_DECL_CYCLE_COLLECTION_CLASS_BODY_NO_UNLINK(_class, _base)           \
+ public:                                                                        \
+   NS_IMETHOD Traverse(void *p,                                                 \
+                       nsCycleCollectionTraversalCallback &cb);                 \
+-  NS_IMETHOD_(void) UnmarkPurple(nsISupports *s)                               \
++  NS_IMETHOD_(nsCycleCollectingAutoRefCnt*) AutoRefCnt(nsISupports *s);        \
+   {                                                                            \
+-    Downcast(s)->UnmarkPurple();                                               \
++    return Downcast(s)->AutoRefCnt();                                          \
+   }                                                                            \
+   static _class* Downcast(nsISupports* s)                                      \
+   {                                                                            \
+     return static_cast<_class*>(static_cast<_base*>(s));                       \
+   }                                                                            \
+   static nsISupports* Upcast(_class *p)                                        \
+   {                                                                            \
+     return NS_ISUPPORTS_CAST(_base*, p);                                       \
+@@ -580,27 +581,16 @@ public:                                 
+   static _class* Downcast(nsISupports* s)                                      \
+   {                                                                            \
+     return static_cast<_class*>(static_cast<_base_class*>(                     \
+       NS_CYCLE_COLLECTION_CLASSNAME(_base_class)::Downcast(s)));               \
+   }                                                                            \
+ };                                                                             \
+ NS_CYCLE_COLLECTION_PARTICIPANT_INSTANCE
+ 
+-/**
+- * This implements a stub UnmarkPurple function for classes that want to be
+- * traversed but whose AddRef/Release functions don't add/remove them to/from
+- * the purple buffer. If you're just using NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+- * then you don't need this.
+- */
+-#define NS_DECL_CYCLE_COLLECTION_UNMARK_PURPLE_STUB(_class)                    \
+-  NS_IMETHODIMP_(void) UnmarkPurple()                                          \
+-  {                                                                            \
+-  }                                                                            \
+-
+ #define NS_IMPL_CYCLE_COLLECTION_CLASS(_class)                                 \
+   NS_CYCLE_COLLECTION_CLASSNAME(_class) NS_CYCLE_COLLECTION_NAME(_class);
+ 
+ #define NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS_BODY                             \
+   public:                                                                      \
+     NS_IMETHOD RootAndUnlinkJSObjects(void *n);                                \
+     NS_IMETHOD Unlink(void *n);                                                \
+     NS_IMETHOD Unroot(void *n);                                                \
 diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 --- a/xpcom/glue/nsISupportsImpl.h
 +++ b/xpcom/glue/nsISupportsImpl.h
@@ -530,3 +719,25 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
      nsAutoRefCnt() : mValue(0) {}
      nsAutoRefCnt(nsrefcnt aValue) : mValue(aValue) {}
  
+@@ -230,19 +266,19 @@ protected:                              
+ public:
+ 
+ #define NS_DECL_CYCLE_COLLECTING_ISUPPORTS                                    \
+ public:                                                                       \
+   NS_IMETHOD QueryInterface(REFNSIID aIID,                                    \
+                             void** aInstancePtr);                             \
+   NS_IMETHOD_(nsrefcnt) AddRef(void);                                         \
+   NS_IMETHOD_(nsrefcnt) Release(void);                                        \
+-  void UnmarkPurple()                                                         \
++  nsCycleCollectingAutoRefCnt* AutoRefCnt()                                   \
+   {                                                                           \
+-    mRefCnt.unmarkPurple();                                                   \
++    return &mRefCnt;                                                          \
+   }                                                                           \
+ protected:                                                                    \
+   nsCycleCollectingAutoRefCnt mRefCnt;                                        \
+   NS_DECL_OWNINGTHREAD                                                        \
+ public:
+ 
+ 
+ ///////////////////////////////////////////////////////////////////////////////
