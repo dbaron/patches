@@ -77,13 +77,17 @@ diff --git a/xpcom/base/nsAgg.h b/xpcom/base/nsAgg.h
 diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 --- a/xpcom/base/nsCycleCollector.cpp
 +++ b/xpcom/base/nsCycleCollector.cpp
-@@ -234,17 +234,16 @@ struct nsCycleCollectorStats
+@@ -230,21 +230,18 @@ struct nsCycleCollectorStats
+     PRUint32 mFreedBytes;
+ 
+     PRUint32 mSetColorGrey;
+     PRUint32 mSetColorBlack;
      PRUint32 mSetColorWhite;
  
      PRUint32 mFailedUnlink;
      PRUint32 mCollectedNode;
-     PRUint32 mBumpGeneration;
-     PRUint32 mZeroGeneration;
+-    PRUint32 mBumpGeneration;
+-    PRUint32 mZeroGeneration;
  
      PRUint32 mSuspectNode;
 -    PRUint32 mSpills;    
@@ -95,13 +99,17 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      nsCycleCollectorStats()
      {
          memset(this, 0, sizeof(nsCycleCollectorStats));
-@@ -268,17 +267,16 @@ struct nsCycleCollectorStats
+@@ -264,21 +261,18 @@ struct nsCycleCollectorStats
+         DUMP(mFreedBytes);
+     
+         DUMP(mSetColorGrey);
+         DUMP(mSetColorBlack);
          DUMP(mSetColorWhite);
      
          DUMP(mFailedUnlink);
          DUMP(mCollectedNode);
-         DUMP(mBumpGeneration);
-         DUMP(mZeroGeneration);
+-        DUMP(mBumpGeneration);
+-        DUMP(mZeroGeneration);
      
          DUMP(mSuspectNode);
 -        DUMP(mSpills);
@@ -113,7 +121,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  };
  #endif
-@@ -656,116 +654,72 @@ struct GCGraph
+@@ -656,230 +650,84 @@ struct GCGraph
      }
      ~GCGraph() { 
      }
@@ -147,14 +155,17 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -#error "index bit overflow"
 -#endif
 -
-     // This class serves as a generational wrapper around a pldhash
-     // table: a subset of generation zero lives in mCache, the
-     // remainder spill into the mBackingStore hashtable. The idea is
-     // to get a higher hit rate and greater locality of reference for
-     // generation zero, in which the vast majority of suspect/forget
-     // calls annihilate one another.
+-    // This class serves as a generational wrapper around a pldhash
+-    // table: a subset of generation zero lives in mCache, the
+-    // remainder spill into the mBackingStore hashtable. The idea is
+-    // to get a higher hit rate and greater locality of reference for
+-    // generation zero, in which the vast majority of suspect/forget
+-    // calls annihilate one another.
++    // This class wraps a linked list of the elements in the purple
++    // buffer.
  
      nsCycleCollectorParams &mParams;
++    nsPurpleBufferEntry mListHead;
  #ifdef DEBUG_CC
      nsCycleCollectorStats &mStats;
  #endif
@@ -183,19 +194,23 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
 -    ~nsPurpleBuffer()
--    {
--        memset(mCache, 0, sizeof(mCache));
--        mBackingStore.Clear();
--    }
--
-     void Init()
++    void Init()
      {
 -        memset(mCache, 0, sizeof(mCache));
--        mBackingStore.Init();
+-        mBackingStore.Clear();
++      mListHead.mPrev = &mListHead;
++      mListHead.mNext = &mListHead;
      }
  
-     void BumpGeneration();
-     void SelectAgedPointers(GCGraphBuilder &builder);
+-    void Init()
+-    {
+-        memset(mCache, 0, sizeof(mCache));
+-        mBackingStore.Init();
+-    }
+-
+-    void BumpGeneration();
+-    void SelectAgedPointers(GCGraphBuilder &builder);
++    void SelectPointers(GCGraphBuilder &builder);
  
  #ifdef DEBUG_CC
      void NoteAll(GCGraphBuilder &builder);
@@ -214,25 +229,146 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -
      void Put(void *p)
      {
-         PRUint32 idx = POINTER_INDEX(p);
-         for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
-             if (!mCache[idx+i]) {
-                 mCache[idx+i] = p;
-                 return;
-             }
-         }
+-        PRUint32 idx = POINTER_INDEX(p);
+-        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
+-            if (!mCache[idx+i]) {
+-                mCache[idx+i] = p;
+-                return;
+-            }
+-        }
 -#ifdef DEBUG_CC
 -        mStats.mSpills++;
 -#endif
-         SpillOne(p);
+-        SpillOne(p);
      }
  
      void Remove(void *p)     
      {
-         PRUint32 idx = POINTER_INDEX(p);
-         for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
-             if (mCache[idx+i] == p) {
-@@ -927,18 +881,18 @@ struct nsCycleCollector
+-        PRUint32 idx = POINTER_INDEX(p);
+-        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
+-            if (mCache[idx+i] == p) {
+-                mCache[idx+i] = (void*)0;
+-                return;
+-            }
+-        }
+-        mBackingStore.Remove(p);
+     }
+ 
+-    void SpillOne(void* &p)
+-    {
+-        mBackingStore.Put(p, mCurrGen);
+-        p = (void*)0;
+-    }
+-
+-    void SpillAll()
+-    {
+-        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
+-            if (mCache[i]) {
+-                SpillOne(mCache[i]);
+-            }
+-        }
+-    }
+-
+-    PRUint32 Count()
+-    {
+-        PRUint32 count = mBackingStore.Count();
+-        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
+-            if (mCache[i]) {
+-                ++count;
+-            }
+-        }
+-        return count;
+-    }
+-};
+-
+-static PLDHashOperator
+-zeroGenerationCallback(const void*  ptr,
+-                       PRUint32&    generation,
+-                       void*        userArg)
+-{
+-#ifdef DEBUG_CC
+-    nsPurpleBuffer *purp = static_cast<nsPurpleBuffer*>(userArg);
+-    purp->mStats.mZeroGeneration++;
+-#endif
+-    generation = 0;
+-    return PL_DHASH_NEXT;
+-}
+-
+-void nsPurpleBuffer::BumpGeneration()
+-{
+-    SpillAll();
+-    if (mCurrGen == 0xffffffff) {
+-        mBackingStore.Enumerate(zeroGenerationCallback, this);
+-        mCurrGen = 0;
+-    } else {
+-        ++mCurrGen;
+-    }
+-#ifdef DEBUG_CC
+-    mStats.mBumpGeneration++;
+-#endif
+-}
+-
+-static inline PRBool
+-SufficientlyAged(PRUint32 generation, nsPurpleBuffer *p)
+-{
+-    return generation + p->mParams.mScanDelay < p->mCurrGen;
+-}
+-
+-struct CallbackClosure
+-{
+-    CallbackClosure(nsPurpleBuffer *aPurpleBuffer, GCGraphBuilder &aBuilder)
+-        : mPurpleBuffer(aPurpleBuffer),
+-          mBuilder(aBuilder)
+-    {
+-    }
+-    nsPurpleBuffer *mPurpleBuffer;
+-    GCGraphBuilder &mBuilder;
+ };
+ 
+ static PRBool
+ AddPurpleRoot(GCGraphBuilder &builder, nsISupports *root);
+ 
+-static PLDHashOperator
+-ageSelectionCallback(const void*  ptr,
+-                     PRUint32&    generation,
+-                     void*        userArg)
++void
++nsPurpleBuffer::SelectPointers(GCGraphBuilder &aBuilder)
+ {
+-    CallbackClosure *closure = static_cast<CallbackClosure*>(userArg);
+-    if (SufficientlyAged(generation, closure->mPurpleBuffer) &&
+-        AddPurpleRoot(closure->mBuilder,
+-                      static_cast<nsISupports *>(const_cast<void*>(ptr))))
+-        return PL_DHASH_REMOVE;
+-
+-    return PL_DHASH_NEXT;
++    for (nsPurpleBufferEntry *e = mListHead.mNext; e != &mListHead;
++         e = e->mNext) {
++         AddPurpleRoot(aBuilder, e->mObject);
++    }
++    // WRITE ME: destroy all the purple buffer entries
+ }
+ 
+-void
+-nsPurpleBuffer::SelectAgedPointers(GCGraphBuilder &aBuilder)
+-{
+-    // Rely on our caller having done a BumpGeneration first, which in
+-    // turn calls SpillAll.
+-    CallbackClosure closure(this, aBuilder);
+-    mBackingStore.Enumerate(ageSelectionCallback, &closure);
+-}
+-
+-
+-
+ ////////////////////////////////////////////////////////////////////////
+ // Implement the LanguageRuntime interface for C++/XPCOM 
+ ////////////////////////////////////////////////////////////////////////
+ 
+ 
+ struct nsCycleCollectionXPCOMRuntime : 
+     public nsCycleCollectionLanguageRuntime 
+ {
+@@ -927,18 +775,18 @@ struct nsCycleCollector
      void MarkRoots(GCGraphBuilder &builder);
      void ScanRoots();
      void RootWhite();
@@ -253,7 +389,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      void ClearGraph()
      {
-@@ -1493,17 +1447,17 @@ AddPurpleRoot(GCGraphBuilder &builder, n
+@@ -1493,43 +1341,36 @@ AddPurpleRoot(GCGraphBuilder &builder, n
      ToParticipant(root, &cp);
  
      PtrInfo *pinfo = builder.AddNode(root, cp,
@@ -269,10 +405,41 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  }
  
  #ifdef DEBUG_CC
- static PLDHashOperator
- noteAllCallback(const void* ptr, PRUint32& generation, void* userArg)
+-static PLDHashOperator
+-noteAllCallback(const void* ptr, PRUint32& generation, void* userArg)
+-{
+-    GCGraphBuilder *builder = static_cast<GCGraphBuilder*>(userArg);
+-    builder->NoteXPCOMRoot(static_cast<nsISupports *>(const_cast<void*>(ptr)));
+-    return PL_DHASH_NEXT;
+-}
+-
+ void
+ nsPurpleBuffer::NoteAll(GCGraphBuilder &builder)
  {
-@@ -1932,91 +1886,102 @@ nsCycleCollector_isScanSafe(nsISupports 
+-    SpillAll();
+-    mBackingStore.Enumerate(noteAllCallback, &builder);
++    for (nsPurpleBufferEntry *e = mListHead.mNext; e != &mListHead;
++         e = e->mNext) {
++        builder->NoteXPCOMRoot(e->mObject);
++    }
+ }
+ #endif
+ 
+ void 
+ nsCycleCollector::SelectPurple(GCGraphBuilder &builder)
+ {
+-    mPurpleBuf.BumpGeneration();
+-    mPurpleBuf.SelectAgedPointers(builder);
++    mPurpleBuf.SelectPointers(builder);
+ }
+ 
+ void
+ nsCycleCollector::MarkRoots(GCGraphBuilder &builder)
+ {
+     mGraph.mRootCount = builder.Count();
+ 
+     // read the PtrInfo out of the graph that we are building
+@@ -1932,91 +1773,102 @@ nsCycleCollector_isScanSafe(nsISupports 
  
      nsXPCOMCycleCollectionParticipant *cp;
      ToParticipant(s, &cp);
@@ -383,7 +550,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          InitMemHook();
  #endif
  
-@@ -2056,18 +2021,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -2056,18 +1908,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef DEBUG_CC
          // We wait until after FinishCollection to check the white nodes because
          // some objects may outlive CollectWhite but then be freed by
@@ -403,7 +570,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
              }
          }
  #endif
-@@ -2566,17 +2530,17 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -2566,17 +2417,17 @@ nsCycleCollector::ExplainLiveExpectedGar
                      }
                  }
  
@@ -422,7 +589,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  "  from other cycles to require multiple rounds of cycle collection in which\n"
  "  this object was likely the reachable object\n",
                                         pi->mName, pi->mPointer, pi->mSCCIndex);
-@@ -2693,29 +2657,28 @@ nsCycleCollector_registerRuntime(PRUint3
+@@ -2693,29 +2544,28 @@ nsCycleCollector_registerRuntime(PRUint3
  void 
  nsCycleCollector_forgetRuntime(PRUint32 langID)
  {
