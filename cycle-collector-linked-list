@@ -132,7 +132,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  };
  #endif
-@@ -656,230 +650,182 @@ struct GCGraph
+@@ -656,230 +650,224 @@ struct GCGraph
      }
      ~GCGraph() { 
      }
@@ -190,6 +190,9 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    nsPurpleBufferEntry *mFreeList;
 +    // The remainder of the current block.
 +    nsPurpleBufferEntry *mUnallocatedEntry, *mUnallocatedEnd;
++
++    // For objects compiled against Gecko 1.9 and 1.9.1.
++    PointerSet mCompatObjects;
  #ifdef DEBUG_CC
      nsCycleCollectorStats &mStats;
  #endif
@@ -233,11 +236,12 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      {
 -        memset(mCache, 0, sizeof(mCache));
 -        mBackingStore.Init();
-+      mCount = 0;
-+      mListHead.mPrev = &mListHead;
-+      mListHead.mNext = &mListHead;
-+      mFreeList = nsnull;
-+      StartBlock(&mFirstBlock);
++        mCount = 0;
++        mListHead.mPrev = &mListHead;
++        mListHead.mNext = &mListHead;
++        mFreeList = nsnull;
++        StartBlock(&mFirstBlock);
++        mCompatObjects.Init();
      }
  
 -    void BumpGeneration();
@@ -336,24 +340,29 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  
 -    void SpillOne(void* &p)
-+    PRUint32 Count() const
++    PRBool PutCompatObject(nsISupports *p)
      {
 -        mBackingStore.Put(p, mCurrGen);
 -        p = (void*)0;
-+        return mCount;
++        ++mCount;
++        return !!mCompatObjects.PutEntry(p);
      }
--
+ 
 -    void SpillAll()
--    {
++    void RemoveCompatObject(nsISupports *p)
+     {
 -        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
 -            if (mCache[i]) {
 -                SpillOne(mCache[i]);
 -            }
 -        }
--    }
--
++        --mCount;
++        mCompatObjects.RemoveEntry(p);
+     }
+ 
 -    PRUint32 Count()
--    {
++    PRUint32 Count() const
+     {
 -        PRUint32 count = mBackingStore.Count();
 -        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
 -            if (mCache[i]) {
@@ -361,9 +370,10 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -            }
 -        }
 -        return count;
--    }
--};
--
++        return mCount;
+     }
+ };
+ 
 -static PLDHashOperator
 -zeroGenerationCallback(const void*  ptr,
 -                       PRUint32&    generation,
@@ -397,40 +407,55 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -    return generation + p->mParams.mScanDelay < p->mCurrGen;
 -}
 -
--struct CallbackClosure
--{
--    CallbackClosure(nsPurpleBuffer *aPurpleBuffer, GCGraphBuilder &aBuilder)
--        : mPurpleBuffer(aPurpleBuffer),
--          mBuilder(aBuilder)
--    {
--    }
--    nsPurpleBuffer *mPurpleBuffer;
--    GCGraphBuilder &mBuilder;
+ struct CallbackClosure
+ {
+     CallbackClosure(nsPurpleBuffer *aPurpleBuffer, GCGraphBuilder &aBuilder)
+         : mPurpleBuffer(aPurpleBuffer),
+           mBuilder(aBuilder)
+     {
+     }
+     nsPurpleBuffer *mPurpleBuffer;
+     GCGraphBuilder &mBuilder;
  };
  
  static PRBool
  AddPurpleRoot(GCGraphBuilder &builder, nsISupports *root);
  
--static PLDHashOperator
+ static PLDHashOperator
 -ageSelectionCallback(const void*  ptr,
 -                     PRUint32&    generation,
 -                     void*        userArg)
-+void
-+nsPurpleBuffer::SelectPointers(GCGraphBuilder &aBuilder)
++selectionCallback(nsVoidPtrHashKey* key, void* userArg)
  {
--    CallbackClosure *closure = static_cast<CallbackClosure*>(userArg);
+     CallbackClosure *closure = static_cast<CallbackClosure*>(userArg);
 -    if (SufficientlyAged(generation, closure->mPurpleBuffer) &&
 -        AddPurpleRoot(closure->mBuilder,
 -                      static_cast<nsISupports *>(const_cast<void*>(ptr))))
--        return PL_DHASH_REMOVE;
++    if (AddPurpleRoot(closure->mBuilder,
++                      static_cast<nsISupports *>(
++                        const_cast<void*>(key->GetKey()))))
+         return PL_DHASH_REMOVE;
+ 
+     return PL_DHASH_NEXT;
+ }
+ 
+ void
+-nsPurpleBuffer::SelectAgedPointers(GCGraphBuilder &aBuilder)
++nsPurpleBuffer::SelectPointers(GCGraphBuilder &aBuilder)
+ {
+-    // Rely on our caller having done a BumpGeneration first, which in
+-    // turn calls SpillAll.
+     CallbackClosure closure(this, aBuilder);
+-    mBackingStore.Enumerate(ageSelectionCallback, &closure);
++    mCompatObjects.EnumerateEntries(selectionCallback, &closure);
++
 +    NS_ASSERTION((mListHead.mNext == &mListHead) == (mCount == 0),
 +                 "count inconsistent with list");
 +    if (mListHead.mNext == &mListHead) {
 +        // The emptying code below is not tolerant of this case.
 +        return;
 +    }
- 
--    return PL_DHASH_NEXT;
++
 +    for (nsPurpleBufferEntry *e = mListHead.mNext; e != &mListHead;
 +         e = e->mNext) {
 +         AddPurpleRoot(aBuilder, e->mObject);
@@ -446,15 +471,6 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    // Should we free our blocks?
  }
  
--void
--nsPurpleBuffer::SelectAgedPointers(GCGraphBuilder &aBuilder)
--{
--    // Rely on our caller having done a BumpGeneration first, which in
--    // turn calls SpillAll.
--    CallbackClosure closure(this, aBuilder);
--    mBackingStore.Enumerate(ageSelectionCallback, &closure);
--}
--
 -
 -
  ////////////////////////////////////////////////////////////////////////
@@ -465,7 +481,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  struct nsCycleCollectionXPCOMRuntime : 
      public nsCycleCollectionLanguageRuntime 
  {
-@@ -927,18 +873,18 @@ struct nsCycleCollector
+@@ -927,18 +915,23 @@ struct nsCycleCollector
      void MarkRoots(GCGraphBuilder &builder);
      void ScanRoots();
      void RootWhite();
@@ -474,10 +490,13 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      nsCycleCollector();
      ~nsCycleCollector();
  
--    PRBool Suspect(nsISupports *n);
--    PRBool Forget(nsISupports *n);
-+    nsPurpleBufferEntry* Suspect(nsISupports *n);
-+    PRBool Forget(nsPurpleBufferEntry *e);
++    // The first pair of Suspect and Forget functions are only used by
++    // old XPCOM binary components.
+     PRBool Suspect(nsISupports *n);
+     PRBool Forget(nsISupports *n);
++    nsPurpleBufferEntry* Suspect2(nsISupports *n);
++    PRBool Forget2(nsPurpleBufferEntry *e);
++
      PRUint32 Collect(PRUint32 aTryCollections = 1);
      PRBool BeginCollection();
      PRBool FinishCollection();
@@ -486,7 +505,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      void ClearGraph()
      {
-@@ -1493,43 +1439,36 @@ AddPurpleRoot(GCGraphBuilder &builder, n
+@@ -1493,43 +1486,36 @@ AddPurpleRoot(GCGraphBuilder &builder, n
      ToParticipant(root, &cp);
  
      PtrInfo *pinfo = builder.AddNode(root, cp,
@@ -536,46 +555,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      mGraph.mRootCount = builder.Count();
  
      // read the PtrInfo out of the graph that we are building
-@@ -1932,91 +1871,99 @@ nsCycleCollector_isScanSafe(nsISupports 
- 
-     nsXPCOMCycleCollectionParticipant *cp;
-     ToParticipant(s, &cp);
- 
-     return cp != nsnull;
- }
- #endif
- 
--PRBool
-+nsPurpleBufferEntry*
- nsCycleCollector::Suspect(nsISupports *n)
- {
-     // Re-entering ::Suspect during collection used to be a fault, but
-     // we are canonicalizing nsISupports pointers using QI, so we will
-     // see some spurious refcount traffic here. 
- 
-     if (mScanInProgress)
--        return PR_FALSE;
-+        return nsnull;
- 
-     NS_ASSERTION(nsCycleCollector_isScanSafe(n),
-                  "suspected a non-scansafe pointer");
-     NS_ASSERTION(NS_IsMainThread(), "trying to suspect from non-main thread");
- 
-     if (mParams.mDoNothing)
--        return PR_FALSE;
-+        return nsnull;
- 
- #ifdef DEBUG_CC
-     mStats.mSuspectNode++;
- 
-     if (nsCycleCollector_shouldSuppress(n))
--        return PR_FALSE;
-+        return nsnull;
- 
- #ifndef __MINGW32__
-     if (mParams.mHookMalloc)
-         InitMemHook();
- #endif
+@@ -1967,19 +1953,18 @@ nsCycleCollector::Suspect(nsISupports *n
  
      if (mParams.mLogPointers) {
          if (!mPtrLog)
@@ -588,33 +568,16 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -
 -    return PR_TRUE;
 +    // Caller is responsible for filling in result's mRefCnt.
-+    return mPurpleBuf.Put(n);
++    return mPurpleBuf.PutCompatObject(n);
  }
  
  
  PRBool
--nsCycleCollector::Forget(nsISupports *n)
-+nsCycleCollector::Forget(nsPurpleBufferEntry *e)
+ nsCycleCollector::Forget(nsISupports *n)
  {
      // Re-entering ::Forget during collection used to be a fault, but
      // we are canonicalizing nsISupports pointers using QI, so we will
-     // see some spurious refcount traffic here. 
- 
-     if (mScanInProgress)
-         return PR_FALSE;
- 
-     NS_ASSERTION(NS_IsMainThread(), "trying to forget from non-main thread");
-     
--    if (mParams.mDoNothing)
--        return PR_TRUE; // it's as good as forgotten
--
- #ifdef DEBUG_CC
-     mStats.mForgetNode++;
- 
- #ifndef __MINGW32__
-     if (mParams.mHookMalloc)
-         InitMemHook();
- #endif
+@@ -2003,20 +1988,103 @@ nsCycleCollector::Forget(nsISupports *n)
  
      if (mParams.mLogPointers) {
          if (!mPtrLog)
@@ -624,10 +587,81 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
 -    mPurpleBuf.Remove(n);
-+    mPurpleBuf.Remove(e);
++    mPurpleBuf.RemoveCompatObject(n);
      return PR_TRUE;
  }
  
++nsPurpleBufferEntry*
++nsCycleCollector::Suspect2(nsISupports *n)
++{
++    // Re-entering ::Suspect during collection used to be a fault, but
++    // we are canonicalizing nsISupports pointers using QI, so we will
++    // see some spurious refcount traffic here. 
++
++    if (mScanInProgress)
++        return nsnull;
++
++    NS_ASSERTION(nsCycleCollector_isScanSafe(n),
++                 "suspected a non-scansafe pointer");
++    NS_ASSERTION(NS_IsMainThread(), "trying to suspect from non-main thread");
++
++    if (mParams.mDoNothing)
++        return nsnull;
++
++#ifdef DEBUG_CC
++    mStats.mSuspectNode++;
++
++    if (nsCycleCollector_shouldSuppress(n))
++        return nsnull;
++
++#ifndef __MINGW32__
++    if (mParams.mHookMalloc)
++        InitMemHook();
++#endif
++
++    if (mParams.mLogPointers) {
++        if (!mPtrLog)
++            mPtrLog = fopen("pointer_log", "w");
++        fprintf(mPtrLog, "S %p\n", static_cast<void*>(n));
++    }
++#endif
++
++    // Caller is responsible for filling in result's mRefCnt.
++    return mPurpleBuf.Put(n);
++}
++
++
++PRBool
++nsCycleCollector::Forget2(nsPurpleBufferEntry *e)
++{
++    // Re-entering ::Forget during collection used to be a fault, but
++    // we are canonicalizing nsISupports pointers using QI, so we will
++    // see some spurious refcount traffic here. 
++
++    if (mScanInProgress)
++        return PR_FALSE;
++
++    NS_ASSERTION(NS_IsMainThread(), "trying to forget from non-main thread");
++    
++#ifdef DEBUG_CC
++    mStats.mForgetNode++;
++
++#ifndef __MINGW32__
++    if (mParams.mHookMalloc)
++        InitMemHook();
++#endif
++
++    if (mParams.mLogPointers) {
++        if (!mPtrLog)
++            mPtrLog = fopen("pointer_log", "w");
++        fprintf(mPtrLog, "F %p\n", static_cast<void*>(n));
++    }
++#endif
++
++    mPurpleBuf.Remove(e);
++    return PR_TRUE;
++}
++
 +#ifdef DEBUG_CC
 +static PRBool
 +IsInPurpleBuf(PtrInfo *aPtrInfo)
@@ -648,7 +682,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          InitMemHook();
  #endif
  
-@@ -2056,18 +2003,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -2056,18 +2124,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef DEBUG_CC
          // We wait until after FinishCollection to check the white nodes because
          // some objects may outlive CollectWhite but then be freed by
@@ -668,7 +702,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
              }
          }
  #endif
-@@ -2566,17 +2512,17 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -2566,17 +2633,17 @@ nsCycleCollector::ExplainLiveExpectedGar
                      }
                  }
  
@@ -687,40 +721,44 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  "  from other cycles to require multiple rounds of cycle collection in which\n"
  "  this object was likely the reachable object\n",
                                         pi->mName, pi->mPointer, pi->mSCCIndex);
-@@ -2693,29 +2639,28 @@ nsCycleCollector_registerRuntime(PRUint3
- void 
- nsCycleCollector_forgetRuntime(PRUint32 langID)
- {
-     if (sCollector)
-         sCollector->ForgetRuntime(langID);
- }
- 
- 
--PRBool
-+nsPurpleBufferEntry*
+@@ -2701,23 +2768,36 @@ nsCycleCollector_forgetRuntime(PRUint32 
+ PRBool
  NS_CycleCollectorSuspect(nsISupports *n)
  {
      if (sCollector)
          return sCollector->Suspect(n);
--    return PR_FALSE;
-+    return nsnull;
+     return PR_FALSE;
  }
  
 -
  PRBool
--NS_CycleCollectorForget(nsISupports *n)
-+NS_CycleCollectorForget(nsPurpleBufferEntry *e)
+ NS_CycleCollectorForget(nsISupports *n)
  {
--    return sCollector ? sCollector->Forget(n) : PR_TRUE;
-+    return sCollector ? sCollector->Forget(e) : PR_TRUE;
+     return sCollector ? sCollector->Forget(n) : PR_TRUE;
  }
  
++nsPurpleBufferEntry*
++NS_CycleCollectorSuspect2(nsISupports *n)
++{
++    if (sCollector)
++        return sCollector->Suspect2(n);
++    return nsnull;
++}
++
++PRBool
++NS_CycleCollectorForget2(nsPurpleBufferEntry *e)
++{
++    return sCollector ? sCollector->Forget2(e) : PR_TRUE;
++}
++
  
  PRUint32
  nsCycleCollector_collect()
  {
      fprintf(stderr, "Starting nsCycleCollector_collect\n");
      PRIntervalTime start = PR_IntervalNow();
+     PRUint32 result = sCollector ? sCollector->Collect() : 0;
+     PRIntervalTime end = PR_IntervalNow();
 diff --git a/xpcom/build/dlldeps.cpp b/xpcom/build/dlldeps.cpp
 --- a/xpcom/build/dlldeps.cpp
 +++ b/xpcom/build/dlldeps.cpp
@@ -745,8 +783,17 @@ diff --git a/xpcom/build/dlldeps.cpp b/xpcom/build/dlldeps.cpp
 diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
 --- a/xpcom/build/nsXPCOM.h
 +++ b/xpcom/build/nsXPCOM.h
-@@ -68,34 +68,37 @@
+@@ -61,41 +61,46 @@
+ # define NS_LogAddRef                NS_LogAddRef_P
+ # define NS_LogRelease               NS_LogRelease_P
+ # define NS_LogCtor                  NS_LogCtor_P
+ # define NS_LogDtor                  NS_LogDtor_P
+ # define NS_LogCOMPtrAddRef          NS_LogCOMPtrAddRef_P
+ # define NS_LogCOMPtrRelease         NS_LogCOMPtrRelease_P
+ # define NS_CycleCollectorSuspect    NS_CycleCollectorSuspect_P
  # define NS_CycleCollectorForget     NS_CycleCollectorForget_P
++# define NS_CycleCollectorSuspect2   NS_CycleCollectorSuspect2_P
++# define NS_CycleCollectorForget2    NS_CycleCollectorForget2_P
  #endif
  
  #include "nscore.h"
@@ -783,7 +830,8 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
   * @status FROZEN
   */
  typedef nsresult (*nsGetModuleProc)(nsIComponentManager *aCompMgr,
-@@ -455,21 +458,22 @@ NS_LogCOMPtrAddRef(void *aCOMPtr, nsISup
+@@ -454,23 +459,32 @@ NS_LogCOMPtrAddRef(void *aCOMPtr, nsISup
+ 
  XPCOM_API(void)
  NS_LogCOMPtrRelease(void *aCOMPtr, nsISupports *aObject);
  
@@ -791,16 +839,22 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
   * The XPCOM cycle collector analyzes and breaks reference cycles between
   * participating XPCOM objects. All objects in the cycle must implement
   * nsCycleCollectionParticipant to break cycles correctly.
++ *
++ * The first two functions below exist only to support binary components
++ * that were compiled for older XPCOM versions.
   */
--XPCOM_API(PRBool)
-+
-+XPCOM_API(nsPurpleBufferEntry*)
+ XPCOM_API(PRBool)
  NS_CycleCollectorSuspect(nsISupports *n);
  
  XPCOM_API(PRBool)
--NS_CycleCollectorForget(nsISupports *n);
-+NS_CycleCollectorForget(nsPurpleBufferEntry *e);
+ NS_CycleCollectorForget(nsISupports *n);
  
++XPCOM_API(nsPurpleBufferEntry*)
++NS_CycleCollectorSuspect2(nsISupports *n);
++
++XPCOM_API(PRBool)
++NS_CycleCollectorForget2(nsPurpleBufferEntry *e);
++
  /**
   * Categories (in the category manager service) used by XPCOM:
   */
@@ -808,11 +862,11 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
  /**
   * A category which is read after component registration but before
   * the "xpcom-startup" notifications. Each category entry is treated
+  * as the contract ID of a service which implements
 diff --git a/xpcom/build/nsXPCOMPrivate.h b/xpcom/build/nsXPCOMPrivate.h
 --- a/xpcom/build/nsXPCOMPrivate.h
 +++ b/xpcom/build/nsXPCOMPrivate.h
-@@ -113,17 +113,19 @@ typedef void       (* xpcomVoidFunc)();
- typedef void       (* LogAddRefFunc)(void*, nsrefcnt, const char*, PRUint32);
+@@ -114,16 +114,19 @@ typedef void       (* LogAddRefFunc)(voi
  typedef void       (* LogReleaseFunc)(void*, nsrefcnt, const char*);
  typedef void       (* LogCtorFunc)(void*, const char*, PRUint32);
  typedef void       (* LogCOMPtrFunc)(void*, nsISupports*);
@@ -820,10 +874,10 @@ diff --git a/xpcom/build/nsXPCOMPrivate.h b/xpcom/build/nsXPCOMPrivate.h
  typedef nsresult   (* GetXPTCallStubFunc)(REFNSIID, nsIXPTCProxy*, nsISomeInterface**);
  typedef void       (* DestroyXPTCallStubFunc)(nsISomeInterface*);
  typedef nsresult   (* InvokeByIndexFunc)(nsISupports*, PRUint32, PRUint32, nsXPTCVariant*);
--typedef PRBool     (* CycleCollectorFunc)(nsISupports*);
+ typedef PRBool     (* CycleCollectorFunc)(nsISupports*);
 +typedef nsPurpleBufferEntry*
-+                   (* CycleCollectorSuspectFunc)(nsISupports *n);
-+typedef PRBool     (* CycleCollectorForgetFunc)(nsPurpleBufferEntry *e);
++                   (* CycleCollectorSuspect2Func)(nsISupports*);
++typedef PRBool     (* CycleCollectorForget2Func)(nsPurpleBufferEntry*);
  
  // PRIVATE AND DEPRECATED
  typedef NS_CALLBACK(XPCOMExitRoutine)(void);
@@ -832,27 +886,27 @@ diff --git a/xpcom/build/nsXPCOMPrivate.h b/xpcom/build/nsXPCOMPrivate.h
  typedef nsresult   (* UnregisterXPCOMExitRoutineFunc)(XPCOMExitRoutine exitRoutine);
  
  typedef struct XPCOMFunctions{
-@@ -182,18 +184,18 @@ typedef struct XPCOMFunctions{
-     LogReleaseFunc logReleaseFunc;
-     LogCtorFunc logCtorFunc;
-     LogCtorFunc logDtorFunc;
-     LogCOMPtrFunc logCOMPtrAddRefFunc;
-     LogCOMPtrFunc logCOMPtrReleaseFunc;
-     GetXPTCallStubFunc getXPTCallStubFunc;
-     DestroyXPTCallStubFunc destroyXPTCallStubFunc;
+@@ -189,16 +192,20 @@ typedef struct XPCOMFunctions{
      InvokeByIndexFunc invokeByIndexFunc;
--    CycleCollectorFunc cycleSuspectFunc;
--    CycleCollectorFunc cycleForgetFunc;
-+    CycleCollectorSuspectFunc cycleSuspectFunc;
-+    CycleCollectorForgetFunc cycleForgetFunc;
+     CycleCollectorFunc cycleSuspectFunc;
+     CycleCollectorFunc cycleForgetFunc;
      StringSetIsVoidFunc stringSetIsVoid;
      StringGetIsVoidFunc stringGetIsVoid;
      CStringSetIsVoidFunc cstringSetIsVoid;
      CStringGetIsVoidFunc cstringGetIsVoid;
  
++    // Added for Mozilla 1.9.2
++    CycleCollectorSuspect2Func cycleSuspect2Func;
++    CycleCollectorForget2Func cycleForget2Func;
++
  } XPCOMFunctions;
  
  typedef nsresult (*GetFrozenFunctionsFunc)(XPCOMFunctions *entryPoints, const char* libraryPath);
+ XPCOM_API(nsresult)
+ NS_GetFrozenFunctions(XPCOMFunctions *entryPoints, const char* libraryPath);
+ 
+ // think hard before changing this
+ #define XPCOM_GLUE_VERSION 1
 diff --git a/xpcom/glue/nsCycleCollectionParticipant.cpp b/xpcom/glue/nsCycleCollectionParticipant.cpp
 --- a/xpcom/glue/nsCycleCollectionParticipant.cpp
 +++ b/xpcom/glue/nsCycleCollectionParticipant.cpp
@@ -1052,7 +1106,7 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 -      NS_ASSERTION(tmp != 0, "purple ISupports pointer with zero refcnt");
 -      if (!NS_CycleCollectorForget(owner))
 -        tmp |= NS_PURPLE_BIT;
-+      if (NS_LIKELY(NS_CycleCollectorForget(e))) {
++      if (NS_LIKELY(NS_CycleCollectorForget2(e))) {
 +        // |e| is now invalid
 +        ++refcount;
 +        mTagged = NS_CCAR_REFCNT_TO_TAGGED(refcount);
@@ -1092,7 +1146,7 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 +      --refcount;
 +      
 +      if (NS_UNLIKELY(refcount == 0)) {
-+        if (NS_UNLIKELY(!NS_CycleCollectorForget(e))) {
++        if (NS_UNLIKELY(!NS_CycleCollectorForget2(e))) {
 +          NS_NOTREACHED("forget should not fail when reference count hits 0");
 +        }
 +        mTagged = NS_CCAR_REFCNT_TO_TAGGED(refcount);
@@ -1114,7 +1168,7 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 -        NS_NOTREACHED("forget should not fail when reference count hits 0");
 +      nsPurpleBufferEntry *e;
 +      if (NS_LIKELY(refcount > 0) &&
-+          ((e = NS_CycleCollectorSuspect(owner)))) {
++          ((e = NS_CycleCollectorSuspect2(owner)))) {
 +        e->mRefCnt = refcount;
 +        mTagged = NS_CCAR_PURPLE_ENTRY_TO_TAGGED(e);
 +      } else {
@@ -1202,8 +1256,7 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 diff --git a/xpcom/glue/standalone/nsXPCOMGlue.cpp b/xpcom/glue/standalone/nsXPCOMGlue.cpp
 --- a/xpcom/glue/standalone/nsXPCOMGlue.cpp
 +++ b/xpcom/glue/standalone/nsXPCOMGlue.cpp
-@@ -543,25 +543,25 @@ NS_InvokeByIndex(nsISupports* that, PRUi
- {
+@@ -544,24 +544,42 @@ NS_InvokeByIndex(nsISupports* that, PRUi
      if (!xpcomFunctions.invokeByIndexFunc)
          return NS_ERROR_NOT_INITIALIZED;
  
@@ -1211,52 +1264,89 @@ diff --git a/xpcom/glue/standalone/nsXPCOMGlue.cpp b/xpcom/glue/standalone/nsXPC
                                              paramCount, params);
  }
  
--XPCOM_API(PRBool)
+ XPCOM_API(PRBool)
 -NS_CycleCollectorSuspect(nsISupports* obj)
-+XPCOM_API(nsPurpleBufferEntry*)
 +NS_CycleCollectorSuspect(nsISupports *obj)
  {
      if (!xpcomFunctions.cycleSuspectFunc)
--        return PR_FALSE;
-+        return nsnull;
+         return PR_FALSE;
  
      return xpcomFunctions.cycleSuspectFunc(obj);
  }
  
  XPCOM_API(PRBool)
 -NS_CycleCollectorForget(nsISupports* obj)
-+NS_CycleCollectorForget(nsPurpleBufferEntry *e)
++NS_CycleCollectorForget(nsISupports *obj)
  {
      if (!xpcomFunctions.cycleForgetFunc)
          return PR_FALSE;
  
--    return xpcomFunctions.cycleForgetFunc(obj);
-+    return xpcomFunctions.cycleForgetFunc(e);
+     return xpcomFunctions.cycleForgetFunc(obj);
  }
++
++XPCOM_API(nsPurpleBufferEntry*)
++NS_CycleCollectorSuspect2(nsISupports *obj)
++{
++    if (!xpcomFunctions.cycleSuspect2Func)
++        return nsnull;
++
++    return xpcomFunctions.cycleSuspect2Func(obj);
++}
++
++XPCOM_API(PRBool)
++NS_CycleCollectorForget2(nsPurpleBufferEntry *e)
++{
++    if (!xpcomFunctions.cycleForget2Func)
++        return PR_FALSE;
++
++    return xpcomFunctions.cycleForget2Func(e);
++}
 diff --git a/xpcom/stub/nsXPComStub.cpp b/xpcom/stub/nsXPComStub.cpp
 --- a/xpcom/stub/nsXPComStub.cpp
 +++ b/xpcom/stub/nsXPComStub.cpp
-@@ -536,20 +536,20 @@ NS_CStringToUTF16(const nsACString &aSrc
- #undef NS_UTF16ToCString
- EXPORT_XPCOM_API(nsresult)
- NS_UTF16ToCString(const nsAString &aSrc, nsCStringEncoding aDestEncoding, nsACString &aDest)
- {
-   return NS_UTF16ToCString_P(aSrc, aDestEncoding, aDest);
- }
+@@ -115,17 +115,21 @@ static const XPCOMFunctions kFrozenFunct
+     &NS_GetXPTCallStub_P,
+     &NS_DestroyXPTCallStub_P,
+     &NS_InvokeByIndex_P,
+     &NS_CycleCollectorSuspect_P,
+     &NS_CycleCollectorForget_P,
+     &NS_StringSetIsVoid_P,
+     &NS_StringGetIsVoid_P,
+     &NS_CStringSetIsVoid_P,
+-    &NS_CStringGetIsVoid_P
++    &NS_CStringGetIsVoid_P,
++
++    // these functions were added post 1.9.1
++    &NS_CycleCollectorSuspect2_P,
++    &NS_CycleCollectorForget2_P
+ };
  
- #undef NS_CycleCollectorSuspect
--EXPORT_XPCOM_API(PRBool)
-+EXPORT_XPCOM_API(nsPurpleBufferEntry*)
- NS_CycleCollectorSuspect(nsISupports* obj)
+ EXPORT_XPCOM_API(nsresult)
+ NS_GetFrozenFunctions(XPCOMFunctions *functions, const char* /* libraryPath */)
  {
-   return NS_CycleCollectorSuspect_P(obj);
+     if (!functions)
+         return NS_ERROR_OUT_OF_MEMORY;
+ 
+@@ -548,8 +552,22 @@ NS_CycleCollectorSuspect(nsISupports* ob
  }
  
  #undef NS_CycleCollectorForget
  EXPORT_XPCOM_API(PRBool)
--NS_CycleCollectorForget(nsISupports* obj)
-+NS_CycleCollectorForget(nsPurpleBufferEntry* e)
+ NS_CycleCollectorForget(nsISupports* obj)
  {
--  return NS_CycleCollectorForget_P(obj);
-+  return NS_CycleCollectorForget_P(e);
+   return NS_CycleCollectorForget_P(obj);
  }
++
++#undef NS_CycleCollectorSuspect2
++EXPORT_XPCOM_API(nsPurpleBufferEntry*)
++NS_CycleCollectorSuspect2(nsISupports* obj)
++{
++  return NS_CycleCollectorSuspect2_P(obj);
++}
++
++#undef NS_CycleCollectorForget2
++EXPORT_XPCOM_API(PRBool)
++NS_CycleCollectorForget2(nsPurpleBufferEntry* e)
++{
++  return NS_CycleCollectorForget2_P(e);
++}
