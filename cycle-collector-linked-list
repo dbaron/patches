@@ -49,7 +49,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  };
  #endif
-@@ -656,230 +650,224 @@ struct GCGraph
+@@ -656,230 +650,239 @@ struct GCGraph
      }
      ~GCGraph() { 
      }
@@ -111,6 +111,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +    // For objects compiled against Gecko 1.9 and 1.9.1.
 +    PointerSet mCompatObjects;
  #ifdef DEBUG_CC
++    PointerSet mNormalObjects; // duplicates our linked list
      nsCycleCollectorStats &mStats;
  #endif
 -    void* mCache[N_POINTERS];
@@ -126,6 +127,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +          mStats(stats)
      {
          Init();
++        mNormalObjects.Init();
      }
  #else
      nsPurpleBuffer(nsCycleCollectorParams &params) 
@@ -173,15 +175,20 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  #ifdef DEBUG_CC
      void NoteAll(GCGraphBuilder &builder);
- #endif
+-#endif
  
--    PRBool Exists(void *p)
-+    nsPurpleBufferEntry* NewEntry()
+     PRBool Exists(void *p)
      {
 -        PRUint32 idx = POINTER_INDEX(p);
 -        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
 -            if (mCache[idx+i] == p)
 -                return PR_TRUE;
++        return mNormalObjects.GetEntry(p) || mCompatObjects.GetEntry(p);
++    }
++#endif
++
++    nsPurpleBufferEntry* NewEntry()
++    {
 +        if (mFreeList) {
 +            nsPurpleBufferEntry *e = mFreeList;
 +            mFreeList = mFreeList->mNext;
@@ -216,10 +223,6 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +        if (!e) {
 +            return nsnull;
          }
--#ifdef DEBUG_CC
--        mStats.mSpills++;
--#endif
--        SpillOne(p);
 +
 +        ++mCount;
 +
@@ -229,6 +232,12 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +        e->mPrev = &mListHead;
 +        mListHead.mNext->mPrev = e;
 +        mListHead.mNext = e;
++
+ #ifdef DEBUG_CC
+-        mStats.mSpills++;
++        mNormalObjects.PutEntry(p);
+ #endif
+-        SpillOne(p);
 +
 +        // Caller is responsible for filling in result's mRefCnt.
 +        return e;
@@ -246,6 +255,10 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -        }
 -        mBackingStore.Remove(p);
 +        NS_ASSERTION(mCount != 0, "must have entries");
++
++#ifdef DEBUG_CC
++        mNormalObjects.RemoveEntry(e->mObject);
++#endif
 +
 +        e->mNext->mPrev = e->mPrev;
 +        e->mPrev->mNext = e->mNext;
@@ -398,7 +411,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  struct nsCycleCollectionXPCOMRuntime : 
      public nsCycleCollectionLanguageRuntime 
  {
-@@ -927,18 +915,23 @@ struct nsCycleCollector
+@@ -927,18 +930,23 @@ struct nsCycleCollector
      void MarkRoots(GCGraphBuilder &builder);
      void ScanRoots();
      void RootWhite();
@@ -422,7 +435,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      void ClearGraph()
      {
-@@ -1499,37 +1492,30 @@ AddPurpleRoot(GCGraphBuilder &builder, n
+@@ -1499,37 +1507,30 @@ AddPurpleRoot(GCGraphBuilder &builder, n
      }
  
      cp->UnmarkPurple(root);
@@ -465,7 +478,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      mGraph.mRootCount = builder.Count();
  
      // read the PtrInfo out of the graph that we are building
-@@ -1967,19 +1953,18 @@ nsCycleCollector::Suspect(nsISupports *n
+@@ -1967,19 +1968,18 @@ nsCycleCollector::Suspect(nsISupports *n
  
      if (mParams.mLogPointers) {
          if (!mPtrLog)
@@ -487,7 +500,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  {
      // Re-entering ::Forget during collection used to be a fault, but
      // we are canonicalizing nsISupports pointers using QI, so we will
-@@ -2003,20 +1988,103 @@ nsCycleCollector::Forget(nsISupports *n)
+@@ -2003,17 +2003,88 @@ nsCycleCollector::Forget(nsISupports *n)
  
      if (mParams.mLogPointers) {
          if (!mPtrLog)
@@ -498,9 +511,9 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
 -    mPurpleBuf.Remove(n);
 +    mPurpleBuf.RemoveCompatObject(n);
-     return PR_TRUE;
- }
- 
++    return PR_TRUE;
++}
++
 +nsPurpleBufferEntry*
 +nsCycleCollector::Suspect2(nsISupports *n)
 +{
@@ -569,50 +582,15 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +#endif
 +
 +    mPurpleBuf.Remove(e);
-+    return PR_TRUE;
-+}
-+
-+#ifdef DEBUG_CC
-+static PRBool
-+IsInPurpleBuf(PtrInfo *aPtrInfo)
-+{
-+    if (aPtrInfo->mLangID != nsIProgrammingLanguage::CPLUSPLUS)
-+        return PR_FALSE;
-+
-+    // XXX WRITE ME!  Lying for now!
-+    return PR_FALSE;
-+}
-+#endif
-+
+     return PR_TRUE;
+ }
+ 
  PRUint32
  nsCycleCollector::Collect(PRUint32 aTryCollections)
  {
  #if defined(DEBUG_CC) && !defined(__MINGW32__)
      if (!mParams.mDoNothing && mParams.mHookMalloc)
-         InitMemHook();
- #endif
- 
-@@ -2056,18 +2124,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
- #ifdef DEBUG_CC
-         // We wait until after FinishCollection to check the white nodes because
-         // some objects may outlive CollectWhite but then be freed by
-         // FinishCycleCollection (like XPConnect's deferred release of native
-         // objects).
-         PRUint32 i, count = mWhiteNodes->Length();
-         for (i = 0; i < count; ++i) {
-             PtrInfo *pinfo = mWhiteNodes->ElementAt(i);
--            if (pinfo->mLangID == nsIProgrammingLanguage::CPLUSPLUS &&
--                mPurpleBuf.Exists(pinfo->mPointer)) {
-+            if (IsInPurpleBuf(pinfo)) {
-                 printf("nsCycleCollector: %s object @%p is still alive after\n"
-                        "  calling RootAndUnlinkJSObjects, Unlink, and Unroot on"
-                        " it!  This probably\n"
-                        "  means the Unlink implementation was insufficient.\n",
-                        pinfo->mName, pinfo->mPointer);
-             }
-         }
- #endif
-@@ -2566,17 +2633,17 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -2566,17 +2637,19 @@ nsCycleCollector::ExplainLiveExpectedGar
                      }
                  }
  
@@ -622,7 +600,9 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
                          PtrInfo *pi = queue.GetNext();
                          if (pi->mColor == white) {
 -                            if (mPurpleBuf.Exists(pi->mPointer)) {
-+                            if (IsInPurpleBuf(pi)) {
++                            if (pi->mLangID ==
++                                    nsIProgrammingLanguage::CPLUSPLUS &&
++                                mPurpleBuf.Exists(pi->mPointer)) {
                                  printf(
  "nsCycleCollector: %s %p in component %d\n"
  "  which was reference counted during the root/unlink/unroot phase of the\n"
@@ -631,7 +611,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  "  from other cycles to require multiple rounds of cycle collection in which\n"
  "  this object was likely the reachable object\n",
                                         pi->mName, pi->mPointer, pi->mSCCIndex);
-@@ -2701,23 +2768,36 @@ nsCycleCollector_forgetRuntime(PRUint32 
+@@ -2701,23 +2774,36 @@ nsCycleCollector_forgetRuntime(PRUint32 
  PRBool
  NS_CycleCollectorSuspect(nsISupports *n)
  {
