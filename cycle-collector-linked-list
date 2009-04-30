@@ -121,7 +121,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  };
  #endif
-@@ -656,230 +650,84 @@ struct GCGraph
+@@ -656,230 +650,154 @@ struct GCGraph
      }
      ~GCGraph() { 
      }
@@ -166,6 +166,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      nsCycleCollectorParams &mParams;
 +    nsPurpleBufferEntry mListHead;
++    Block mFirstBlock;
++    // mFreeList is singly-linked via mNext.
++    nsPurpleBufferEntry *mFreeList;
++    // The remainder of the current block.
++    nsPurpleBufferEntry *mUnallocatedEntry, *mUnallocatedEnd;
  #ifdef DEBUG_CC
      nsCycleCollectorStats &mStats;
  #endif
@@ -193,23 +198,36 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  #endif
  
--    ~nsPurpleBuffer()
-+    void Init()
+     ~nsPurpleBuffer()
      {
 -        memset(mCache, 0, sizeof(mCache));
 -        mBackingStore.Clear();
-+      mListHead.mPrev = &mListHead;
-+      mListHead.mNext = &mListHead;
++        Block *b = mFirstBlock.mNext; 
++        while (b) {
++            Block *next = b->mNext;
++            delete b;
++            b = next;
++        }
      }
  
--    void Init()
--    {
+     void Init()
+     {
 -        memset(mCache, 0, sizeof(mCache));
 -        mBackingStore.Init();
--    }
--
++      mListHead.mPrev = &mListHead;
++      mListHead.mNext = &mListHead;
++      mFreeList = nsnull;
++      StartBlock(&mFirstBlock);
+     }
+ 
 -    void BumpGeneration();
 -    void SelectAgedPointers(GCGraphBuilder &builder);
++    void StartBlock(Block *aBlock)
++    {
++        mUnallocatedEntry = aBlock->mEntries;
++        mUnallocatedEnd = aBlock->mEntries + NS_ARRAY_LENGTH(aBlock->mEntries);
++    }
++
 +    void SelectPointers(GCGraphBuilder &builder);
  
  #ifdef DEBUG_CC
@@ -217,17 +235,35 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  #endif
  
 -    PRBool Exists(void *p)
--    {
++    nsPurpleBufferEntry* NewEntry()
+     {
 -        PRUint32 idx = POINTER_INDEX(p);
 -        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
 -            if (mCache[idx+i] == p)
 -                return PR_TRUE;
--        }
++        if (mFreeList) {
++            nsPurpleBufferEntry *e = mFreeList;
++            mFreeList = mFreeList->mNext;
++            return e;
+         }
 -        PRUint32 gen;
 -        return mBackingStore.Get(p, &gen);
--    }
--
-     void Put(void *p)
++
++        if (mUnallocatedEntry == mUnallocatedEnd) {
++            Block *b = new Block;
++            if (!b) {
++                return nsnull;
++            }
++            StartBlock(b);
++        }
++
++        nsPurpleBufferEntry *e = mUnallocatedEntry;
++        ++mUnallocatedEntry;
++        return e;
+     }
+ 
+-    void Put(void *p)
++    nsPurpleBufferEntry* Put(nsISupports *p)
      {
 -        PRUint32 idx = POINTER_INDEX(p);
 -        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
@@ -235,14 +271,28 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -                mCache[idx+i] = p;
 -                return;
 -            }
--        }
++        nsPurpleBufferEntry *e = NewEntry();
++        if (!e) {
++            return nsnull;
+         }
 -#ifdef DEBUG_CC
 -        mStats.mSpills++;
 -#endif
 -        SpillOne(p);
++
++        e->mObject = p;
++
++        e->mNext = mListHead.mNext;
++        e->mPrev = &mListHead;
++        mListHead.mNext->mPrev = e;
++        mListHead.mNext = e;
++
++        // Caller is responsible for filling in result's mRefCnt.
++        return e;
      }
  
-     void Remove(void *p)     
+-    void Remove(void *p)     
++    void Remove(nsPurpleBufferEntry *e)
      {
 -        PRUint32 idx = POINTER_INDEX(p);
 -        for (PRUint32 i = 0; i < ASSOCIATIVITY; ++i) {
@@ -252,6 +302,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -            }
 -        }
 -        mBackingStore.Remove(p);
++        e->mNext->mPrev = e->mPrev;
++        e->mPrev->mNext = e->mNext;
++
++        e->mNext = mFreeList;
++        mFreeList = e;
      }
  
 -    void SpillOne(void* &p)
@@ -259,7 +314,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -        mBackingStore.Put(p, mCurrGen);
 -        p = (void*)0;
 -    }
--
++private:
++    struct Block {
++        Block *mNext;
++        nsPurpleBufferEntry mEntries[512];
+ 
 -    void SpillAll()
 -    {
 -        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
@@ -323,6 +382,8 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -    }
 -    nsPurpleBuffer *mPurpleBuffer;
 -    GCGraphBuilder &mBuilder;
++        Block() : mNext(nsnull) {}
++    };
  };
  
  static PRBool
@@ -368,7 +429,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  struct nsCycleCollectionXPCOMRuntime : 
      public nsCycleCollectionLanguageRuntime 
  {
-@@ -927,18 +775,18 @@ struct nsCycleCollector
+@@ -927,18 +845,18 @@ struct nsCycleCollector
      void MarkRoots(GCGraphBuilder &builder);
      void ScanRoots();
      void RootWhite();
@@ -389,7 +450,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
      void ClearGraph()
      {
-@@ -1493,43 +1341,36 @@ AddPurpleRoot(GCGraphBuilder &builder, n
+@@ -1493,43 +1411,36 @@ AddPurpleRoot(GCGraphBuilder &builder, n
      ToParticipant(root, &cp);
  
      PtrInfo *pinfo = builder.AddNode(root, cp,
@@ -439,7 +500,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      mGraph.mRootCount = builder.Count();
  
      // read the PtrInfo out of the graph that we are building
-@@ -1932,91 +1773,102 @@ nsCycleCollector_isScanSafe(nsISupports 
+@@ -1932,91 +1843,100 @@ nsCycleCollector_isScanSafe(nsISupports 
  
      nsXPCOMCycleCollectionParticipant *cp;
      ToParticipant(s, &cp);
@@ -487,10 +548,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  #endif
  
-     mPurpleBuf.Put(n);
- 
-+    // XXX WRITE ME!
-     return PR_TRUE;
+-    mPurpleBuf.Put(n);
+-
+-    return PR_TRUE;
++    // Caller is responsible for filling in result's mRefCnt.
++    return mPurpleBuf.Put(n);
  }
  
  
@@ -525,8 +587,9 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
      }
  #endif
  
+-    mPurpleBuf.Remove(n);
 +    // XXX WRITE ME!
-     mPurpleBuf.Remove(n);
++    mPurpleBuf.Remove(e);
      return PR_TRUE;
  }
  
@@ -550,7 +613,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
          InitMemHook();
  #endif
  
-@@ -2056,18 +1908,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
+@@ -2056,18 +1976,17 @@ nsCycleCollector::Collect(PRUint32 aTryC
  #ifdef DEBUG_CC
          // We wait until after FinishCollection to check the white nodes because
          // some objects may outlive CollectWhite but then be freed by
@@ -570,7 +633,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
              }
          }
  #endif
-@@ -2566,17 +2417,17 @@ nsCycleCollector::ExplainLiveExpectedGar
+@@ -2566,17 +2485,17 @@ nsCycleCollector::ExplainLiveExpectedGar
                      }
                  }
  
@@ -589,7 +652,7 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  "  from other cycles to require multiple rounds of cycle collection in which\n"
  "  this object was likely the reachable object\n",
                                         pi->mName, pi->mPointer, pi->mSCCIndex);
-@@ -2693,29 +2544,28 @@ nsCycleCollector_registerRuntime(PRUint3
+@@ -2693,29 +2612,28 @@ nsCycleCollector_registerRuntime(PRUint3
  void 
  nsCycleCollector_forgetRuntime(PRUint32 langID)
  {
