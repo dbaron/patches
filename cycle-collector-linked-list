@@ -140,7 +140,11 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
  
  struct nsPurpleBuffer
  {
--
++private:
++    struct Block {
++        Block *mNext;
++        nsPurpleBufferEntry mEntries[512];
+ 
 -#define ASSOCIATIVITY 2
 -#define INDEX_LOW_BIT 6
 -#define N_INDEX_BITS 13
@@ -161,6 +165,9 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -    // to get a higher hit rate and greater locality of reference for
 -    // generation zero, in which the vast majority of suspect/forget
 -    // calls annihilate one another.
++        Block() : mNext(nsnull) {}
++    };
++public:
 +    // This class wraps a linked list of the elements in the purple
 +    // buffer.
  
@@ -308,17 +315,13 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 +        e->mNext = mFreeList;
 +        mFreeList = e;
      }
- 
+-
 -    void SpillOne(void* &p)
 -    {
 -        mBackingStore.Put(p, mCurrGen);
 -        p = (void*)0;
 -    }
-+private:
-+    struct Block {
-+        Block *mNext;
-+        nsPurpleBufferEntry mEntries[512];
- 
+-
 -    void SpillAll()
 -    {
 -        for (PRUint32 i = 0; i < N_POINTERS; ++i) {
@@ -382,8 +385,6 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 -    }
 -    nsPurpleBuffer *mPurpleBuffer;
 -    GCGraphBuilder &mBuilder;
-+        Block() : mNext(nsnull) {}
-+    };
  };
  
  static PRBool
@@ -689,7 +690,45 @@ diff --git a/xpcom/base/nsCycleCollector.cpp b/xpcom/base/nsCycleCollector.cpp
 diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
 --- a/xpcom/build/nsXPCOM.h
 +++ b/xpcom/build/nsXPCOM.h
-@@ -455,21 +455,23 @@ NS_LogCOMPtrAddRef(void *aCOMPtr, nsISup
+@@ -68,34 +68,37 @@
+ # define NS_CycleCollectorForget     NS_CycleCollectorForget_P
+ #endif
+ 
+ #include "nscore.h"
+ #include "nsXPCOMCID.h"
+ 
+ #ifdef __cplusplus
+ #define DECL_CLASS(c) class c
++#define DECL_STRUCT(c) struct c
+ #else
+ #define DECL_CLASS(c) typedef struct c c
++#define DECL_STRUCT(c) typedef struct c c
+ #endif
+ 
+ DECL_CLASS(nsAString);
+ DECL_CLASS(nsACString);
+ 
+ DECL_CLASS(nsISupports);
+ DECL_CLASS(nsIModule);
+ DECL_CLASS(nsIComponentManager);
+ DECL_CLASS(nsIComponentRegistrar);
+ DECL_CLASS(nsIServiceManager);
+ DECL_CLASS(nsIFile);
+ DECL_CLASS(nsILocalFile);
+ DECL_CLASS(nsIDirectoryServiceProvider);
+ DECL_CLASS(nsIMemory);
+ DECL_CLASS(nsIDebug);
+ DECL_CLASS(nsITraceRefcnt);
++DECL_STRUCT(nsPurpleBufferEntry);
+ 
+ /**
+  * Every XPCOM component implements this function signature, which is the
+  * only entrypoint XPCOM uses to the function.
+  *
+  * @status FROZEN
+  */
+ typedef nsresult (*nsGetModuleProc)(nsIComponentManager *aCompMgr,
+@@ -455,21 +458,22 @@ NS_LogCOMPtrAddRef(void *aCOMPtr, nsISup
  XPCOM_API(void)
  NS_LogCOMPtrRelease(void *aCOMPtr, nsISupports *aObject);
  
@@ -699,7 +738,6 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
   * nsCycleCollectionParticipant to break cycles correctly.
   */
 -XPCOM_API(PRBool)
-+struct nsPurpleBufferEntry;
 +
 +XPCOM_API(nsPurpleBufferEntry*)
  NS_CycleCollectorSuspect(nsISupports *n);
@@ -715,6 +753,51 @@ diff --git a/xpcom/build/nsXPCOM.h b/xpcom/build/nsXPCOM.h
  /**
   * A category which is read after component registration but before
   * the "xpcom-startup" notifications. Each category entry is treated
+diff --git a/xpcom/build/nsXPCOMPrivate.h b/xpcom/build/nsXPCOMPrivate.h
+--- a/xpcom/build/nsXPCOMPrivate.h
++++ b/xpcom/build/nsXPCOMPrivate.h
+@@ -113,17 +113,19 @@ typedef void       (* xpcomVoidFunc)();
+ typedef void       (* LogAddRefFunc)(void*, nsrefcnt, const char*, PRUint32);
+ typedef void       (* LogReleaseFunc)(void*, nsrefcnt, const char*);
+ typedef void       (* LogCtorFunc)(void*, const char*, PRUint32);
+ typedef void       (* LogCOMPtrFunc)(void*, nsISupports*);
+ 
+ typedef nsresult   (* GetXPTCallStubFunc)(REFNSIID, nsIXPTCProxy*, nsISomeInterface**);
+ typedef void       (* DestroyXPTCallStubFunc)(nsISomeInterface*);
+ typedef nsresult   (* InvokeByIndexFunc)(nsISupports*, PRUint32, PRUint32, nsXPTCVariant*);
+-typedef PRBool     (* CycleCollectorFunc)(nsISupports*);
++typedef nsPurpleBufferEntry*
++                   (* CycleCollectorSuspectFunc)(nsISupports *n);
++typedef PRBool     (* CycleCollectorForgetFunc)(nsPurpleBufferEntry *e);
+ 
+ // PRIVATE AND DEPRECATED
+ typedef NS_CALLBACK(XPCOMExitRoutine)(void);
+ 
+ typedef nsresult   (* RegisterXPCOMExitRoutineFunc)(XPCOMExitRoutine exitRoutine, PRUint32 priority);
+ typedef nsresult   (* UnregisterXPCOMExitRoutineFunc)(XPCOMExitRoutine exitRoutine);
+ 
+ typedef struct XPCOMFunctions{
+@@ -182,18 +184,18 @@ typedef struct XPCOMFunctions{
+     LogReleaseFunc logReleaseFunc;
+     LogCtorFunc logCtorFunc;
+     LogCtorFunc logDtorFunc;
+     LogCOMPtrFunc logCOMPtrAddRefFunc;
+     LogCOMPtrFunc logCOMPtrReleaseFunc;
+     GetXPTCallStubFunc getXPTCallStubFunc;
+     DestroyXPTCallStubFunc destroyXPTCallStubFunc;
+     InvokeByIndexFunc invokeByIndexFunc;
+-    CycleCollectorFunc cycleSuspectFunc;
+-    CycleCollectorFunc cycleForgetFunc;
++    CycleCollectorSuspectFunc cycleSuspectFunc;
++    CycleCollectorForgetFunc cycleForgetFunc;
+     StringSetIsVoidFunc stringSetIsVoid;
+     StringGetIsVoidFunc stringGetIsVoid;
+     CStringSetIsVoidFunc cstringSetIsVoid;
+     CStringGetIsVoidFunc cstringGetIsVoid;
+ 
+ } XPCOMFunctions;
+ 
+ typedef nsresult (*GetFrozenFunctionsFunc)(XPCOMFunctions *entryPoints, const char* libraryPath);
 diff --git a/xpcom/glue/nsCycleCollectionParticipant.cpp b/xpcom/glue/nsCycleCollectionParticipant.cpp
 --- a/xpcom/glue/nsCycleCollectionParticipant.cpp
 +++ b/xpcom/glue/nsCycleCollectionParticipant.cpp
@@ -988,7 +1071,7 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
 +  {
 +    NS_ASSERTION(mTagged != NS_CCAR_TAGGED_STABILIZED_REFCNT,
 +                 "should have checked for stabilization first");
-+    return !(mTagged & NS_CCAR_REFCNT_BIT);
++    return !(NS_PTR_TO_INT32(mTagged) & NS_CCAR_REFCNT_BIT);
    }
  
    nsrefcnt get() const
@@ -1041,3 +1124,37 @@ diff --git a/xpcom/glue/nsISupportsImpl.h b/xpcom/glue/nsISupportsImpl.h
  
  
  ///////////////////////////////////////////////////////////////////////////////
+diff --git a/xpcom/glue/standalone/nsXPCOMGlue.cpp b/xpcom/glue/standalone/nsXPCOMGlue.cpp
+--- a/xpcom/glue/standalone/nsXPCOMGlue.cpp
++++ b/xpcom/glue/standalone/nsXPCOMGlue.cpp
+@@ -543,25 +543,25 @@ NS_InvokeByIndex(nsISupports* that, PRUi
+ {
+     if (!xpcomFunctions.invokeByIndexFunc)
+         return NS_ERROR_NOT_INITIALIZED;
+ 
+     return xpcomFunctions.invokeByIndexFunc(that, methodIndex,
+                                             paramCount, params);
+ }
+ 
+-XPCOM_API(PRBool)
+-NS_CycleCollectorSuspect(nsISupports* obj)
++XPCOM_API(nsPurpleBufferEntry*)
++NS_CycleCollectorSuspect(nsISupports *obj)
+ {
+     if (!xpcomFunctions.cycleSuspectFunc)
+-        return PR_FALSE;
++        return nsnull;
+ 
+     return xpcomFunctions.cycleSuspectFunc(obj);
+ }
+ 
+ XPCOM_API(PRBool)
+-NS_CycleCollectorForget(nsISupports* obj)
++NS_CycleCollectorForget(nsPurpleBufferEntry *e)
+ {
+     if (!xpcomFunctions.cycleForgetFunc)
+         return PR_FALSE;
+ 
+-    return xpcomFunctions.cycleForgetFunc(obj);
++    return xpcomFunctions.cycleForgetFunc(e);
+ }
