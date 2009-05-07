@@ -1,0 +1,193 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Clear the weak back pointers in nsTextEditRules and nsHTMLEditRules when they are no longer valid, to prepare for editor cycle collection.  (Bug 423233)
+
+diff --git a/editor/libeditor/base/nsEditRules.h b/editor/libeditor/base/nsEditRules.h
+--- a/editor/libeditor/base/nsEditRules.h
++++ b/editor/libeditor/base/nsEditRules.h
+@@ -33,20 +33,20 @@
+  * the provisions above, a recipient may use your version of this file under
+  * the terms of any one of the MPL, the GPL or the LGPL.
+  *
+  * ***** END LICENSE BLOCK ***** */
+ 
+ #ifndef nsEditRules_h__
+ #define nsEditRules_h__
+ 
++// 783223c9-153a-4e01-8422-39a3afe469da
+ #define NS_IEDITRULES_IID \
+-{ /* a6cf911d-15b3-11d2-932e-00805f8add32 */ \
+-0xa6cf911d, 0x15b3, 0x11d2, \
+-{0x93, 0x2e, 0x00, 0x80, 0x5f, 0x8a, 0xdd, 0x32} }
++{ 0x783223c9, 0x153a, 0x4e01, \
++  { 0x84, 0x22, 0x39, 0xa3, 0xaf, 0xe4, 0x69, 0xda } }
+ 
+ class nsPlaintextEditor;
+ class nsISelection;
+ 
+ /***************************************************************************
+  * base for an object to encapsulate any additional info needed to be passed
+  * to rules system by the editor
+  */
+@@ -68,16 +68,17 @@ class nsIEditRules : public nsISupports
+ {
+ public:
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_IEDITRULES_IID)
+   
+ //Interfaces for addref and release and queryinterface
+ //NOTE: Use   NS_DECL_ISUPPORTS_INHERITED in any class inherited from nsIEditRules
+ 
+   NS_IMETHOD Init(nsPlaintextEditor *aEditor, PRUint32 aFlags)=0;
++  NS_IMETHOD DetachEditor()=0;
+   NS_IMETHOD BeforeEdit(PRInt32 action, nsIEditor::EDirection aDirection)=0;
+   NS_IMETHOD AfterEdit(PRInt32 action, nsIEditor::EDirection aDirection)=0;
+   NS_IMETHOD WillDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, PRBool *aCancel, PRBool *aHandled)=0;
+   NS_IMETHOD DidDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, nsresult aResult)=0;
+   NS_IMETHOD GetFlags(PRUint32 *aFlags)=0;
+   NS_IMETHOD SetFlags(PRUint32 aFlags)=0;
+   NS_IMETHOD DocumentIsEmpty(PRBool *aDocumentIsEmpty)=0;
+ };
+diff --git a/editor/libeditor/html/nsHTMLEditRules.cpp b/editor/libeditor/html/nsHTMLEditRules.cpp
+--- a/editor/libeditor/html/nsHTMLEditRules.cpp
++++ b/editor/libeditor/html/nsHTMLEditRules.cpp
+@@ -220,21 +220,22 @@ mDocChangeRange(nsnull)
+   mCachedStyles[16] = StyleCache(nsEditProperty::cssBackgroundColor, emptyString, emptyString);
+   mCachedStyles[17] = StyleCache(nsEditProperty::sub, emptyString, emptyString);
+   mCachedStyles[18] = StyleCache(nsEditProperty::sup, emptyString, emptyString);
+ }
+ 
+ nsHTMLEditRules::~nsHTMLEditRules()
+ {
+   // remove ourselves as a listener to edit actions
+-  // In the normal case, we have already been removed by 
+-  // ~nsHTMLEditor, in which case we will get an error here
++  // In some cases, we have already been removed by 
++  // ~nsHTMLEditor, in which case we will get a null pointer here
+   // which we ignore.  But this allows us to add the ability to
+   // switch rule sets on the fly if we want.
+-  mHTMLEditor->RemoveEditActionListener(this);
++  if (mHTMLEditor)
++    mHTMLEditor->RemoveEditActionListener(this);
+ }
+ 
+ /********************************************************
+  *  XPCOM Cruft
+  ********************************************************/
+ 
+ NS_IMPL_ADDREF_INHERITED(nsHTMLEditRules, nsTextEditRules)
+ NS_IMPL_RELEASE_INHERITED(nsHTMLEditRules, nsTextEditRules)
+@@ -297,16 +298,22 @@ nsHTMLEditRules::Init(nsPlaintextEditor 
+   }
+ 
+   // add ourselves as a listener to edit actions
+   res = mHTMLEditor->AddEditActionListener(this);
+ 
+   return res;
+ }
+ 
++NS_IMETHODIMP
++nsHTMLEditRules::DetachEditor()
++{
++  mHTMLEditor = nsnull;
++  return nsTextEditRules::DetachEditor();
++}
+ 
+ NS_IMETHODIMP
+ nsHTMLEditRules::BeforeEdit(PRInt32 action, nsIEditor::EDirection aDirection)
+ {
+   if (mLockRulesSniffing) return NS_OK;
+   
+   nsAutoLockRulesSniffing lockIt((nsTextEditRules*)this);
+   mDidExplicitlySetInterline = PR_FALSE;
+diff --git a/editor/libeditor/html/nsHTMLEditRules.h b/editor/libeditor/html/nsHTMLEditRules.h
+--- a/editor/libeditor/html/nsHTMLEditRules.h
++++ b/editor/libeditor/html/nsHTMLEditRules.h
+@@ -82,16 +82,17 @@ public:
+   NS_DECL_ISUPPORTS_INHERITED
+   
+             nsHTMLEditRules();
+   virtual   ~nsHTMLEditRules();
+ 
+ 
+   // nsIEditRules methods
+   NS_IMETHOD Init(nsPlaintextEditor *aEditor, PRUint32 aFlags);
++  NS_IMETHOD DetachEditor();
+   NS_IMETHOD BeforeEdit(PRInt32 action, nsIEditor::EDirection aDirection);
+   NS_IMETHOD AfterEdit(PRInt32 action, nsIEditor::EDirection aDirection);
+   NS_IMETHOD WillDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, PRBool *aCancel, PRBool *aHandled);
+   NS_IMETHOD DidDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, nsresult aResult);
+ 
+   // nsIHTMLEditRules methods
+   
+   NS_IMETHOD GetListState(PRBool *aMixed, PRBool *aOL, PRBool *aUL, PRBool *aDL);
+diff --git a/editor/libeditor/text/nsPlaintextEditor.cpp b/editor/libeditor/text/nsPlaintextEditor.cpp
+--- a/editor/libeditor/text/nsPlaintextEditor.cpp
++++ b/editor/libeditor/text/nsPlaintextEditor.cpp
+@@ -110,16 +110,19 @@ nsPlaintextEditor::~nsPlaintextEditor()
+   // remove the rules as an action listener.  Else we get a bad ownership loop later on.
+   // it's ok if the rules aren't a listener; we ignore the error.
+   nsCOMPtr<nsIEditActionListener> mListener = do_QueryInterface(mRules);
+   RemoveEditActionListener(mListener);
+   
+   // Remove event listeners. Note that if we had an HTML editor,
+   //  it installed its own instead of these
+   RemoveEventListeners();
++
++  if (mRules)
++    mRules->DetachEditor();
+ }
+ 
+ NS_IMPL_ADDREF_INHERITED(nsPlaintextEditor, nsEditor)
+ NS_IMPL_RELEASE_INHERITED(nsPlaintextEditor, nsEditor)
+ 
+ NS_INTERFACE_MAP_BEGIN(nsPlaintextEditor)
+   NS_INTERFACE_MAP_ENTRY(nsIPlaintextEditor)
+   NS_INTERFACE_MAP_ENTRY(nsIEditorMailSupport)
+diff --git a/editor/libeditor/text/nsTextEditRules.cpp b/editor/libeditor/text/nsTextEditRules.cpp
+--- a/editor/libeditor/text/nsTextEditRules.cpp
++++ b/editor/libeditor/text/nsTextEditRules.cpp
+@@ -178,16 +178,23 @@ nsTextEditRules::Init(nsPlaintextEditor 
+     prefBranch->GetBoolPref("bidi.edit.delete_immediately",
+                             &deleteBidiImmediately);
+   mDeleteBidiImmediately = deleteBidiImmediately;
+ 
+   return res;
+ }
+ 
+ NS_IMETHODIMP
++nsTextEditRules::DetachEditor()
++{
++  mEditor = nsnull;
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ nsTextEditRules::GetFlags(PRUint32 *aFlags)
+ {
+   if (!aFlags) { return NS_ERROR_NULL_POINTER; }
+   *aFlags = mFlags;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+diff --git a/editor/libeditor/text/nsTextEditRules.h b/editor/libeditor/text/nsTextEditRules.h
+--- a/editor/libeditor/text/nsTextEditRules.h
++++ b/editor/libeditor/text/nsTextEditRules.h
+@@ -61,16 +61,17 @@ class nsTextEditRules : public nsIEditRu
+ public:
+   NS_DECL_ISUPPORTS
+   
+               nsTextEditRules();
+   virtual     ~nsTextEditRules();
+ 
+   // nsIEditRules methods
+   NS_IMETHOD Init(nsPlaintextEditor *aEditor, PRUint32 aFlags);
++  NS_IMETHOD DetachEditor();
+   NS_IMETHOD BeforeEdit(PRInt32 action, nsIEditor::EDirection aDirection);
+   NS_IMETHOD AfterEdit(PRInt32 action, nsIEditor::EDirection aDirection);
+   NS_IMETHOD WillDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, PRBool *aCancel, PRBool *aHandled);
+   NS_IMETHOD DidDoAction(nsISelection *aSelection, nsRulesInfo *aInfo, nsresult aResult);
+   NS_IMETHOD GetFlags(PRUint32 *aFlags);
+   NS_IMETHOD SetFlags(PRUint32 aFlags);
+   NS_IMETHOD DocumentIsEmpty(PRBool *aDocumentIsEmpty);
+ 
