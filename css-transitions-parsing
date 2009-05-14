@@ -1,0 +1,2422 @@
+From: Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>
+
+Implement CSS transitions: implement the parsing and computation of the transition properties.  (Bug 435441)
+
+diff --git a/dom/public/idl/css/nsIDOMCSS2Properties.idl b/dom/public/idl/css/nsIDOMCSS2Properties.idl
+--- a/dom/public/idl/css/nsIDOMCSS2Properties.idl
++++ b/dom/public/idl/css/nsIDOMCSS2Properties.idl
+@@ -17,16 +17,17 @@
+  * The Initial Developer of the Original Code is
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 2000
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Vidur Apparao <vidur@netscape.com> (original author)
+  *   Johnny Stenback <jst@netscape.com>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -615,10 +616,24 @@ interface nsIDOMNSCSS2Properties : nsIDO
+            attribute DOMString        wordWrap;
+                                         // raises(DOMException) on setting
+ 
+            attribute DOMString        MozTransform;
+                                         // raises(DOMException) on setting
+ 
+            attribute DOMString        MozTransformOrigin;
+                                         // raises(DOMException) on setting 
+-	
++           attribute DOMString        transitionProperty;
++                                        // raises(DOMException) on setting
++
++           attribute DOMString        transitionDuration;
++                                        // raises(DOMException) on setting
++
++           attribute DOMString        transitionDelay;
++                                        // raises(DOMException) on setting
++
++           attribute DOMString        transitionTimingFunction;
++                                        // raises(DOMException) on setting
++
++           attribute DOMString        transition;
++                                        // raises(DOMException) on setting
++
+ };
+diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
+--- a/layout/base/nsStyleConsts.h
++++ b/layout/base/nsStyleConsts.h
+@@ -16,16 +16,17 @@
+  *
+  * The Initial Developer of the Original Code is
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1998
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Mats Palmgren <mats.palmgren@bredband.net>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -776,16 +777,27 @@
+ // color-interpolation and color-interpolation-filters
+ #define NS_STYLE_COLOR_INTERPOLATION_AUTO           0
+ #define NS_STYLE_COLOR_INTERPOLATION_SRGB           1
+ #define NS_STYLE_COLOR_INTERPOLATION_LINEARRGB      2
+ 
+ #endif // MOZ_SVG
+ 
+ /*****************************************************************************
++ * Constants for transitions                                                 *
++ *****************************************************************************/
++
++// CSS Transitions
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE         0
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR       1
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN      2
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT     3
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT  4
++
++/*****************************************************************************
+  * Constants for media features.                                             *
+  *****************************************************************************/
+ 
+ // orientation
+ #define NS_STYLE_ORIENTATION_PORTRAIT           0
+ #define NS_STYLE_ORIENTATION_LANDSCAPE          1
+ 
+ // scan
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -17,16 +17,17 @@
+  * The Initial Developer of the Original Code is
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1998
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Daniel Glazman <glazman@netscape.com>
+  *   Mats Palmgren <mats.palmgren@bredband.net>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -235,16 +236,20 @@ PRBool nsCSSDeclaration::AppendValueToSt
+             *static_cast<nsCSSValueList*const*>(storage);
+         do {
+           AppendCSSValueToString(aProperty, val->mValue, aResult);
+           val = val->mNext;
+           if (val) {
+             if (aProperty == eCSSProperty_cursor
+                 || aProperty == eCSSProperty_text_shadow
+                 || aProperty == eCSSProperty_box_shadow
++                || aProperty == eCSSProperty__webkit_transition_property
++                || aProperty == eCSSProperty__webkit_transition_duration
++                || aProperty == eCSSProperty__webkit_transition_timing_function
++                || aProperty == eCSSProperty__webkit_transition_delay
+ #ifdef MOZ_SVG
+                 || aProperty == eCSSProperty_stroke_dasharray
+ #endif
+                )
+               aResult.Append(PRUnichar(','));
+             aResult.Append(PRUnichar(' '));
+           }
+         } while (val);
+@@ -285,47 +290,52 @@ nsCSSDeclaration::AppendCSSValueToString
+   if (eCSSUnit_String <= unit && unit <= eCSSUnit_Attr) {
+     if (unit == eCSSUnit_Attr) {
+       aResult.AppendLiteral("attr(");
+     }
+     nsAutoString  buffer;
+     aValue.GetStringValue(buffer);
+     aResult.Append(buffer);
+   }
+-  else if (eCSSUnit_Array <= unit && unit <= eCSSUnit_Counters) {
++  else if (eCSSUnit_Array <= unit && unit <= eCSSUnit_Cubic_Bezier) {
+     switch (unit) {
+       case eCSSUnit_Counter:  aResult.AppendLiteral("counter(");  break;
+       case eCSSUnit_Counters: aResult.AppendLiteral("counters("); break;
++      case eCSSUnit_Cubic_Bezier: aResult.AppendLiteral("cubic-bezier("); break;
+       default: break;
+     }
+ 
+     nsCSSValue::Array *array = aValue.GetArrayValue();
+     PRBool mark = PR_FALSE;
+     for (PRUint16 i = 0, i_end = array->Count(); i < i_end; ++i) {
+       if (aProperty == eCSSProperty_border_image && i >= 5) {
+         if (array->Item(i).GetUnit() == eCSSUnit_Null) {
+           continue;
+         }
+         if (i == 5) {
+           aResult.AppendLiteral(" /");
+         }
+       }
+       if (mark && array->Item(i).GetUnit() != eCSSUnit_Null) {
+-        if (unit == eCSSUnit_Array)
++        if (unit == eCSSUnit_Array &&
++            eCSSProperty__webkit_transition_timing_function != aProperty)
+           aResult.AppendLiteral(" ");
+         else
+           aResult.AppendLiteral(", ");
+       }
+       nsCSSProperty prop =
+         ((eCSSUnit_Counter <= unit && unit <= eCSSUnit_Counters) &&
+          i == array->Count() - 1)
+         ? eCSSProperty_list_style_type : aProperty;
+       if (AppendCSSValueToString(prop, array->Item(i), aResult)) {
+         mark = PR_TRUE;
+       }
++    }
++    if (eCSSUnit_Array == unit && aProperty == eCSSProperty__webkit_transition_timing_function) {
++      aResult.AppendLiteral(")");
+     }
+   }
+   /* Although Function is backed by an Array, we'll handle it separately
+    * because it's a bit quirky.
+    */
+   else if (eCSSUnit_Function == unit) {
+     const nsCSSValue::Array* array = aValue.GetArrayValue();
+     NS_ASSERTION(array->Count() >= 1, "Functions must have at least one element for the name.");
+@@ -387,16 +397,19 @@ nsCSSDeclaration::AppendCSSValueToString
+       }
+       if ((NS_STYLE_PAGE_MARKS_REGISTER & intValue) != 0) {
+         if ((NS_STYLE_PAGE_MARKS_CROP & intValue) != 0) {
+           aResult.Append(PRUnichar(' '));
+         }
+         AppendASCIItoUTF16(nsCSSProps::LookupPropertyValue(aProperty, NS_STYLE_PAGE_MARKS_REGISTER), aResult);
+       }
+     }
++    else if (eCSSProperty__webkit_transition_property == aProperty) {
++      AppendASCIItoUTF16(nsCSSProps::GetStringValue((nsCSSProperty) aValue.GetIntValue()), aResult);
++    }
+     else {
+       const nsAFlatCString& name = nsCSSProps::LookupPropertyValue(aProperty, aValue.GetIntValue());
+       AppendASCIItoUTF16(name, aResult);
+     }
+   }
+   else if (eCSSUnit_EnumColor == unit) {
+     // we can lookup the property in the ColorTable and then
+     // get a string mapping the name
+@@ -457,23 +470,25 @@ nsCSSDeclaration::AppendCSSValueToString
+   switch (unit) {
+     case eCSSUnit_Null:         break;
+     case eCSSUnit_Auto:         aResult.AppendLiteral("auto");     break;
+     case eCSSUnit_Inherit:      aResult.AppendLiteral("inherit");  break;
+     case eCSSUnit_Initial:      aResult.AppendLiteral("-moz-initial"); break;
+     case eCSSUnit_None:         aResult.AppendLiteral("none");     break;
+     case eCSSUnit_Normal:       aResult.AppendLiteral("normal");   break;
+     case eCSSUnit_System_Font:  aResult.AppendLiteral("-moz-use-system-font"); break;
++    case eCSSUnit_All:          aResult.AppendLiteral("all"); break;
+     case eCSSUnit_Dummy:        break;
+ 
+     case eCSSUnit_String:       break;
+     case eCSSUnit_URL:          break;
+     case eCSSUnit_Image:        break;
+     case eCSSUnit_Array:        break;
+     case eCSSUnit_Attr:
++    case eCSSUnit_Cubic_Bezier:
+     case eCSSUnit_Counter:
+     case eCSSUnit_Counters:     aResult.Append(PRUnichar(')'));    break;
+     case eCSSUnit_Local_Font:   break;
+     case eCSSUnit_Font_Format:  break;
+     case eCSSUnit_Function:     break;
+     case eCSSUnit_Integer:      break;
+     case eCSSUnit_Enumerated:   break;
+     case eCSSUnit_EnumColor:    break;
+@@ -842,16 +857,62 @@ nsCSSDeclaration::GetValue(nsCSSProperty
+     case eCSSProperty_pause: {
+       if (AppendValueToString(eCSSProperty_pause_before, aValue)) {
+         aValue.Append(PRUnichar(' '));
+         if (!AppendValueToString(eCSSProperty_pause_after, aValue))
+           aValue.Truncate();
+       }
+       break;
+     }
++    case eCSSProperty__webkit_transition: {
++      const nsCSSProperty* subprops =
++        nsCSSProps::SubpropertyEntryFor(aProperty);
++      NS_ASSERTION(nsCSSProps::kTypeTable[subprops[0]] == eCSSType_ValueList &&
++                   nsCSSProps::kTypeTable[subprops[1]] == eCSSType_ValueList &&
++                   nsCSSProps::kTypeTable[subprops[2]] == eCSSType_ValueList &&
++                   nsCSSProps::kTypeTable[subprops[3]] == eCSSType_ValueList,
++                   "type mismatch");
++      // this is ugly but I don't think there's much choice:  we need to print
++      // subprops[0][0] subprops[0][1] subprops[0][2] subprops[0][3],
++      // subprops[1][0] subprops[1][1] ... etc.
++      nsCSSCompressedDataBlock *data = GetValueIsImportant(aProperty)
++        ? mImportantData : mData;
++      const nsCSSValueList* val[4];
++      for (int i = 0; i < 4; ++i) {
++        const void *storage = data->StorageFor(subprops[i]);
++        val[i] = *static_cast<nsCSSValueList*const*>(storage);
++      }
++      PRBool firstTime = PR_TRUE;
++      while (val[0] || val[1] || val[2] || val[3]) {
++        if (!firstTime) {
++          // we've already added one transition, and we're still in the loop, so
++          // add a delimiter between them
++          aValue.AppendLiteral(", ");
++        }
++        else
++          firstTime = PR_FALSE;
++
++        PRBool subpropAppended = PR_FALSE;
++        for (int j = 0; j < 4; ++j) {
++          if (val[j]) {
++            if (subpropAppended) {
++              aValue.Append(PRUnichar(' '));
++              subpropAppended = PR_FALSE;
++            }
++            if (val[j]->mValue.GetUnit() != eCSSUnit_Initial)
++              if (AppendCSSValueToString(subprops[j], val[j]->mValue, aValue)) {
++                subpropAppended = PR_TRUE;
++              }
++            val[j] = val[j]->mNext;
++          }
++        }
++      }
++      break;
++    }
++
+ #ifdef MOZ_SVG
+     case eCSSProperty_marker: {
+       nsCSSValue endValue, midValue, startValue;
+       GetValueOrImportantValue(eCSSProperty_marker_end, endValue);
+       GetValueOrImportantValue(eCSSProperty_marker_mid, midValue);
+       GetValueOrImportantValue(eCSSProperty_marker_start, startValue);
+       if (endValue == midValue && midValue == startValue)
+         AppendValueToString(eCSSProperty_marker_end, aValue);
+diff --git a/layout/style/nsCSSKeywordList.h b/layout/style/nsCSSKeywordList.h
+--- a/layout/style/nsCSSKeywordList.h
++++ b/layout/style/nsCSSKeywordList.h
+@@ -577,16 +577,23 @@ CSS_KEY(-moz-win-media-toolbox, _moz_win
+ CSS_KEY(-moz-win-media-toolbox, _moz_win_media_toolbox)
+ CSS_KEY(-moz-win-communications-toolbox, _moz_win_communications_toolbox)
+ CSS_KEY(-moz-win-browsertabbar-toolbox, _moz_win_browsertabbar_toolbox)
+ CSS_KEY(-moz-win-mediatext, _moz_win_mediatext)
+ CSS_KEY(-moz-win-communicationstext, _moz_win_communicationstext)
+ CSS_KEY(-moz-win-glass, _moz_win_glass)
+ CSS_KEY(-moz-mac-unified-toolbar, _moz_mac_unified_toolbar)
+ 
++// CSS transition keywords
++CSS_KEY(ease, ease)
++CSS_KEY(linear, linear)
++CSS_KEY(ease-in, ease_in)
++CSS_KEY(ease-out, ease_out)
++CSS_KEY(ease-in-out, ease_in_out)
++
+ #ifdef MOZ_SVG
+ //CSS_KEY(all, all)
+ CSS_KEY(alphabetic, alphabetic)
+ //CSS_KEY(auto, auto)
+ CSS_KEY(bevel, bevel)
+ CSS_KEY(butt, butt)
+ CSS_KEY(central, central)
+ CSS_KEY(crispedges, crispedges)
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -21,16 +21,18 @@
+  *
+  * Contributor(s):
+  *   emk <VYV03354@nifty.ne.jp>
+  *   Daniel Glazman <glazman@netscape.com>
+  *   L. David Baron <dbaron@dbaron.org>
+  *   Boris Zbarsky <bzbarsky@mit.edu>
+  *   Mats Palmgren <mats.palmgren@bredband.net>
+  *   Christian Biesinger <cbiesinger@web.de>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
++ *   Siraj Razick <siraj.razick@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -74,16 +76,17 @@
+ #include "nsXMLNameSpaceMap.h"
+ #include "nsThemeConstants.h"
+ #include "nsContentErrors.h"
+ #include "nsPrintfCString.h"
+ #include "nsIMediaList.h"
+ #include "nsILookAndFeel.h"
+ #include "nsStyleUtil.h"
+ #include "nsIPrincipal.h"
++
+ #include "prprf.h"
+ #include "math.h"
+ #include "nsContentUtils.h"
+ #include "nsDOMError.h"
+ #include "nsAutoPtr.h"
+ #include "nsTArray.h"
+ 
+ // Flags for ParseVariant method
+@@ -101,16 +104,18 @@
+ #define VARIANT_COUNTER         0x000800  //
+ #define VARIANT_ATTR            0x001000  //
+ #define VARIANT_IDENTIFIER      0x002000  // D
+ #define VARIANT_AUTO            0x010000  // A
+ #define VARIANT_INHERIT         0x020000  // H eCSSUnit_Initial, eCSSUnit_Inherit
+ #define VARIANT_NONE            0x040000  // O
+ #define VARIANT_NORMAL          0x080000  // M
+ #define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
++#define VARIANT_CUBIC_BEZIER    0x200000  // CSS transition timing function
++#define VARIANT_TRANSITION_PROPERTY   0x400000  // CSS transition property name
+ 
+ // Common combinations of variants
+ #define VARIANT_AL   (VARIANT_AUTO | VARIANT_LENGTH)
+ #define VARIANT_LP   (VARIANT_LENGTH | VARIANT_PERCENT)
+ #define VARIANT_AH   (VARIANT_AUTO | VARIANT_INHERIT)
+ #define VARIANT_AHLP (VARIANT_AH | VARIANT_LP)
+ #define VARIANT_AHI  (VARIANT_AH | VARIANT_INTEGER)
+ #define VARIANT_AHK  (VARIANT_AH | VARIANT_KEYWORD)
+@@ -136,16 +141,17 @@
+ #define VARIANT_HCK  (VARIANT_HK | VARIANT_COLOR)
+ #define VARIANT_HUO  (VARIANT_INHERIT | VARIANT_URL | VARIANT_NONE)
+ #define VARIANT_AHUO (VARIANT_AUTO | VARIANT_HUO)
+ #define VARIANT_HPN  (VARIANT_INHERIT | VARIANT_PERCENT | VARIANT_NUMBER)
+ #define VARIANT_HOK  (VARIANT_HK | VARIANT_NONE)
+ #define VARIANT_HN   (VARIANT_INHERIT | VARIANT_NUMBER)
+ #define VARIANT_HON  (VARIANT_HN | VARIANT_NONE)
+ #define VARIANT_HOS  (VARIANT_INHERIT | VARIANT_NONE | VARIANT_STRING)
++#define VARIANT_TIMING_FUNCTION (VARIANT_KEYWORD | VARIANT_CUBIC_BEZIER)
+ 
+ //----------------------------------------------------------------------
+ 
+ // Your basic top-down recursive descent style parser
+ class CSSParserImpl : public nsICSSParser {
+ public:
+   CSSParserImpl();
+   virtual ~CSSParserImpl();
+@@ -430,16 +436,23 @@ protected:
+   PRBool ParsePause();
+   PRBool ParseQuotes();
+   PRBool ParseSize();
+   PRBool ParseTextDecoration(nsCSSValue& aValue);
+ 
+   nsCSSValueList* ParseCSSShadowList(PRBool aUsesSpread);
+   PRBool ParseTextShadow();
+   PRBool ParseBoxShadow();
++  PRBool ParseTransitionTime(nsCSSProperty aPropID);
++  PRBool ParseTransitionProperty();
++  PRBool ParseTransition();
++  PRBool ParseTransitionTimingFunction();
++  PRBool ParseTransitionTimingFunctionValues(nsCSSValue& aValue);
++  PRBool ParseTransitionTimingFunctionValueComponent( float& aComponent, char aStop);
++  PRBool AppendValueToList(nsCSSValueList*& list, nsCSSValue& value);
+ 
+ #ifdef MOZ_SVG
+   PRBool ParsePaint(nsCSSValuePair* aResult,
+                     nsCSSProperty aPropID);
+   PRBool ParseDasharray();
+   PRBool ParseMarker();
+ #endif
+ 
+@@ -4388,16 +4401,39 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+        tk->mIdent.LowerCaseEqualsLiteral("counters"))) {
+     return ParseCounter(aValue);
+   }
+   if (((aVariantMask & VARIANT_ATTR) != 0) &&
+       (eCSSToken_Function == tk->mType) &&
+       tk->mIdent.LowerCaseEqualsLiteral("attr")) {
+     return ParseAttr(aValue);
+   }
++  if (((aVariantMask & VARIANT_TRANSITION_PROPERTY) != 0) && 
++      (eCSSToken_Ident == tk->mType)) {
++    if (tk->mIdent.LowerCaseEqualsLiteral("none")) {
++      aValue.SetNoneValue();
++      return PR_TRUE;
++    } else if (tk->mIdent.LowerCaseEqualsLiteral("all")) {
++      aValue.SetAllValue();
++      return PR_TRUE;
++    } else {
++      nsCSSProperty propID = nsCSSProps::LookupProperty(tk->mIdent);
++      if (propID != eCSSProperty_UNKNOWN) {
++        aValue.SetIntValue(propID, eCSSUnit_Enumerated);
++        return PR_TRUE;
++      }
++    }
++  }
++  if (((aVariantMask & VARIANT_CUBIC_BEZIER) != 0) &&
++    (eCSSToken_Function == tk->mType)) {
++     if (tk->mIdent.LowerCaseEqualsLiteral("cubic-bezier")) {
++      UngetToken();
++      return ParseTransitionTimingFunctionValues(aValue);
++    }
++  }
+ 
+   UngetToken();
+   return PR_FALSE;
+ }
+ 
+ 
+ PRBool
+ CSSParserImpl::ParseCounter(nsCSSValue& aValue)
+@@ -4857,16 +4893,26 @@ static const nsCSSProperty kOutlineRadiu
+ };
+ 
+ PRBool
+ CSSParserImpl::ParseProperty(nsCSSProperty aPropID)
+ {
+   NS_ASSERTION(aPropID < eCSSProperty_COUNT, "index out of range");
+ 
+   switch (aPropID) {  // handle shorthand or multiple properties
++
++  case eCSSProperty__webkit_transition:
++      return ParseTransition();
++  case eCSSProperty__webkit_transition_property:
++    return ParseTransitionProperty();
++  case eCSSProperty__webkit_transition_timing_function:
++    return ParseTransitionTimingFunction();
++  case eCSSProperty__webkit_transition_duration:
++  case eCSSProperty__webkit_transition_delay:
++    return ParseTransitionTime(aPropID);
+   case eCSSProperty_background:
+     return ParseBackground();
+   case eCSSProperty_background_position:
+     return ParseBackgroundPosition();
+   case eCSSProperty_border:
+     return ParseBorderSide(kBorderTopIDs, PR_TRUE);
+   case eCSSProperty_border_color:
+     return ParseBorderColor();
+@@ -5112,16 +5158,21 @@ CSSParserImpl::ParseProperty(nsCSSProper
+ 
+ PRBool
+ CSSParserImpl::ParseSingleValueProperty(nsCSSValue& aValue,
+                                         nsCSSProperty aPropID)
+ {
+   switch (aPropID) {
+   case eCSSProperty_UNKNOWN:
+   case eCSSProperty_background:
++  case eCSSProperty__webkit_transition:
++  case eCSSProperty__webkit_transition_property:
++  case eCSSProperty__webkit_transition_timing_function:
++  case eCSSProperty__webkit_transition_duration:
++  case eCSSProperty__webkit_transition_delay:
+   case eCSSProperty_background_position:
+   case eCSSProperty_border:
+   case eCSSProperty_border_color:
+   case eCSSProperty_border_bottom_colors:
+   case eCSSProperty_border_image:
+   case eCSSProperty_border_left_colors:
+   case eCSSProperty_border_right_colors:
+   case eCSSProperty_border_end_color:
+@@ -7563,16 +7614,430 @@ CSSParserImpl::ParseTextDecoration(nsCSS
+       }
+       aValue.SetIntValue(intValue, eCSSUnit_Enumerated);
+     }
+     return PR_TRUE;
+   }
+   return PR_FALSE;
+ }
+ 
++
++PRBool CSSParserImpl::ParseTransitionTime(nsCSSProperty aPropID)
++{
++  NS_PRECONDITION(aPropID == eCSSProperty__webkit_transition_duration ||
++                  aPropID == eCSSProperty__webkit_transition_delay, "Invalid property");
++  nsCSSValue timeval;
++  // first see if 'inherit' is specified.  If it is, it can be the only thing
++  // specified, so don't attempt to parse any additional properties
++  if (ParseVariant(timeval, VARIANT_INHERIT, nsnull)) {
++    nsCSSValueList* list = new nsCSSValueList();
++    list->mValue = timeval;
++    mTempData.SetPropertyBit(aPropID);
++    switch (aPropID) {
++      case eCSSProperty__webkit_transition_duration:
++        mTempData.mDisplay.mTransitionDuration = list;
++        break;
++      case eCSSProperty__webkit_transition_delay:
++        mTempData.mDisplay.mTransitionDelay = list;
++        break;
++      default:
++        NS_NOTREACHED("Invalid transition property");
++        delete list;
++        return PR_FALSE;
++    }
++    return PR_TRUE;
++  }
++
++  // now try to parse normal time values
++  if (!ParseVariant(timeval, VARIANT_TIME, nsnull))
++    return PR_FALSE;
++  nsCSSValueList* listHead = new nsCSSValueList();
++  nsCSSValueList* list = listHead;
++  if (!list) {
++    mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++    return PR_FALSE;
++  }
++  list->mValue = timeval;
++
++  for (;;) {
++    if (ExpectSymbol(',', PR_TRUE))
++      continue;
++    if (ExpectEndProperty()) {
++      mTempData.SetPropertyBit(aPropID);
++      switch (aPropID) {
++        case eCSSProperty__webkit_transition_duration:
++          mTempData.mDisplay.mTransitionDuration = listHead;
++          break;
++        case eCSSProperty__webkit_transition_delay:
++          mTempData.mDisplay.mTransitionDelay = listHead;
++          break;
++        default:
++          NS_NOTREACHED("Invalid transition property");
++      }
++      return PR_TRUE;
++    }
++    if (ParseVariant(timeval, VARIANT_TIME, nsnull)) {
++      list->mNext = new nsCSSValueList();
++      list = list->mNext;
++      if (list)
++        list->mValue = timeval;
++      else
++        mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++    }
++    else
++      break;
++  }
++  delete listHead;
++  return PR_FALSE;
++}
++
++PRBool CSSParserImpl::ParseTransitionProperty()
++{
++  nsCSSValue value;
++  // first see if 'inherit' is specified.  If it is, it can be the only thing
++  // specified, so don't attempt to parse any additional properties
++  if (ParseVariant(value, VARIANT_INHERIT, nsnull)) {
++    nsCSSValueList* list = new nsCSSValueList();
++    list->mValue = value;
++    mTempData.SetPropertyBit(eCSSProperty__webkit_transition_property);
++    mTempData.mDisplay.mTransitionProperty = list;
++    return PR_TRUE;
++  }
++
++  // FIXME: what if there is an invalid value in the list -- should we go on and
++  // try the next one or just drop the entire declaration?
++  // e.g. -webkit-transition-property: invalid-property, left, opacity;
++  if (!ParseVariant(value, VARIANT_TRANSITION_PROPERTY, nsnull)) {
++    return PR_FALSE;
++  }
++  // Check if the property ID is an animatable property (e.g. it takes values of
++  // <integer>, <number>, <length>, <percentage>, <color>, <time>, <angle> or <transform-list>
++  if (eCSSUnit_Enumerated == value.GetUnit() &&
++      !nsCSSProps::IsAnimatable(value.GetIntValue())) {
++    // FIXME: maybe we should just skip over this one if it's invalid instead of
++    // aborting the parse?
++    return PR_FALSE;
++  }
++  nsCSSValueList* list = new nsCSSValueList();
++  nsCSSValueList* listHead = list;
++  if (!list) {
++    mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++    return PR_FALSE;
++  }
++  
++  list->mValue = value;
++
++  for (;;) {
++    if (ExpectSymbol(',', PR_TRUE))
++      continue;
++    if (ExpectEndProperty()) {
++      mTempData.SetPropertyBit(eCSSProperty__webkit_transition_property);
++      mTempData.mDisplay.mTransitionProperty = listHead;
++      return PR_TRUE;
++    }
++    if (ParseVariant(value, VARIANT_TRANSITION_PROPERTY, nsnull)) {
++      if (eCSSUnit_Enumerated != value.GetUnit() ||
++          nsCSSProps::IsAnimatable(value.GetIntValue())) {
++        list->mNext = new nsCSSValueList();
++        list = list->mNext;
++        if (list)
++          list->mValue = value;
++        else
++          mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++      } // if token is a property name but isn't animatable, just ignore it and check the next token
++    } else {
++      break;
++    }
++  }
++  delete listHead;
++  return PR_FALSE;
++}
++
++PRBool CSSParserImpl::ParseTransitionTimingFunction()
++{
++  nsCSSValue timeFunction;
++  // first see if 'inherit' is specified.  If it is, it can be the only thing
++  // specified, so don't attempt to parse any additional properties
++  if (ParseVariant(timeFunction, VARIANT_INHERIT, nsnull)) {
++    nsCSSValueList* list = new nsCSSValueList();
++    list->mValue = timeFunction;
++    mTempData.SetPropertyBit(eCSSProperty__webkit_transition_timing_function);
++    mTempData.mDisplay.mTransitionTimingFunction = list;
++    return PR_TRUE;
++  }
++
++  if (!ParseVariant(timeFunction, VARIANT_TIMING_FUNCTION,
++                    nsCSSProps::kTransitionTimingFunctionTable)) {
++    return PR_FALSE;
++  }
++
++  nsCSSValueList* list = new nsCSSValueList;
++  nsCSSValueList* listHead = list;
++  if (!list) {
++    mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++    return PR_FALSE;
++  }
++
++  list->mValue = timeFunction;
++  for (;;) {
++     if (ExpectSymbol (',', PR_TRUE))
++       continue;
++       if (ExpectEndProperty()) {
++         mTempData.SetPropertyBit(eCSSProperty__webkit_transition_timing_function);
++         mTempData.mDisplay.mTransitionTimingFunction = listHead;
++         return PR_TRUE;
++       }
++      if (ParseVariant(timeFunction, VARIANT_TIMING_FUNCTION,
++                       nsCSSProps::kTransitionTimingFunctionTable)) {
++        list->mNext = new nsCSSValueList();
++        list = list->mNext;
++        if (list) 
++          list->mValue = timeFunction ;
++        else 
++          mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++      }
++  }
++
++  delete listHead;
++  return PR_FALSE;
++}
++
++PRBool CSSParserImpl::ParseTransitionTimingFunctionValues(nsCSSValue& aValue)
++{
++  if (!GetToken(PR_TRUE)) {
++    REPORT_UNEXPECTED_EOF(PEColorEOF);
++    return PR_FALSE;
++  }
++
++  nsRefPtr<nsCSSValue::Array> val = nsCSSValue::Array::Create(4);
++  if (!val) {
++       mScanner.SetLowLevelError( NS_ERROR_OUT_OF_MEMORY );
++  }
++  float x1,x2,y1,y2;
++  nsCSSToken* tk = &mToken;
++
++  if (tk->mType == eCSSToken_Function){
++    if (ExpectSymbol('(',PR_FALSE)) {
++     ParseTransitionTimingFunctionValueComponent(x1,',');
++     ParseTransitionTimingFunctionValueComponent(y1,',');
++     ParseTransitionTimingFunctionValueComponent(x2,',');
++     ParseTransitionTimingFunctionValueComponent(y2,')');
++    }
++  }
++  
++  val->Item(0).SetFloatValue(x1, eCSSUnit_Number);
++  val->Item(1).SetFloatValue(y1, eCSSUnit_Number);
++  val->Item(2).SetFloatValue(x2, eCSSUnit_Number);
++  val->Item(3).SetFloatValue(y2, eCSSUnit_Number);
++
++  aValue.SetArrayValue(val, eCSSUnit_Cubic_Bezier);
++  
++  return PR_TRUE;
++}
++
++PRBool CSSParserImpl::ParseTransitionTimingFunctionValueComponent(float& aComponent, char aStop)
++{
++  if (!GetToken(PR_TRUE)) {
++    REPORT_UNEXPECTED_EOF(PEColorComponentEOF);
++    return PR_FALSE;
++  }
++  nsCSSToken* tk = &mToken;
++  if (tk->mType == eCSSToken_Number) {
++    aComponent = tk->mNumber;
++    if (ExpectSymbol(aStop,PR_TRUE)) {
++     return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
++PRBool CSSParserImpl::AppendValueToList(nsCSSValueList*& list, nsCSSValue& value)
++{
++  nsCSSValueList **end = nsnull;
++  // if the list is empty, simply create a new head node
++  if (!list){
++    end = &list;
++  }
++  // otherwise advance to the last item in the list and create a new item at the
++  // end
++  else {
++    nsCSSValueList* tmp = list;
++    // advance to the last item in the list
++    while (tmp->mNext)
++      tmp = tmp->mNext;
++    end = &tmp->mNext;
++  }
++  NS_ASSERTION(end && (*end == nsnull), "'end' should be pointing to a NULL pointer");
++  *end = new nsCSSValueList();
++  if (!(*end)) {
++    mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++    return PR_FALSE;
++  }
++  (*end)->mValue = value;
++  return PR_TRUE;
++}
++
++PRBool CSSParserImpl::ParseTransition()
++{
++  static const nsCSSProperty kTransitionProperties[] = {
++    eCSSProperty__webkit_transition_property,
++    eCSSProperty__webkit_transition_duration,
++    eCSSProperty__webkit_transition_timing_function,
++    eCSSProperty__webkit_transition_delay
++  };
++  static const PRSize numProps = sizeof(kTransitionProperties)/sizeof(kTransitionProperties[0]);
++  // this is a shorthand property that accepts -property, -delay, -duration, and
++  // -timing-function with some components missing.  there can be
++  // multiple transitions, separated with commas
++
++  nsCSSValue tempValue;
++  // first see if 'inherit' is specified.  If it is, it can be the only thing
++  // specified, so don't attempt to parse any additional properties
++  if (ParseVariant(tempValue, VARIANT_INHERIT, nsnull)) {
++    for (int i = 0; i < numProps; ++i) {
++      nsCSSValueList* list = new nsCSSValueList();
++      list->mValue = tempValue;
++      switch (kTransitionProperties[i]) {
++        case eCSSProperty__webkit_transition_property:
++          mTempData.mDisplay.mTransitionProperty = list;
++          break;
++        case eCSSProperty__webkit_transition_duration:
++          mTempData.mDisplay.mTransitionDuration = list;
++          break;
++        case eCSSProperty__webkit_transition_timing_function:
++          mTempData.mDisplay.mTransitionTimingFunction = list;
++          break;
++        case eCSSProperty__webkit_transition_delay:
++          mTempData.mDisplay.mTransitionDelay = list;
++          break;
++        default:
++          NS_NOTREACHED("Invalid transition property");
++          delete list;
++          return PR_FALSE;
++      }
++      mTempData.SetPropertyBit(kTransitionProperties[i]);
++    }
++    return PR_TRUE;
++  }
++
++  nsCSSValueList* properties[numProps] = { nsnull };
++  // flags to determine whethe ra particular subproperty was specified for this
++  // transition
++  PRBool parsedProperty[numProps] = { PR_FALSE };
++  PRUint8 i;
++  PRBool atEOP = PR_FALSE;
++  for (;;) {
++    for (;;) {
++      PRBool foundProperty = PR_FALSE;
++      // check to see if we're at the end of one full transition definition
++      // (either because we hit a comma or because we hit the end of the
++      // property definition)
++      if (ExpectSymbol(',', PR_TRUE))
++        break;
++      if (ExpectEndProperty()) {
++        atEOP = PR_TRUE;
++        break;
++      }
++
++      // else, try to parse the next transition sub-property
++      for (i = 0; !foundProperty && i < numProps; ++i) {
++        if (!parsedProperty[i]) {
++          // if we haven't found this property yet, try to parse it
++          PRInt32 variantMask;
++          const PRInt32* table = nsnull;
++          switch (kTransitionProperties[i]) {
++            case eCSSProperty__webkit_transition_property:
++              variantMask = VARIANT_TRANSITION_PROPERTY;
++              break;
++            case eCSSProperty__webkit_transition_duration:
++            case eCSSProperty__webkit_transition_delay:
++              variantMask = VARIANT_TIME;
++              break;
++            case eCSSProperty__webkit_transition_timing_function:
++              variantMask = VARIANT_TIMING_FUNCTION;
++              table = nsCSSProps::kTransitionTimingFunctionTable;
++              break;
++            default:
++              NS_NOTREACHED("Invalid transition property");
++          }
++          if (ParseVariant(tempValue, variantMask, table)) {
++            parsedProperty[i] = PR_TRUE;
++            AppendValueToList(properties[i], tempValue);
++            foundProperty = PR_TRUE;
++            break;  // break out of inner loop, continue looking for next sub-property
++          }
++        }
++      }
++      if (!foundProperty) {
++        // we're not at a ',' or at the end of a the property but we couldn't
++        // parse any of the sub-properties, so the declaration is invalid
++        return PR_FALSE;
++      }
++    }
++
++    // we hit the end of the property or the end of one transition
++    // definition, add its components to the list
++    for (i = 0; i < numProps; ++i) {
++      // if the all of the subproperties were not explicitly specified, fill
++      // in the missing ones with initial values.
++      if (!parsedProperty[i]) {
++        switch (kTransitionProperties[i]) {
++          case eCSSProperty__webkit_transition_property:
++            tempValue.SetAllValue();
++            mTempData.mDisplay.mTransitionProperty = properties[i];
++            break;
++          case eCSSProperty__webkit_transition_duration:
++            tempValue.SetFloatValue(0.0, eCSSUnit_Seconds);
++            mTempData.mDisplay.mTransitionDuration = properties[i];
++            break;
++          case eCSSProperty__webkit_transition_timing_function:
++            tempValue.SetIntValue(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE, eCSSUnit_Enumerated);
++            mTempData.mDisplay.mTransitionTimingFunction = properties[i];
++            break;
++          case eCSSProperty__webkit_transition_delay:
++            tempValue.SetFloatValue(0.0, eCSSUnit_Seconds);
++            mTempData.mDisplay.mTransitionDelay = properties[i];
++            break;
++          default:
++            NS_NOTREACHED("Invalid transition property");
++        }
++        AppendValueToList(properties[i], tempValue);
++      }
++      // reset flags for next transition
++      parsedProperty[i] = PR_FALSE;
++    }
++
++    if (atEOP)
++      break;
++    // else we just hit a ',' so continue parsing the next compound transition
++  }
++
++  // Save all parsed transition sub-properties in mTempData
++  for (i = 0; i < numProps; ++i) {
++    switch (kTransitionProperties[i]) {
++      case eCSSProperty__webkit_transition_property:
++        mTempData.mDisplay.mTransitionProperty = properties[i];
++        break;
++      case eCSSProperty__webkit_transition_duration:
++        mTempData.mDisplay.mTransitionDuration = properties[i];
++        break;
++      case eCSSProperty__webkit_transition_timing_function:
++          mTempData.mDisplay.mTransitionTimingFunction = properties[i];
++        break;
++      case eCSSProperty__webkit_transition_delay:
++        mTempData.mDisplay.mTransitionDelay = properties[i];
++        break;
++      default:
++        NS_NOTREACHED("Invalid transition property");
++    }
++    mTempData.SetPropertyBit(kTransitionProperties[i]);
++  }
++  return PR_TRUE;
++}
++
+ nsCSSValueList*
+ CSSParserImpl::ParseCSSShadowList(PRBool aUsesSpread)
+ {
+   nsAutoParseCompoundProperty compound(this);
+ 
+   // Parses x, y, radius, color (in two possible orders)
+   // This parses the input into a list. Either it contains just a "none" or
+   // "inherit" value, or a list of arrays.
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -500,16 +500,21 @@ CSS_PROP_TEXT(text-align, text_align, Te
+ CSS_PROP_TEXT(text-align, text_align, TextAlign, 0, Text, mTextAlign, eCSSType_Value, kTextAlignKTable)
+ CSS_PROP_TEXTRESET(text-decoration, text_decoration, TextDecoration, 0, Text, mDecoration, eCSSType_Value, kTextDecorationKTable)
+ CSS_PROP_TEXT(text-indent, text_indent, TextIndent, 0, Text, mTextIndent, eCSSType_Value, nsnull)
+ CSS_PROP_TEXT(text-shadow, text_shadow, TextShadow, 0, Text, mTextShadow, eCSSType_ValueList, nsnull)
+ CSS_PROP_TEXT(text-transform, text_transform, TextTransform, 0, Text, mTextTransform, eCSSType_Value, kTextTransformKTable)
+ CSS_PROP_DISPLAY(-moz-transform, _moz_transform, MozTransform, 0, Display, mTransform, eCSSType_ValueList, kDisplayKTable)
+ CSS_PROP_DISPLAY(-moz-transform-origin, _moz_transform_origin, MozTransformOrigin, 0, Display, mTransformOrigin, eCSSType_ValuePair, kBackgroundPositionKTable)
+ CSS_PROP_POSITION(top, top, Top, 0, Position, mOffset.mTop, eCSSType_Value, nsnull)
++CSS_PROP_SHORTHAND(-webkit-transition , _webkit_transition, Transition, 0)
++CSS_PROP_DISPLAY(-webkit-transition-delay , _webkit_transition_delay, TransitionDelay, 0, Display , mTransitionDelay, eCSSType_ValueList, nsnull)
++CSS_PROP_DISPLAY(-webkit-transition-duration , _webkit_transition_duration, TransitionDuration, 0, Display , mTransitionDuration, eCSSType_ValueList, nsnull)
++CSS_PROP_DISPLAY(-webkit-transition-property , _webkit_transition_property, TransitionProperty, 0, Display , mTransitionProperty, eCSSType_ValueList /* list of CSS properties that have transitions ? */, nsnull)
++CSS_PROP_DISPLAY(-webkit-transition-timing-function , _webkit_transition_timing_function, TransitionTimingFunction, 0, Display , mTransitionTimingFunction, eCSSType_ValueList, kTransitionTimingFunctionTable)
+ CSS_PROP_TEXTRESET(unicode-bidi, unicode_bidi, UnicodeBidi, 0, Text, mUnicodeBidi, eCSSType_Value, kUnicodeBidiKTable)
+ CSS_PROP_USERINTERFACE(-moz-user-focus, user_focus, MozUserFocus, 0, UserInterface, mUserFocus, eCSSType_Value, kUserFocusKTable) // XXX bug 3935
+ CSS_PROP_USERINTERFACE(-moz-user-input, user_input, MozUserInput, 0, UserInterface, mUserInput, eCSSType_Value, kUserInputKTable) // XXX ??? // XXX bug 3935
+ CSS_PROP_USERINTERFACE(-moz-user-modify, user_modify, MozUserModify, 0, UserInterface, mUserModify, eCSSType_Value, kUserModifyKTable) // XXX bug 3935
+ CSS_PROP_UIRESET(-moz-user-select, user_select, MozUserSelect, 0, UserInterface, mUserSelect, eCSSType_Value, kUserSelectKTable) // XXX bug 3935
+ CSS_PROP_TEXTRESET(vertical-align, vertical_align, VerticalAlign, 0, Text, mVerticalAlign, eCSSType_Value, kVerticalAlignKTable)
+ CSS_PROP_VISIBILITY(visibility, visibility, Visibility, 0, Display, mVisibility, eCSSType_Value, kVisibilityKTable)  // reflow for collapse
+ CSS_PROP_BACKENDONLY(voice-family, voice_family, VoiceFamily, 0, Aural, mVoiceFamily, eCSSType_Value, nsnull)
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -16,16 +16,17 @@
+  *
+  * The Initial Developer of the Original Code is
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1999
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Mats Palmgren <mats.palmgren@bredband.net>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -1080,16 +1081,25 @@ const PRInt32 nsCSSProps::kBoxPackKTable
+ const PRInt32 nsCSSProps::kBoxPackKTable[] = {
+   eCSSKeyword_start,  NS_STYLE_BOX_PACK_START,
+   eCSSKeyword_center,   NS_STYLE_BOX_PACK_CENTER,
+   eCSSKeyword_end, NS_STYLE_BOX_PACK_END,
+   eCSSKeyword_justify, NS_STYLE_BOX_PACK_JUSTIFY, 
+   eCSSKeyword_UNKNOWN,-1
+ };
+ 
++const PRInt32 nsCSSProps::kTransitionTimingFunctionTable[] = {
++  eCSSKeyword_ease, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE,
++  eCSSKeyword_linear, NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR,
++  eCSSKeyword_ease_in, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN,
++  eCSSKeyword_ease_out, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT, 
++  eCSSKeyword_ease_in_out, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT, 
++  eCSSKeyword_UNKNOWN,-1
++};
++
+ #ifdef MOZ_SVG
+ // keyword tables for SVG properties
+ 
+ const PRInt32 nsCSSProps::kDominantBaselineKTable[] = {
+   eCSSKeyword_use_script, NS_STYLE_DOMINANT_BASELINE_USE_SCRIPT,
+   eCSSKeyword_no_change, NS_STYLE_DOMINANT_BASELINE_NO_CHANGE,
+   eCSSKeyword_reset_size, NS_STYLE_DOMINANT_BASELINE_RESET_SIZE,
+   eCSSKeyword_alphabetic, NS_STYLE_DOMINANT_BASELINE_ALPHABETIC,
+@@ -1732,16 +1742,24 @@ static const nsCSSProperty gMozPaddingEn
+ };
+ 
+ static const nsCSSProperty gPauseSubpropTable[] = {
+   eCSSProperty_pause_after,
+   eCSSProperty_pause_before,
+   eCSSProperty_UNKNOWN
+ };
+ 
++static const nsCSSProperty gTransitionSubpropTable[] = {
++  eCSSProperty__webkit_transition_property,
++  eCSSProperty__webkit_transition_duration,
++  eCSSProperty__webkit_transition_timing_function,
++  eCSSProperty__webkit_transition_delay,
++  eCSSProperty_UNKNOWN
++};
++
+ #ifdef MOZ_SVG
+ static const nsCSSProperty gMarkerSubpropTable[] = {
+   eCSSProperty_marker_start,
+   eCSSProperty_marker_mid,
+   eCSSProperty_marker_end,
+   eCSSProperty_UNKNOWN
+ };
+ #endif
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -16,16 +16,17 @@
+  *
+  * The Initial Developer of the Original Code is
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1998
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Mats Palmgren <mats.palmgren@bredband.net>
++ *   Joanthon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -69,16 +70,27 @@ public:
+     NS_ASSERTION(0 <= aProperty && aProperty < eCSSProperty_COUNT,
+                  "out of range");
+     return (aProperty >= eCSSProperty_COUNT_no_shorthands);
+   }
+ 
+   // Same but for @font-face descriptors
+   static nsCSSFontDesc LookupFontDesc(const nsAString& aProperty);
+   static nsCSSFontDesc LookupFontDesc(const nsACString& aProperty);
++
++  static inline PRBool IsAnimatable(PRInt32 aProperty) {
++    NS_ASSERTION(0 <= aProperty && aProperty < (PRInt32) eCSSProperty_COUNT,
++                 "out of range");
++    // only animate individual properties
++    if (aProperty >= (PRInt32) eCSSProperty_COUNT_no_shorthands)
++      return PR_FALSE;
++
++    // FIXME: actually check if property is animatable
++    return PR_TRUE;
++  }
+ 
+   // Given a property enum, get the string value
+   static const nsAFlatCString& GetStringValue(nsCSSProperty aProperty);
+   static const nsAFlatCString& GetStringValue(nsCSSFontDesc aFontDesc);
+ 
+   // Given a CSS Property and a Property Enum Value
+   // Return back a const nsString& representation of the 
+   // value. Return back nullstr if no value is found
+@@ -200,11 +212,12 @@ public:
+   static const PRInt32 kUserModifyKTable[];
+   static const PRInt32 kUserSelectKTable[];
+   static const PRInt32 kVerticalAlignKTable[];
+   static const PRInt32 kVisibilityKTable[];
+   static const PRInt32 kVolumeKTable[];
+   static const PRInt32 kWhitespaceKTable[];
+   static const PRInt32 kWidthKTable[]; // also min-width, max-width
+   static const PRInt32 kWordwrapKTable[];
++  static const PRInt32 kTransitionTimingFunctionTable[];
+ };
+ 
+ #endif /* nsCSSProps_h___ */
+diff --git a/layout/style/nsCSSStruct.cpp b/layout/style/nsCSSStruct.cpp
+--- a/layout/style/nsCSSStruct.cpp
++++ b/layout/style/nsCSSStruct.cpp
+@@ -259,16 +259,20 @@ nsCSSValueListRect::sides[4] = {
+   &nsCSSValueListRect::mBottom,
+   &nsCSSValueListRect::mLeft,
+ };
+ 
+ // --- nsCSSDisplay -----------------
+ 
+ /* During allocation, null-out the transform list. */
+ nsCSSDisplay::nsCSSDisplay(void) : mTransform(nsnull)
++  , mTransitionProperty(nsnull)
++  , mTransitionDuration(nsnull)
++  , mTransitionTimingFunction(nsnull)
++  , mTransitionDelay(nsnull)
+ {
+   MOZ_COUNT_CTOR(nsCSSDisplay);
+ }
+ 
+ nsCSSDisplay::~nsCSSDisplay(void)
+ {
+   MOZ_COUNT_DTOR(nsCSSDisplay);
+ }
+diff --git a/layout/style/nsCSSStruct.h b/layout/style/nsCSSStruct.h
+--- a/layout/style/nsCSSStruct.h
++++ b/layout/style/nsCSSStruct.h
+@@ -347,16 +347,20 @@ struct nsCSSDisplay : public nsCSSStruct
+   nsCSSValue mClear;
+   nsCSSRect  mClip;
+   nsCSSValue mOverflowX;
+   nsCSSValue mOverflowY;
+   nsCSSValue mVisibility;
+   nsCSSValue mOpacity;
+   nsCSSValueList *mTransform; // List of Arrays containing transform information
+   nsCSSValuePair mTransformOrigin;
++  nsCSSValueList* mTransitionProperty;
++  nsCSSValueList* mTransitionDuration;
++  nsCSSValueList* mTransitionTimingFunction;
++  nsCSSValueList* mTransitionDelay;
+ 
+   // temp fix for bug 24000 
+   nsCSSValue mBreakBefore;
+   nsCSSValue mBreakAfter;
+   // end temp fix
+ private:
+   nsCSSDisplay(const nsCSSDisplay& aOther); // NOT IMPLEMENTED
+ };
+diff --git a/layout/style/nsCSSValue.cpp b/layout/style/nsCSSValue.cpp
+--- a/layout/style/nsCSSValue.cpp
++++ b/layout/style/nsCSSValue.cpp
+@@ -357,16 +357,22 @@ void nsCSSValue::SetInitialValue()
+ }
+ 
+ void nsCSSValue::SetNoneValue()
+ {
+   Reset();
+   mUnit = eCSSUnit_None;
+ }
+ 
++void nsCSSValue::SetAllValue()
++{
++  Reset();
++  mUnit = eCSSUnit_All;
++}
++
+ void nsCSSValue::SetNormalValue()
+ {
+   Reset();
+   mUnit = eCSSUnit_Normal;
+ }
+ 
+ void nsCSSValue::SetSystemFontValue()
+ {
+diff --git a/layout/style/nsCSSValue.h b/layout/style/nsCSSValue.h
+--- a/layout/style/nsCSSValue.h
++++ b/layout/style/nsCSSValue.h
+@@ -57,28 +57,30 @@ enum nsCSSUnit {
+ enum nsCSSUnit {
+   eCSSUnit_Null         = 0,      // (n/a) null unit, value is not specified
+   eCSSUnit_Auto         = 1,      // (n/a) value is algorithmic
+   eCSSUnit_Inherit      = 2,      // (n/a) value is inherited
+   eCSSUnit_Initial      = 3,      // (n/a) value is default UA value
+   eCSSUnit_None         = 4,      // (n/a) value is none
+   eCSSUnit_Normal       = 5,      // (n/a) value is normal (algorithmic, different than auto)
+   eCSSUnit_System_Font  = 6,      // (n/a) value is -moz-use-system-font
+-  eCSSUnit_Dummy        = 7,      // (n/a) a fake but specified value, used
++  eCSSUnit_All          = 7,      // (n/a) value is all
++  eCSSUnit_Dummy        = 8,      // (n/a) a fake but specified value, used
+                                   //       only in temporary values
+-  eCSSUnit_DummyInherit = 8,      // (n/a) a fake but specified value, used
++  eCSSUnit_DummyInherit = 9,      // (n/a) a fake but specified value, used
+                                   //       only in temporary values
+   eCSSUnit_String       = 10,     // (PRUnichar*) a string value
+   eCSSUnit_Attr         = 11,     // (PRUnichar*) a attr(string) value
+   eCSSUnit_Local_Font   = 12,     // (PRUnichar*) a local font name
+   eCSSUnit_Font_Format  = 13,     // (PRUnichar*) a font format name
+   eCSSUnit_Array        = 20,     // (nsCSSValue::Array*) a list of values
+   eCSSUnit_Counter      = 21,     // (nsCSSValue::Array*) a counter(string,[string]) value
+   eCSSUnit_Counters     = 22,     // (nsCSSValue::Array*) a counters(string,string[,string]) value
+-  eCSSUnit_Function     = 23,     // (nsCSSValue::Array*) a function with parameters.  First elem of array is name,
++  eCSSUnit_Cubic_Bezier = 23,     // (nsCSSValue::Array*) a list of float values 
++  eCSSUnit_Function     = 24,     // (nsCSSValue::Array*) a function with parameters.  First elem of array is name,
+                                   //  the rest of the values are arguments.
+ 
+   eCSSUnit_URL          = 30,     // (nsCSSValue::URL*) value
+   eCSSUnit_Image        = 31,     // (nsCSSValue::Image*) value
+   eCSSUnit_Integer      = 50,     // (int) simple value
+   eCSSUnit_Enumerated   = 51,     // (int) value has enumerated meaning
+   eCSSUnit_EnumColor    = 80,     // (int) enumerated color (kColorKTable)
+   eCSSUnit_Color        = 81,     // (nscolor) an RGBA value
+@@ -136,17 +138,17 @@ public:
+   friend struct Array;
+ 
+   struct URL;
+   friend struct URL;
+ 
+   struct Image;
+   friend struct Image;
+   
+-  // for valueless units only (null, auto, inherit, none, normal)
++  // for valueless units only (null, auto, inherit, none, all, normal)
+   explicit nsCSSValue(nsCSSUnit aUnit = eCSSUnit_Null)
+     : mUnit(aUnit)
+   {
+     NS_ASSERTION(aUnit <= eCSSUnit_DummyInherit, "not a valueless unit");
+   }
+ 
+   nsCSSValue(PRInt32 aValue, nsCSSUnit aUnit) NS_HIDDEN;
+   nsCSSValue(float aValue, nsCSSUnit aUnit) NS_HIDDEN;
+@@ -279,16 +281,17 @@ public:
+   NS_HIDDEN_(void)  SetColorValue(nscolor aValue);
+   NS_HIDDEN_(void)  SetArrayValue(nsCSSValue::Array* aArray, nsCSSUnit aUnit);
+   NS_HIDDEN_(void)  SetURLValue(nsCSSValue::URL* aURI);
+   NS_HIDDEN_(void)  SetImageValue(nsCSSValue::Image* aImage);
+   NS_HIDDEN_(void)  SetAutoValue();
+   NS_HIDDEN_(void)  SetInheritValue();
+   NS_HIDDEN_(void)  SetInitialValue();
+   NS_HIDDEN_(void)  SetNoneValue();
++  NS_HIDDEN_(void)  SetAllValue();
+   NS_HIDDEN_(void)  SetNormalValue();
+   NS_HIDDEN_(void)  SetSystemFontValue();
+   NS_HIDDEN_(void)  SetDummyValue();
+   NS_HIDDEN_(void)  SetDummyInheritValue();
+   NS_HIDDEN_(void)  StartImageLoad(nsIDocument* aDocument)
+                                    const;  // Not really const, but pretending
+ 
+   // Returns an already addrefed buffer.  Can return null on allocation
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -21,16 +21,17 @@
+  *
+  * Contributor(s):
+  *   Daniel Glazman <glazman@netscape.com>
+  *   Boris Zbarsky <bzbarsky@mit.edu>
+  *   Christopher A. Aillon <christopher@aillon.com>
+  *   Mats Palmgren <mats.palmgren@bredband.net>
+  *   Christian Biesinger <cbiesinger@web.de>
+  *   Michael Ventnor <m.ventnor@gmail.com>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -42,16 +43,17 @@
+  * ***** END LICENSE BLOCK ***** */
+ 
+ /* DOM object returned from element.getComputedStyle() */
+ 
+ #include "nsComputedDOMStyle.h"
+ 
+ #include "nsDOMError.h"
+ #include "nsDOMString.h"
++#include "nsPrintfCString.h"
+ #include "nsIDOMCSS2Properties.h"
+ #include "nsIDOMElement.h"
+ #include "nsIDOMCSSPrimitiveValue.h"
+ #include "nsStyleContext.h"
+ #include "nsIScrollableFrame.h"
+ #include "nsContentUtils.h"
+ #include "prprf.h"
+ 
+@@ -3997,16 +3999,153 @@ nsComputedDOMStyle::GetMask(nsIDOMCSSVal
+   else
+     val->SetIdent(nsGkAtoms::none);
+ 
+   return CallQueryInterface(val, aValue);
+ }
+ 
+ #endif // MOZ_SVG
+ 
++nsresult
++nsComputedDOMStyle::GetTransitionDelay(nsIDOMCSSValue** aValue)
++{
++  const nsStyleDisplay* display = GetStyleDisplay();
++
++  if (!display->mTransitions) {
++    nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
++    val->SetNumber(0);
++    return CallQueryInterface(val, aValue);
++  }
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  nsTransition* transition = display->mTransitions;
++  while (transition) {
++    nsROCSSPrimitiveValue* delay = GetROCSSPrimitiveValue();
++    if (!delay || !valueList->AppendCSSValue(delay)) {
++      delete valueList;
++      delete delay;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++    delay->SetTime((float)transition->GetDelay() / (float)PR_MSEC_PER_SEC);
++    transition = transition->mNext;
++  }
++
++  return CallQueryInterface(valueList, aValue);
++}
++
++nsresult
++nsComputedDOMStyle::GetTransitionDuration(nsIDOMCSSValue** aValue)
++{
++  const nsStyleDisplay* display = GetStyleDisplay();
++
++  if (!display->mTransitions) {
++    nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
++    val->SetNumber(0);
++    return CallQueryInterface(val, aValue);
++  }
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  nsTransition* transition = display->mTransitions;
++  while (transition) {
++    nsROCSSPrimitiveValue* duration = GetROCSSPrimitiveValue();
++    if (!duration || !valueList->AppendCSSValue(duration)) {
++      delete valueList;
++      delete duration;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    duration->SetTime((float)transition->GetDuration() / (float)PR_MSEC_PER_SEC);
++    transition = transition->mNext;
++  }
++
++  return CallQueryInterface(valueList, aValue);
++}
++
++nsresult
++nsComputedDOMStyle::GetTransitionProperty(nsIDOMCSSValue** aValue)
++{
++  const nsStyleDisplay* display = GetStyleDisplay();
++
++  if (!display->mTransitions) {
++    nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
++    val->SetIdent(eCSSKeyword_all);
++    return CallQueryInterface(val, aValue);
++  }
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  nsTransition* transition = display->mTransitions;
++  while (transition) {
++    nsROCSSPrimitiveValue* property = GetROCSSPrimitiveValue();
++    if (!property || !valueList->AppendCSSValue(property)) {
++      delete valueList;
++      delete property;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++    if (transition->IsPropertyAll())
++      property->SetIdent(eCSSKeyword_all);
++    else if (transition->IsPropertyNone())
++      property->SetIdent(eCSSKeyword_none);
++    else
++      property->SetIdent(nsCSSProps::GetStringValue(transition->GetProperty()));
++    transition = transition->mNext;
++  }
++
++  return CallQueryInterface(valueList, aValue);
++}
++
++nsresult
++nsComputedDOMStyle::GetTransitionTimingFunction(nsIDOMCSSValue** aValue)
++{
++  const nsStyleDisplay* display = GetStyleDisplay();
++
++  if (!display->mTransitions) {
++    nsROCSSPrimitiveValue* val = GetROCSSPrimitiveValue();
++    NS_ENSURE_TRUE(val, NS_ERROR_OUT_OF_MEMORY);
++    val->SetIdent(eCSSKeyword_ease);
++    return CallQueryInterface(val, aValue);
++  }
++
++  nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
++  NS_ENSURE_TRUE(valueList, NS_ERROR_OUT_OF_MEMORY);
++
++  nsTransition* transition = display->mTransitions;
++  while (transition) {
++    nsROCSSPrimitiveValue* timingFunction = GetROCSSPrimitiveValue();
++    if (!timingFunction || !valueList->AppendCSSValue(timingFunction)) {
++      delete valueList;
++      delete timingFunction;
++      return NS_ERROR_OUT_OF_MEMORY;
++    }
++
++    // FIXME: should we use keywords here or control points?  
++    nsCSSKeyword keyword = nsCSSProps::ValueToKeywordEnum(transition->GetTimingFunction().mTimingFunctionType, nsCSSProps::kTransitionTimingFunctionTable);
++    if (eCSSKeyword_UNKNOWN != keyword) {
++      timingFunction->SetIdent(keyword);
++    } else {
++      // set the value from the cubic-bezier control points
++      timingFunction->SetIdent(nsPrintfCString(64, "cubic-bezier(%g, %g, %g, %g)",
++                                               transition->GetTimingFunction().mX1,
++                                               transition->GetTimingFunction().mY1,
++                                               transition->GetTimingFunction().mX2,
++                                               transition->GetTimingFunction().mY2));
++    }
++    transition = transition->mNext;
++  }
++
++  return CallQueryInterface(valueList, aValue);
++}
+ 
+ #define COMPUTED_STYLE_MAP_ENTRY(_prop, _method)              \
+   { eCSSProperty_##_prop, &nsComputedDOMStyle::Get##_method }
+ 
+ const nsComputedDOMStyle::ComputedStyleMapEntry*
+ nsComputedDOMStyle::GetQueryablePropertyMap(PRUint32* aLength)
+ {
+   /* ******************************************************************* *\
+@@ -4196,16 +4335,20 @@ nsComputedDOMStyle::GetQueryableProperty
+     COMPUTED_STYLE_MAP_ENTRY(_moz_outline_radius_topRight,   OutlineRadiusTopRight),
+     COMPUTED_STYLE_MAP_ENTRY(stack_sizing,                  StackSizing),
+     COMPUTED_STYLE_MAP_ENTRY(_moz_transform,                MozTransform),
+     COMPUTED_STYLE_MAP_ENTRY(_moz_transform_origin,         MozTransformOrigin),
+     COMPUTED_STYLE_MAP_ENTRY(user_focus,                    UserFocus),
+     COMPUTED_STYLE_MAP_ENTRY(user_input,                    UserInput),
+     COMPUTED_STYLE_MAP_ENTRY(user_modify,                   UserModify),
+     COMPUTED_STYLE_MAP_ENTRY(user_select,                   UserSelect),
++    COMPUTED_STYLE_MAP_ENTRY(_webkit_transition_delay,      TransitionDelay),
++    COMPUTED_STYLE_MAP_ENTRY(_webkit_transition_duration,   TransitionDuration),
++    COMPUTED_STYLE_MAP_ENTRY(_webkit_transition_property,   TransitionProperty),
++    COMPUTED_STYLE_MAP_ENTRY(_webkit_transition_timing_function, TransitionTimingFunction),
+     COMPUTED_STYLE_MAP_ENTRY(word_wrap,                     WordWrap)
+ 
+ #ifdef MOZ_SVG
+     ,
+     COMPUTED_STYLE_MAP_ENTRY(clip_path,                     ClipPath),
+     COMPUTED_STYLE_MAP_ENTRY(clip_rule,                     ClipRule),
+     COMPUTED_STYLE_MAP_ENTRY(color_interpolation,           ColorInterpolation),
+     COMPUTED_STYLE_MAP_ENTRY(color_interpolation_filters,   ColorInterpolationFilters),
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -286,16 +286,22 @@ private:
+   /* Column properties */
+   nsresult GetColumnCount(nsIDOMCSSValue** aValue);
+   nsresult GetColumnWidth(nsIDOMCSSValue** aValue);
+   nsresult GetColumnGap(nsIDOMCSSValue** aValue);
+   nsresult GetColumnRuleWidth(nsIDOMCSSValue** aValue);
+   nsresult GetColumnRuleStyle(nsIDOMCSSValue** aValue);
+   nsresult GetColumnRuleColor(nsIDOMCSSValue** aValue);
+ 
++  /* CSS Transitions */
++  nsresult GetTransitionProperty(nsIDOMCSSValue** aValue);
++  nsresult GetTransitionDuration(nsIDOMCSSValue** aValue);
++  nsresult GetTransitionDelay(nsIDOMCSSValue** aValue);
++  nsresult GetTransitionTimingFunction(nsIDOMCSSValue** aValue);
++
+ #ifdef MOZ_SVG
+   /* SVG properties */
+   nsresult GetSVGPaintFor(PRBool aFill, nsIDOMCSSValue** aValue);
+ 
+   nsresult GetFill(nsIDOMCSSValue** aValue);
+   nsresult GetStroke(nsIDOMCSSValue** aValue);
+   nsresult GetMarkerEnd(nsIDOMCSSValue** aValue);
+   nsresult GetMarkerMid(nsIDOMCSSValue** aValue);
+diff --git a/layout/style/nsROCSSPrimitiveValue.cpp b/layout/style/nsROCSSPrimitiveValue.cpp
+--- a/layout/style/nsROCSSPrimitiveValue.cpp
++++ b/layout/style/nsROCSSPrimitiveValue.cpp
+@@ -263,29 +263,34 @@ nsROCSSPrimitiveValue::GetCssText(nsAStr
+             break;
+           tmpStr.Append(comma + colorValue);
+         }
+ 
+         tmpStr.Append(NS_LITERAL_STRING(")"));
+ 
+         break;
+       }
++    case CSS_S :
++      {
++        tmpStr.AppendFloat(mValue.mFloat);
++        tmpStr.AppendLiteral("s");
++        break;
++      }
+     case CSS_CM :
+     case CSS_MM :
+     case CSS_IN :
+     case CSS_PT :
+     case CSS_PC :
+     case CSS_UNKNOWN :
+     case CSS_EMS :
+     case CSS_EXS :
+     case CSS_DEG :
+     case CSS_RAD :
+     case CSS_GRAD :
+     case CSS_MS :
+-    case CSS_S :
+     case CSS_HZ :
+     case CSS_KHZ :
+     case CSS_DIMENSION :
+       NS_ERROR("We have a bogus value set.  This should not happen");
+       return NS_ERROR_DOM_INVALID_ACCESS_ERR;
+   }
+ 
+   if (NS_SUCCEEDED(result)) {
+diff --git a/layout/style/nsROCSSPrimitiveValue.h b/layout/style/nsROCSSPrimitiveValue.h
+--- a/layout/style/nsROCSSPrimitiveValue.h
++++ b/layout/style/nsROCSSPrimitiveValue.h
+@@ -193,16 +193,24 @@ public:
+       NS_ADDREF(mValue.mRect);
+       mType = CSS_RECT;
+     }
+     else {
+       mType = CSS_UNKNOWN;
+     }
+   }
+ 
++  void SetTime(float aValue)
++  {
++    Reset();
++    mValue.mFloat = aValue;
++    mType = CSS_S;
++  }
++
++
+   void Reset(void)
+   {
+     switch (mType) {
+       case CSS_IDENT:
+         NS_ASSERTION(mValue.mAtom, "Null atom should never happen");
+         NS_RELEASE(mValue.mAtom);
+         break;
+       case CSS_STRING:
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -22,16 +22,17 @@
+  * Contributor(s):
+  *   Original Author: David W. Hyatt (hyatt@netscape.com)
+  *   Daniel Glazman <glazman@netscape.com>
+  *   Roger B. Sidje <rbs@maths.uq.edu.au>
+  *   Mats Palmgren <mats.palmgren@bredband.net>
+  *   L. David Baron <dbaron@dbaron.org>
+  *   Christian Biesinger <cbiesinger@web.de>
+  *   Michael Ventnor <m.ventnor@gmail.com>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -3153,32 +3154,330 @@ static nsStyleTransformMatrix ReadTransf
+     nsStyleTransformMatrix currMatrix;
+     currMatrix.SetToTransformFunction(currElem.GetArrayValue(), aContext,
+                                       aPresContext);
+     result *= currMatrix;
+   }
+   return result;
+ }
+ 
++// This function will count the number of transitions owned by the given
++// nsStyleDisplay that return true for the given test function.  If the test
++// function is null, counts all transitions
++typedef PRBool (nsTransition::*TransitionTestFunc)(void) const;
++inline static int GetNumTransitions(const nsStyleDisplay* aStyleDisplay,
++                                    TransitionTestFunc aTestFunc = nsnull)
++{
++  nsTransition* t = aStyleDisplay->mTransitions;
++  int len = 0;
++  while (t) {
++    if (aTestFunc && !(t->*aTestFunc)())
++      break;
++    len++;
++    t = t->mNext;
++  }
++  return len;
++}
++
++// A simple helper function to get the length of a nsCSSValueList
++inline static int GetValueListLength(nsCSSValueList* aValueList)
++{
++  int len = 0;
++  nsCSSValueList* val = aValueList;
++  while (val) {
++    len++;
++    val = val->mNext;
++  }
++  return len;
++}
++
+ const void*
+ nsRuleNode::ComputeDisplayData(void* aStartStruct,
+                                const nsRuleDataStruct& aData, 
+                                nsStyleContext* aContext, 
+                                nsRuleNode* aHighestNode,
+                                const RuleDetail aRuleDetail, PRBool aInherited)
+ {
+   COMPUTE_START_RESET(Display, (), display, parentDisplay,
+                       Display, displayData)
+   nsIAtom* pseudoTag = aContext->GetPseudoType();
+   PRBool generatedContent = (pseudoTag == nsCSSPseudoElements::before || 
+                              pseudoTag == nsCSSPseudoElements::after);
+   NS_ASSERTION(!generatedContent || parentContext,
+                "Must have parent context for generated content");
+   if (parentDisplay == display && generatedContent)
+     parentDisplay = parentContext->GetStyleDisplay();
++
++  // CSS Transitions
++  nsCSSValueList* delayList = displayData.mTransitionDelay;
++  nsCSSValueList* durationList = displayData.mTransitionDuration;
++  nsCSSValueList* propertyList = displayData. mTransitionProperty;
++  nsCSSValueList* functionList = displayData.mTransitionTimingFunction;
++
++  // Transition properties are stored in nsCSSDisplay separately in jagged
++  // arrays.  The number of transitions is equal to the number of elements in
++  // the longest array.  Arrays with fewer elements will be filled in with
++  // default values
++
++  // Transitions are difficult to handle correctly because of this.  For example
++  // we need to handle scenarios such as:
++  //  * a more general rule specifies transition-property: a, b, c;
++  //  * a more specific rule overrides as transition-property: d;
++  //
++  //  If only the general rule applied, we would fill in the extra properties
++  //  (duration, delay, etc) with initial values to create 3 fully-specified
++  //  transitions.  But when the more specific rule applies, we should only
++  //  create a single transition.  In order to do this we need to remember which
++  //  properties were explicitly specified and which ones were just filled in
++  //  with initial values to get a fully-specified transition
++
++  // cache whether any of the properties are specified as 'inherit' so we can
++  // use it below
++  PRBool delayInherited = displayData.mTransitionDelay &&
++    displayData.mTransitionDelay->mValue.GetUnit() == eCSSUnit_Inherit;
++  PRBool durationInherited = displayData.mTransitionDuration &&
++    displayData.mTransitionDuration->mValue.GetUnit() == eCSSUnit_Inherit;
++  PRBool propertyInherited = displayData.mTransitionProperty &&
++    displayData.mTransitionProperty->mValue.GetUnit() == eCSSUnit_Inherit;
++  PRBool timingFunctionInherited = displayData.mTransitionTimingFunction &&
++    displayData.mTransitionTimingFunction->mValue.GetUnit() == eCSSUnit_Inherit;
++
++  // General algorithm to determine how many total transitions we need to build.
++  // For each property:
++  //  - if there is no value specified in for the property in displayData, use
++  //    the values from the start struct, but only if they were explicitly
++  //    specified
++  //  - if there is a value specified for the property in displayData:
++  //    - if the value is 'inherit', count the number of values for that
++  //      property are specified by the parent, but only those that were
++  //      explicitly specified
++  //    - otherwise, count the number of values specified in displayData
++
++  int numTransitions = 0;
++  int numDurations = 0;
++  int numProperties = 0;
++  int numDelays = 0;
++  int numTimingFuncs = 0;
++
++  // calculate number of transition-duration elements
++  if (durationList) {
++    if (durationInherited) {
++      numDurations = GetNumTransitions(parentDisplay, &nsTransition::GetDurationExplicit);
++    } else {
++      numDurations = GetValueListLength(durationList);
++    }
++  } else {
++    numDurations = GetNumTransitions(display, &nsTransition::GetDurationExplicit);
++  }
++  if (numDurations > numTransitions)
++    numTransitions = numDurations;
++
++  // calculate number of transition-property elements
++  if (propertyList) {
++    if (propertyInherited) {
++      numProperties = GetNumTransitions(parentDisplay, &nsTransition::GetPropertyExplicit);
++    } else {
++      numProperties = GetValueListLength(propertyList);
++    }
++  } else {
++    numProperties = GetNumTransitions(display, &nsTransition::GetPropertyExplicit);
++  }
++  if (numProperties > numTransitions)
++    numTransitions = numProperties;
++
++  // calculate number of transition-delay elements
++  if (delayList) {
++    if (delayInherited) {
++      numDelays = GetNumTransitions(parentDisplay, &nsTransition::GetDelayExplicit);
++    } else {
++      numDelays = GetValueListLength(delayList);
++    }
++  } else {
++    numDelays = GetNumTransitions(display, &nsTransition::GetDelayExplicit);
++  }
++  if (numDelays > numTransitions)
++    numTransitions = numDelays;
++
++  // calculate number of transition-timing-function elements
++  if (functionList) {
++    if (timingFunctionInherited) {
++      numTimingFuncs = GetNumTransitions(parentDisplay, &nsTransition::GetTimingFunctionExplicit);
++    } else {
++      numTimingFuncs = GetValueListLength(functionList);
++    }
++  } else {
++    numTimingFuncs = GetNumTransitions(display, &nsTransition::GetTimingFunctionExplicit);
++  }
++  if (numTimingFuncs > numTransitions)
++    numTransitions = numTimingFuncs;
++
++  // determine the total number of transition objects we had already from
++  // aStartStruct
++  int numExistingTransitions = GetNumTransitions(display);
++
++  // if the transitions we already had from the start struct exceed the number
++  // we calculated above, prune the extras.  This can happen for example if a
++  // less-specific rule contains 3 values for a particular property and a
++  // more-specific rule contains only a single value.
++  if (numExistingTransitions > numTransitions)
++  {
++    nsTransition* t = display->mTransitions;
++    nsTransition* prev;
++    for (int i = 0; i < numTransitions; ++i)
++    {
++      prev = t;
++      t = t->mNext;
++    }
++    // prev is now the last valid transition, so save it so we can clear the mNext
++    // pointer and delete the remaining transitions
++    prev->mNext = nsnull;
++    while (t) {
++      nsTransition *p = t;
++      t = t->mNext;
++      delete p;
++    }
++  } else if (numExistingTransitions < numTransitions)
++  {
++    // otherwise allocate new nsTransition objects to reach numTransitions
++    nsTransition** t = &display->mTransitions;
++    for (int i = 0; i < numTransitions; ++i)
++    {
++      if (!*t) {
++        *t = new nsTransition();
++        continue;
++      }
++      else if (!(*t)->mNext) {
++        (*t)->mNext = new nsTransition();
++      }
++      t = &(*t)->mNext;
++    }
++  }
++
++  // We've already allocated the proper number of transitions above, now we just
++  // need to fill them in with the appropriate values
++  nsTransition* transition = display->mTransitions;
++  nsTransition* inheritedTransition = parentDisplay->mTransitions;
++  for (int i = 0; i < numTransitions; ++i) {
++    if (delayInherited) {
++      if (inheritedTransition)
++        transition->SetDelay(inheritedTransition->GetDelay(),
++                             inheritedTransition->GetDelayExplicit());
++    } else if (delayList) {
++      switch (delayList->mValue.GetUnit()) {
++        case eCSSUnit_Seconds:
++          transition->SetDelay(PR_MSEC_PER_SEC *
++                               delayList->mValue.GetFloatValue(), (numDelays-- > 0));
++          break;
++        case eCSSUnit_Milliseconds:
++          transition->SetDelay(delayList->mValue.GetFloatValue(), (numDelays-- > 0));
++          break;
++        case eCSSUnit_Initial:
++          transition->SetDelay(0.0);
++          break;
++        default:
++          NS_NOTREACHED("Invalid delay unit");
++      }
++      // if we're at the end of the list, start at the beginning and repeat
++      // until we're out of transitions to populate
++      delayList = delayList->mNext ? delayList->mNext :
++        displayData.mTransitionDelay;
++    }
++
++    if (durationInherited) {
++      if (inheritedTransition)
++        transition->SetDuration(inheritedTransition->GetDuration(),
++                                inheritedTransition->GetDurationExplicit());
++    } else if (durationList) {
++      switch (durationList->mValue.GetUnit()) {
++        case eCSSUnit_Seconds:
++          transition->SetDuration(PR_MSEC_PER_SEC *
++                                  durationList->mValue.GetFloatValue(), (numDurations-- > 0));
++          break;
++        case eCSSUnit_Milliseconds:
++          transition->SetDuration(durationList->mValue.GetFloatValue(), (numDurations-- > 0));
++          break;
++        case eCSSUnit_Initial:
++          transition->SetDuration(0.0);
++          break;
++        default:
++          NS_NOTREACHED("Invalid duration unit");
++      }
++      // repeat from the beginning if we reach the end
++      durationList = durationList->mNext ? durationList->mNext :
++        displayData.mTransitionDuration;
++    }
++
++    if (propertyInherited) {
++      if (inheritedTransition) {
++        if (inheritedTransition->IsPropertyAll())
++          transition->SetPropertyAll(inheritedTransition->GetPropertyExplicit());
++        if (inheritedTransition->IsPropertyNone())
++          transition->SetPropertyNone(inheritedTransition->GetPropertyExplicit());
++        else
++          transition->SetProperty(inheritedTransition->GetProperty(),
++                                  inheritedTransition->GetPropertyExplicit());
++      }
++    } else if (propertyList) {
++      switch (propertyList->mValue.GetUnit()) {
++        case eCSSUnit_Enumerated:
++          transition->SetProperty((nsCSSProperty)
++                                  propertyList->mValue.GetIntValue());
++          break;
++        case eCSSUnit_All:
++        case eCSSUnit_Initial:
++          transition->SetPropertyAll((numProperties-- > 0));
++          break;
++        case eCSSUnit_None:
++          transition->SetPropertyNone((numProperties-- > 0));
++          break;
++        default:
++          NS_NOTREACHED("Invalid transition property unit");
++      }
++      // repeat from the beginning if we reach the end
++      propertyList = propertyList->mNext ? propertyList->mNext :
++        displayData.mTransitionProperty;
++    }
++
++    if (timingFunctionInherited) {
++      if (inheritedTransition)
++        transition->SetTimingFunction(inheritedTransition->GetTimingFunction(),
++                                      inheritedTransition->GetTimingFunctionExplicit());
++    } else if (functionList) {
++      switch (functionList->mValue.GetUnit()) {
++        case eCSSUnit_Enumerated:
++          transition->SetTimingFunction(nsTimingFunction(functionList->mValue.GetIntValue()));
++          functionList = functionList->mNext;
++          break;
++        case eCSSUnit_Cubic_Bezier:
++          {
++            nsCSSValue::Array* array = functionList->mValue.GetArrayValue();
++            NS_ASSERTION(array && array->Count() == 4, "Need 4 control points");
++            transition->SetTimingFunction(nsTimingFunction(array->Item(0).GetFloatValue(),
++                                                           array->Item(1).GetFloatValue(),
++                                                           array->Item(2).GetFloatValue(),
++                                                           array->Item(3).GetFloatValue()),
++                                          (numTimingFuncs-- > 0));
++            // repeat from the beginning if we reach the end
++            functionList = functionList->mNext ? functionList->mNext :
++              displayData.mTransitionTimingFunction;
++          }
++          break;
++        case eCSSUnit_Initial:
++          transition->SetTimingFunction(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE);
++          break;
++        default:
++          NS_NOTREACHED("Invalid transition property unit");
++      }
++    }
++    // advance to the next inherited transition or cycle back to the beginning
++    if (inheritedTransition)
++      inheritedTransition = inheritedTransition->mNext ?
++        inheritedTransition->mNext : parentDisplay->mTransitions;
++    transition = transition->mNext;
++  }
+ 
+   // opacity: factor, inherit, initial
+   SetFactor(displayData.mOpacity, display->mOpacity, inherited,
+             parentDisplay->mOpacity, 1.0f, SETFCT_OPACITY);
+ 
+   // display: enum, none, inherit, initial
+   SetDiscrete(displayData.mDisplay, display->mDisplay, inherited,
+               SETDSC_ENUMERATED | SETDSC_NONE, parentDisplay->mDisplay,
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -18,16 +18,17 @@
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1998
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   David Hyatt (hyatt@netscape.com)
+  *   Mats Palmgren <mats.palmgren@bredband.net>
+  *   Michael Ventnor <m.ventnor@gmail.com>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -1249,16 +1250,131 @@ PRBool nsStyleBackground::HasFixedBackgr
+ {
+   return mBackgroundAttachment == NS_STYLE_BG_ATTACHMENT_FIXED &&
+          mBackgroundImage;
+ }
+ 
+ // --------------------
+ // nsStyleDisplay
+ //
++void nsTimingFunction::AssignFromKeyword(PRInt32 aTimingFunctionType) {
++    mTimingFunctionType = aTimingFunctionType;
++    switch (aTimingFunctionType) {
++      case NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE:
++        mX1 = 0.25;
++        mY1 = 0.10;
++        mX2 = 0.25;
++        mY2 = 1.0;
++        break;
++      case NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN:
++        mX1 = 0.42;
++        mY1 = 0.0;
++        mX2 = 1.0;
++        mY2 = 1.0;
++        break;
++      case NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT:
++        mX1 = 0.0;
++        mY1 = 0.0;
++        mX2 = 0.58;
++        mY2 = 1.0;
++        break;
++      case NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT:
++        mX1 = 0.42;
++        mY1 = 0.0;
++        mX2 = 0.58;
++        mY2 = 1.0;
++        break;
++      case  NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR:
++        mX1 = 0.0;
++        mY1 = 0.0;
++        mX2 = 1.0;
++        mY2 = 1.0;
++        break;
++      default:
++        NS_NOTREACHED("Invalid timing function type");
++        // just initialize to 'ease', which is the default
++        mX1 = 0.25;
++        mY1 = 0.1;
++        mX2 = 0.25;
++        mY2 = 1.0;
++        break;
++    }
++}
++
++nsTransition::nsTransition() :
++  mNext(nsnull)
++  , mTimingFunction(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE)
++  , mDuration(0.0)
++  , mDelay(0.0)
++  , mProperty(eCSSProperty_UNKNOWN)
++  , mPropertyNone(PR_FALSE)
++  , mPropertyAll(PR_TRUE)
++  , mPropertyExplicit(PR_FALSE)
++  , mDelayExplicit(PR_FALSE)
++  , mDurationExplicit(PR_FALSE)
++  , mTimingFunctionExplicit(PR_FALSE)
++{
++}
++
++nsTransition::nsTransition(nsTransition& aCopy) :
++  mNext(aCopy.mNext ? new nsTransition(*aCopy.mNext) : nsnull)
++  , mTimingFunction(aCopy.mTimingFunction)
++  , mDuration(aCopy.mDuration)
++  , mDelay(aCopy.mDelay)
++  , mProperty(aCopy.mProperty)
++  , mPropertyNone(aCopy.mPropertyNone)
++  , mPropertyAll(aCopy.mPropertyAll)
++  , mPropertyExplicit(aCopy.mPropertyExplicit)
++  , mDelayExplicit(aCopy.mDelayExplicit)
++  , mDurationExplicit(aCopy.mDurationExplicit)
++  , mTimingFunctionExplicit(aCopy.mTimingFunctionExplicit)
++{
++}
++
++void nsTransition::SetTimingFunction(nsTimingFunction aTimingFunction, PRBool aExplicit)
++{
++  mTimingFunction = aTimingFunction;
++  mTimingFunctionExplicit = aExplicit;
++}
++
++void nsTransition::SetDelay(float aDelay, PRBool aExplicit)
++{
++  mDelay = aDelay;
++  mDelayExplicit = aExplicit;
++}
++
++void nsTransition::SetDuration(float aDuration, PRBool aExplicit)
++{
++  mDuration = aDuration;
++  mDurationExplicit = aExplicit;
++}
++
++void nsTransition::SetProperty(nsCSSProperty aProperty, PRBool aExplicit)
++{
++  NS_ASSERTION(aProperty != eCSSProperty_UNKNOWN, "invalid property");
++  mProperty = aProperty;
++  mPropertyNone = PR_FALSE;
++  mPropertyAll = PR_FALSE;
++  mPropertyExplicit = PR_TRUE;
++}
++
++void nsTransition::SetPropertyNone(PRBool aExplicit) {
++  mPropertyNone = PR_TRUE;
++  mPropertyAll = PR_FALSE;
++  mProperty = eCSSProperty_UNKNOWN;
++  mPropertyExplicit = aExplicit;
++}
++
++void nsTransition::SetPropertyAll(PRBool aExplicit) {
++  mPropertyNone = PR_FALSE;
++  mPropertyAll = PR_TRUE;
++  mProperty = eCSSProperty_UNKNOWN;
++  mPropertyExplicit = aExplicit;
++}
++
+ 
+ nsStyleDisplay::nsStyleDisplay()
+ {
+   mAppearance = NS_THEME_NONE;
+   mDisplay = NS_STYLE_DISPLAY_INLINE;
+   mOriginalDisplay = NS_STYLE_DISPLAY_NONE;
+   mPosition = NS_STYLE_POSITION_STATIC;
+   mFloats = NS_STYLE_FLOAT_NONE;
+@@ -1268,16 +1384,17 @@ nsStyleDisplay::nsStyleDisplay()
+   mOverflowX = NS_STYLE_OVERFLOW_VISIBLE;
+   mOverflowY = NS_STYLE_OVERFLOW_VISIBLE;
+   mClipFlags = NS_STYLE_CLIP_AUTO;
+   mClip.SetRect(0,0,0,0);
+   mOpacity = 1.0f;
+   mTransformPresent = PR_FALSE; // No transform
+   mTransformOrigin[0].SetPercentValue(0.5f); // Transform is centered on origin
+   mTransformOrigin[1].SetPercentValue(0.5f); 
++  mTransitions = nsnull;
+ }
+ 
+ nsStyleDisplay::nsStyleDisplay(const nsStyleDisplay& aSource)
+ {
+   mAppearance = aSource.mAppearance;
+   mDisplay = aSource.mDisplay;
+   mOriginalDisplay = aSource.mOriginalDisplay;
+   mBinding = aSource.mBinding;
+@@ -1295,16 +1412,30 @@ nsStyleDisplay::nsStyleDisplay(const nsS
+   /* Copy over the transformation information. */
+   mTransformPresent = aSource.mTransformPresent;
+   if (mTransformPresent)
+     mTransform = aSource.mTransform;
+   
+   /* Copy over transform origin. */
+   mTransformOrigin[0] = aSource.mTransformOrigin[0];
+   mTransformOrigin[1] = aSource.mTransformOrigin[1];
++
++  mTransitions = nsnull;
++  // copy transition list
++  nsTransition* transition = aSource.mTransitions;
++  nsTransition** tail = &mTransitions;
++  while (transition) {
++    if (!*tail)
++      *tail = new nsTransition(*transition);
++    else {
++      (*tail)->mNext = new nsTransition(*transition);
++      *tail = (*tail)->mNext;
++    }
++    transition = transition->mNext;
++  }
+ }
+ 
+ nsChangeHint nsStyleDisplay::CalcDifference(const nsStyleDisplay& aOther) const
+ {
+   nsChangeHint hint = nsChangeHint(0);
+ 
+   if (!EqualURIs(mBinding, aOther.mBinding)
+       || mPosition != aOther.mPosition
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -18,16 +18,17 @@
+  * Netscape Communications Corporation.
+  * Portions created by the Initial Developer are Copyright (C) 1998
+  * the Initial Developer. All Rights Reserved.
+  *
+  * Contributor(s):
+  *   Mats Palmgren <mats.palmgren@bredband.net>
+  *   Masayuki Nakano <masayuki@d-toybox.com>
+  *   Rob Arnold <robarnold@mozilla.com>
++ *   Jonathon Jongsma <jonathon.jongsma@collabora.co.uk>, Collabora Ltd.
+  *
+  * Alternatively, the contents of this file may be used under the terms of
+  * either of the GNU General Public License Version 2 or later (the "GPL"),
+  * or the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
+  * in which case the provisions of the GPL or the LGPL are applicable instead
+  * of those above. If you wish to allow use of your version of this file only
+  * under the terms of either the GPL or the LGPL, and not to allow others to
+  * use your version of this file under the terms of the MPL, indicate your
+@@ -840,16 +841,98 @@ struct nsStyleVisibility {
+   }
+ 
+   PRBool IsVisibleOrCollapsed() const {
+     return ((mVisible == NS_STYLE_VISIBILITY_VISIBLE) ||
+             (mVisible == NS_STYLE_VISIBILITY_COLLAPSE));
+   }
+ };
+ 
++struct nsTimingFunction {
++  nsTimingFunction(PRInt32 aTimingFunctionType=NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE)
++  {
++    AssignFromKeyword(aTimingFunctionType);
++  }
++
++  nsTimingFunction(float x1, float y1, float x2, float y2) :
++    mX1(x1)
++    , mY1(y1)
++    , mX2(x2)
++    , mY2(y2)
++    , mTimingFunctionType(-1)
++  {}
++
++  float mX1;
++  float mY1;
++  float mX2;
++  float mY2;
++  PRInt32 mTimingFunctionType;
++
++  PRBool operator==(const nsTimingFunction& aOther) const
++  {
++    return !(*this != aOther);
++  }
++
++  PRBool operator!=(const nsTimingFunction& aOther) const
++  {
++    return ((mX1 != mX1) ||
++            (mY1 != mY1) ||
++            (mX2 != mX2) ||
++            (mY2 != mY2));
++  }
++private:
++  void AssignFromKeyword(PRInt32 aTimingFunctionType);
++};
++
++struct nsTransition {
++  nsTransition();
++  explicit nsTransition(nsTransition& aCopy);
++public:
++  nsTimingFunction& GetTimingFunction() { return mTimingFunction; }
++  const nsTimingFunction& GetTimingFunction() const { return mTimingFunction; }
++  float GetDelay() const { return mDelay; }
++  float GetDuration() const { return mDuration; }
++  nsCSSProperty GetProperty() const { return mProperty; }
++  PRBool IsPropertyNone() const { return mPropertyNone; }
++  PRBool IsPropertyAll() const { return mPropertyAll; }
++
++  void SetTimingFunction(nsTimingFunction aTimingFunction, PRBool aExplicit=PR_TRUE);
++  void SetDelay(float aDelay, PRBool aExplicit=PR_TRUE);
++  void SetDuration(float aDuration, PRBool aExplicit=PR_TRUE);
++  void SetProperty(nsCSSProperty aProperty, PRBool aExplicit=PR_TRUE);
++  void SetPropertyNone(PRBool aExplicit=PR_TRUE);
++  void SetPropertyAll(PRBool aExplicit=PR_TRUE);
++
++  // check whether the property was specified explicitly or filled in
++  // automatically
++  inline PRBool GetPropertyExplicit() const { return mPropertyExplicit; }
++  inline PRBool GetDelayExplicit() const { return mDelayExplicit; }
++  inline PRBool GetDurationExplicit() const { return mDurationExplicit; }
++  inline PRBool GetTimingFunctionExplicit() const { return mTimingFunctionExplicit; }
++
++  // linked list
++  nsTransition* mNext;
++
++private:
++  nsTimingFunction mTimingFunction;
++  float mDuration;
++  float mDelay;
++  nsCSSProperty mProperty;
++  PRBool mPropertyNone;
++  PRBool mPropertyAll;
++
++  // bits that specify whether the given transition sub-properties were
++  // explicitly specified or whether they were inherited or filled in from
++  // repetition
++  PRBool mPropertyExplicit;
++  PRBool mDelayExplicit;
++  PRBool mDurationExplicit;
++  PRBool mTimingFunctionExplicit;
++};
++
+ struct nsStyleDisplay {
+   nsStyleDisplay();
+   nsStyleDisplay(const nsStyleDisplay& aOther); 
+   ~nsStyleDisplay() {}
+ 
+   void* operator new(size_t sz, nsPresContext* aContext) CPP_THROW_NEW {
+     return aContext->AllocateFromShell(sz);
+   }
+@@ -881,16 +964,17 @@ struct nsStyleDisplay {
+   PRUint8 mPosition;            // [reset] see nsStyleConsts.h
+   PRUint8 mFloats;              // [reset] see nsStyleConsts.h NS_STYLE_FLOAT_*
+   PRUint8 mBreakType;           // [reset] see nsStyleConsts.h NS_STYLE_CLEAR_*
+   PRPackedBool mBreakBefore;    // [reset] 
+   PRPackedBool mBreakAfter;     // [reset] 
+   PRUint8 mOverflowX;           // [reset] see nsStyleConsts.h
+   PRUint8 mOverflowY;           // [reset] see nsStyleConsts.h
+   PRUint8   mClipFlags;         // [reset] see nsStyleConsts.h
++  nsTransition* mTransitions;   // [reset]
+   PRPackedBool mTransformPresent;  // [reset] Whether there is a -moz-transform.
+   nsStyleTransformMatrix mTransform; // [reset] The stored transform matrix
+   nsStyleCoord mTransformOrigin[2]; // [reset] percent, coord.
+ 
+   PRBool IsBlockInside() const {
+     return NS_STYLE_DISPLAY_BLOCK == mDisplay ||
+            NS_STYLE_DISPLAY_LIST_ITEM == mDisplay ||
+            NS_STYLE_DISPLAY_INLINE_BLOCK == mDisplay;
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -1627,16 +1627,57 @@ var gCSSProperties = {
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		/* XXX requires position to be set */
+ 		/* XXX 0 may or may not be equal to auto */
+ 		initial_values: [ "auto" ],
+ 		other_values: [ "32px", "-3em", "12%" ],
+ 		invalid_values: []
+ 	},
++	"-webkit-transition-delay": {
++		domProp: "transitionDelay",
++		inherited: false,
++		type: CSS_TYPE_LONGHAND,
++		initial_values: [ "0", "0s", "0ms" ],
++		other_values: [ "1s", "250ms", "-100ms", "-1s", "1s, 250ms, 2.3s"],
++		invalid_values: []
++	},
++	"-webkit-transition-duration": {
++		domProp: "transitionDuration",
++		inherited: false,
++		type: CSS_TYPE_LONGHAND,
++		initial_values: [ "0" , "0s", "0ms" ],
++		other_values: [ "1s", "250ms", "-1ms", "-2s", "1s, 250ms, 2.3s"],
++		invalid_values: []
++	},
++	"-webkit-transition-property": {
++		domProp: "transitionProperty",
++		inherited: false,
++		type: CSS_TYPE_LONGHAND,
++		initial_values: [ "all" ],
++		other_values: [ "none", "left", "top", "color", "width, height, opacity" ],
++		invalid_values: [ "auto" ]
++	},
++	"-webkit-transition-timing-function": {
++		domProp: "transitionTimingFunction",
++		inherited: false,
++		type: CSS_TYPE_LONGHAND,
++		initial_values: [ "ease" ],
++		other_values: [ "linear", "ease-in", "ease-out", "ease-in-out", "cubic-bezier(0.25, 0.1, 0.25, 1.0)", "linear, ease-in, cubic-bezier(0.1, 0.2, 0.8, 0.9)" ],
++		invalid_values: [ "none", "auto" ]
++	},
++	"-webkit-transition": {
++		domProp: "transition",
++		inherited: false,
++		type: CSS_TYPE_TRUE_SHORTHAND,
++		subproperties: [ "-webkit-transition-property", "-webkit-transition-duration", "-webkit-transition-timing-function", "-webkit-transition-delay" ],
++		initial_values: [ "all 0s ease 0s" ],
++		other_values: [ "width 1s linear 2s", "height", "2s", "ease-in-out", "2s ease-in", "opacity linear", "ease-out 2s", "2s, 1s width, 500ms height linear, 1s opacity 4s cubic-bezier(0.0, 0.1, 1.0, 1.0)" ],
++		invalid_values: [ ]
++	},
+ 	"unicode-bidi": {
+ 		domProp: "unicodeBidi",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "normal" ],
+ 		other_values: [ "embed", "bidi-override" ],
+ 		invalid_values: [ "auto", "none" ]
+ 	},
+diff --git a/layout/style/test/test_inherit_storage.html b/layout/style/test/test_inherit_storage.html
+--- a/layout/style/test/test_inherit_storage.html
++++ b/layout/style/test/test_inherit_storage.html
+@@ -20,33 +20,35 @@ https://bugzilla.mozilla.org/show_bug.cg
+ </div>
+ <pre id="test">
+ <script class="testbody" type="text/javascript">
+ 
+ /** Test for parsing, storage, and serialization of CSS 'inherit' **/
+ 
+ var gDeclaration = document.getElementById("testnode").style;
+ 
++
+ var gKnownFails2 = {
+   "-moz-border-end": true,
+   "-moz-border-radius": true,
+   "-moz-border-start": true,
+   "-moz-column-rule": true,
+   "-moz-outline-radius": true,
+   "background": true,
+   "border": true,
+   "border-bottom": true,
+   "border-left": true,
+   "border-right": true,
+   "border-top": true,
+   "cue": true,
+   "font": true,
+   "list-style": true,
+   "outline": true,
+-  "pause": true
++  "pause": true,
++  "-webkit-transition": true
+ };
+ 
+ function test_property(property)
+ {
+   var info = gCSSProperties[property];
+ 
+   function check_initial(sproperty) {
+     var sinfo = gCSSProperties[sproperty];
+diff --git a/layout/style/test/test_initial_storage.html b/layout/style/test/test_initial_storage.html
+--- a/layout/style/test/test_initial_storage.html
++++ b/layout/style/test/test_initial_storage.html
+@@ -20,33 +20,35 @@ https://bugzilla.mozilla.org/show_bug.cg
+ </div>
+ <pre id="test">
+ <script class="testbody" type="text/javascript">
+ 
+ /** Test for parsing, storage, and serialization of CSS '-moz-initial' **/
+ 
+ var gDeclaration = document.getElementById("testnode").style;
+ 
++
+ var gKnownFails2 = {
+   "-moz-border-end": true,
+   "-moz-border-radius": true,
+   "-moz-border-start": true,
+   "-moz-column-rule": true,
+   "-moz-outline-radius": true,
+   "background": true,
+   "border": true,
+   "border-bottom": true,
+   "border-left": true,
+   "border-right": true,
+   "border-top": true,
+   "cue": true,
+   "font": true,
+   "list-style": true,
+   "outline": true,
+-  "pause": true
++  "pause": true,
++  "-webkit-transition": true
+ };
+ 
+ function test_property(property)
+ {
+   var info = gCSSProperties[property];
+ 
+   function check_initial(sproperty) {
+     var sinfo = gCSSProperties[sproperty];
+diff --git a/layout/style/test/test_value_storage.html b/layout/style/test/test_value_storage.html
+--- a/layout/style/test/test_value_storage.html
++++ b/layout/style/test/test_value_storage.html
+@@ -50,16 +50,17 @@ var gShorthandsWithoutCondensingSerializ
+   "-moz-border-radius": true,
+   "-moz-outline-radius": true,
+   "background": true, // really there, but not complete
+   "cue": true,
+   "font": true,
+   "list-style": true,
+   "outline": true,
+   "pause": true,
++  "-webkit-transition": true,
+ };
+ 
+ var gNotAccepted = {
+   "-moz-column-width": [ "50%" ],
+   "list-style": [ "none disc outside" ],
+ };
+ 
+ var gSystemFont = {
