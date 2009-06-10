@@ -2,10 +2,81 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Implement CSS transitions:  handle starting and management of the animations.  (Bug 435441)
 
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -801,16 +801,26 @@ public:
+     return !mSameDocDirtyRegion.IsEmpty() || !mCrossDocDirtyRegion.IsEmpty();
+   }
+ 
+   void ClearMozAfterPaintEvents() {
+     mSameDocDirtyRegion.SetEmpty();
+     mCrossDocDirtyRegion.SetEmpty();
+   }
+ 
++  PRBool IsProcessingAnimationStyleChange() const {
++    return mProcessingAnimationStyleChange;
++  }
++
++  void SetProcessingAnimationStyleChange(PRBool aProcessing) {
++    NS_ASSERTION(aProcessing != mProcessingAnimationStyleChange,
++                 "should never nest");
++    mProcessingAnimationStyleChange = aProcessing;
++  }
++
+   /**
+    * Notify the prescontext that the presshell is about to reflow a reflow root.
+    * The single argument indicates whether this reflow should be interruptible.
+    * If aInterruptible is false then CheckForInterrupt and HasPendingInterrupt
+    * will always return false. If aInterruptible is true then CheckForInterrupt
+    * will return true when a pending event is detected.  This is for use by the
+    * presshell only.  Reflow code wanting to prevent interrupts should use
+    * InterruptPreventer.
+@@ -1008,20 +1018,20 @@ protected:
+   unsigned              mGetUserFontSetCalled : 1;
+   // Do we currently have an event posted to call FlushUserFontSet?
+   unsigned              mPostedFlushUserFontSet : 1;
+ 
+   // resize reflow is supressed when the only change has been to zoom
+   // the document rather than to change the document's dimensions
+   unsigned              mSupressResizeReflow : 1;
+ 
+-#ifdef IBMBIDI
+   unsigned              mIsVisual : 1;
+ 
+-#endif
++  unsigned              mProcessingAnimationStyleChange : 1;
++
+ #ifdef DEBUG
+   PRBool                mInitialized;
+ #endif
+ 
+ 
+ protected:
+ 
+   ~nsPresContext() NS_HIDDEN;
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -512,16 +512,34 @@ EqualImages(imgIRequest *aOldImage, imgI
+@@ -95,16 +95,17 @@
+ #include "nsStyleChangeList.h"
+ #include "nsIDOMRange.h"
+ #include "nsITableLayout.h"    //selection necessity
+ #include "nsITableCellLayout.h"//  "
+ #include "nsITextControlFrame.h"
+ #include "nsINameSpaceManager.h"
+ #include "nsIPercentHeightObserver.h"
+ #include "nsStyleStructInlines.h"
++#include "nsCSSProps.h"
+ 
+ #ifdef IBMBIDI
+ #include "nsBidiPresUtils.h"
+ #endif
+ 
+ // For triple-click pref
+ #include "nsIServiceManager.h"
+ #include "imgIContainer.h"
+@@ -512,16 +513,34 @@ EqualImages(imgIRequest *aOldImage, imgI
  
    nsCOMPtr<nsIURI> oldURI, newURI;
    aOldImage->GetURI(getter_AddRefs(oldURI));
@@ -40,7 +111,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
      // If the old context had a background image image and new context
      // does not have the same image, clear the image load notifier
      // (which keeps the image loading, if it still is) for the frame.
-@@ -569,16 +587,45 @@ nsFrame::DidSetStyleContext(nsStyleConte
+@@ -569,16 +588,46 @@ nsFrame::DidSetStyleContext(nsStyleConte
  
    // If the page contains markup that overrides text direction, and
    // does not contain any characters that would activate the Unicode
@@ -50,30 +121,31 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
      PresContext()->SetBidiEnabled();
    }
 +
-+  if (!PresContext()->ProcessingAnimationStyleChange()) {
++  if (!PresContext()->IsProcessingAnimationStyleChange()) {
 +    const nsStyleDisplay *disp = GetStyleDisplay();
 +    for (PRUint32 i = 0, i_end = disp->mTransitions.Length(); i < i_end; ++i) {
 +      const nsTransition& t = disp->mTransitions[i];
 +      // Check delay and duration first, since they default to zero, and
 +      // when they're both zero, we can ignore the transition.
-+      if (t.mDelay != 0.0f || t.mDuration != 0.0f) {
++      if (t.GetDelay() != 0.0f || t.GetDuration() != 0.0f) {
 +        // We might have something to transition.  See if any of the
 +        // properties in question changed and are animatable.
-+        if (t.mProperty == eCSSPropertyExtra_no_properties ||
-+                   t.mProperty == eCSSProperty_UNKNOWN) {
++        nsCSSProperty property = t.GetProperty();
++        if (property == eCSSPropertyExtra_no_properties ||
++            property == eCSSProperty_UNKNOWN) {
 +          // Nothing to do, but need to exclude this from cases below.
-+        } else if (t.mProperty == eCSSPropertyExtra_all_properties) {
++        } else if (property == eCSSPropertyExtra_all_properties) {
 +          for (nsCSSProperty p = nsCSSProperty(0); 
-+               p < nsCSSProperty_COUNT_no_shorthands;
++               p < eCSSProperty_COUNT_no_shorthands;
 +               p = nsCSSProperty(p + 1)) {
 +            ConsiderStartingTransition(p, this, aOldStyleContext);
 +          }
-+        } else if (nsCSSProps::IsShorthand(t.mProperty)) {
-+          CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(p, t.mProperty) {
-+            ConsiderStartingTransition(*p, this, aOldStyleContext);
++        } else if (nsCSSProps::IsShorthand(property)) {
++          CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(subprop, property) {
++            ConsiderStartingTransition(*subprop, this, aOldStyleContext);
 +          }
 +        } else {
-+          ConsiderStartingTransition(t.mProperty, this, aOldStyleContext);
++          ConsiderStartingTransition(property, this, aOldStyleContext);
 +        }
 +      }
 +    }
@@ -86,3 +158,24 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    NS_ASSERTION(nsLayoutUtils::sDisableGetUsedXAssertions ||
                 !NS_SUBTREE_DIRTY(this) ||
                 (GetStateBits() & NS_FRAME_IN_REFLOW),
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -56,16 +56,17 @@
+ // A property that is a *-ltr-source or *-rtl-source property for one of
+ // the directional pseudo-shorthand properties.
+ #define CSS_PROPERTY_DIRECTIONAL_SOURCE           (1<<0)
+ #define CSS_PROPERTY_VALUE_LIST_USES_COMMAS       (1<<1) /* otherwise spaces */
+ #define CSS_PROPERTY_APPLIES_TO_FIRST_LETTER      (1<<2)
+ #define CSS_PROPERTY_APPLIES_TO_FIRST_LINE        (1<<3)
+ #define CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE \
+   (CSS_PROPERTY_APPLIES_TO_FIRST_LETTER | CSS_PROPERTY_APPLIES_TO_FIRST_LINE)
++#define CSS_PROPERTY_CAN_ANIMATE                  (1<<4)
+ 
+ class nsCSSProps {
+ public:
+   static void AddRefTable(void);
+   static void ReleaseTable(void);
+ 
+   // Given a property string, return the enum value
+   static nsCSSProperty LookupProperty(const nsAString& aProperty);
