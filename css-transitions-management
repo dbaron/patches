@@ -110,6 +110,45 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  protected:
  
    ~nsPresContext() NS_HIDDEN;
+diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
+--- a/layout/build/nsLayoutStatics.cpp
++++ b/layout/build/nsLayoutStatics.cpp
+@@ -80,16 +80,17 @@
+ #include "nsCCUncollectableMarker.h"
+ #include "nsTextFragment.h"
+ #include "nsCSSRuleProcessor.h"
+ #include "nsXMLHttpRequest.h"
+ #include "nsDOMThreadService.h"
+ #include "nsHTMLDNSPrefetch.h"
+ #include "nsCrossSiteListenerProxy.h"
+ #include "nsFocusManager.h"
++#include "nsTransitionManager.h"
+ 
+ #ifdef MOZ_XUL
+ #include "nsXULPopupManager.h"
+ #include "nsXULContentUtils.h"
+ #include "nsXULElement.h"
+ #include "nsXULPrototypeCache.h"
+ #include "nsXULTooltipListener.h"
+ 
+@@ -273,16 +274,17 @@ nsLayoutStatics::Initialize()
+   nsHTMLMediaElement::InitMediaTypes();
+ #endif
+ 
+ #ifdef MOZ_SYDNEYAUDIO
+   nsAudioStream::InitLibrary();
+ #endif
+ 
+   nsCrossSiteListenerProxy::Startup();
++  nsTransitionManager::InitializeAnimationInfo();
+ 
+   return NS_OK;
+ }
+ 
+ void
+ nsLayoutStatics::Shutdown()
+ {
+   nsFocusManager::Shutdown();
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
@@ -193,32 +232,11 @@ diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
  
  LOCAL_INCLUDES	= \
  		-I$(srcdir)/../../content/base/src \
-diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
---- a/layout/style/nsCSSProps.h
-+++ b/layout/style/nsCSSProps.h
-@@ -56,16 +56,17 @@
- // A property that is a *-ltr-source or *-rtl-source property for one of
- // the directional pseudo-shorthand properties.
- #define CSS_PROPERTY_DIRECTIONAL_SOURCE           (1<<0)
- #define CSS_PROPERTY_VALUE_LIST_USES_COMMAS       (1<<1) /* otherwise spaces */
- #define CSS_PROPERTY_APPLIES_TO_FIRST_LETTER      (1<<2)
- #define CSS_PROPERTY_APPLIES_TO_FIRST_LINE        (1<<3)
- #define CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE \
-   (CSS_PROPERTY_APPLIES_TO_FIRST_LETTER | CSS_PROPERTY_APPLIES_TO_FIRST_LINE)
-+#define CSS_PROPERTY_CAN_ANIMATE                  (1<<4)
- 
- class nsCSSProps {
- public:
-   static void AddRefTable(void);
-   static void ReleaseTable(void);
- 
-   // Given a property string, return the enum value
-   static nsCSSProperty LookupProperty(const nsAString& aProperty);
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,197 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -260,6 +278,104 @@ new file mode 100644
 +#include "nsIFrame.h"
 +#include "nsCSSProps.h"
 +
++struct CSSPropertyAnimationInfo {
++  enum Type {
++    eCannotAnimate,
++    eStyleSides,
++    eStyleCoord,
++    eNsCoord
++  };
++
++  Type mType;
++  PRUint32 mIndex;
++};
++
++struct ArbitraryStyleStruct; /* dummy type */
++
++struct StyleSidesAnimationInfo {
++  nsCSSProperty mProperty;
++  nsStyleSides ArbitraryStyleStruct::* mLocation;
++  PRUint8 mSide;
++};
++
++static const StyleSidesAnimationInfo gStyleSidesAnimInfo[] = {
++  { eCSSProperty_margin_top, (nsStyleSides ArbitraryStyleStruct::*)&nsStyleMargin::mMargin, NS_SIDE_TOP },
++  { eCSSProperty_margin_right, (nsStyleSides ArbitraryStyleStruct::*)&nsStyleMargin::mMargin, NS_SIDE_RIGHT },
++  { eCSSProperty_margin_bottom, (nsStyleSides ArbitraryStyleStruct::*)&nsStyleMargin::mMargin, NS_SIDE_BOTTOM },
++  { eCSSProperty_margin_left, (nsStyleSides ArbitraryStyleStruct::*)&nsStyleMargin::mMargin, NS_SIDE_LEFT },
++  { eCSSProperty_padding_top, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePadding::mPadding, NS_SIDE_TOP },
++  { eCSSProperty_padding_right, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePadding::mPadding, NS_SIDE_RIGHT },
++  { eCSSProperty_padding_bottom, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePadding::mPadding, NS_SIDE_BOTTOM },
++  { eCSSProperty_padding_left, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePadding::mPadding, NS_SIDE_LEFT },
++  { eCSSProperty_top, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePosition::mOffset, NS_SIDE_TOP },
++  { eCSSProperty_right, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePosition::mOffset, NS_SIDE_RIGHT },
++  { eCSSProperty_bottom, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePosition::mOffset, NS_SIDE_BOTTOM },
++  { eCSSProperty_left, (nsStyleSides ArbitraryStyleStruct::*)&nsStylePosition::mOffset, NS_SIDE_LEFT }
++};
++
++struct StyleCoordAnimationInfo {
++  nsCSSProperty mProperty;
++  nsStyleCoord ArbitraryStyleStruct::* mLocation;
++};
++
++// for animation length->length, percent->percent, or number->number
++static const StyleCoordAnimationInfo gStyleCoordAnimInfo[] = {
++  { eCSSProperty_outline_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleOutline::mOutlineWidth },
++  { eCSSProperty_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mWidth },
++  { eCSSProperty_min_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mMinWidth },
++  { eCSSProperty_max_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mMaxWidth },
++  { eCSSProperty_height, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mHeight },
++  { eCSSProperty_min_height, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mMinHeight },
++  { eCSSProperty_max_height, (nsStyleCoord ArbitraryStyleStruct::*)&nsStylePosition::mMaxHeight },
++  { eCSSProperty_vertical_align, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleTextReset::mVerticalAlign },
++  { eCSSProperty_letter_spacing, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleText::mLetterSpacing },
++  { eCSSProperty_line_height, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleText::mLineHeight },
++  { eCSSProperty_text_indent, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleText::mTextIndent },
++  { eCSSProperty_marker_offset, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleContent::mMarkerOffset },
++  { eCSSProperty__moz_column_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleColumn::mColumnWidth },
++  { eCSSProperty__moz_column_gap, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleColumn::mColumnGap },
++  { eCSSProperty_stroke_dashoffset, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleSVG::mStrokeDashoffset },
++  { eCSSProperty_stroke_width, (nsStyleCoord ArbitraryStyleStruct::*)&nsStyleSVG::mStrokeWidth }
++};
++
++struct NsCoordAnimationInfo {
++  nsCSSProperty mProperty;
++  nscoord ArbitraryStyleStruct::* mLocation;
++};
++
++static const NsCoordAnimationInfo gNsCoordAnimInfo[] = {
++  { eCSSProperty_outline_offset, (nscoord ArbitraryStyleStruct::*)&nsStyleOutline::mOutlineOffset },
++  { eCSSProperty_word_spacing, (nscoord ArbitraryStyleStruct::*)&nsStyleText::mWordSpacing }
++};
++
++static CSSPropertyAnimationInfo gAnimInfo[eCSSProperty_COUNT_no_shorthands];
++
++/* static */ void
++nsTransitionManager::InitializeAnimationInfo()
++{
++  for (PRUint32 i = 0; i < eCSSProperty_COUNT_no_shorthands; ++i) {
++    gAnimInfo[i].mType = CSSPropertyAnimationInfo::eCannotAnimate;
++  }
++
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gStyleSidesAnimInfo); ++i) {
++    nsCSSProperty prop = gStyleSidesAnimInfo[i].mProperty;
++    gAnimInfo[prop].mType = CSSPropertyAnimationInfo::eStyleSides;
++    gAnimInfo[prop].mIndex = i;
++  }
++
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gStyleCoordAnimInfo); ++i) {
++    nsCSSProperty prop = gStyleCoordAnimInfo[i].mProperty;
++    gAnimInfo[prop].mType = CSSPropertyAnimationInfo::eStyleCoord;
++    gAnimInfo[prop].mIndex = i;
++  }
++
++  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gNsCoordAnimInfo); ++i) {
++    nsCSSProperty prop = gNsCoordAnimInfo[i].mProperty;
++    gAnimInfo[prop].mType = CSSPropertyAnimationInfo::eNsCoord;
++    gAnimInfo[prop].mIndex = i;
++  }
++}
++
 +static void
 +ConsiderStartingTransition(nsCSSProperty aProperty,
 +                           nsIFrame *aFrame,
@@ -269,7 +385,8 @@ new file mode 100644
 +    NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(aProperty),
 +                      "property out of range");
 +
-+    if (!nsCSSProps::PropHasFlags(aProperty, CSS_PROPERTY_CAN_ANIMATE)) {
++    const CSSPropertyAnimationInfo& animInfo = gAnimInfo[aProperty];
++    if (animInfo.mType == CSSPropertyAnimationInfo::eCannotAnimate) {
 +        return;
 +    }
 +    
@@ -321,7 +438,7 @@ diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManag
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,53 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -368,6 +485,8 @@ new file mode 100644
 +public:
 +    void StyleContextChanged(nsIFrame *aFrame,
 +                             nsStyleContext *aOldStyleContext);
++
++    static void InitializeAnimationInfo();
 +
 +private:
 +};
