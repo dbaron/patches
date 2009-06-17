@@ -5,7 +5,44 @@ Implement CSS transitions:  handle starting and management of the animations.  (
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
-@@ -798,16 +798,26 @@ public:
+@@ -65,16 +65,17 @@
+ #include "nsChangeHint.h"
+ // This also pulls in gfxTypes.h, which we cannot include directly.
+ #include "gfxRect.h"
+ #include "nsRegion.h"
+ #include "nsTArray.h"
+ #include "nsAutoPtr.h"
+ #include "nsThreadUtils.h"
+ #include "nsContentUtils.h"
++#include "nsTransitionManager.h"
+ 
+ class nsImageLoader;
+ #ifdef IBMBIDI
+ class nsBidiPresUtils;
+ #endif // IBMBIDI
+ 
+ struct nsRect;
+ 
+@@ -208,16 +209,18 @@ public:
+       return mDocument;
+   }
+ 
+ #ifdef _IMPL_NS_LAYOUT
+   nsStyleSet* StyleSet() { return GetPresShell()->StyleSet(); }
+ 
+   nsFrameManager* FrameManager()
+     { return GetPresShell()->FrameManager(); } 
++
++  nsTransitionManager* TransitionManager() { return &mTransitionManager; }
+ #endif
+ 
+   /**
+    * Rebuilds all style data by throwing out the old rule tree and
+    * building a new one, and additionally applying aExtraHint (which
+    * must not contain nsChangeHint_ReconstructFrame) to the root frame.
+    * Also rebuild the user font set.
+    */
+@@ -798,16 +801,26 @@ public:
      return !mSameDocDirtyRegion.IsEmpty() || !mCrossDocDirtyRegion.IsEmpty();
    }
  
@@ -32,7 +69,25 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
     * will return true when a pending event is detected.  This is for use by the
     * presshell only.  Reflow code wanting to prevent interrupts should use
     * InterruptPreventer.
-@@ -1005,20 +1015,20 @@ protected:
+@@ -897,16 +910,17 @@ protected:
+   nsCOMPtr<nsIDocument> mDocument;
+   nsIDeviceContext*     mDeviceContext; // [STRONG] could be weak, but
+                                         // better safe than sorry.
+                                         // Cannot reintroduce cycles
+                                         // since there is no dependency
+                                         // from gfx back to layout.
+   nsIEventStateManager* mEventManager;  // [STRONG]
+   nsILookAndFeel*       mLookAndFeel;   // [STRONG]
++  nsTransitionManager   mTransitionManager;
+   nsIAtom*              mMedium;        // initialized by subclass ctors;
+                                         // weak pointer to static atom
+ 
+   nsILinkHandler*       mLinkHandler;   // [WEAK]
+   nsIAtom*              mLangGroup;     // [STRONG]
+ 
+   nsRefPtrHashtable<nsVoidPtrHashKey, nsImageLoader>
+                         mImageLoaders[IMAGE_LOAD_TYPE_COUNT];
+@@ -1005,20 +1019,20 @@ protected:
    unsigned              mGetUserFontSetCalled : 1;
    // Do we currently have an event posted to call FlushUserFontSet?
    unsigned              mPostedFlushUserFontSet : 1;
@@ -76,44 +131,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  // For triple-click pref
  #include "nsIServiceManager.h"
  #include "imgIContainer.h"
-@@ -512,16 +513,36 @@ EqualImages(imgIRequest *aOldImage, imgI
- 
-   nsCOMPtr<nsIURI> oldURI, newURI;
-   aOldImage->GetURI(getter_AddRefs(oldURI));
-   aNewImage->GetURI(getter_AddRefs(newURI));
-   PRBool equal;
-   return NS_SUCCEEDED(oldURI->Equals(newURI, &equal)) && equal;
- }
- 
-+static void
-+ConsiderStartingTransition(nsCSSProperty aProperty,
-+                           nsIFrame *aFrame,
-+                           nsStyleContext *aOldStyleContext)
-+{
-+  // IsShorthand itself will assert if aProperty is not a property.
-+  NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(aProperty),
-+                    "property out of range");
-+
-+  if (!nsCSSProps::PropHasFlags(aProperty, CSS_PROPERTY_CAN_ANIMATE)) {
-+    return;
-+  }
-+  
-+  // FIXME: Check to see if aProperty has changed, and if it has, start
-+  // a transition as appropriate (considering currently running
-+  // transitions as appropriate).
-+  // Do NOT compare to aOldStyleContext if we already have a transition
-+  // going for this property (even if it hasn't moved yet).
-+}
-+
- // Subclass hook for style post processing
- /* virtual */ void
- nsFrame::DidSetStyleContext(nsStyleContext* aOldStyleContext)
- {
-   if (aOldStyleContext) {
-     // If the old context had a background image image and new context
-     // does not have the same image, clear the image load notifier
-     // (which keeps the image loading, if it still is) for the frame.
-@@ -569,16 +590,46 @@ nsFrame::DidSetStyleContext(nsStyleConte
+@@ -569,16 +570,22 @@ nsFrame::DidSetStyleContext(nsStyleConte
  
    // If the page contains markup that overrides text direction, and
    // does not contain any characters that would activate the Unicode
@@ -123,35 +141,11 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
      PresContext()->SetBidiEnabled();
    }
 +
-+  if (aOldStyleContext && !PresContext()->IsProcessingAnimationStyleChange()) {
-+    const nsStyleDisplay *disp = GetStyleDisplay();
-+    for (PRUint32 i = 0, i_end = disp->mTransitions.Length(); i < i_end; ++i) {
-+      const nsTransition& t = disp->mTransitions[i];
-+      // Check delay and duration first, since they default to zero, and
-+      // when they're both zero, we can ignore the transition.
-+      if (t.GetDelay() != 0.0f || t.GetDuration() != 0.0f) {
-+        // We might have something to transition.  See if any of the
-+        // properties in question changed and are animatable.
-+        nsCSSProperty property = t.GetProperty();
-+        if (property == eCSSPropertyExtra_no_properties ||
-+            property == eCSSProperty_UNKNOWN) {
-+          // Nothing to do, but need to exclude this from cases below.
-+        } else if (property == eCSSPropertyExtra_all_properties) {
-+          for (nsCSSProperty p = nsCSSProperty(0); 
-+               p < eCSSProperty_COUNT_no_shorthands;
-+               p = nsCSSProperty(p + 1)) {
-+            ConsiderStartingTransition(p, this, aOldStyleContext);
-+          }
-+        } else if (nsCSSProps::IsShorthand(property)) {
-+          CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(subprop, property) {
-+            ConsiderStartingTransition(*subprop, this, aOldStyleContext);
-+          }
-+        } else {
-+          ConsiderStartingTransition(property, this, aOldStyleContext);
-+        }
-+      }
-+    }
++  if (aOldStyleContext) {
++    PresContext()->TransitionManager()->
++      StyleContextChanged(this, aOldStyleContext);
 +  }
++  
  }
  
  /* virtual */ nsMargin
@@ -160,6 +154,45 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    NS_ASSERTION(nsLayoutUtils::sDisableGetUsedXAssertions ||
                 !NS_SUBTREE_DIRTY(this) ||
                 (GetStateBits() & NS_FRAME_IN_REFLOW),
+diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
+--- a/layout/style/Makefile.in
++++ b/layout/style/Makefile.in
+@@ -120,16 +120,17 @@ EXPORTS		= \
+ 		nsStyleCoord.h \
+ 		nsStyleSet.h \
+ 		nsStyleStruct.h \
+ 		nsStyleStructFwd.h \
+ 		nsStyleStructInlines.h \
+ 		nsStyleStructList.h \
+ 		nsStyleTransformMatrix.h \
+ 		nsStyleUtil.h \
++		nsTransitionManager.h \
+ 		$(NULL)
+ 
+ CPPSRCS		= \
+ 		nsCSSAnonBoxes.cpp \
+ 		nsCSSDataBlock.cpp \
+ 		nsCSSDeclaration.cpp \
+ 		nsCSSKeywords.cpp \
+ 		nsCSSLoader.cpp \
+@@ -160,16 +161,17 @@ CPPSRCS		= \
+ 		nsROCSSPrimitiveValue.cpp \
+ 		nsRuleNode.cpp \
+ 		nsStyleContext.cpp \
+ 		nsStyleCoord.cpp \
+ 		nsStyleSet.cpp \
+ 		nsStyleStruct.cpp \
+ 		nsStyleTransformMatrix.cpp \
+ 		nsStyleUtil.cpp \
++		nsTransitionManager.cpp \
+ 		$(NULL)
+ 
+ FORCE_STATIC_LIB = 1
+ 
+ include $(topsrcdir)/config/rules.mk
+ 
+ LOCAL_INCLUDES	= \
+ 		-I$(srcdir)/../../content/base/src \
 diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
 --- a/layout/style/nsCSSProps.h
 +++ b/layout/style/nsCSSProps.h
@@ -181,3 +214,162 @@ diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
  
    // Given a property string, return the enum value
    static nsCSSProperty LookupProperty(const nsAString& aProperty);
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsTransitionManager.cpp
+@@ -0,0 +1,98 @@
++/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsTransitionManager.
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2009
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++#include "nsTransitionManager.h"
++#include "nsIFrame.h"
++#include "nsCSSProps.h"
++
++static void
++ConsiderStartingTransition(nsCSSProperty aProperty,
++                           nsIFrame *aFrame,
++                           nsStyleContext *aOldStyleContext)
++{
++    // IsShorthand itself will assert if aProperty is not a property.
++    NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(aProperty),
++                      "property out of range");
++
++    if (!nsCSSProps::PropHasFlags(aProperty, CSS_PROPERTY_CAN_ANIMATE)) {
++        return;
++    }
++    
++    // FIXME: Check to see if aProperty has changed, and if it has, start
++    // a transition as appropriate (considering currently running
++    // transitions as appropriate).
++    // Do NOT compare to aOldStyleContext if we already have a transition
++    // going for this property (even if it hasn't moved yet).
++}
++
++void
++nsTransitionManager::StyleContextChanged(nsIFrame *aFrame,
++                                         nsStyleContext *aOldStyleContext)
++{
++    if (aFrame->PresContext()->IsProcessingAnimationStyleChange()) {
++        return;
++    }
++
++    const nsStyleDisplay *disp = aFrame->GetStyleDisplay();
++    for (PRUint32 i = 0, i_end = disp->mTransitions.Length(); i < i_end; ++i) {
++        const nsTransition& t = disp->mTransitions[i];
++        // Check delay and duration first, since they default to zero, and
++        // when they're both zero, we can ignore the transition.
++        if (t.GetDelay() != 0.0f || t.GetDuration() != 0.0f) {
++            // We might have something to transition.  See if any of the
++            // properties in question changed and are animatable.
++            nsCSSProperty property = t.GetProperty();
++            if (property == eCSSPropertyExtra_no_properties ||
++                property == eCSSProperty_UNKNOWN) {
++                // Nothing to do, but need to exclude this from cases below.
++            } else if (property == eCSSPropertyExtra_all_properties) {
++                for (nsCSSProperty p = nsCSSProperty(0); 
++                     p < eCSSProperty_COUNT_no_shorthands;
++                     p = nsCSSProperty(p + 1)) {
++                    ConsiderStartingTransition(p, aFrame, aOldStyleContext);
++                }
++            } else if (nsCSSProps::IsShorthand(property)) {
++                CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(subprop, property) {
++                    ConsiderStartingTransition(*subprop, aFrame,
++                                               aOldStyleContext);
++                }
++            } else {
++                ConsiderStartingTransition(property, aFrame, aOldStyleContext);
++            }
++        }
++    }
++}
+diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsTransitionManager.h
+@@ -0,0 +1,51 @@
++/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsTransitionManager.
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2009
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++#ifndef nsTransitionManager_h_
++#define nsTransitionManager_h_
++
++class nsIFrame;
++class nsStyleContext;
++
++class nsTransitionManager {
++public:
++    void StyleContextChanged(nsIFrame *aFrame,
++                             nsStyleContext *aOldStyleContext);
++
++private:
++};
++
++#endif /* !defined(nsTransitionManager_h_) */
