@@ -184,7 +184,7 @@ diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/base/nsRefreshDriver.cpp
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,191 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -229,27 +229,119 @@ new file mode 100644
 +
 +#include "nsRefreshDriver.h"
 +#include "nsPresContext.h"
++#include "nsComponentManagerUtils.h"
++
++#define REFRESH_INTERVAL_MILLISECONDS 20
 +
 +using mozilla::TimeStamp;
++
++nsRefreshDriver::nsRefreshDriver()
++{
++}
++
++nsRefreshDriver::~nsRefreshDriver()
++{
++    NS_ABORT_IF_FALSE(ObserverCount() == 0,
++                      "observers should have unregistered");
++    NS_ABORT_IF_FALSE(!mTimer, "timer should be gone");
++}
 +
 +TimeStamp
 +nsRefreshDriver::MostRecentRefresh() const
 +{
-+    // FIXME: WRITE ME
++    if (!mTimer) {
++        const_cast<nsRefreshDriver*>(this)->StartTimer();
++    }
++
++    return mMostRecentRefresh;
 +}
 +
 +PRBool
 +nsRefreshDriver::AddRefreshObserver(nsARefreshObserver *aObserver,
 +                                    mozFlushType aFlushType)
 +{
-+    // FIXME: WRITE ME
++    nsTArray<nsARefreshObserver*>& array = ArrayFor(aFlushType);
++    PRBool success = array.AppendElement(aObserver) != nsnull;
++
++    if (!mTimer) {
++        StartTimer();
++    }
++
++    return success;
 +}
 +
 +PRBool
 +nsRefreshDriver::RemoveRefreshObserver(nsARefreshObserver *aObserver,
 +                                       mozFlushType aFlushType)
 +{
-+    // FIXME: WRITE ME
++    nsTArray<nsARefreshObserver*>& array = ArrayFor(aFlushType);
++    PRBool success = array.RemoveElement(aObserver);
++
++    if (ObserverCount() == 0) {
++        StopTimer();
++    }
++
++    return success;
++}
++
++void
++nsRefreshDriver::StartTimer()
++{
++    UpdateMostRecentRefresh();
++
++    mTimer = do_CreateInstance(NS_TIMER_CONTRACTID);
++    if (!mTimer) {
++        return;
++    }
++
++    nsresult rv = mTimer->InitWithCallback(this, REFRESH_INTERVAL_MILLISECONDS,
++                                           nsITimer::TYPE_REPEATING_SLACK);
++    if (NS_FAILED(rv)) {
++        mTimer = nsnull;
++    }
++}
++
++void
++nsRefreshDriver::StopTimer()
++{
++    if (!mTimer) {
++        return;
++    }
++
++    mTimer->Cancel();
++    mTimer = nsnull;
++}
++
++PRUint32
++nsRefreshDriver::ObserverCount() const
++{
++    PRUint32 sum = 0;
++    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(mObservers); ++i) {
++        sum += mObservers[i].Length();
++    }
++    return sum;
++}
++
++void
++nsRefreshDriver::UpdateMostRecentRefresh()
++{
++    mMostRecentRefresh = TimeStamp::Now();
++}
++
++nsTArray<nsARefreshObserver*>&
++nsRefreshDriver::ArrayFor(mozFlushType aFlushType)
++{
++    switch (aFlushType) {
++        case Flush_Style:
++            return mObservers[0];
++        case Flush_Layout:
++            return mObservers[1];
++        case Flush_Display:
++            return mObservers[2];
++        default:
++            NS_ABORT_IF_FALSE(PR_FALSE, "bad flush type");
++            return *static_cast<nsTArray<nsARefreshObserver*>*>(nsnull);
++    }
 +}
 +
 +/*
@@ -269,14 +361,26 @@ new file mode 100644
 +NS_IMETHODIMP
 +nsRefreshDriver::Notify(nsITimer *aTimer)
 +{
-+    // FIXME: WRITE ME
++    UpdateMostRecentRefresh();
++
++    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(mObservers); ++i) {
++        nsTArray<nsARefreshObserver*> array = mObservers[i];
++        for (PRUint32 j = 0, j_end = array.Length(); j < j_end; ++j) {
++            array[j]->WillRefresh(mMostRecentRefresh);
++        }
++    }
++
++    if (ObserverCount() == 0) {
++        StopTimer();
++    }
++
 +    return NS_OK;
 +}
 diff --git a/layout/base/nsRefreshDriver.h b/layout/base/nsRefreshDriver.h
 new file mode 100644
 --- /dev/null
 +++ b/layout/base/nsRefreshDriver.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,116 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -326,6 +430,7 @@ new file mode 100644
 +#include "mozFlushType.h"
 +#include "nsITimer.h"
 +#include "nsCOMPtr.h"
++#include "nsTArray.h"
 +
 +/**
 + * An abstract base class to be implemented by callers wanting to be
@@ -344,6 +449,9 @@ new file mode 100644
 + */
 +class nsRefreshDriver : private nsITimerCallback {
 +public:
++    nsRefreshDriver();
++    ~nsRefreshDriver();
++
 +    /**
 +     * Return the time of the most recent refresh.  This is intended to
 +     * be used by callers who want to start an animation now and what to
@@ -362,6 +470,7 @@ new file mode 100644
 +     *     type to highest, in order registered)
 +     *   + which observers get notified when there is a flush during
 +     *     times when we're not painting
++     * and it must be either Flush_Style, Flush_Layout, or Flush_Display.
 +     */
 +    PRBool AddRefreshObserver(nsARefreshObserver *aObserver,
 +                              mozFlushType aFlushType);
@@ -374,8 +483,17 @@ new file mode 100644
 +    // nsITimerCallback implementation
 +    NS_IMETHOD Notify(nsITimer *aTimer);
 +
++    void StartTimer();
++    void StopTimer();
++    PRUint32 ObserverCount() const;
++    void UpdateMostRecentRefresh();
++    nsTArray<nsARefreshObserver*>& ArrayFor(mozFlushType aFlushType);
++
 +    nsCOMPtr<nsITimer> mTimer;
 +    mozilla::TimeStamp mMostRecentRefresh; // only valid when mTimer non-null
++
++    // separate arrays for each flush type we support
++    nsTArray<nsARefreshObserver*> mObservers[3];
 +};
 +
 +#endif /* !defined(nsRefreshDriver_h_) */
