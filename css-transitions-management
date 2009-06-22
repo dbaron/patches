@@ -62,6 +62,48 @@ diff --git a/layout/base/Makefile.in b/layout/base/Makefile.in
  XPIDLSRCS  += \
  		nsIBoxObject.idl \
  		$(NULL)
+diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
+--- a/layout/base/nsCSSFrameConstructor.h
++++ b/layout/base/nsCSSFrameConstructor.h
+@@ -63,16 +63,17 @@ class nsIPresShell;
+ class nsFrameManager;
+ class nsIDOMHTMLSelectElement;
+ class nsPresContext;
+ class nsStyleChangeList;
+ class nsIFrame;
+ struct nsGenConInitializer;
+ class ChildIterator;
+ class nsICSSAnonBoxPseudo;
++class nsPageContentFrame;
+ 
+ struct nsFindFrameHint
+ {
+   nsIFrame *mPrimaryFrameForPrevSibling;  // weak ref to the primary frame for the content for which we need a frame
+   nsFindFrameHint() : mPrimaryFrameForPrevSibling(nsnull) { }
+ };
+ 
+ typedef void (nsLazyFrameConstructionCallback)
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -385,16 +385,17 @@ public:
+   NS_IMETHOD CancelAllPendingReflows() = 0;
+ 
+   /**
+    * Recreates the frames for a node
+    */
+   NS_IMETHOD RecreateFramesFor(nsIContent* aContent) = 0;
+ 
+   void PostRecreateFramesFor(nsIContent* aContent);
++  void PostRestyleFor(nsIContent* aContent);
+   
+   /**
+    * Determine if it is safe to flush all pending notifications
+    * @param aIsSafeToFlush PR_TRUE if it is safe, PR_FALSE otherwise.
+    * 
+    */
+   NS_IMETHOD IsSafeToFlush(PRBool& aIsSafeToFlush) = 0;
+ 
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
@@ -187,11 +229,38 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
  protected:
  
    ~nsPresContext() NS_HIDDEN;
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -3622,16 +3622,23 @@ PresShell::RecreateFramesFor(nsIContent*
+ 
+ void
+ nsIPresShell::PostRecreateFramesFor(nsIContent* aContent)
+ {
+   FrameConstructor()->PostRestyleEvent(aContent, eReStyle_Self,
+           nsChangeHint_ReconstructFrame);
+ }
+ 
++void
++nsIPresShell::PostRestyleFor(nsIContent* aContent)
++{
++  FrameConstructor()->PostRestyleEvent(aContent, eReStyle_Self,
++                                       NS_STYLE_HINT_NONE);
++}
++
+ NS_IMETHODIMP
+ PresShell::ClearFrameRefs(nsIFrame* aFrame)
+ {
+   mPresContext->EventStateManager()->ClearFrameRefs(aFrame);
+   
+   if (aFrame == mCurrentEventFrame) {
+     mCurrentEventContent = aFrame->GetContent();
+     mCurrentEventFrame = nsnull;
 diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/base/nsRefreshDriver.cpp
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,204 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -237,6 +306,7 @@ new file mode 100644
 +#include "nsRefreshDriver.h"
 +#include "nsPresContext.h"
 +#include "nsComponentManagerUtils.h"
++#include "prlog.h"
 +
 +/*
 + * TODO:
@@ -377,8 +447,13 @@ new file mode 100644
 +{
 +    UpdateMostRecentRefresh();
 +
-+    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(mObservers); ++i) {
-+        nsTArray<nsARefreshObserver*> array = mObservers[i];
++    // Clone observers to deal with removal during notification.
++    nsTArray<nsARefreshObserver*> observers[3] = {
++      mObservers[0], mObservers[1], mObservers[2]
++    };
++    PR_STATIC_ASSERT(NS_ARRAY_LENGTH(observers) == NS_ARRAY_LENGTH(mObservers));
++    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(observers); ++i) {
++        nsTArray<nsARefreshObserver*> array = observers[i];
 +        for (PRUint32 j = 0, j_end = array.Length(); j < j_end; ++j) {
 +            array[j]->WillRefresh(mMostRecentRefresh);
 +        }
@@ -783,7 +858,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,776 @@
+@@ -0,0 +1,811 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1062,7 +1137,8 @@ new file mode 100644
 +
 +struct FrameTransitions : public PRCList
 +{
-+    FrameTransitions() { PR_INIT_CLIST(this); }
++    FrameTransitions(nsIFrame *aFrame) : mFrame(aFrame)
++        { PR_INIT_CLIST(this); }
 +    ~FrameTransitions() { DropStyleRule(); PR_REMOVE_LINK(this); }
 +
 +    // Either zero or one for each CSS property:
@@ -1074,6 +1150,8 @@ new file mode 100644
 +    // The style rule for the transitions (which contains the time stamp
 +    // for which it is valid).
 +    nsRefPtr<FrameTransitionsStyleRule> mStyleRule;
++
++    nsIFrame *mFrame;
 +};
 +
 +static void
@@ -1418,7 +1496,7 @@ new file mode 100644
 +        aFrame->GetProperty(nsGkAtoms::transitionsProperty));
 +    if (!ft) {
 +        // FIXME: Consider arena-allocating?
-+        ft = new FrameTransitions();
++        ft = new FrameTransitions(aFrame);
 +        if (!ft) {
 +            NS_WARNING("out of memory");
 +            return;
@@ -1554,11 +1632,43 @@ new file mode 100644
 +/* virtual */ void
 +nsTransitionManager::WillRefresh(mozilla::TimeStamp aTime)
 +{
-+    // FIXME: Trim transitions that have completed!
++    nsPresContext *presContext = nsPresContext::FromTransitionManager(this);
 +
-+    // FIXME: If all completed, remove from refresh driver.
++    // Trim transitions that have completed, and post restyle events for
++    // frames that are still transitioning.
++    {
++        PRCList *next = PR_LIST_HEAD(&mFrameTransitions);
++        while (next != &mFrameTransitions) {
++            FrameTransitions *ft = static_cast<FrameTransitions*>(next);
++            next = PR_NEXT_LINK(next);
 +
-+    // FIXME: Post restyle events
++            PRUint32 i = ft->mPropertyTransitions.Length();
++            NS_ABORT_IF_FALSE(i != 0, "empty transitions list?");
++            do {
++                --i;
++                FramePropertyTransition &pt = ft->mPropertyTransitions[i];
++                if (pt.mStartTime + pt.mDuration >= aTime) {
++                    // This transition has completed.
++                    ft->mPropertyTransitions.RemoveElementAt(i);
++                }
++            } while (i != 0);
++
++            if (ft->mPropertyTransitions.IsEmpty()) {
++                ft->mFrame->DeleteProperty(nsGkAtoms::transitionsProperty);
++                // |ft| is now a dangling pointer!
++            } else {
++                presContext->PresShell()->
++                    PostRestyleFor(ft->mFrame->GetContent());
++            }
++        }
++    }
++
++    // If we have no transitions left, remove ourselves from the refresh
++    // driver.
++    if (PR_CLIST_IS_EMPTY(&mFrameTransitions)) {
++        presContext->RefreshDriver()->RemoveRefreshObserver(this, Flush_Style);
++        return;
++    }
 +}
 diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
 new file mode 100644
