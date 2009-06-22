@@ -1,0 +1,281 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Pass the frame through from style reresolution to rule matching so that we can get transitions off the frame.  (Bug 435441)
+
+diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
+--- a/layout/base/nsFrameManager.cpp
++++ b/layout/base/nsFrameManager.cpp
+@@ -1173,17 +1173,18 @@ nsFrameManager::ReResolveStyleContext(ns
+       // function.
+       nsIContent* pseudoContent =
+           aParentContent ? aParentContent : localContent;
+       if (pseudoTag == nsCSSPseudoElements::before ||
+           pseudoTag == nsCSSPseudoElements::after) {
+         // XXX what other pseudos do we need to treat like this?
+         newContext = styleSet->ProbePseudoStyleFor(pseudoContent,
+                                                    pseudoTag,
+-                                                   parentContext).get();
++                                                   parentContext,
++                                                   aFrame).get();
+         if (!newContext) {
+           // This pseudo should no longer exist; gotta reframe
+           NS_UpdateHint(aMinChange, nsChangeHint_ReconstructFrame);
+           aChangeList->AppendChange(aFrame, pseudoContent,
+                                     nsChangeHint_ReconstructFrame);
+           // We're reframing anyway; just keep the same context
+           newContext = oldContext;
+           newContext->AddRef();
+@@ -1194,23 +1195,26 @@ nsFrameManager::ReResolveStyleContext(ns
+                        "firstLetter pseudoTag without a nsFirstLetterFrame");
+           nsBlockFrame* block = nsBlockFrame::GetNearestAncestorBlock(aFrame);
+           pseudoContent = block->GetContent();
+         } else if (pseudoTag == nsCSSAnonBoxes::pageBreak) {
+           pseudoContent = nsnull;
+         }
+         newContext = styleSet->ResolvePseudoStyleFor(pseudoContent,
+                                                      pseudoTag,
+-                                                     parentContext).get();
++                                                     parentContext,
++                                                     nsnull,
++                                                     aFrame).get();
+       }
+     }
+     else {
+       NS_ASSERTION(localContent,
+                    "non pseudo-element frame without content node");
+-      newContext = styleSet->ResolveStyleFor(content, parentContext).get();
++      newContext = styleSet->ResolveStyleFor(content, parentContext,
++                                             aFrame).get();
+     }
+     NS_ASSERTION(newContext, "failed to get new style context");
+     if (newContext) {
+       if (!parentContext) {
+         if (oldContext->GetRuleNode() == newContext->GetRuleNode()) {
+           // We're the root of the style context tree and the new style
+           // context returned has the same rule node.  This means that
+           // we can use FindChildWithRules to keep a lot of the old
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -839,16 +839,17 @@ RuleProcessorData::RuleProcessorData(nsP
+ {
+   MOZ_COUNT_CTOR(RuleProcessorData);
+ 
+   NS_ASSERTION(!aContent || aContent->IsNodeOfType(nsINode::eELEMENT),
+                "non-element leaked into SelectorMatches");
+ 
+   mPresContext = aPresContext;
+   mContent = aContent;
++  mFrameForTransitions = nsnull;
+   mParentContent = nsnull;
+   mRuleWalker = aRuleWalker;
+   mScopedRoot = nsnull;
+ 
+   mContentTag = nsnull;
+   mContentID = nsnull;
+   mHasAttributes = PR_FALSE;
+   mIsHTMLContent = PR_FALSE;
+diff --git a/layout/style/nsRuleProcessorData.h b/layout/style/nsRuleProcessorData.h
+--- a/layout/style/nsRuleProcessorData.h
++++ b/layout/style/nsRuleProcessorData.h
+@@ -114,16 +114,17 @@ public:
+   // If aCheckEdgeOnly is true, the function will return 1 if the result
+   // is 1, and something other than 1 (maybe or maybe not a valid
+   // result) otherwise.
+   PRInt32 GetNthIndex(PRBool aIsOfType, PRBool aIsFromEnd,
+                       PRBool aCheckEdgeOnly);
+ 
+   nsPresContext*    mPresContext;
+   nsIContent*       mContent;       // weak ref
++  nsIFrame*         mFrameForTransitions;
+   nsIContent*       mParentContent; // if content, content->GetParent(); weak ref
+   nsRuleWalker*     mRuleWalker; // Used to add rules to our results.
+   nsIContent*       mScopedRoot;    // Root of scoped stylesheet (set and unset by the supplier of the scoped stylesheet
+   
+   nsIAtom*          mContentTag;    // if content, then content->GetTag()
+   nsIAtom*          mContentID;     // if styled content, then weak reference to styledcontent->GetID()
+   PRPackedBool      mIsHTMLContent; // if content, then does QI on HTMLContent, true or false
+   PRPackedBool      mIsLink;        // if content, calls nsStyleUtil::IsHTMLLink or nsStyleUtil::IsLink
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -671,41 +671,44 @@ PRBool nsStyleSet::BuildDefaultStyleData
+ #undef STYLE_STRUCT_RESET
+ #undef SSARG_PRESCONTEXT
+ 
+   return PR_TRUE;
+ }
+ 
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ResolveStyleFor(nsIContent* aContent,
+-                            nsStyleContext* aParentContext)
++                            nsStyleContext* aParentContext,
++                            nsIFrame* aFrameForTransitions)
+ {
+   NS_ENSURE_FALSE(mInShutdown, nsnull);
+   
+   nsStyleContext*  result = nsnull;
+   nsPresContext* presContext = PresContext();
+ 
+   NS_ASSERTION(aContent, "must have content");
+   NS_ASSERTION(aContent->IsNodeOfType(nsINode::eELEMENT),
+                "content must be element");
+ 
+   if (aContent && presContext) {
+     ElementRuleProcessorData data(presContext, aContent, mRuleWalker);
++    data.mFrameForTransitions = aFrameForTransitions;
+     FileRules(EnumRulesMatching, &data);
+     result = GetContext(presContext, aParentContext, nsnull).get();
+ 
+     // Now reset the walker back to the root of the tree.
+     mRuleWalker->Reset();
+   }
+ 
+   return result;
+ }
+ 
+ already_AddRefed<nsStyleContext>
+-nsStyleSet::ResolveStyleForRules(nsStyleContext* aParentContext, const nsCOMArray<nsIStyleRule> &rules)
++nsStyleSet::ResolveStyleForRules(nsStyleContext* aParentContext,
++                                 const nsCOMArray<nsIStyleRule> &rules)
+ {
+   NS_ENSURE_FALSE(mInShutdown, nsnull);
+   nsStyleContext* result = nsnull;
+   nsPresContext *presContext = PresContext();
+ 
+   if (presContext) {
+     mRuleWalker->SetLevel(eDocSheet, PR_FALSE);
+     for (PRInt32 i = 0; i < rules.Count(); i++) {
+@@ -755,17 +758,18 @@ EnumPseudoRulesMatching(nsIStyleRuleProc
+   aProcessor->RulesMatching(data);
+   return PR_TRUE;
+ }
+ 
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ResolvePseudoStyleFor(nsIContent* aParentContent,
+                                   nsIAtom* aPseudoTag,
+                                   nsStyleContext* aParentContext,
+-                                  nsICSSPseudoComparator* aComparator)
++                                  nsICSSPseudoComparator* aComparator,
++                                  nsIFrame* aFrameForTransitions)
+ {
+   NS_ENSURE_FALSE(mInShutdown, nsnull);
+ 
+   nsStyleContext*  result = nsnull;
+   nsPresContext *presContext = PresContext();
+ 
+   NS_ASSERTION(aPseudoTag, "must have pseudo tag");
+   NS_ASSERTION(!aParentContent ||
+@@ -776,32 +780,34 @@ nsStyleSet::ResolvePseudoStyleFor(nsICon
+                "null content must correspond to anonymous box");
+   NS_ASSERTION(nsCSSAnonBoxes::IsAnonBox(aPseudoTag) ||
+                nsCSSPseudoElements::IsPseudoElement(aPseudoTag),
+                "aPseudoTag must be pseudo-element or anonymous box");
+ 
+   if (aPseudoTag && presContext) {
+     PseudoRuleProcessorData data(presContext, aParentContent, aPseudoTag,
+                                  aComparator, mRuleWalker);
++    data.mFrameForTransitions = aFrameForTransitions;
+     WalkRestrictionRule(aPseudoTag);
+     FileRules(EnumPseudoRulesMatching, &data);
+ 
+     result = GetContext(presContext, aParentContext, aPseudoTag).get();
+ 
+     // Now reset the walker back to the root of the tree.
+     mRuleWalker->Reset();
+   }
+ 
+   return result;
+ }
+ 
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ProbePseudoStyleFor(nsIContent* aParentContent,
+                                 nsIAtom* aPseudoTag,
+-                                nsStyleContext* aParentContext)
++                                nsStyleContext* aParentContext,
++                                nsIFrame* aFrameForTransitions)
+ {
+   NS_ENSURE_FALSE(mInShutdown, nsnull);
+   
+   nsStyleContext*  result = nsnull;
+   nsPresContext *presContext = PresContext();
+ 
+   NS_ASSERTION(aPseudoTag, "must have pseudo tag");
+   NS_ASSERTION(aParentContent &&
+@@ -814,16 +820,17 @@ nsStyleSet::ProbePseudoStyleFor(nsIConte
+                "null content must correspond to anonymous box");
+   NS_ASSERTION(nsCSSAnonBoxes::IsAnonBox(aPseudoTag) ||
+                nsCSSPseudoElements::IsPseudoElement(aPseudoTag),
+                "aPseudoTag must be pseudo-element or anonymous box");
+ 
+   if (aPseudoTag && presContext) {
+     PseudoRuleProcessorData data(presContext, aParentContent, aPseudoTag,
+                                  nsnull, mRuleWalker);
++    data.mFrameForTransitions = aFrameForTransitions;
+     WalkRestrictionRule(aPseudoTag);
+     // not the root if there was a restriction rule
+     nsRuleNode *adjustedRoot = mRuleWalker->GetCurrentNode();
+     FileRules(EnumPseudoRulesMatching, &data);
+ 
+     if (mRuleWalker->GetCurrentNode() != adjustedRoot)
+       result = GetContext(presContext, aParentContext, aPseudoTag).get();
+ 
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -90,21 +90,23 @@ class nsStyleSet
+ 
+   nsRuleNode* GetRuleTree() { return mRuleTree; }
+ 
+   // enable / disable the Quirk style sheet
+   void EnableQuirkStyleSheet(PRBool aEnable);
+ 
+   // get a style context for a non-pseudo frame.
+   already_AddRefed<nsStyleContext>
+-  ResolveStyleFor(nsIContent* aContent, nsStyleContext* aParentContext);
++  ResolveStyleFor(nsIContent* aContent, nsStyleContext* aParentContext,
++                  nsIFrame* aFrameForTransitions = nsnull);
+ 
+   // get a style context from some rules
+   already_AddRefed<nsStyleContext>
+-  ResolveStyleForRules(nsStyleContext* aParentContext, const nsCOMArray<nsIStyleRule> &rules);
++  ResolveStyleForRules(nsStyleContext* aParentContext,
++                       const nsCOMArray<nsIStyleRule> &rules);
+ 
+   // Get a style context for a non-element (which no rules will match),
+   // such as text nodes, placeholder frames, and the nsFirstLetterFrame
+   // for everything after the first letter.
+   //
+   // Perhaps this should go away and we shouldn't even create style
+   // contexts for such content nodes.  However, not doing any rule
+   // matching for them is a first step.
+@@ -114,25 +116,27 @@ class nsStyleSet
+   // get a style context for a pseudo-element (i.e.,
+   // |aPseudoTag == nsCOMPtr<nsIAtom>(do_GetAtom(":first-line"))|, in
+   // which case aParentContent must be non-null, or an anonymous box, in
+   // which case it may be null or non-null.
+   already_AddRefed<nsStyleContext>
+   ResolvePseudoStyleFor(nsIContent* aParentContent,
+                         nsIAtom* aPseudoTag,
+                         nsStyleContext* aParentContext,
+-                        nsICSSPseudoComparator* aComparator = nsnull);
++                        nsICSSPseudoComparator* aComparator = nsnull,
++                        nsIFrame* aFrameForTransitions = nsnull);
+ 
+   // This functions just like ResolvePseudoStyleFor except that it will
+   // return nsnull if there are no explicit style rules for that
+   // pseudo element.  It should be used only for pseudo-elements.
+   already_AddRefed<nsStyleContext>
+   ProbePseudoStyleFor(nsIContent* aParentContent,
+                       nsIAtom* aPseudoTag,
+-                      nsStyleContext* aParentContext);
++                      nsStyleContext* aParentContext,
++                      nsIFrame* aFrameForTransitions = nsnull);
+ 
+   // Append all the currently-active font face rules to aArray.  Return
+   // true for success and false for failure.
+   PRBool AppendFontFaceRules(nsPresContext* aPresContext,
+                              nsTArray<nsFontFaceRuleContainer>& aArray);
+ 
+   // Begin ignoring style context destruction, to avoid lots of unnecessary
+   // work on document teardown.
