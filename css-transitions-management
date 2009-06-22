@@ -783,7 +783,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,756 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -956,6 +956,32 @@ new file mode 100644
 +    return GetPropertyValueInternal(aStyleContext, aInfo).Get(aInfo.mSide);
 +}
 +
++template <class InfoType>
++static inline typename InfoType::location_type&
++GetSettablePropertyValue(void* aStyleStruct, const InfoType& aInfo)
++{
++    return *reinterpret_cast<typename InfoType::location_type*>(
++      reinterpret_cast<char*>(aStyleStruct) + aInfo.mLocation);
++}
++
++// General setter
++template <class InfoType>
++static inline void
++SetPropertyValue(void* aStyleStruct, const InfoType& aInfo,
++                 const typename InfoType::location_type& aValue)
++{
++    GetSettablePropertyValue(aStyleStruct, aInfo) = aValue;
++}
++
++// Setter specific to nsStyleSides.
++static inline void
++SetPropertyValue(void* aStyleStruct,
++                 const StyleSidesAnimationInfo& aInfo,
++                 const nsStyleCoord& aValue)
++{
++    GetSettablePropertyValue(aStyleStruct, aInfo).Set(aInfo.mSide, aValue);
++}
++
 +/* static */ void
 +nsTransitionManager::InitializeAnimationInfo()
 +{
@@ -998,10 +1024,10 @@ new file mode 100644
 +    nsStyleUnit mUnit; // valid when gAnimInfo[mProperty].mType is
 +                       // eStyleSides or eStyleCoord
 +    TransitionEndpoint mStartValue, mEndValue;
-+    TimeStamp mStartTime;
++    TimeStamp mStartTime; // actual start plus transition delay
 +
 +    // data from the relevant nsTransition
-+    TimeDuration mDelay, mDuration;
++    TimeDuration mDuration;
 +    nsTimingFunction mTimingFunction;
 +};
 +
@@ -1063,6 +1089,25 @@ new file mode 100644
 +
 +NS_IMPL_ISUPPORTS1(FrameTransitionsStyleRule, nsIStyleRule)
 +
++static nsStyleCoord
++CoordFromPortion(const FramePropertyTransition &aPT,
++                 double aValuePortion)
++{
++    nsStyleCoord val;
++    if (aPT.mUnit == eStyleUnit_Coord) {
++        val.SetCoordValue(NSToCoordRound(
++          aPT.mStartValue.mCoord * (1.0 - aValuePortion) +
++          aPT.mEndValue.mCoord * aValuePortion));
++    } else {
++        NS_ABORT_IF_FALSE(aPT.mUnit == eStyleUnit_Percent,
++                          "unexpected unit");
++        val.SetPercentValue(
++          aPT.mStartValue.mPercent * (1.0 - aValuePortion) +
++          aPT.mEndValue.mPercent * aValuePortion);
++    }
++    return val;
++}
++
 +static void
 +FrameTransitionsPostResolveCallback(void* aStyleStruct, nsRuleData* aRuleData)
 +{
@@ -1080,7 +1125,48 @@ new file mode 100644
 +        FramePropertyTransition &pt = ft->mPropertyTransitions[i];
 +        if (aRuleData->mSIDs & nsCSSProps::kSIDTable[pt.mProperty])
 +        {
-+            // FIXME: WRITE ME
++            NS_ABORT_IF_FALSE(rule->RefreshTime() - pt.mStartTime <
++                                  pt.mDuration,
++                              "should have trimmed completed transition");
++            double timePortion =
++                (rule->RefreshTime() - pt.mStartTime).ToSeconds() /
++                pt.mDuration.ToSeconds();
++            if (timePortion < 0.0)
++                timePortion = 0.0;
++
++            // FIXME: USE TIMING FUNCTION INSTEAD OF LINEAR!
++            double valuePortion = timePortion;
++
++            const CSSPropertyAnimationInfo& animInfo = gAnimInfo[pt.mProperty];
++            switch (animInfo.mType) {
++                case CSSPropertyAnimationInfo::eCannotAnimate: {
++                    NS_ABORT_IF_FALSE(PR_FALSE, "bad property");
++                    break;
++                }
++                case CSSPropertyAnimationInfo::eStyleSides: {
++                    const StyleSidesAnimationInfo& sidesInfo =
++                        gStyleSidesAnimInfo[animInfo.mIndex];
++                    SetPropertyValue(aStyleStruct, sidesInfo,
++                                     CoordFromPortion(pt, valuePortion));
++                    break;
++                }
++                case CSSPropertyAnimationInfo::eStyleCoord: {
++                    const StyleCoordAnimationInfo& coordInfo =
++                        gStyleCoordAnimInfo[animInfo.mIndex];
++                    SetPropertyValue(aStyleStruct, coordInfo,
++                                     CoordFromPortion(pt, valuePortion));
++                    break;
++                }
++                case CSSPropertyAnimationInfo::eNsCoord: {
++                    const NsCoordAnimationInfo& coordInfo =
++                        gNsCoordAnimInfo[animInfo.mIndex];
++                    nscoord val = NSToCoordRound(
++                      pt.mStartValue.mCoord * (1.0 - valuePortion) +
++                      pt.mEndValue.mCoord * valuePortion);
++                    SetPropertyValue(aStyleStruct, coordInfo, val);
++                    break;
++                }
++            }
 +        }
 +    }
 +}
@@ -1300,8 +1386,8 @@ new file mode 100644
 +    nsRefreshDriver *rd = aFrame->PresContext()->RefreshDriver();
 +
 +    t.mProperty = aProperty;
-+    t.mStartTime = rd->MostRecentRefresh();
-+    t.mDelay = TimeDuration::FromMilliseconds(aTransition.GetDelay());
++    t.mStartTime = rd->MostRecentRefresh() +
++                   TimeDuration::FromMilliseconds(aTransition.GetDelay());
 +    t.mDuration = TimeDuration::FromMilliseconds(aTransition.GetDuration());
 +    t.mTimingFunction = aTransition.GetTimingFunction();
 +
