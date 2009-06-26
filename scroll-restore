@@ -1,0 +1,1890 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Represent scrolling operations (to named anchor, to content, to position) as objects, maintain them better during page loading, when resizing windows, and when restoring from session history.  (Bug 43114)
+
+diff --git a/content/base/src/nsContentSink.cpp b/content/base/src/nsContentSink.cpp
+--- a/content/base/src/nsContentSink.cpp
++++ b/content/base/src/nsContentSink.cpp
+@@ -323,19 +323,16 @@ nsContentSink::StyleSheetLoaded(nsICSSSt
+         // We might not have really started layout, since this sheet was still
+         // loading.  Do it now.  Probably doesn't matter whether we do this
+         // before or after we unblock scripts, but before feels saner.  Note
+         // that if mDeferredLayoutStart is true, that means any subclass
+         // StartLayout() stuff that needs to happen has already happened, so we
+         // don't need to worry about it.
+         StartLayout(PR_FALSE);
+       }
+-
+-      // Go ahead and try to scroll to our ref if we have one
+-      ScrollToRef();
+     }
+     
+     mScriptLoader->RemoveExecuteBlocker();
+   }
+ 
+   return NS_OK;
+ }
+ 
+@@ -1164,70 +1161,16 @@ nsContentSink::ProcessOfflineManifest(ns
+   }
+   default:
+     NS_ASSERTION(PR_FALSE,
+           "Cache selection algorithm didn't decide on proper action");
+     break;
+   }
+ }
+ 
+-void
+-nsContentSink::ScrollToRef()
+-{
+-  if (mRef.IsEmpty()) {
+-    return;
+-  }
+-
+-  if (mScrolledToRefAlready) {
+-    return;
+-  }
+-
+-  char* tmpstr = ToNewCString(mRef);
+-  if (!tmpstr) {
+-    return;
+-  }
+-
+-  nsUnescape(tmpstr);
+-  nsCAutoString unescapedRef;
+-  unescapedRef.Assign(tmpstr);
+-  nsMemory::Free(tmpstr);
+-
+-  nsresult rv = NS_ERROR_FAILURE;
+-  // We assume that the bytes are in UTF-8, as it says in the spec:
+-  // http://www.w3.org/TR/html4/appendix/notes.html#h-B.2.1
+-  NS_ConvertUTF8toUTF16 ref(unescapedRef);
+-
+-  nsPresShellIterator iter(mDocument);
+-  nsCOMPtr<nsIPresShell> shell;
+-  while ((shell = iter.GetNextShell())) {
+-    // Check an empty string which might be caused by the UTF-8 conversion
+-    if (!ref.IsEmpty()) {
+-      // Note that GoToAnchor will handle flushing layout as needed.
+-      rv = shell->GoToAnchor(ref, mChangeScrollPosWhenScrollingToRef);
+-    } else {
+-      rv = NS_ERROR_FAILURE;
+-    }
+-
+-    // If UTF-8 URI failed then try to assume the string as a
+-    // document's charset.
+-
+-    if (NS_FAILED(rv)) {
+-      const nsACString &docCharset = mDocument->GetDocumentCharacterSet();
+-
+-      rv = nsContentUtils::ConvertStringFromCharset(docCharset, unescapedRef, ref);
+-
+-      if (NS_SUCCEEDED(rv) && !ref.IsEmpty())
+-        rv = shell->GoToAnchor(ref, mChangeScrollPosWhenScrollingToRef);
+-    }
+-    if (NS_SUCCEEDED(rv)) {
+-      mScrolledToRefAlready = PR_TRUE;
+-    }
+-  }
+-}
+-
+ nsresult
+ nsContentSink::RefreshIfEnabled(nsIViewManager* vm)
+ {
+   if (!vm) {
+     // vm might be null if the shell got Destroy() called already
+     return NS_OK;
+   }
+ 
+@@ -1320,17 +1263,19 @@ nsContentSink::StartLayout(PRBool aIgnor
+     nsReadingIterator<char> start, end;
+ 
+     ref.BeginReading(start);
+     ref.EndReading(end);
+ 
+     if (FindCharInReadable('#', start, end)) {
+       ++start; // Skip over the '#'
+ 
+-      mRef = Substring(start, end);
++      // FIXME: Tell the pres shell that its scroll destination is
++      // Substring(start, end);
++      // FIXME: and maybe do something with mChangeScrollPosWhenScrollingToRef?
+     }
+   }
+ }
+ 
+ void
+ nsContentSink::NotifyAppend(nsIContent* aContainer, PRUint32 aStartIndex)
+ {
+   if (aContainer->GetCurrentDoc() != mDocument) {
+@@ -1389,20 +1334,16 @@ nsContentSink::Notify(nsITimer *timer)
+                 "late, backoff count: %d", delay, mBackoffCount));
+   }
+ #endif
+ 
+   if (WaitForPendingSheets()) {
+     mDeferredFlushTags = PR_TRUE;
+   } else {
+     FlushTags();
+-
+-    // Now try and scroll to the reference
+-    // XXX Should we scroll unconditionally for history loads??
+-    ScrollToRef();
+   }
+ 
+   mNotificationTimer = nsnull;
+   MOZ_TIMER_DEBUGLOG(("Stop: nsHTMLContentSink::Notify()\n"));
+   MOZ_TIMER_STOP(mWatch);
+   return NS_OK;
+ }
+ 
+@@ -1452,17 +1393,16 @@ nsContentSink::WillInterruptImpl()
+       // If it's already time for us to have a notification
+       if (diff > interval || mDroppedTimer) {
+         mBackoffCount--;
+         SINK_TRACE(gContentSinkLogModuleInfo, SINK_TRACE_REFLOW,
+                    ("nsContentSink::WillInterrupt: flushing tags since we've "
+                     "run out time; backoff count: %d", mBackoffCount));
+         result = FlushTags();
+         if (mDroppedTimer) {
+-          ScrollToRef();
+           mDroppedTimer = PR_FALSE;
+         }
+       } else if (!mNotificationTimer) {
+         interval -= diff;
+         PRInt32 delay = interval;
+ 
+         // Convert to milliseconds
+         delay /= PR_USEC_PER_MSEC;
+@@ -1710,18 +1650,16 @@ nsContentSink::WillParseImpl(void)
+ void
+ nsContentSink::WillBuildModelImpl()
+ {
+   if (mCanInterruptParser) {
+     mDocument->BlockOnload();
+ 
+     mBeginLoadTime = PR_IntervalToMicroseconds(PR_IntervalNow());
+   }
+-
+-  mScrolledToRefAlready = PR_FALSE;
+ }
+ 
+ void
+ nsContentSink::ContinueInterruptedParsingIfEnabled()
+ {
+   if (mParser && mParser->IsParserEnabled()) {
+     mParser->ContinueInterruptedParsing();
+   }
+diff --git a/content/base/src/nsContentSink.h b/content/base/src/nsContentSink.h
+--- a/content/base/src/nsContentSink.h
++++ b/content/base/src/nsContentSink.h
+@@ -242,19 +242,16 @@ protected:
+                                        CacheSelectionAction *aAction);
+ 
+   // Searches for the offline cache manifest attribute and calls one
+   // of the above defined methods to select the document's application
+   // cache, let it be associated with the document and eventually
+   // schedule the cache update process.
+   void ProcessOfflineManifest(nsIContent *aElement);
+ 
+-  // Tries to scroll to the URI's named anchor. Once we've successfully
+-  // done that, further calls to this method will be ignored.
+-  void ScrollToRef();
+   nsresult RefreshIfEnabled(nsIViewManager* vm);
+ 
+   // Start layout.  If aIgnorePendingSheets is true, this will happen even if
+   // we still have stylesheet loads pending.  Otherwise, we'll wait until the
+   // stylesheets are all done loading.
+   void StartLayout(PRBool aIgnorePendingSheets);
+ 
+   PRBool IsTimeToNotify();
+@@ -297,18 +294,16 @@ protected:
+   nsCOMPtr<nsIURI>              mDocumentBaseURI;
+   nsCOMPtr<nsIDocShell>         mDocShell;
+   nsCOMPtr<nsICSSLoader>        mCSSLoader;
+   nsRefPtr<nsNodeInfoManager>   mNodeInfoManager;
+   nsRefPtr<nsScriptLoader>      mScriptLoader;
+ 
+   nsCOMArray<nsIScriptElement> mScriptElements;
+ 
+-  nsCString mRef; // ScrollTo #ref
+-
+   // back off timer notification after count
+   PRInt32 mBackoffCount;
+ 
+   // Notification interval in microseconds
+   PRInt32 mNotificationInterval;
+ 
+   // Time of last notification
+   // Note: mLastNotificationTime is only valid once mLayoutStarted is true.
+@@ -318,17 +313,16 @@ protected:
+   nsCOMPtr<nsITimer> mNotificationTimer;
+ 
+   // Do we notify based on time?
+   PRPackedBool mNotifyOnTimer;
+ 
+   // Have we already called BeginUpdate for this set of content changes?
+   PRUint8 mBeganUpdate : 1;
+   PRUint8 mLayoutStarted : 1;
+-  PRUint8 mScrolledToRefAlready : 1;
+   PRUint8 mCanInterruptParser : 1;
+   PRUint8 mDynamicLowerValue : 1;
+   PRUint8 mParsing : 1;
+   PRUint8 mDroppedTimer : 1;
+   PRUint8 mChangeScrollPosWhenScrollingToRef : 1;
+   // If true, we deferred starting layout until sheets load
+   PRUint8 mDeferredLayoutStart : 1;
+   // If true, we deferred notifications until sheets load
+diff --git a/content/html/document/src/nsHTMLContentSink.cpp b/content/html/document/src/nsHTMLContentSink.cpp
+--- a/content/html/document/src/nsHTMLContentSink.cpp
++++ b/content/html/document/src/nsHTMLContentSink.cpp
+@@ -1809,18 +1809,16 @@ HTMLContentSink::DidBuildModel(void)
+       mDocShell->IsBeingDestroyed(&bDestroying);
+     }
+ 
+     if (!bDestroying) {
+       StartLayout(PR_FALSE);
+     }
+   }
+ 
+-  ScrollToRef();
+-
+   mDocument->ScriptLoader()->RemoveObserver(this);
+ 
+   // Make sure we no longer respond to document mutations.  We've flushed all
+   // our notifications out, so there's no need to do anything else here.
+ 
+   // XXXbz I wonder whether we could End() our contexts here too, or something,
+   // just to make sure we no longer notify...  Or is the mIsDocumentObserver
+   // thing sufficient?
+diff --git a/content/xml/document/src/nsXMLContentSink.cpp b/content/xml/document/src/nsXMLContentSink.cpp
+--- a/content/xml/document/src/nsXMLContentSink.cpp
++++ b/content/xml/document/src/nsXMLContentSink.cpp
+@@ -366,18 +366,16 @@ nsXMLContentSink::DidBuildModel()
+           NS_SUCCEEDED(mDocument->CSSLoader()->AddObserver(this))) {
+         // wait for those sheets to load
+         startLayout = PR_FALSE;
+       }
+     }
+     
+     if (startLayout) {
+       StartLayout(PR_FALSE);
+-
+-      ScrollToRef();
+     }
+ 
+     mDocument->RemoveObserver(this);
+     mIsDocumentObserver = PR_FALSE;
+ 
+     mDocument->EndLoad();
+   }
+ 
+@@ -454,18 +452,16 @@ nsXMLContentSink::OnTransformDone(nsresu
+     nsNodeUtils::ContentInserted(mDocument, rootContent,
+                                  mDocument->IndexOf(rootContent));
+     mDocument->EndUpdate(UPDATE_CONTENT_MODEL);
+   }
+   
+   // Start the layout process
+   StartLayout(PR_FALSE);
+ 
+-  ScrollToRef();
+-
+   originalDocument->EndLoad();
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::StyleSheetLoaded(nsICSSStyleSheet* aSheet,
+                                    PRBool aWasAlternate,
+@@ -473,17 +469,16 @@ nsXMLContentSink::StyleSheetLoaded(nsICS
+ {
+   if (!mPrettyPrinting) {
+     return nsContentSink::StyleSheetLoaded(aSheet, aWasAlternate, aStatus);
+   }
+ 
+   if (!mDocument->CSSLoader()->HasPendingLoads()) {
+     mDocument->CSSLoader()->RemoveObserver(this);
+     StartLayout(PR_FALSE);
+-    ScrollToRef();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::WillInterrupt(void)
+ {
+diff --git a/layout/base/Makefile.in b/layout/base/Makefile.in
+--- a/layout/base/Makefile.in
++++ b/layout/base/Makefile.in
+@@ -134,16 +134,17 @@ CPPSRCS		= \
+ 		nsLayoutDebugger.cpp \
+ 		nsLayoutHistoryState.cpp \
+ 		nsLayoutUtils.cpp \
+ 		nsPresContext.cpp \
+ 		nsPresShell.cpp \
+ 		nsPresState.cpp \
+ 		nsQuoteList.cpp \
+ 		nsRefreshDriver.cpp \
++		nsScrollDestination.cpp \
+ 		nsStyleChangeList.cpp \
+ 		nsStyleSheetService.cpp \
+ 		$(NULL)
+ 
+ ifndef MOZ_XUL
+ XPIDLSRCS  += \
+ 		nsIBoxObject.idl \
+ 		$(NULL)
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -428,26 +428,30 @@ public:
+ 
+   /**
+    * Informs the pres shell that the document is now at the anchor with
+    * the given name.  If |aScroll| is true, scrolls the view of the
+    * document so that the anchor with the specified name is displayed at
+    * the top of the window.  If |aAnchorName| is empty, then this informs
+    * the pres shell that there is no current target, and |aScroll| must
+    * be false.
++   *
++   * FIXME Remove?
+    */
+   NS_IMETHOD GoToAnchor(const nsAString& aAnchorName, PRBool aScroll) = 0;
+ 
+   /**
+    * Tells the presshell to scroll again to the last anchor scrolled to by
+    * GoToAnchor, if any. This scroll only happens if the scroll
+    * position has not changed since the last GoToAnchor. This is called
+    * by nsDocumentViewer::LoadComplete. This clears the last anchor
+    * scrolled to by GoToAnchor (we don't want to keep it alive if it's
+    * removed from the DOM), so don't call this more than once.
++   *
++   * FIXME Remove?
+    */
+   NS_IMETHOD ScrollToAnchor() = 0;
+ 
+   /**
+    * Scrolls the view of the document so that the primary frame of the content
+    * is displayed at the top of the window. Layout is flushed before scrolling.
+    *
+    * @param aContent  The content object of which primary frame should be
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -116,17 +116,16 @@
+ #include "nsFrameSelection.h"
+ #include "nsIDOMNSHTMLInputElement.h" //optimization for ::DoXXX commands
+ #include "nsIDOMNSHTMLTextAreaElement.h"
+ #include "nsViewsCID.h"
+ #include "nsFrameManager.h"
+ #include "nsXPCOM.h"
+ #include "nsISupportsPrimitives.h"
+ #include "nsILayoutHistoryState.h"
+-#include "nsILineIterator.h" // for ScrollContentIntoView
+ #include "nsTimer.h"
+ #include "nsWeakPtr.h"
+ #include "plarena.h"
+ #include "pldhash.h"
+ #include "nsIObserverService.h"
+ #include "nsIObserver.h"
+ #include "nsIDocShell.h"        // for reflow observation
+ #include "nsIBaseWindow.h"
+@@ -1042,21 +1041,16 @@ protected:
+ 
+   // DoReflow returns whether the reflow finished without interruption
+   PRBool DoReflow(nsIFrame* aFrame, PRBool aInterruptible);
+ #ifdef DEBUG
+   void DoVerifyReflow();
+   void VerifyHasDirtyRootAncestor(nsIFrame* aFrame);
+ #endif
+ 
+-  // Helper for ScrollContentIntoView
+-  void DoScrollContentIntoView(nsIContent* aContent,
+-                               PRIntn      aVPercent,
+-                               PRIntn      aHPercent);
+-
+   friend class nsPresShellEventCB;
+ 
+   class ReflowEvent;
+   friend class ReflowEvent;
+ 
+   class ReflowEvent : public nsRunnable {
+   public:
+     NS_DECL_NSIRUNNABLE
+@@ -1170,25 +1164,16 @@ protected:
+   // not in reflow.
+   nsIFrame* mCurrentReflowRoot;
+ #endif
+ 
+   // Set of frames that we should mark with NS_FRAME_HAS_DIRTY_CHILDREN after
+   // we finish reflowing mCurrentReflowRoot.
+   nsTHashtable< nsPtrHashKey<nsIFrame> > mFramesToDirty;
+ 
+-  // Information needed to properly handle scrolling content into view if the
+-  // pre-scroll reflow flush can be interrupted.  mContentToScrollTo is
+-  // non-null between the initial scroll attempt and the first time we finish
+-  // processing all our dirty roots.  mContentScrollVPosition and
+-  // mContentScrollHPosition are only used when it's non-null.
+-  nsCOMPtr<nsIContent> mContentToScrollTo;
+-  PRIntn mContentScrollVPosition;
+-  PRIntn mContentScrollHPosition;
+-
+   class nsDelayedEvent
+   {
+   public:
+     virtual ~nsDelayedEvent() {};
+     virtual void Dispatch(PresShell* aShell) {}
+     // This is needed only by nsDelayedFocusBlur.
+     virtual PRBool Equals(nsPIDOMEventTarget* aTarget, PRUint32 aEventType)
+     {
+@@ -1877,18 +1862,16 @@ PresShell::Destroy()
+     delete mReflowCountMgr;
+     mReflowCountMgr = nsnull;
+   }
+ #endif
+ 
+   if (mHaveShutDown)
+     return NS_OK;
+ 
+-  mContentToScrollTo = nsnull;
+-
+   if (mPresContext) {
+     // We need to notify the destroying the nsPresContext to ESM for
+     // suppressing to use from ESM.
+     mPresContext->EventStateManager()->NotifyDestroyPresContext(mPresContext);
+   }
+ 
+   {
+     nsCOMPtr<nsIObserverService> os =
+@@ -3259,36 +3242,39 @@ PresShell::EndUpdate(nsIDocument *aDocum
+     mStyleSet->EndUpdate();
+     if (mStylesHaveChanged)
+       ReconstructStyleData();
+   }
+ 
+   mFrameConstructor->EndUpdate();
+ }
+ 
++// FIXME: Does this need all the callsites it currently has?
+ void
+ PresShell::RestoreRootScrollPosition()
+ {
+   // Restore frame state for the root scroll frame
+   nsCOMPtr<nsILayoutHistoryState> historyState =
+     mDocument->GetLayoutHistoryState();
+   // Make sure we don't reenter reflow via the sync paint that happens while
+   // we're scrolling to our restored position.  Entering reflow for the
+-  // scrollable frame will cause it to reenter ScrollToRestoredPosition(), and
++  // scrollable frame will cause it to reenter ScrollToDestination(), and
+   // it'll get all confused.
+   nsAutoScriptBlocker scriptBlocker;
+ 
++  // XXX Restore state for all scroll frames, not just the root!
++  // and depth first.
++  // for non-root, it's currently done elsewhere
+   if (historyState) {
+     nsIFrame* scrollFrame = GetRootScrollFrame();
+     if (scrollFrame) {
+       nsIScrollableFrame* scrollableFrame = do_QueryFrame(scrollFrame);
+       if (scrollableFrame) {
+         FrameManager()->RestoreFrameStateFor(scrollFrame, historyState,
+                                              nsIStatefulFrame::eDocumentScrollState);
+-        scrollableFrame->ScrollToRestoredPosition();
+       }
+     }
+   }
+ }
+ 
+ void
+ PresShell::BeginLoad(nsIDocument *aDocument)
+ {  
+@@ -3985,299 +3971,36 @@ PresShell::ScrollToAnchor()
+     return NS_OK;
+ 
+   nsresult rv = ScrollContentIntoView(mLastAnchorScrolledTo, NS_PRESSHELL_SCROLL_TOP,
+                                       NS_PRESSHELL_SCROLL_ANYWHERE);
+   mLastAnchorScrolledTo = nsnull;
+   return rv;
+ }
+ 
+-/*
+- * Helper (per-continuation) for ScrollContentIntoView.
+- *
+- * @param aFrame [in] Frame whose bounds should be unioned
+- * @param aVPercent [in] same as for ScrollContentIntoView
+- * @param aRect [inout] rect into which its bounds should be unioned
+- * @param aHaveRect [inout] whether aRect contains data yet
+- * @param aClosestScrolledView [inout] the view to which aRect is relative.
+- *   If null, should be filled in appropriately.  If non-null, the function
+- *   will no-op if the closest scrolling view doesn't match.
+- */
+-static void
+-UnionRectForClosestScrolledView(nsIFrame* aFrame,
+-                                PRIntn aVPercent,
+-                                nsRect& aRect,
+-                                PRBool& aHaveRect,
+-                                nsIView*& aClosestScrolledView)
+-{
+-  nsRect  frameBounds = aFrame->GetRect();
+-  nsPoint offset;
+-  nsIView* closestView;
+-  aFrame->GetOffsetFromView(offset, &closestView);
+-  frameBounds.MoveTo(offset);
+-
+-  // If this is an inline frame and either the bounds height is 0 (quirks
+-  // layout model) or aVPercent is not NS_PRESSHELL_SCROLL_ANYWHERE, we need to
+-  // change the top of the bounds to include the whole line.
+-  if (frameBounds.height == 0 || aVPercent != NS_PRESSHELL_SCROLL_ANYWHERE) {
+-    nsIAtom* frameType = NULL;
+-    nsIFrame *prevFrame = aFrame;
+-    nsIFrame *f = aFrame;
+-
+-    while (f &&
+-           (frameType = f->GetType()) == nsGkAtoms::inlineFrame) {
+-      prevFrame = f;
+-      f = prevFrame->GetParent();
+-    }
+-
+-    if (f != aFrame &&
+-        f &&
+-        frameType == nsGkAtoms::blockFrame) {
+-      // find the line containing aFrame and increase the top of |offset|.
+-      nsAutoLineIterator lines = f->GetLineIterator();
+-      if (lines) {
+-        PRInt32 index = lines->FindLineContaining(prevFrame);
+-        if (index >= 0) {
+-          nsIFrame *trash1;
+-          PRInt32 trash2;
+-          nsRect lineBounds;
+-          PRUint32 trash3;
+-
+-          if (NS_SUCCEEDED(lines->GetLine(index, &trash1, &trash2,
+-                                          lineBounds, &trash3))) {
+-            nsPoint blockOffset;
+-            nsIView* blockView;
+-            f->GetOffsetFromView(blockOffset, &blockView);
+-
+-            if (blockView == closestView) {
+-              // XXX If views not equal, this is hard.  Do we want to bother?
+-              nscoord newoffset = lineBounds.y + blockOffset.y;
+-
+-              if (newoffset < frameBounds.y)
+-                frameBounds.y = newoffset;
+-            }
+-          }
+-        }
+-      }
+-    }
+-  }
+-
+-  NS_ASSERTION(closestView && !closestView->ToScrollableView(),
+-               "What happened to the scrolled view?  "
+-               "The frame should not be directly in the scrolling view!");
+-  
+-  // Walk up the view hierarchy.  Make sure to add the view's position
+-  // _after_ we get the parent and see whether it's scrollable.  We want to
+-  // make sure to get the scrolled view's position after it has been scrolled.
+-  while (closestView) {
+-    nsIView* parent = closestView->GetParent();
+-    if (parent && parent->ToScrollableView())
+-      break;
+-    frameBounds += closestView->GetPosition();
+-    closestView = parent;
+-  }
+-
+-  if (!aClosestScrolledView)
+-    aClosestScrolledView = closestView;
+-
+-  if (aClosestScrolledView == closestView) {
+-    if (aHaveRect) {
+-      // We can't use nsRect::UnionRect since it drops empty rects on
+-      // the floor, and we need to include them.  (Thus we need
+-      // aHaveRect to know when to drop the initial value on the floor.)
+-      aRect.UnionRectIncludeEmpty(aRect, frameBounds);
+-    } else {
+-      aHaveRect = PR_TRUE;
+-      aRect = frameBounds;
+-    }
+-  }
+-}
+-
+-/**
+- * This function takes a scrolling view, a rect, and a scroll position and
+- * attempts to scroll that rect to that position in that view.  The rect
+- * should be in the coordinate system of the _scrolled_ view.
+- */
+-static void ScrollViewToShowRect(nsIScrollableView* aScrollingView,
+-                                 nsRect &           aRect,
+-                                 PRIntn             aVPercent,
+-                                 PRIntn             aHPercent)
+-{
+-  // Determine the visible rect in the scrolling view's coordinate space.
+-  // The size of the visible area is the clip view size
+-  nsRect visibleRect = aScrollingView->View()->GetBounds(); // get width and height
+-  aScrollingView->GetScrollPosition(visibleRect.x, visibleRect.y);
+-
+-  // The actual scroll offsets
+-  nscoord scrollOffsetX = visibleRect.x;
+-  nscoord scrollOffsetY = visibleRect.y;
+-
+-  nscoord lineHeight;
+-  aScrollingView->GetLineHeight(&lineHeight);
+-  
+-  // See how the rect should be positioned vertically
+-  if (NS_PRESSHELL_SCROLL_ANYWHERE == aVPercent ||
+-      (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aVPercent &&
+-       aRect.height < lineHeight)) {
+-    // The caller doesn't care where the frame is positioned vertically,
+-    // so long as it's fully visible
+-    if (aRect.y < visibleRect.y) {
+-      // Scroll up so the frame's top edge is visible
+-      scrollOffsetY = aRect.y;
+-    } else if (aRect.YMost() > visibleRect.YMost()) {
+-      // Scroll down so the frame's bottom edge is visible. Make sure the
+-      // frame's top edge is still visible
+-      scrollOffsetY += aRect.YMost() - visibleRect.YMost();
+-      if (scrollOffsetY > aRect.y) {
+-        scrollOffsetY = aRect.y;
+-      }
+-    }
+-  } else if (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aVPercent) {
+-    // Scroll only if no part of the frame is visible in this view
+-    if (aRect.YMost() - lineHeight < visibleRect.y) {
+-      // Scroll up so the frame's top edge is visible
+-      scrollOffsetY = aRect.y;
+-    }  else if (aRect.y + lineHeight > visibleRect.YMost()) {
+-      // Scroll down so the frame's bottom edge is visible. Make sure the
+-      // frame's top edge is still visible
+-      scrollOffsetY += aRect.YMost() - visibleRect.YMost();
+-      if (scrollOffsetY > aRect.y) {
+-        scrollOffsetY = aRect.y;
+-      }
+-    }
+-  } else {
+-    // Align the frame edge according to the specified percentage
+-    nscoord frameAlignY =
+-      NSToCoordRound(aRect.y + aRect.height * (aVPercent / 100.0f));
+-    scrollOffsetY =
+-      NSToCoordRound(frameAlignY - visibleRect.height * (aVPercent / 100.0f));
+-  }
+-
+-  // See how the frame should be positioned horizontally
+-  if (NS_PRESSHELL_SCROLL_ANYWHERE == aHPercent ||
+-      (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aHPercent &&
+-       aRect.width < lineHeight)) {
+-    // The caller doesn't care where the frame is positioned horizontally,
+-    // so long as it's fully visible
+-    if (aRect.x < visibleRect.x) {
+-      // Scroll left so the frame's left edge is visible
+-      scrollOffsetX = aRect.x;
+-    } else if (aRect.XMost() > visibleRect.XMost()) {
+-      // Scroll right so the frame's right edge is visible. Make sure the
+-      // frame's left edge is still visible
+-      scrollOffsetX += aRect.XMost() - visibleRect.XMost();
+-      if (scrollOffsetX > aRect.x) {
+-        scrollOffsetX = aRect.x;
+-      }
+-    }
+-  } else if (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aHPercent) {
+-    // Scroll only if no part of the frame is visible in this view
+-    // XXXbz using the line height here is odd, but there are no
+-    // natural dimensions to use here, really....
+-    if (aRect.XMost() - lineHeight < visibleRect.x) {
+-      // Scroll left so the frame's left edge is visible
+-      scrollOffsetX = aRect.x;
+-    }  else if (aRect.x + lineHeight > visibleRect.XMost()) {
+-      // Scroll right so the frame's right edge is visible. Make sure the
+-      // frame's left edge is still visible
+-      scrollOffsetX += aRect.XMost() - visibleRect.XMost();
+-      if (scrollOffsetX > aRect.x) {
+-        scrollOffsetX = aRect.x;
+-      }
+-    }
+-  } else {
+-    // Align the frame edge according to the specified percentage
+-    nscoord frameAlignX =
+-      NSToCoordRound(aRect.x + (aRect.width) * (aHPercent / 100.0f));
+-    scrollOffsetX =
+-      NSToCoordRound(frameAlignX - visibleRect.width * (aHPercent / 100.0f));
+-  }
+-
+-  aScrollingView->ScrollTo(scrollOffsetX, scrollOffsetY, 0);
+-}
+-
+ NS_IMETHODIMP
+ PresShell::ScrollContentIntoView(nsIContent* aContent,
+                                  PRIntn      aVPercent,
+                                  PRIntn      aHPercent)
+ {
+   nsCOMPtr<nsIContent> content = aContent; // Keep content alive while flushing.
+   NS_ENSURE_TRUE(content, NS_ERROR_NULL_POINTER);
+   nsCOMPtr<nsIDocument> currentDoc = content->GetCurrentDoc();
+   NS_ENSURE_STATE(currentDoc);
+ 
+-  mContentToScrollTo = aContent;
+-  mContentScrollVPosition = aVPercent;
+-  mContentScrollHPosition = aHPercent;
++  // FIXME: Hook up a scroll destination here (to multiple layers of scrollable
++  // views / frames)!
+ 
+   // Flush layout and attempt to scroll in the process.
+   currentDoc->FlushPendingNotifications(Flush_InterruptibleLayout);
+ 
+-  // If mContentToScrollTo is non-null, that means we interrupted the reflow
+-  // (or suppressed it altogether because we're suppressing interruptible
+-  // flushes right now) and won't necessarily get the position correct, but do
+-  // a best-effort scroll here.  The other option would be to do this inside
+-  // FlushPendingNotifications, but I'm not sure the repeated scrolling that
+-  // could trigger if reflows keep getting interrupted would be more desirable
+-  // than a single best-effort scroll followed by one final scroll on the first
+-  // completed reflow.
+-  if (mContentToScrollTo) {
+-    DoScrollContentIntoView(content, aVPercent, aHPercent);
+-  }
+-  return NS_OK;
+-}
+-
+-void
+-PresShell::DoScrollContentIntoView(nsIContent* aContent,
+-                                   PRIntn      aVPercent,
+-                                   PRIntn      aHPercent)
+-{
+-  nsIFrame* frame = GetPrimaryFrameFor(aContent);
+-  if (!frame) {
+-    mContentToScrollTo = nsnull;
+-    return;
+-  }
+-
+-  if (frame->GetStateBits() & NS_FRAME_FIRST_REFLOW) {
+-    // The reflow flush before this scroll got interrupted, and this frame's
+-    // coords and size are all zero, and it has no content showing anyway.
+-    // Don't bother scrolling to it.  We'll try again when we finish up layout.
+-    return;
+-  }
+-
+-  // This is a two-step process.
+-  // Step 1: Find the bounds of the rect we want to scroll into view.  For
+-  //         example, for an inline frame we may want to scroll in the whole
+-  //         line.
+-  // Step 2: Walk the views that are parents of the frame and scroll them
+-  //         appropriately.
+-  
+-  nsIView *closestView = nsnull;
+-  nsRect frameBounds;
+-  PRBool haveRect = PR_FALSE;
+-  do {
+-    UnionRectForClosestScrolledView(frame, aVPercent, frameBounds, haveRect,
+-                                    closestView);
+-  } while ((frame = frame->GetNextContinuation()));
+-
+-  // Walk up the view hierarchy.  Make sure to add the view's position
+-  // _after_ we get the parent and see whether it's scrollable.  We want to
+-  // make sure to get the scrolled view's position after it has been scrolled.
+-  nsIScrollableView* scrollingView = nsnull;
+-  while (closestView) {
+-    nsIView* parent = closestView->GetParent();
+-    if (parent) {
+-      scrollingView = parent->ToScrollableView();
+-      if (scrollingView) {
+-        ScrollViewToShowRect(scrollingView, frameBounds, aVPercent, aHPercent);
+-      }
+-    }
+-    frameBounds += closestView->GetPosition();
+-    closestView = parent;
+-  }
++  // FIXME: If there was nothing to reflow in that flush, we still need to do
++  // the scroll!
++
++  return NS_OK;
+ }
+ 
+ // GetLinkLocation: copy link location to clipboard
+ NS_IMETHODIMP PresShell::GetLinkLocation(nsIDOMNode* aNode, nsAString& aLocationString)
+ {
+ #ifdef DEBUG_dr
+   printf("dr :: PresShell::GetLinkLocation\n");
+ #endif
+@@ -4811,22 +4534,16 @@ PresShell::FlushPendingNotifications(moz
+     // There might be more pending constructors now, but we're not going to
+     // worry about them.  They can't be triggered during reflow, so we should
+     // be good.
+ 
+     if (aType >= (mSuppressInterruptibleReflows ? Flush_Layout : Flush_InterruptibleLayout) &&
+         !mIsDestroying) {
+       mFrameConstructor->RecalcQuotesAndCounters();
+       mViewManager->FlushDelayedResize();
+-      if (ProcessReflowCommands(aType < Flush_Layout) && mContentToScrollTo) {
+-        // We didn't get interrupted.  Go ahead and scroll to our content
+-        DoScrollContentIntoView(mContentToScrollTo, mContentScrollVPosition,
+-                                mContentScrollHPosition);
+-        mContentToScrollTo = nsnull;
+-      }
+     }
+ 
+     PRUint32 updateFlags = NS_VMREFRESH_NO_SYNC;
+     if (aType >= Flush_Display) {
+       // Flushing paints, so perform the invalidates and drawing
+       // immediately
+       updateFlags = NS_VMREFRESH_IMMEDIATE;
+     }
+diff --git a/layout/base/nsScrollDestination.cpp b/layout/base/nsScrollDestination.cpp
+new file mode 100644
+--- /dev/null
++++ b/layout/base/nsScrollDestination.cpp
+@@ -0,0 +1,463 @@
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsScrollDestination.cpp
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2005
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org> (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++#include "nsScrollDestination.h"
++#include "nsIScrollableView.h"
++#include "nsLayoutAtoms.h"
++#include "nsILineIterator.h"
++
++NS_IMPL_ISUPPORTS1(nsScrollDestination, nsScrollDestination)
++
++nsUserScrollDestination::nsUserScrollDestination()
++  : mRestoreRect(-1, -1, -1, -1)
++  , mLastPos(-1, -1)
++{
++}
++
++/* virtual */ void
++nsUserScrollDestination::Scroll(nsIScrollableFrame *aScrollFrame)
++{
++  if (mRestoreRect.y == -1 || mLastPos.x == -1 || mLastPos.y == -1) {
++    return;
++  }
++  nsIScrollableView* scrollingView = aScrollFrame->GetScrollableView();
++  if (!scrollingView) {
++    return;
++  }
++  // make sure our scroll position did not change for where we last put
++  // it. if it does then the user must have moved it, and we no longer
++  // need to restore.
++  nscoord x = 0;
++  nscoord y = 0;
++  scrollingView->GetScrollPosition(x, y);
++
++  // if we didn't move, we still need to restore
++  if (x == mLastPos.x && y == mLastPos.y) {
++    nsRect childRect(0, 0, 0, 0);
++    nsIView* child = nsnull;
++    nsresult rv = scrollingView->GetScrolledView(child);
++    if (NS_SUCCEEDED(rv) && child)
++      childRect = child->GetBounds();
++
++    PRInt32 cx, cy, x, y;
++    scrollingView->GetScrollPosition(cx,cy);
++
++    x = (int)mRestoreRect.x;
++    y = (int)mRestoreRect.y;
++
++    // if our position is greater than the scroll position, scroll.
++    // remember that we could be incrementally loading so we may enter
++    // and scroll many times.
++    if (y > cy || x > cx) {
++      scrollingView->ScrollTo(x, y, 0);
++      // scrollpostion goes from twips to pixels. this fixes any roundoff
++      // problems.
++      scrollingView->GetScrollPosition(mLastPos.x, mLastPos.y);
++    } else {
++      // if we reached the position then stop
++      mRestoreRect.y = -1;
++      mLastPos.x = -1;
++      mLastPos.y = -1;
++    }
++  } else {
++    // user moved the position, so we won't need to restore
++    mLastPos.x = -1;
++    mLastPos.y = -1;
++  }
++}
++
++/* virtual */ void
++nsUserScrollDestination::Save(nsIScrollableFrame *aScrollFrame)
++{
++  // XXX Replace this (and Restore) with a better algorithm like that in
++  // https://bugzilla.mozilla.org/show_bug.cgi?id=16806#c39
++
++  // XXX Said algorithm would really live in |Remember|, so that we
++  // could use it for zoom/resize as well.
++
++  nsIScrollableView* scrollingView = aScrollFrame->GetScrollableView();
++  PRInt32 x,y;
++  scrollingView->GetScrollPosition(x,y);
++  nsIView* child = nsnull;
++  scrollingView->GetScrolledView(child);
++  if ((x == 0 && y == 0) || !child) {
++    mRestoreRect.SetRect(-1, -1, -1, -1);
++  }
++  nsRect childRect = child->GetBounds();
++  mRestoreRect.SetRect(x, y, childRect.width, childRect.height);
++}
++
++/* virtual */ void
++nsUserScrollDestination::Restore(nsIScrollableFrame *aScrollFrame)
++{
++  mLastPos.x = -1;
++  mLastPos.y = -1;
++
++  nsIScrollableView* scrollingView = aScrollFrame->GetScrollableView();
++  if (scrollingView) {
++    scrollingView->GetScrollPosition(mLastPos.x, mLastPos.y);
++  } else {
++    mLastPos = nsPoint(0, 0);
++  }
++
++  Scroll(aScrollFrame);
++}
++
++/* virtual */ void
++nsUserScrollDestination::ReplaceDestination(nsScrollDestination *aPrevious)
++{
++}
++
++/* virtual */ PRBool
++nsUserScrollDestination::IsExact()
++{
++  return PR_TRUE;
++}
++
++/* virtual */ nsScrollDestination*
++nsUserScrollDestination::GetPreviousDestination()
++{
++  NS_NOTREACHED("should only be called when IsExact is false");
++  return nsnull;
++}
++
++nsContentScrollDestination::nsContentScrollDestination(nsIContent *aTarget,
++                                                       PRIntn aVPercent,
++                                                       PRIntn aHPercent,
++                                                       PRBool aRepeat)
++  : mTarget(aTarget)
++  , mVPercent(aVPercent)
++  , mHPercent(aHPercent)
++  , mRepeating(aRepeat)
++{
++}
++
++/**
++ * This function takes a scrolling view, a rect, and a scroll position and
++ * attempts to scroll that rect to that position in that view.  The rect
++ * should be in the coordinate system of the _scrolled_ view.
++ */
++static void ScrollViewToShowRect(nsIScrollableView* aScrollingView,
++                                 nsRect &           aRect,
++                                 PRIntn             aVPercent,
++                                 PRIntn             aHPercent)
++{
++  // Determine the visible rect in the scrolling view's coordinate space.
++  // The size of the visible area is the clip view size
++  nsRect visibleRect = aScrollingView->View()->GetBounds(); // get width and height
++  aScrollingView->GetScrollPosition(visibleRect.x, visibleRect.y);
++
++  // The actual scroll offsets
++  nscoord scrollOffsetX = visibleRect.x;
++  nscoord scrollOffsetY = visibleRect.y;
++
++  nscoord lineHeight;
++  aScrollingView->GetLineHeight(&lineHeight);
++  
++  // See how the rect should be positioned vertically
++  if (NS_PRESSHELL_SCROLL_ANYWHERE == aVPercent ||
++      (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aVPercent &&
++       aRect.height < lineHeight)) {
++    // The caller doesn't care where the frame is positioned vertically,
++    // so long as it's fully visible
++    if (aRect.y < visibleRect.y) {
++      // Scroll up so the frame's top edge is visible
++      scrollOffsetY = aRect.y;
++    } else if (aRect.YMost() > visibleRect.YMost()) {
++      // Scroll down so the frame's bottom edge is visible. Make sure the
++      // frame's top edge is still visible
++      scrollOffsetY += aRect.YMost() - visibleRect.YMost();
++      if (scrollOffsetY > aRect.y) {
++        scrollOffsetY = aRect.y;
++      }
++    }
++  } else if (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aVPercent) {
++    // Scroll only if no part of the frame is visible in this view
++    if (aRect.YMost() - lineHeight < visibleRect.y) {
++      // Scroll up so the frame's top edge is visible
++      scrollOffsetY = aRect.y;
++    }  else if (aRect.y + lineHeight > visibleRect.YMost()) {
++      // Scroll down so the frame's bottom edge is visible. Make sure the
++      // frame's top edge is still visible
++      scrollOffsetY += aRect.YMost() - visibleRect.YMost();
++      if (scrollOffsetY > aRect.y) {
++        scrollOffsetY = aRect.y;
++      }
++    }
++  } else {
++    // Align the frame edge according to the specified percentage
++    nscoord frameAlignY =
++      NSToCoordRound(aRect.y + aRect.height * (aVPercent / 100.0f));
++    scrollOffsetY =
++      NSToCoordRound(frameAlignY - visibleRect.height * (aVPercent / 100.0f));
++  }
++
++  // See how the frame should be positioned horizontally
++  if (NS_PRESSHELL_SCROLL_ANYWHERE == aHPercent ||
++      (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aHPercent &&
++       aRect.width < lineHeight)) {
++    // The caller doesn't care where the frame is positioned horizontally,
++    // so long as it's fully visible
++    if (aRect.x < visibleRect.x) {
++      // Scroll left so the frame's left edge is visible
++      scrollOffsetX = aRect.x;
++    } else if (aRect.XMost() > visibleRect.XMost()) {
++      // Scroll right so the frame's right edge is visible. Make sure the
++      // frame's left edge is still visible
++      scrollOffsetX += aRect.XMost() - visibleRect.XMost();
++      if (scrollOffsetX > aRect.x) {
++        scrollOffsetX = aRect.x;
++      }
++    }
++  } else if (NS_PRESSHELL_SCROLL_IF_NOT_VISIBLE == aHPercent) {
++    // Scroll only if no part of the frame is visible in this view
++    // XXXbz using the line height here is odd, but there are no
++    // natural dimensions to use here, really....
++    if (aRect.XMost() - lineHeight < visibleRect.x) {
++      // Scroll left so the frame's left edge is visible
++      scrollOffsetX = aRect.x;
++    }  else if (aRect.x + lineHeight > visibleRect.XMost()) {
++      // Scroll right so the frame's right edge is visible. Make sure the
++      // frame's left edge is still visible
++      scrollOffsetX += aRect.XMost() - visibleRect.XMost();
++      if (scrollOffsetX > aRect.x) {
++        scrollOffsetX = aRect.x;
++      }
++    }
++  } else {
++    // Align the frame edge according to the specified percentage
++    nscoord frameAlignX =
++      NSToCoordRound(aRect.x + (aRect.width) * (aHPercent / 100.0f));
++    scrollOffsetX =
++      NSToCoordRound(frameAlignX - visibleRect.width * (aHPercent / 100.0f));
++  }
++
++  // XXXldb Shouldn't we check that it's not 'overflow:hidden'!?
++  aScrollingView->ScrollTo(scrollOffsetX, scrollOffsetY, 0);
++}
++
++/*
++ * Helper (per-continuation) for ScrollContentIntoView.
++ *
++ * @param aFrame [in] Frame whose bounds should be unioned
++ * @param aVPercent [in] same as for ScrollContentIntoView
++ * @param aRect [inout] rect into which its bounds should be unioned
++ * @param aHaveRect [inout] whether aRect contains data yet
++ * @param aClosestScrolledView [inout] the view to which aRect is relative.
++ *   If null, should be filled in appropriately.  If non-null, the function
++ *   will no-op if the closest scrolling view doesn't match.
++ */
++static void
++UnionRectForClosestScrolledView(nsIFrame* aFrame,
++                                PRIntn aVPercent,
++                                nsRect& aRect,
++                                PRBool& aHaveRect,
++                                nsIView*& aClosestScrolledView)
++{
++  nsRect  frameBounds = aFrame->GetRect();
++  nsPoint offset;
++  nsIView* closestView;
++  aFrame->GetOffsetFromView(offset, &closestView);
++  frameBounds.MoveTo(offset);
++
++  // If this is an inline frame and either the bounds height is 0 (quirks
++  // layout model) or aVPercent is not NS_PRESSHELL_SCROLL_ANYWHERE, we need to
++  // change the top of the bounds to include the whole line.
++  if (frameBounds.height == 0 || aVPercent != NS_PRESSHELL_SCROLL_ANYWHERE) {
++    nsIAtom* frameType = NULL;
++    nsIFrame *prevFrame = aFrame;
++    nsIFrame *f = aFrame;
++
++    while (f &&
++           (frameType = f->GetType()) == nsGkAtoms::inlineFrame) {
++      prevFrame = f;
++      f = prevFrame->GetParent();
++    }
++
++    if (f != aFrame &&
++        f &&
++        frameType == nsGkAtoms::blockFrame) {
++      // find the line containing aFrame and increase the top of |offset|.
++      nsAutoLineIterator lines = f->GetLineIterator();
++      if (lines) {
++        PRInt32 index = lines->FindLineContaining(prevFrame);
++        if (index >= 0) {
++          nsIFrame *trash1;
++          PRInt32 trash2;
++          nsRect lineBounds;
++          PRUint32 trash3;
++
++          if (NS_SUCCEEDED(lines->GetLine(index, &trash1, &trash2,
++                                          lineBounds, &trash3))) {
++            nsPoint blockOffset;
++            nsIView* blockView;
++            f->GetOffsetFromView(blockOffset, &blockView);
++
++            if (blockView == closestView) {
++              // XXX If views not equal, this is hard.  Do we want to bother?
++              nscoord newoffset = lineBounds.y + blockOffset.y;
++
++              if (newoffset < frameBounds.y)
++                frameBounds.y = newoffset;
++            }
++          }
++        }
++      }
++    }
++  }
++
++  NS_ASSERTION(closestView && !closestView->ToScrollableView(),
++               "What happened to the scrolled view?  "
++               "The frame should not be directly in the scrolling view!");
++  
++  // Walk up the view hierarchy.  Make sure to add the view's position
++  // _after_ we get the parent and see whether it's scrollable.  We want to
++  // make sure to get the scrolled view's position after it has been scrolled.
++  while (closestView) {
++    nsIView* parent = closestView->GetParent();
++    if (parent && parent->ToScrollableView())
++      break;
++    frameBounds += closestView->GetPosition();
++    closestView = parent;
++  }
++
++  if (!aClosestScrolledView)
++    aClosestScrolledView = closestView;
++
++  if (aClosestScrolledView == closestView) {
++    if (aHaveRect) {
++      // We can't use nsRect::UnionRect since it drops empty rects on
++      // the floor, and we need to include them.  (Thus we need
++      // aHaveRect to know when to drop the initial value on the floor.)
++      aRect.UnionRectIncludeEmpty(aRect, frameBounds);
++    } else {
++      aHaveRect = PR_TRUE;
++      aRect = frameBounds;
++    }
++  }
++}
++
++/* virtual */ void
++nsContentScrollDestination::Scroll(nsIScrollableFrame *aScrollFrame)
++{
++  if (mSatisfied)
++    return;
++
++  nsIFrame* frame = GetPrimaryFrameFor(mTarget);
++
++  // This is a two-step process.
++  // Step 1: Find the bounds of the rect we want to scroll into view.  For
++  //         example, for an inline frame we may want to scroll in the whole
++  //         line.
++  // Step 2: Walk the views that are parents of the frame and scroll them
++  //         appropriately.
++  
++  nsIView *closestView = nsnull;
++  nsRect frameBounds;
++  PRBool haveRect = PR_FALSE;
++  do {
++    UnionRectForClosestScrolledView(frame, aVPercent, frameBounds, haveRect,
++                                    closestView);
++  } while ((frame = frame->GetNextContinuation()));
++
++  // XXX CHANGE THIS TO:
++  //   ONLY SCROLL THIS VIEW!
++  //   SET mSatisfied WHEN NEEDED!
++  
++  // Walk up the view hierarchy.  Make sure to add the view's position
++  // _after_ we get the parent and see whether it's scrollable.  We want to
++  // make sure to get the scrolled view's position after it has been scrolled.
++  nsIScrollableView* scrollingView = nsnull;
++  while (closestView) {
++    nsIView* parent = closestView->GetParent();
++    if (parent) {
++      scrollingView = parent->ToScrollableView();
++      if (scrollingView) {
++        ScrollViewToShowRect(scrollingView, frameBounds, mVPercent, mHPercent);
++      }
++    }
++    frameBounds += closestView->GetPosition();
++    closestView = parent;
++  }
++
++  if (!mRepeating)
++    mSatisfied = PR_TRUE;
++}
++
++/* virtual */ void
++nsContentScrollDestination::Save(nsIScrollableFrame *aScrollFrame)
++{
++  // XXX TURN FRAME INTO STATE KEY
++}
++
++/* virtual */ void
++nsContentScrollDestination::Restore(nsIScrollableFrame *aScrollFrame)
++{
++  if (mPrevious)
++    mPrevious->Restore(aScrollFrame);
++
++  mSatisfied = PR_FALSE;
++
++  // XXX TURN STATE KEY INTO FRAME
++
++  Scroll(aScrollFrame);
++}
++
++/* virtual */ void
++nsContentScrollDestination::ReplaceDestination(nsScrollDestination *aPrevious)
++{
++  if (IsExact())
++    return;
++
++  // Don't chain inexact destinations, since we don't want a huge chain
++  // of destinations to build up when tabbing.
++  mPrevious = aPrevious->IsExact() ? aPrevious
++                                   : aPrevious->GetPreviousDestination();
++}
++
++/* virtual */ PRBool
++nsContentScrollDestination::IsExact()
++{
++  return mVPercent != NS_PRESSHELL_SCROLL_ANYWHERE &&
++         mHPercent != NS_PRESSHELL_SCROLL_ANYWHERE;
++}
++
++/* virtual */ nsScrollDestination*
++nsContentScrollDestination::GetPreviousDestination()
++{
++  NS_ASSERTION(!IsExact(), "should only be called when IsExact is false");
++  return mPrevious;
++}
+diff --git a/layout/base/nsScrollDestination.h b/layout/base/nsScrollDestination.h
+new file mode 100644
+--- /dev/null
++++ b/layout/base/nsScrollDestination.h
+@@ -0,0 +1,155 @@
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsScrollDestination.h.
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2005
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org> (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++#ifndef nsScrollDestination_h_
++#define nsScrollDestination_h_
++
++#include "nsISupports.h"
++#include "nsIFrame.h"
++#include "nsIScrollableFrame.h"
++
++// f5cd140d-c192-4e58-a390-0bf579440ed3
++#define NS_SCROLLDESTINATION_IID \
++{ 0xf5cd140d, 0xc192, 0x4e58, \
++  { 0xa3, 0x90, 0x0b, 0xf5, 0x79, 0x44, 0x0e, 0xd3 } }
++
++/**
++ * An abstract class representing where a scrollable area (viewport or
++ * otherwise) should scroll to or is currently scrolled to.
++ *
++ * Derived from nsISupports so it can be put on an nsPresState.
++ */
++class nsScrollDestination : public nsISupports {
++public:
++  NS_DECLARE_STATIC_IID_ACCESSOR(NS_SCROLLDESTINATION_IID)
++
++  NS_DECL_ISUPPORTS
++
++  /**
++   * Scroll to the destination.  This is called every time the scroll
++   * frame is reflowed, so in many cases it should do nothing.
++   */
++  virtual void Scroll(nsIScrollableFrame *aScrollFrame) = 0;
++
++  /**
++   * Remember the position so that the next call to Scroll will restore
++   * it well following operations like zoom or window resize.  If
++   * remembered data have not been invalidated (XXX how?), should do
++   * nothing to preserve earlier remembered data.
++   */
++  virtual void Remember() = 0;
++
++  /**
++   * Used for session history saving and restoring.  Restore is
++   * responsible for doing the necessary scrolling.
++   */
++  virtual void Save(nsIScrollableFrame *aScrollFrame) = 0;
++  virtual void Restore(nsIScrollableFrame *aScrollFrame) = 0;
++
++  /**
++   * When initializing a scroll destination, this should be called with
++   * the old destination at its location, which may be saved for
++   * restoration purposes if |this| is not exact.
++   */
++  virtual void ReplaceDestination(nsScrollDestination *aPrevious) = 0;
++
++  /**
++   * Does this destination describe an exact location (rather than just
++   * a constraint on the location, in which case the previous
++   * destination may be needed).
++   *
++   * For internal scroll destination use only.
++   */
++  virtual PRBool IsExact() = 0;
++
++  // For internal scroll destination use only.
++  virtual nsScrollDestination* GetPreviousDestination() = 0;
++};
++
++NS_DEFINE_STATIC_IID_ACCESSOR(nsScrollDestination, NS_SCROLLDESTINATION_IID)
++
++/**
++ * A representation of a position chosen by the user through scrolling
++ * mechanisms such as scrollbars or arrow keys.
++ */
++class nsUserScrollDestination : public nsScrollDestination {
++public:
++  nsUserScrollDestination();
++  virtual void Scroll(nsIScrollableFrame *aScrollFrame);
++  virtual void Save(nsIScrollableFrame *aScrollFrame);
++  virtual void Restore(nsIScrollableFrame *aScrollFrame);
++  virtual void ReplaceDestination(nsScrollDestination *aPrevious);
++protected:
++  virtual PRBool IsExact();
++  virtual nsScrollDestination* GetPreviousDestination();
++
++  nsRect mRestoreRect;
++  nsPoint mLastPos;
++};
++
++
++/**
++ * A position based on the location of a particular frame.
++ */
++class nsContentScrollDestination : public nsScrollDestination {
++public:
++  /**
++   * aRepeat means to repeat each reflow until the percentages can be
++   * satisfied.
++   *
++   * aVPercent and aHPercent can be NS_PRESSHELL_SCROLL_ANYWHERE
++   */
++  nsContentScrollDestination(nsIContent *aTarget,
++                             PRIntn aVPercent, PRIntn aHPercent,
++                             PRBool aRepeat);
++
++  virtual void Scroll(nsIScrollableFrame *aScrollFrame);
++  virtual void Save(nsIScrollableFrame *aScrollFrame);
++  virtual void Restore(nsIScrollableFrame *aScrollFrame);
++  virtual void ReplaceDestination(nsScrollDestination *aPrevious);
++protected:
++  virtual PRBool IsExact();
++  virtual nsScrollDestination* GetPreviousDestination();
++
++  // IsExact should depend on parameters
++
++  nsCOMPtr<nsScrollDestination> mPrevious;
++  nsIContent *mTarget;
++  PRIntn mVPercent, mHPercent;
++  PRPackedBool mRepeating;
++  PRPackedBool mSatisfied;
++};
++
++#endif /* !defined(nsScrollDestination_h_) */
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -820,17 +820,17 @@ nsHTMLScrollFrame::Reflow(nsPresContext*
+   state.mComputedBorder = aReflowState.mComputedBorderPadding -
+     aReflowState.mComputedPadding;
+ 
+   nsresult rv = ReflowContents(&state, aDesiredSize);
+   if (NS_FAILED(rv))
+     return rv;
+   
+   PlaceScrollArea(state);
+-  mInner.ScrollToRestoredPosition();
++  mInner.ScrollToDestination();
+ 
+   PRBool didHaveHScrollbar = mInner.mHasHorizontalScrollbar;
+   PRBool didHaveVScrollbar = mInner.mHasVerticalScrollbar;
+   mInner.mHasHorizontalScrollbar = state.mShowHScrollbar;
+   mInner.mHasVerticalScrollbar = state.mShowVScrollbar;
+   nsRect newScrollAreaBounds = mInner.mScrollableView->View()->GetBounds();
+   nsRect newScrolledAreaBounds = mInner.mScrolledFrame->GetView()->GetBounds();
+   if (mInner.mSkippedScrollbarLayout ||
+@@ -1270,25 +1270,22 @@ nsGfxScrollFrameInner::nsGfxScrollFrameI
+                                              PRBool aIsRoot,
+                                              PRBool aIsXUL)
+   : mScrollableView(nsnull),
+     mHScrollbarBox(nsnull),
+     mVScrollbarBox(nsnull),
+     mScrolledFrame(nsnull),
+     mScrollCornerBox(nsnull),
+     mOuter(aOuter),
+-    mRestoreRect(-1, -1, -1, -1),
+-    mLastPos(-1, -1),
+     mNeverHasVerticalScrollbar(PR_FALSE),
+     mNeverHasHorizontalScrollbar(PR_FALSE),
+     mHasVerticalScrollbar(PR_FALSE), 
+     mHasHorizontalScrollbar(PR_FALSE),
+     mViewInitiatedScroll(PR_FALSE),
+     mFrameInitiatedScroll(PR_FALSE),
+-    mDidHistoryRestore(PR_FALSE),
+     mIsRoot(aIsRoot),
+     mIsXUL(aIsXUL),
+     mSupppressScrollbarUpdate(PR_FALSE),
+     mSkippedScrollbarLayout(PR_FALSE),
+     mDidLoadHistoryVScrollbarHint(PR_FALSE),
+     mHistoryVScrollbarHint(PR_FALSE),
+     mHadNonInitialReflow(PR_FALSE),
+     mHorizontalOverflow(PR_FALSE),
+@@ -1476,73 +1473,42 @@ nsGfxScrollFrameInner::GetScrollbarStyle
+   NS_ASSERTION(result.mHorizontal != NS_STYLE_OVERFLOW_VISIBLE &&
+                result.mHorizontal != NS_STYLE_OVERFLOW_CLIP &&
+                result.mVertical != NS_STYLE_OVERFLOW_VISIBLE &&
+                result.mVertical != NS_STYLE_OVERFLOW_CLIP,
+                "scrollbars should not have been created");
+   return result;
+ }
+ 
++void
++nsGfxScrollFrameInner::SetDestination(nsScrollDestination *aDestination)
++{
++  nsIScrollableFrame *scrollableFrame;
++  CallQueryInterface(mOuter, &scrollableFrame);
++
++  if (aDestination) {
++    aDestination->ReplaceDestination(mDestination);
++    aDestination->Scroll(scrollableFrame);
++  } else {
++    scrollableFrame->ScrollTo(nsPoint(0,0), 0);
++  }
++  mDestination = aDestination;
++}
++
+   /**
+    * this code is resposible for restoring the scroll position back to some
+    * saved position. if the user has not moved the scroll position manually
+    * we keep scrolling down until we get to our original position. keep in
+    * mind that content could incrementally be coming in. we only want to stop
+    * when we reach our new position.
+    */
++// FIXME: REWRITE
+ void
+ nsGfxScrollFrameInner::ScrollToRestoredPosition()
+ {
+-  nsIScrollableView* scrollingView = GetScrollableView();
+-  if (!scrollingView) {
+-    return;
+-  }
+-  if (mRestoreRect.y == -1 || mLastPos.x == -1 || mLastPos.y == -1) {
+-    return;
+-  }
+-  // make sure our scroll position did not change for where we last put
+-  // it. if it does then the user must have moved it, and we no longer
+-  // need to restore.
+-  nscoord x = 0;
+-  nscoord y = 0;
+-  scrollingView->GetScrollPosition(x, y);
+-
+-  // if we didn't move, we still need to restore
+-  if (x == mLastPos.x && y == mLastPos.y) {
+-    nsRect childRect(0, 0, 0, 0);
+-    nsIView* child = nsnull;
+-    nsresult rv = scrollingView->GetScrolledView(child);
+-    if (NS_SUCCEEDED(rv) && child)
+-      childRect = child->GetBounds();
+-
+-    PRInt32 cx, cy, x, y;
+-    scrollingView->GetScrollPosition(cx,cy);
+-
+-    x = (int)mRestoreRect.x;
+-    y = (int)mRestoreRect.y;
+-
+-    // if our position is greater than the scroll position, scroll.
+-    // remember that we could be incrementally loading so we may enter
+-    // and scroll many times.
+-    if (y != cy || x != cx) {
+-      scrollingView->ScrollTo(x, y, 0);
+-      // scrollpostion goes from twips to pixels. this fixes any roundoff
+-      // problems.
+-      scrollingView->GetScrollPosition(mLastPos.x, mLastPos.y);
+-    } else {
+-      // if we reached the position then stop
+-      mRestoreRect.y = -1;
+-      mLastPos.x = -1;
+-      mLastPos.y = -1;
+-    }
+-  } else {
+-    // user moved the position, so we won't need to restore
+-    mLastPos.x = -1;
+-    mLastPos.y = -1;
+-  }
+ }
+ 
+ nsresult
+ nsGfxScrollFrameInner::FireScrollPortEvent()
+ {
+   mAsyncScrollPortEvent.Forget();
+ 
+   // Keep this in sync with PostOverflowEvent().
+@@ -2336,17 +2302,17 @@ nsXULScrollFrame::Layout(nsBoxLayoutStat
+   if (needsLayout) {
+     nsBoxLayoutState resizeState(aState);
+     LayoutScrollArea(resizeState, scrollAreaRect);
+   }
+ 
+   if (!mInner.mSupppressScrollbarUpdate) { 
+     mInner.LayoutScrollbars(aState, clientRect, oldScrollAreaBounds, scrollAreaRect);
+   }
+-  mInner.ScrollToRestoredPosition();
++  mInner.ScrollToDestination();
+   if (!(GetStateBits() & NS_FRAME_FIRST_REFLOW)) {
+     mInner.mHadNonInitialReflow = PR_TRUE;
+   }
+ 
+   mInner.PostOverflowEvent();
+   return NS_OK;
+ }
+ 
+@@ -2779,49 +2745,29 @@ nsGfxScrollFrameInner::SaveState(nsIStat
+   }
+ 
+   nsIScrollbarMediator* mediator = do_QueryFrame(GetScrolledFrame());
+   if (mediator) {
+     // child handles its own scroll state, so don't bother saving state here
+     return nsnull;
+   }
+ 
+-  nsIScrollableView* scrollingView = GetScrollableView();
+-  PRInt32 x,y;
+-  scrollingView->GetScrollPosition(x,y);
+-  // Don't save scroll position if we are at (0,0)
+-  if (!x && !y) {
++  if (!mDestination) {
+     return nsnull;
+   }
+ 
+-  nsIView* child = nsnull;
+-  scrollingView->GetScrolledView(child);
+-  if (!child) {
+-    return nsnull;
+-  }
+-
+-  nsRect childRect = child->GetBounds();
+-  childRect.x = x;
+-  childRect.y = y;
+   nsPresState* state = new nsPresState();
+   if (!state) {
+     return nsnull;
+   }
+ 
+-  state->SetScrollState(childRect);
++  state->SetStatePropertyAsSupports(NS_LITERAL_STRING("destination"),
++                                    mDestination);
+ 
+   return state;
+ }
+ 
+ void
+ nsGfxScrollFrameInner::RestoreState(nsPresState* aState)
+ {
+-  mRestoreRect = aState->GetScrollState();
+-  mLastPos.x = -1;
+-  mLastPos.y = -1;
+-  mDidHistoryRestore = PR_TRUE;
+-  nsIScrollableView* scrollingView = GetScrollableView();
+-  if (scrollingView) {
+-    scrollingView->GetScrollPosition(mLastPos.x, mLastPos.y);
+-  } else {
+-    mLastPos = nsPoint(0, 0);
+-  }
++  aState->GetStatePropertyAsSupports(NS_LITERAL_STRING("destination"),
++                                     getter_AddRefs(mDestination));
+ }
+diff --git a/layout/generic/nsGfxScrollFrame.h b/layout/generic/nsGfxScrollFrame.h
+--- a/layout/generic/nsGfxScrollFrame.h
++++ b/layout/generic/nsGfxScrollFrame.h
+@@ -46,16 +46,17 @@
+ #include "nsIScrollableFrame.h"
+ #include "nsIScrollPositionListener.h"
+ #include "nsIStatefulFrame.h"
+ #include "nsThreadUtils.h"
+ #include "nsIScrollableView.h"
+ #include "nsIView.h"
+ #include "nsIReflowCallback.h"
+ #include "nsBoxLayoutState.h"
++#include "nsScrollDestination.h"
+ 
+ class nsPresContext;
+ class nsIPresShell;
+ class nsIContent;
+ class nsIAtom;
+ class nsIDocument;
+ class nsIScrollFrameInternal;
+ class nsPresState;
+@@ -136,17 +137,18 @@ public:
+   // Like ScrollPositionDidChange, but initiated by this frame rather than from the
+   // scrolling view
+   void InternalScrollPositionDidChange(nscoord aX, nscoord aY);
+ 
+   nsIScrollableView* GetScrollableView() const { return mScrollableView; }
+ 
+   nsIView* GetParentViewForChildFrame(nsIFrame* aFrame) const;
+ 
+-  void ScrollToRestoredPosition();
++  void SetDestination(nsScrollDestination *aDestination);
++  void ScrollToDestination();
+ 
+   nsPresState* SaveState(nsIStatefulFrame::SpecialStateID aStateID);
+   void RestoreState(nsPresState* aState);
+   void SaveVScrollbarStateToGlobalHistory();
+   nsresult GetVScrollbarHintFromGlobalHistory(PRBool* aVScrollbarNeeded);
+ 
+   nsIFrame* GetScrolledFrame() const { return mScrolledFrame; }
+ 
+@@ -189,26 +191,26 @@ public:
+   nsRevocableEventPtr<AsyncScrollPortEvent> mAsyncScrollPortEvent;
+   nsIScrollableView* mScrollableView;
+   nsIBox* mHScrollbarBox;
+   nsIBox* mVScrollbarBox;
+   nsIFrame* mScrolledFrame;
+   nsIBox* mScrollCornerBox;
+   nsContainerFrame* mOuter;
+ 
+-  nsRect mRestoreRect;
+-  nsPoint mLastPos;
++  // XXX When the user scrolls we need to replace mDestination with a
++  // user scrolled destination with no saved state.
++  nsCOMPtr<nsScrollDestination> mDestination;
+ 
+   PRPackedBool mNeverHasVerticalScrollbar:1;
+   PRPackedBool mNeverHasHorizontalScrollbar:1;
+   PRPackedBool mHasVerticalScrollbar:1;
+   PRPackedBool mHasHorizontalScrollbar:1;
+   PRPackedBool mViewInitiatedScroll:1;
+   PRPackedBool mFrameInitiatedScroll:1;
+-  PRPackedBool mDidHistoryRestore:1;
+   // Is this the scrollframe for the document's viewport?
+   PRPackedBool mIsRoot:1;
+   // Is mOuter an nsXULScrollFrame?
+   PRPackedBool mIsXUL:1;
+   // If true, don't try to layout the scrollbars in Reflow().  This can be
+   // useful if multiple passes are involved, because we don't want to place the
+   // scrollbars at the wrong size.
+   PRPackedBool mSupppressScrollbarUpdate:1;
+@@ -280,17 +282,17 @@ public:
+   NS_IMETHOD GetPadding(nsMargin& aPadding);
+   virtual PRBool IsCollapsed(nsBoxLayoutState& aBoxLayoutState);
+   
+   NS_IMETHOD Reflow(nsPresContext*          aPresContext,
+                     nsHTMLReflowMetrics&     aDesiredSize,
+                     const nsHTMLReflowState& aReflowState,
+                     nsReflowStatus&          aStatus);
+ 
+-  // Because there can be only one child frame, these two function return
++  // Because there can be only one child frame, these two functions return
+   // NS_ERROR_FAILURE
+   NS_IMETHOD AppendFrames(nsIAtom*        aListName,
+                           nsIFrame*       aFrameList);
+   NS_IMETHOD InsertFrames(nsIAtom*        aListName,
+                           nsIFrame*       aPrevFrame,
+                           nsIFrame*       aFrameList);
+ 
+   virtual void Destroy();
+@@ -347,18 +349,18 @@ public:
+     return NS_OK;
+   }
+   NS_IMETHOD RestoreState(nsPresState* aState) {
+     NS_ENSURE_ARG_POINTER(aState);
+     mInner.RestoreState(aState);
+     return NS_OK;
+   }
+ 
+-  virtual void ScrollToRestoredPosition() {
+-    mInner.ScrollToRestoredPosition();
++  virtual void SetDestination(nsScrollDestination* aDestination) {
++    mInner.SetDestination(aDestination);
+   }
+ 
+   virtual nsMargin GetActualScrollbarSizes() const {
+     return mInner.GetActualScrollbarSizes();
+   }
+   virtual nsMargin GetDesiredScrollbarSizes(nsBoxLayoutState* aState);
+   virtual nsMargin GetDesiredScrollbarSizes(nsPresContext* aPresContext,
+           nsIRenderingContext* aRC) {
+@@ -373,18 +375,16 @@ public:
+    * @see nsGkAtoms::scrollFrame
+    */
+   virtual nsIAtom* GetType() const;
+   
+ #ifdef NS_DEBUG
+   NS_IMETHOD GetFrameName(nsAString& aResult) const;
+ #endif
+ 
+-  PRBool DidHistoryRestore() { return mInner.mDidHistoryRestore; }
+-
+ #ifdef ACCESSIBILITY
+   NS_IMETHOD GetAccessible(nsIAccessible** aAccessible);
+ #endif
+ 
+ protected:
+   nsHTMLScrollFrame(nsIPresShell* aShell, nsStyleContext* aContext, PRBool aIsRoot);
+   virtual PRIntn GetSkipSides() const;
+   
+@@ -447,17 +447,17 @@ public:
+     return mInner.BuildDisplayList(aBuilder, aDirtyRect, aLists);
+   }
+ 
+   // XXXldb Is this actually used?
+ #if 0
+   virtual nscoord GetMinWidth(nsIRenderingContext *aRenderingContext);
+ #endif
+ 
+-  // Because there can be only one child frame, these two function return
++  // Because there can be only one child frame, these two functions return
+   // NS_ERROR_FAILURE
+   NS_IMETHOD AppendFrames(nsIAtom*        aListName,
+                           nsIFrame*       aFrameList);
+   NS_IMETHOD InsertFrames(nsIAtom*        aListName,
+                           nsIFrame*       aPrevFrame,
+                           nsIFrame*       aFrameList);
+ 
+   virtual void Destroy();
+@@ -546,18 +546,18 @@ public:
+     return NS_OK;
+   }
+   NS_IMETHOD RestoreState(nsPresState* aState) {
+     NS_ENSURE_ARG_POINTER(aState);
+     mInner.RestoreState(aState);
+     return NS_OK;
+   }
+ 
+-  virtual void ScrollToRestoredPosition() {
+-    mInner.ScrollToRestoredPosition();
++  virtual void SetDestination(nsScrollDestination* aDestination) {
++    mInner.SetDestination(aDestination);
+   }
+ 
+   virtual nsMargin GetActualScrollbarSizes() const {
+     return mInner.GetActualScrollbarSizes();
+   }
+   virtual nsMargin GetDesiredScrollbarSizes(nsBoxLayoutState* aState);
+   virtual nsMargin GetDesiredScrollbarSizes(nsPresContext* aPresContext,
+           nsIRenderingContext* aRC) {
+diff --git a/layout/generic/nsIScrollableFrame.h b/layout/generic/nsIScrollableFrame.h
+--- a/layout/generic/nsIScrollableFrame.h
++++ b/layout/generic/nsIScrollableFrame.h
+@@ -46,16 +46,17 @@
+ #include "nsISupports.h"
+ #include "nsCoord.h"
+ #include "nsIViewManager.h"
+ #include "nsIScrollableViewProvider.h"
+ #include "nsPresContext.h"
+ #include "nsIFrame.h" // to get nsIBox, which is a typedef
+ 
+ class nsBoxLayoutState;
++class nsScrollDestination;
+ 
+ class nsIScrollableFrame : public nsIScrollableViewProvider {
+ public:
+ 
+   NS_DECLARE_FRAME_ACCESSOR(nsIScrollableFrame)
+ 
+   /**
+    * Get the frame that we are scrolling within the scrollable frame.
+@@ -107,18 +108,20 @@ public:
+    */
+   virtual void SetScrollbarVisibility(PRBool aVerticalVisible, PRBool aHorizontalVisible) = 0;
+ 
+   virtual nsIBox* GetScrollbarBox(PRBool aVertical) = 0;
+ 
+   virtual void CurPosAttributeChanged(nsIContent* aChild, PRInt32 aModType) = 0;
+ 
+   /**
+-   * This tells the scroll frame to try scrolling to the scroll
+-   * position that was restored from the history. This must be called
+-   * at least once after state has been restored. It is called by the
+-   * scrolled frame itself during reflow, but sometimes state can be
+-   * restored after reflows are done...
++   * Set a scroll destination:  the frame should scroll to this
++   * destination and then remember it.  The destination object will be
++   * used again if the scroll frame is resized of if it is saved into
++   * and restored from session history.
++   *
++   * A destination of null is allowed, and causes scrolling to the origin.
+    */
+-  virtual void ScrollToRestoredPosition() = 0;
++  virtual void SetDestination(nsScrollDestination* aDestination) = 0;
++
+ };
+ 
+ #endif
