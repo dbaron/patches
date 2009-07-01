@@ -205,189 +205,45 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  };
  
  typedef void (nsLazyFrameConstructionCallback)
-diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
---- a/layout/base/nsFrameManager.cpp
-+++ b/layout/base/nsFrameManager.cpp
-@@ -907,42 +907,42 @@ nsFrameManager::DebugVerifyStyleTree(nsI
-     nsStyleContext* parentContext = context->GetParent();
-     VerifyStyleTree(GetPresContext(), aFrame, parentContext);
-   }
- }
- 
- #endif // DEBUG
- 
- nsresult
--nsFrameManager::ReParentStyleContext(nsIFrame* aFrame)
-+nsFrameManager::DoReParentStyleContext(nsIFrame* aFrame)
+@@ -84,16 +85,19 @@ class nsFrameConstructorSaveState;
+ class nsCSSFrameConstructor
  {
-   if (nsGkAtoms::placeholderFrame == aFrame->GetType()) {
-     // Also reparent the out-of-flow
-     nsIFrame* outOfFlow =
-       nsPlaceholderFrame::GetRealFrameForPlaceholder(aFrame);
-     NS_ASSERTION(outOfFlow, "no out-of-flow frame");
- 
--    ReParentStyleContext(outOfFlow);
-+    DoReParentStyleContext(outOfFlow);
+ public:
+   nsCSSFrameConstructor(nsIDocument *aDocument, nsIPresShell* aPresShell);
+   ~nsCSSFrameConstructor(void) {
+     NS_ASSERTION(mUpdateCount == 0, "Dying in the middle of our own update?");
    }
  
-   // DO NOT verify the style tree before reparenting.  The frame
-   // tree has already been changed, so this check would just fail.
-   nsStyleContext* oldContext = aFrame->GetStyleContext();
-   // XXXbz can oldContext really ever be null?
-   if (oldContext) {
-     nsPresContext *presContext = GetPresContext();
-     nsRefPtr<nsStyleContext> newContext;
-     nsIFrame* providerFrame = nsnull;
-     PRBool providerIsChild = PR_FALSE;
-     nsIFrame* providerChild = nsnull;
-     aFrame->GetParentStyleContextFrame(presContext, &providerFrame,
-                                        &providerIsChild);
-     nsStyleContext* newParentContext = nsnull;
-     if (providerIsChild) {
--      ReParentStyleContext(providerFrame);
-+      DoReParentStyleContext(providerFrame);
-       newParentContext = providerFrame->GetStyleContext();
-       providerChild = providerFrame;
-     } else if (providerFrame) {
-       newParentContext = providerFrame->GetStyleContext();
-     } else {
-       NS_NOTREACHED("Reparenting something that has no usable parent? "
-                     "Shouldn't happen!");
-     }
-@@ -985,17 +985,17 @@ nsFrameManager::ReParentStyleContext(nsI
-                   nsPlaceholderFrame::GetRealFrameForPlaceholder(child);
-                 NS_ASSERTION(outOfFlowFrame, "no out-of-flow frame");
- 
-                 NS_ASSERTION(outOfFlowFrame != providerChild,
-                              "Out of flow provider?");
-               }
- #endif
- 
--              ReParentStyleContext(child);
-+              DoReParentStyleContext(child);
-             }
- 
-             child = child->GetNextSibling();
-           }
- 
-           childList = aFrame->GetAdditionalChildListName(listIndex++);
-         } while (childList);
- 
-@@ -1004,17 +1004,17 @@ nsFrameManager::ReParentStyleContext(nsI
-         // Reparent its style context just in case one of our ancestors
-         // (split or not) hasn't done so already). It's not a problem to
-         // reparent the same frame twice because the "if (newContext !=
-         // oldContext)" check will prevent us from redoing work.
-         if ((aFrame->GetStateBits() & NS_FRAME_IS_SPECIAL) &&
-             !aFrame->GetPrevInFlow()) {
-           nsIFrame* sib = static_cast<nsIFrame*>(aFrame->GetProperty(nsGkAtoms::IBSplitSpecialSibling));
-           if (sib) {
--            ReParentStyleContext(sib);
-+            DoReParentStyleContext(sib);
-           }
-         }
- 
-         // do additional contexts 
-         PRInt32 contextIndex = -1;
-         while (1) {
-           nsStyleContext* oldExtraContext =
-             aFrame->GetAdditionalStyleContext(++contextIndex);
-@@ -1050,16 +1050,26 @@ nsFrameManager::ReParentStyleContext(nsI
-         VerifyStyleTree(GetPresContext(), aFrame, newParentContext);
- #endif
-       }
-     }
-   }
-   return NS_OK;
- }
- 
-+nsresult
-+nsFrameManager::ReParentStyleContext(nsIFrame* aFrame)
-+{
-+  nsresult rv = DoReParentStyleContext(aFrame);
++  struct RestyleData;
++  friend struct RestyleData;
 +
-+  GetPresContext()->TransitionManager()->DoneChangingStyles();
-+
-+  return rv;
-+}
-+
- static nsChangeHint
- CaptureChange(nsStyleContext* aOldContext, nsStyleContext* aNewContext,
-               nsIFrame* aFrame, nsIContent* aContent,
-               nsStyleChangeList* aChangeList, nsChangeHint aMinChange,
-               nsChangeHint aChangeToAssume)
- {
-   nsChangeHint ourChange = aOldContext->CalcStyleDifference(aNewContext);
-   NS_UpdateHint(ourChange, aChangeToAssume);
-@@ -1459,19 +1469,19 @@ nsFrameManager::ReResolveStyleContext(ns
-     }
-   }
- #endif
+   // Maintain global objects - gXBLService
+   static nsIXBLService * GetXBLService();
+   static void ReleaseGlobals() { NS_IF_RELEASE(gXBLService); }
  
-   return aMinChange;
- }
- 
- void
--nsFrameManager::ComputeStyleChangeFor(nsIFrame          *aFrame, 
--                                      nsStyleChangeList *aChangeList,
--                                      nsChangeHint       aMinChange)
-+nsFrameManager::DoComputeStyleChangeFor(nsIFrame          *aFrame, 
-+                                        nsStyleChangeList *aChangeList,
-+                                        nsChangeHint       aMinChange)
- {
-   if (aMinChange) {
-     aChangeList->AppendChange(aFrame, aFrame->GetContent(), aMinChange);
+   // get the alternate text for a content node
+   static void GetAlternateTextFor(nsIContent*    aContent,
+                                   nsIAtom*       aTag,  // content object's tag
+                                   nsXPIDLString& aAltText);
+@@ -1599,18 +1603,16 @@ private:
    }
  
-   nsChangeHint topLevelChange = aMinChange;
+   void CountersDirty() {
+     NS_PRECONDITION(mUpdateCount != 0, "Instant counter updates are bad news");
+     mCountersDirty = PR_TRUE;
+   }
  
-   nsIFrame* frame = aFrame;
-@@ -1513,16 +1523,25 @@ nsFrameManager::ComputeStyleChangeFor(ns
-     }
-     
-     frame2 = static_cast<nsIFrame*>
-                         (propTable->GetProperty(frame2, nsGkAtoms::IBSplitSpecialSibling));
-     frame = frame2;
-   } while (frame2);
- }
+ public:
+-  struct RestyleData;
+-  friend struct RestyleData;
  
-+void
-+nsFrameManager::ComputeStyleChangeFor(nsIFrame          *aFrame, 
-+                                      nsStyleChangeList *aChangeList,
-+                                      nsChangeHint       aMinChange)
-+{
-+  DoComputeStyleChangeFor(aFrame, aChangeList, aMinChange);
-+
-+  GetPresContext()->TransitionManager()->DoneChangingStyles();
-+}
+   struct RestyleData {
+     nsReStyleHint mRestyleHint;  // What we want to restyle
+     nsChangeHint  mChangeHint;   // The minimal change hint for "self"
+   };
  
- nsReStyleHint
- nsFrameManager::HasAttributeDependentStyle(nsIContent *aContent,
-                                            nsIAtom *aAttribute,
-                                            PRInt32 aModType,
-                                            PRUint32 aStateMask)
- {
-   nsReStyleHint hint = mStyleSet->HasAttributeDependentStyle(GetPresContext(),
-diff --git a/layout/base/nsFrameManager.h b/layout/base/nsFrameManager.h
---- a/layout/base/nsFrameManager.h
-+++ b/layout/base/nsFrameManager.h
-@@ -236,11 +236,16 @@ public:
- 
- private:
-   NS_HIDDEN_(nsChangeHint)
-     ReResolveStyleContext(nsPresContext    *aPresContext,
-                           nsIFrame          *aFrame,
-                           nsIContent        *aParentContent,
-                           nsStyleChangeList *aChangeList, 
-                           nsChangeHint       aMinChange);
-+  NS_HIDDEN_(void)
-+    DoComputeStyleChangeFor(nsIFrame* aFrame,
-+                            nsStyleChangeList* aChangeList,
-+                            nsChangeHint aMinChange);
-+  NS_HIDDEN_(nsresult) DoReParentStyleContext(nsIFrame* aFrame);
- };
- 
- #endif
+   struct RestyleEnumerateData : public RestyleData {
+     nsCOMPtr<nsIContent> mContent;
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
@@ -467,7 +323,7 @@ diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/base/nsRefreshDriver.cpp
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,219 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -668,10 +524,6 @@ new file mode 100644
 +    };
 +    PR_STATIC_ASSERT(NS_ARRAY_LENGTH(observers) == NS_ARRAY_LENGTH(mObservers));
 +    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(observers); ++i) {
-+        if (i == 0) {
-+            // This is the Flush_Style case.
-+            presContext->SetProcessingAnimationStyleChange(PR_TRUE);
-+        }
 +        nsTArray<nsARefreshObserver*> array = observers[i];
 +        for (PRUint32 j = 0, j_end = array.Length(); j < j_end; ++j) {
 +            array[j]->WillRefresh(mMostRecentRefresh);
@@ -682,7 +534,6 @@ new file mode 100644
 +            // FIXME: We should only flush if the WillRefresh calls did
 +            // something.
 +            presShell->FlushPendingNotifications(Flush_Style);
-+            presContext->SetProcessingAnimationStyleChange(PR_FALSE);
 +        }
 +    }
 +
@@ -1082,7 +933,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,860 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1443,14 +1294,13 @@ new file mode 100644
 +        if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
 +                                   nsCSSProps::kSIDTable[pt.mProperty]))
 +        {
-+            NS_ABORT_IF_FALSE(rule->RefreshTime() - pt.mStartTime <
-+                                  pt.mDuration,
-+                              "should have trimmed completed transition");
 +            double timePortion =
 +                (rule->RefreshTime() - pt.mStartTime).ToSeconds() /
 +                pt.mDuration.ToSeconds();
 +            if (timePortion < 0.0)
 +                timePortion = 0.0; // use start value during transition-delay
++            if (timePortion > 1.0)
++                timePortion = 1.0; // we might be behind on flushing
 +
 +            double valuePortion =
 +                pt.mTimingFunction.GetSplineValue(timePortion);
@@ -1765,9 +1615,7 @@ new file mode 100644
 +        AddFrameTransitions(ft);
 +    }
 +
-+    // DoneChangingStyles takes care of restyling immediately after
-+    // finishing this subtree, with the transition-based style.
-+    presContext->PresShell()->PostRestyleFor(aFrame->GetContent());
++    presContext->PresShell()->PostRestyleFor(aFrame->GetContent(), PR_TRUE);
 +
 +    nsTArray<FramePropertyTransition> &pts = ft->mPropertyTransitions;
 +    for (PRUint32 i = 0, i_end = pts.Length(); i < i_end; ++i) {
@@ -1800,28 +1648,6 @@ new file mode 100644
 +    }
 +
 +    PR_INSERT_BEFORE(aFrameTransitions, &mFrameTransitions);
-+}
-+
-+void
-+nsTransitionManager::DoneChangingStyles()
-+{
-+    // FIXME: What about things we flush here that were actually posted
-+    // before this style change started?
-+
-+    // We want to flush two types of events that were posted during
-+    // style reresolution:
-+    //   (1) restyle events for transitions that we just started
-+    //   (2) restyle events for elements that were already
-+    //       transitioning, but for which we skipped the transition
-+    //       style rule so that we could see if they needed a new
-+    //       transition
-+    nsPresContext *presContext = nsPresContext::FromTransitionManager(this);
-+    if (!presContext->IsProcessingAnimationStyleChange())
-+    {
-+        presContext->SetProcessingAnimationStyleChange(PR_TRUE);
-+        presContext->PresShell()->FlushPendingNotifications(Flush_Style);
-+        presContext->SetProcessingAnimationStyleChange(PR_FALSE);
-+    }
 +}
 +
 +/*
@@ -1944,7 +1770,8 @@ new file mode 100644
 +
 +            // We need to restyle even if the transition rule no longer
 +            // applies (in which case we just made it not apply).
-+            presContext->PresShell()->PostRestyleFor(ft->mFrame->GetContent());
++            presContext->PresShell()->PostRestyleFor(ft->mFrame->GetContent(),
++                                                     PR_TRUE);
 +
 +            if (ft->mPropertyTransitions.IsEmpty()) {
 +                ft->mFrame->DeleteProperty(nsGkAtoms::transitionsProperty);
@@ -1971,7 +1798,7 @@ diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManag
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.h
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,97 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -2036,7 +1863,6 @@ new file mode 100644
 +
 +    void StyleContextChanged(nsIFrame *aFrame,
 +                             nsStyleContext *aOldStyleContext);
-+    void DoneChangingStyles();
 +
 +    static void InitializeAnimationInfo();
 +
@@ -2095,7 +1921,7 @@ diff --git a/layout/style/test/test_transitions.html b/layout/style/test/test_tr
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/test/test_transitions.html
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,234 @@
 +<!DOCTYPE HTML>
 +<html>
 +<!--
@@ -2213,8 +2039,8 @@ new file mode 100644
 +    is(getComputedStyle(p, "").textIndent, "0px",
 +       "should be zero before changing value");
 +    p.style.textIndent = "100px";
-+    todo_is(getComputedStyle(p, "").textIndent, "0px",
-+            "should be zero right after starting transition");
++    is(getComputedStyle(p, "").textIndent, "0px",
++       "should be zero right after starting transition");
 +    tftests.push([ p, tf ]);
 +}
 +add_future_call(2, function() { check_tf_test(0.25); }); TestStarted();
@@ -2317,8 +2143,7 @@ new file mode 100644
 +        cval = cval.substring(0, cval.length - 2);
 +
 +        // allow to be within 1px of the exact value
-+        var func = (time == 0 && value_portion != 1) ? todo : ok;
-+        func(Math.abs(Number(cval) - 100 * value_portion) <= tolerance * 100,
++        ok(Math.abs(Number(cval) - 100 * value_portion) <= tolerance * 100,
 +           "delay test: computed value " + cvorig +
 +           " should be within " + (tolerance * 100) + "px of " +
 +           (100 * value_portion) + "px" +
