@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Implement CSS transitions:  handle starting and management of the animations.  (Bug 435441)
+Implement CSS transitions:  handle starting and management of the animations, and add support for transitions of length and percentage values.  (Bug 435441)
 
 diff --git a/content/base/src/nsGkAtomList.h b/content/base/src/nsGkAtomList.h
 --- a/content/base/src/nsGkAtomList.h
@@ -939,7 +939,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,991 @@
+@@ -0,0 +1,860 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1002,11 +1002,7 @@ new file mode 100644
 +    eCannotAnimate,
 +    eStyleSides,
 +    eStyleCoord,
-+    eNsCoord,
-+    eNsColor
-+#if 0
-+    ePaintServer
-+#endif
++    eNsCoord
 +  };
 +
 +  Type mType;
@@ -1086,49 +1082,6 @@ new file mode 100644
 +  { eCSSProperty_outline_offset, offsetof(nsStyleOutline, mOutlineOffset) },
 +  { eCSSProperty_word_spacing, offsetof(nsStyleText, mWordSpacing) }
 +};
-+
-+struct NsColorAnimationInfo {
-+  typedef nscolor location_type;
-+
-+  nsCSSProperty mProperty;
-+  size_t mLocation;
-+};
-+
-+static const NsColorAnimationInfo gNsColorAnimInfo[] = {
-+  { eCSSProperty_color, offsetof(nsStyleColor, mColor) },
-+  { eCSSProperty_background_color,
-+    offsetof(nsStyleBackground, mBackgroundColor) },
-+#if 0 // FIXME
-+  { eCSSProperty_border_top_color,
-+    offsetof(nsStyleBorder, mBorderColor[0]) },
-+  { eCSSProperty_border_right_color_value,
-+    offsetof(nsStyleBorder, mBorderColor[1]) },
-+  { eCSSProperty_border_bottom_color,
-+    offsetof(nsStyleBorder, mBorderColor[2]) },
-+  { eCSSProperty_border_left_color_value,
-+    offsetof(nsStyleBorder, mBorderColor[3]) },
-+  { eCSSProperty_outline_color, offsetof(nsStyleOutline, mOutlineColor) },
-+#endif
-+  { eCSSProperty__moz_column_rule_color,
-+    offsetof(nsStyleColumn, mColumnRuleColor) },
-+  { eCSSProperty_stop_color, offsetof(nsStyleSVGReset, mStopColor) },
-+  { eCSSProperty_flood_color, offsetof(nsStyleSVGReset, mFloodColor) },
-+  { eCSSProperty_lighting_color, offsetof(nsStyleSVGReset, mLightingColor) }
-+};
-+
-+struct PaintServerAnimationInfo {
-+  typedef nsStyleSVGPaint location_type;
-+
-+  nsCSSProperty mProperty;
-+  size_t mLocation;
-+};
-+
-+static const NsColorAnimationInfo gPaintServerAnimInfo[] = {
-+  { eCSSProperty_fill , offsetof(nsStyleSVG, mFill) },
-+  { eCSSProperty_stroke , offsetof(nsStyleSVG, mStroke) },
-+};
-+
-+//  { eCSSProperty_ , offsetof(nsStyle, ) },
 +
 +static CSSPropertyAnimationInfo gAnimInfo[eCSSProperty_COUNT_no_shorthands];
 +
@@ -1213,22 +1166,6 @@ new file mode 100644
 +        gAnimInfo[prop].mType = CSSPropertyAnimationInfo::eNsCoord;
 +        gAnimInfo[prop].mIndex = i;
 +    }
-+
-+    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gNsColorAnimInfo); ++i) {
-+        nsCSSProperty prop = gNsColorAnimInfo[i].mProperty;
-+        NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(prop), "must be longhand");
-+        gAnimInfo[prop].mType = CSSPropertyAnimationInfo::eNsColor;
-+        gAnimInfo[prop].mIndex = i;
-+    }
-+
-+#if 0
-+    for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gPaintServerAnimInfo); ++i) {
-+        nsCSSProperty prop = gPaintServerAnimInfo[i].mProperty;
-+        NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(prop), "must be longhand");
-+        gAnimInfo[prop].mType = CSSPropertyAnimationInfo::ePaintServer;
-+        gAnimInfo[prop].mIndex = i;
-+    }
-+#endif
 +}
 +
 +/*****************************************************************************
@@ -1239,7 +1176,6 @@ new file mode 100644
 +{
 +    nscoord mCoord;
 +    float mPercent;
-+    nscolor mColor;
 +};
 +
 +struct FramePropertyTransition
@@ -1346,22 +1282,6 @@ new file mode 100644
 +    return val;
 +}
 +
-+static nscolor
-+ColorFromPortion(nscolor aStartColor, nscolor aEndColor, double aValuePortion)
-+{
-+  double inv = 1.0 - aValuePortion;
-+  // FIXME: Does it matter if these are premultiplied?  I think it does.
-+  // So the spec should say what to do here...
-+  return NS_RGBA(PRUint8(NS_GET_R(aStartColor) * inv +
-+                         NS_GET_R(aEndColor) * aValuePortion),
-+                 PRUint8(NS_GET_G(aStartColor) * inv +
-+                         NS_GET_G(aEndColor) * aValuePortion),
-+                 PRUint8(NS_GET_B(aStartColor) * inv +
-+                         NS_GET_B(aEndColor) * aValuePortion),
-+                 PRUint8(NS_GET_A(aStartColor) * inv +
-+                         NS_GET_A(aEndColor) * aValuePortion));
-+}
-+
 +static void
 +FrameTransitionsPostResolveCallback(void* aStyleStruct, nsRuleData* aRuleData)
 +{
@@ -1420,24 +1340,6 @@ new file mode 100644
 +                    SetPropertyValue(aStyleStruct, coordInfo, val);
 +                    break;
 +                }
-+                case CSSPropertyAnimationInfo::eNsColor: {
-+                    const NsColorAnimationInfo& colorInfo =
-+                        gNsColorAnimInfo[animInfo.mIndex];
-+                    SetPropertyValue(aStyleStruct, colorInfo,
-+                                     ColorFromPortion(pt.mStartValue.mColor,
-+                                                      pt.mEndValue.mColor,
-+                                                      valuePortion));
-+                    break;
-+                }
-+#if 0
-+                case CSSPropertyAnimationInfo::ePaintServer: {
-+                    const PaintServerAnimationInfo& paintServerInfo =
-+                        gPaintServerAnimInfo[animInfo.mIndex];
-+                    SetPropertyValue(aStyleStruct, paintServerInfo,
-+                                     ColorFromPortion(pt, valuePortion));
-+                    break;
-+                }
-+#endif
 +            }
 +
 +            if (aRuleData->mSIDs & NS_STYLE_INHERIT_BIT(Margin)) {
@@ -1662,39 +1564,6 @@ new file mode 100644
 +            t.mEndValue.mCoord   = newVal;
 +            break;
 +        }
-+        case CSSPropertyAnimationInfo::eNsColor: {
-+            const NsColorAnimationInfo& colorInfo =
-+                gNsColorAnimInfo[animInfo.mIndex];
-+            const nscolor &oldVal =
-+                GetPropertyValue(aOldStyleContext, colorInfo);
-+            const nscolor &newVal =
-+                GetPropertyValue(aFrame->GetStyleContext(), colorInfo);
-+            if (oldVal == newVal) {
-+                return;
-+            }
-+            t.mStartValue.mColor = oldVal;
-+            t.mEndValue.mColor   = newVal;
-+            break;
-+        }
-+#if 0
-+        case CSSPropertyAnimationInfo::ePaintServer: {
-+            const PaintServerAnimationInfo& paintServerInfo =
-+                gPaintServerAnimInfo[animInfo.mIndex];
-+            const nsStyleSVGPaint &oldVal =
-+                GetPropertyValue(aOldStyleContext, paintServerInfo);
-+            const nsStyleSVGPaint &newVal =
-+                GetPropertyValue(aFrame->GetStyleContext(), paintServerInfo);
-+            // FIXME: Support gradient animation.
-+            if (oldVal == newVal ||
-+                oldVal.mType != eStyleSVGPaintType_Color ||
-+                newVal.mType != eStyleSVGPaintType_Color) {
-+                return;
-+            }
-+            t.mStartValue.mColor = oldVal.mPaint.mColor;
-+            t.mEndValue.mColor   = newVal.mPaint.mColor;
-+            break;
-+        }
-+#endif
 +    }
 +
 +    nsPresContext *presContext = aFrame->PresContext();
