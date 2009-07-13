@@ -945,7 +945,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,921 @@
+@@ -0,0 +1,957 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1521,33 +1521,11 @@ new file mode 100644
 +                      "property out of range");
 +
 +    const CSSPropertyAnimationInfo& animInfo = gAnimInfo[aProperty];
-+    if (animInfo.mType == CSSPropertyAnimationInfo::eCannotAnimate) {
-+        return;
-+    }
-+
-+    PRUint32 currentIndex = PRUint32(-1);
-+    if (aFrameTransitions) {
-+        nsTArray<FramePropertyTransition> &pts =
-+            aFrameTransitions->mPropertyTransitions;
-+        for (PRUint32 i = 0, i_end = pts.Length(); i < i_end; ++i) {
-+            if (pts[i].mProperty == aProperty) {
-+                currentIndex = i;
-+                break;
-+            }
-+        }
-+    }
-+
-+    const TransitionEndpoint *endVal = nsnull;
-+    if (currentIndex != PRUint32(-1)) {
-+        endVal =
-+            &aFrameTransitions->mPropertyTransitions[currentIndex].mEndValue;
-+    }
-+
 +    FramePropertyTransition t;
 +    PRBool shouldAnimate;
 +    switch (animInfo.mType) {
 +        case CSSPropertyAnimationInfo::eCannotAnimate: {
-+            NS_ABORT_IF_FALSE(PR_FALSE, "should have returned earlier");
++            return;
 +        }
 +        case CSSPropertyAnimationInfo::eStyleSides: {
 +            const StyleSidesAnimationInfo& sidesInfo =
@@ -1558,8 +1536,6 @@ new file mode 100644
 +                GetPropertyValue(aFrame->GetStyleContext(), sidesInfo);
 +            shouldAnimate = ShouldAnimateStyleCoords(oldVal, newVal);
 +            if (shouldAnimate) {
-+                // FIXME: Adjust old value using endVal if there's
-+                // currently a transition for this frame+property!
 +                InitStyleCoordTransition(oldVal, newVal, t);
 +            }
 +            break;
@@ -1573,8 +1549,6 @@ new file mode 100644
 +                GetPropertyValue(aFrame->GetStyleContext(), coordInfo);
 +            shouldAnimate = ShouldAnimateStyleCoords(oldVal, newVal);
 +            if (shouldAnimate) {
-+                // FIXME: Adjust old value using endVal if there's
-+                // currently a transition for this frame+property!
 +                InitStyleCoordTransition(oldVal, newVal, t);
 +            }
 +            break;
@@ -1588,12 +1562,22 @@ new file mode 100644
 +                GetPropertyValue(aFrame->GetStyleContext(), coordInfo);
 +            shouldAnimate = oldVal != newVal;
 +            if (shouldAnimate) {
-+                // FIXME: Adjust old value using endVal if there's
-+                // currently a transition for this frame+property!
 +                t.mStartValue.mCoord = oldVal;
 +                t.mEndValue.mCoord   = newVal;
 +            }
 +            break;
++        }
++    }
++
++    PRUint32 currentIndex = PRUint32(-1);
++    if (aFrameTransitions) {
++        nsTArray<FramePropertyTransition> &pts =
++            aFrameTransitions->mPropertyTransitions;
++        for (PRUint32 i = 0, i_end = pts.Length(); i < i_end; ++i) {
++            if (pts[i].mProperty == aProperty) {
++                currentIndex = i;
++                break;
++            }
 +        }
 +    }
 +
@@ -1620,12 +1604,64 @@ new file mode 100644
 +        return;
 +    }
 +
++    // When we interrupt an running transition, we want to reduce the
++    // duration of the new transition *if* the new transition would have
++    // been longer had it started from the endpoint of the currently
++    // running transition.
++    double durationFraction = 1.0;
++    if (currentIndex != PRUint32(-1)) {
++        const TransitionEndpoint &endVal =
++            aFrameTransitions->mPropertyTransitions[currentIndex].mEndValue;
++
++        switch (animInfo.mType) {
++            case CSSPropertyAnimationInfo::eCannotAnimate: {
++                NS_ABORT_IF_FALSE(PR_FALSE, "unexpected property");
++            }
++            case CSSPropertyAnimationInfo::eStyleSides:
++            case CSSPropertyAnimationInfo::eStyleCoord: {
++                if (t.mUnit == eStyleUnit_Percent) {
++                    NS_ABORT_IF_FALSE(aFrameTransitions->mPropertyTransitions
++                                        [currentIndex].mUnit ==
++                                      eStyleUnit_Percent,
++                                      "unit mismatch");
++                    durationFraction =
++                        double(t.mStartValue.mPercent - t.mEndValue.mPercent) /
++                        double(endVal.mPercent - t.mEndValue.mPercent);
++                    break;
++                }
++                // else fall through
++            }
++            case CSSPropertyAnimationInfo::eNsCoord: {
++                durationFraction =
++                    double(t.mStartValue.mCoord - t.mEndValue.mCoord) /
++                    double(endVal.mCoord - t.mEndValue.mCoord);
++                break;
++            }
++        }
++        if (durationFraction < 0.0)
++            durationFraction = -durationFraction;
++        if (durationFraction > 1.0)
++            durationFraction = 1.0;
++    }
++
++
 +    nsRefreshDriver *rd = presContext->RefreshDriver();
 +
 +    t.mProperty = aProperty;
++    float delay = aTransition.GetDelay();
++    float duration = aTransition.GetDuration();
++    if (durationFraction != 1.0) {
++        // Negative delays are essentially part of the transition
++        // function, so reduce them along with the duration, but don't
++        // reduce positive delays.  (See comment above about
++        // durationFraction.)
++        if (delay < 0.0f)
++            delay *= durationFraction;
++        duration *= durationFraction;
++    }
 +    t.mStartTime = rd->MostRecentRefresh() +
-+                   TimeDuration::FromMilliseconds(aTransition.GetDelay());
-+    t.mDuration = TimeDuration::FromMilliseconds(aTransition.GetDuration());
++                   TimeDuration::FromMilliseconds(delay);
++    t.mDuration = TimeDuration::FromMilliseconds(duration);
 +    const nsTimingFunction &tf = aTransition.GetTimingFunction();
 +    t.mTimingFunction.Init(tf.mX1, tf.mY1, tf.mX2, tf.mY2);
 +
