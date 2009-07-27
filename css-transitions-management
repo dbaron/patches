@@ -1121,7 +1121,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -0,0 +1,1235 @@
+@@ -0,0 +1,1284 @@
 +/* vim: set shiftwidth=4 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -1471,6 +1471,34 @@ new file mode 100644
 +    TimeStamp mRefreshTime;
 +};
 +
++class CoverTransitionStartStyleRule : public nsIStyleRule
++{
++public:
++    // nsISupportsImplementation
++    NS_DECL_ISUPPORTS
++
++    // nsIStyleRule implementation
++    NS_IMETHOD MapRuleInfoInto(nsRuleData* aRuleData);
++#ifdef DEBUG
++    NS_IMETHOD List(FILE* out = stdout, PRInt32 aIndent = 0) const;
++#endif
++
++    NS_HIDDEN_(void) CoverValue(nsCSSProperty aProperty,
++                                nsStyleContext *aOldStyleContext);
++
++private:
++    struct CoveredValue;
++    friend struct CoveredValue;
++    struct CoveredValue {
++        nsCSSProperty mProperty;
++        nsStyleUnit mUnit;
++        TransitionEndpoint mCoveredValue;
++    };
++
++
++    nsTArray<CoveredValue> mCoveredValues;
++};
++
 +struct ElementTransitions : public PRCList
 +{
 +    ElementTransitions(nsIContent *aElement, nsIAtom *aElementProperty,
@@ -1520,20 +1548,6 @@ new file mode 100644
 +}
 +
 +NS_IMPL_ISUPPORTS1(ElementTransitionsStyleRule, nsIStyleRule)
-+
-+class CoverTransitionStartStyleRule : public nsIStyleRule
-+{
-+public:
-+    // nsISupportsImplementation
-+    NS_DECL_ISUPPORTS
-+
-+    // nsIStyleRule implementation
-+    NS_IMETHOD MapRuleInfoInto(nsRuleData* aRuleData);
-+#ifdef DEBUG
-+    NS_IMETHOD List(FILE* out = stdout, PRInt32 aIndent = 0) const;
-+#endif
-+
-+};
 +
 +static nsStyleCoord
 +CoordFromPortion(const ElementPropertyTransition &aPT,
@@ -1782,6 +1796,18 @@ new file mode 100644
 +}
 +#endif
 +
++void
++CoverTransitionStartStyleRule::CoverValue(nsCSSProperty aProperty,
++                                          nsStyleContext *aOldStyleContext)
++{
++    CoveredValue *v = mCoveredValues.AppendElement();
++    if (!v) {
++        NS_WARNING("out of memory");
++        return;
++    }
++
++    v->mProperty = aProperty;
++}
 +
 +/*****************************************************************************
 + * nsTransitionManager                                                       *
@@ -1812,18 +1838,6 @@ new file mode 100644
 +    NS_PRECONDITION(aOldStyleContext->HasPseudoElementData() ==
 +                        aNewStyleContext->HasPseudoElementData(),
 +                    "pseudo type mismatch");
-+    // FIXME NOW: fix comment!
-+    // FIXME: This method is somewhat suboptimal as described in
-+    // http://lists.w3.org/Archives/Public/www-style/2009Jun/0121.html .
-+    // The working group decided that instead of the current behavior it
-+    // gives us, a transition property on an element should not cause
-+    // any transitions if the property change is itself inheriting a
-+    // value that is transitioning on an ancestor.  (In other words,
-+    // we'll get the correct behavior if we implement immediate
-+    // restyling with the transition, except for the case of negative
-+    // transition-delay... unless we do both immediate restyling (for
-+    // zero) and then restyle again for the negative transition-delay.)
-+
 +    if (aNewStyleContext->PresContext()->IsProcessingAnimationStyleChange()) {
 +        return nsnull;
 +    }
@@ -1884,10 +1898,45 @@ new file mode 100644
 +            }
 +        }
 +    }
-+    
-+    if (startedAny) {
-+        // FIXME: WRITE ME!
++
++    if (!startedAny) {
++        return nsnull;
 +    }
++
++    // In the CSS working group discussion (2009 Jul 15 telecon,
++    // http://www.w3.org/mid/4A5E1470.4030904@inkedblade.net ) of
++    // http://lists.w3.org/Archives/Public/www-style/2009Jun/0121.html ,
++    // the working group decided that a transition property on an
++    // element should not cause any transitions if the property change
++    // is itself inheriting a value that is transitioning on an
++    // ancestor.  So, to get the correct behavior, we continue the
++    // restyle that caused this transition using a "covering" rule that
++    // covers up any changes on which we started transitions, so that
++    // descendants don't start their own transitions.  (In the case of
++    // negative transition delay, this covering rule produces different
++    // results than applying the transition rule immediately would).
++    // Our caller is responsible for restyling again using this covering
++    // rule.
++
++    nsRefPtr<CoverTransitionStartStyleRule coverRule =
++        new CoverTransitionStartStyleRule;
++    if (!coverRule) {
++        NS_WARNING("out of memory");
++        return nsnull;
++    }
++    
++    for (PRUint32 iHigh = 0; iHigh < nsCSSPropertySet::kChunkCount; ++iHigh) {
++        if (!whichStarted.HasPropertyInChunk(iHigh))
++            continue;
++        for (PRInt32 iLow = 0; iLow < nsCSSPropertySet::kBitsInChunk; ++iLow) {
++            if (!whichStarted.HasPropertyAt(iHigh, iLow))
++                continue;
++            nsCSSProperty iProp = nsCSSPropertySet::CSSPropertyAt(iHigh, iLow);
++            coverRule->CoverValue(iProp, aOldStyleContext);
++        }
++    }
++
++    return coverRule.forget();
 +}
 +
 +static PRBool
