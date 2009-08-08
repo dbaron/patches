@@ -1,0 +1,245 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Remove InspectorCSSUtils, part 3: Remove the trivial methods and replace their callers with appropriate internal calls.  (Bug 371655)
+
+diff --git a/layout/inspector/src/inCSSValueSearch.cpp b/layout/inspector/src/inCSSValueSearch.cpp
+--- a/layout/inspector/src/inCSSValueSearch.cpp
++++ b/layout/inspector/src/inCSSValueSearch.cpp
+@@ -61,24 +61,26 @@ inCSSValueSearch::inCSSValueSearch()
+     mProperties(nsnull),
+     mResultCount(0),
+     mPropertyCount(0),
+     mIsActive(PR_FALSE),
+     mHoldResults(PR_TRUE),
+     mReturnRelativeURLs(PR_TRUE),
+     mNormalizeChromeURLs(PR_FALSE)
+ {
++  nsCSSProps::AddRefTable();
+   mProperties = new nsCSSProperty[100];
+   mCSSUtils = do_GetService(kInspectorCSSUtilsCID);
+ }
+ 
+ inCSSValueSearch::~inCSSValueSearch()
+ {
+   delete[] mProperties;
+   delete mResults;
++  nsCSSProps::ReleaseTable();
+ }
+ 
+ NS_IMPL_ISUPPORTS2(inCSSValueSearch, inISearchProcess, inICSSValueSearch)
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ // inISearchProcess
+ 
+ NS_IMETHODIMP 
+@@ -254,18 +256,18 @@ inCSSValueSearch::SetNormalizeChromeURLs
+ {
+   mNormalizeChromeURLs = aNormalizeChromeURLs;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP 
+ inCSSValueSearch::AddPropertyCriteria(const PRUnichar *aPropName)
+ {
+-  nsCSSProperty prop;
+-  mCSSUtils->LookupCSSProperty(nsDependentString(aPropName), &prop);
++  nsCSSProperty prop =
++    nsCSSProps::LookupProperty(nsDependentString(aPropName));
+   mProperties[mPropertyCount] = prop;
+   mPropertyCount++;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP 
+ inCSSValueSearch::GetTextCriteria(PRUnichar** aTextCriteria)
+ {
+diff --git a/layout/inspector/src/inCSSValueSearch.h b/layout/inspector/src/inCSSValueSearch.h
+--- a/layout/inspector/src/inCSSValueSearch.h
++++ b/layout/inspector/src/inCSSValueSearch.h
+@@ -40,16 +40,17 @@
+ 
+ #include "inICSSValueSearch.h"
+ 
+ #include "nsCOMPtr.h"
+ #include "nsString.h"
+ #include "nsIDOMDocument.h"
+ #include "inISearchObserver.h"
+ #include "nsTArray.h"
++#include "nsCSSProps.h"
+ #include "nsIInspectorCSSUtils.h"
+ 
+ class nsIDOMCSSStyleSheet;
+ class nsIDOMCSSRuleList;
+ class nsIDOMCSSStyleRule;
+ class nsIURI;
+ 
+ class inCSSValueSearch : public inICSSValueSearch
+diff --git a/layout/inspector/src/inDOMUtils.cpp b/layout/inspector/src/inDOMUtils.cpp
+--- a/layout/inspector/src/inDOMUtils.cpp
++++ b/layout/inspector/src/inDOMUtils.cpp
+@@ -173,25 +173,20 @@ inDOMUtils::GetCSSStyleRules(nsIDOMEleme
+     // if the document they're in doesn't have a presshell.  Bail out.
+     return NS_OK;
+   }
+ 
+   nsCOMPtr<nsISupportsArray> rules;
+   NS_NewISupportsArray(getter_AddRefs(rules));
+   if (!rules) return NS_ERROR_OUT_OF_MEMORY;
+ 
+-  nsCOMPtr<nsIStyleRule> srule;
+   nsCOMPtr<nsICSSStyleRule> cssRule;
+   nsCOMPtr<nsIDOMCSSRule> domRule;
+-  for (PRBool isRoot;
+-       mCSSUtils->IsRuleNodeRoot(ruleNode, &isRoot), !isRoot;
+-       mCSSUtils->GetRuleNodeParent(ruleNode, &ruleNode))
+-  {
+-    mCSSUtils->GetRuleNodeRule(ruleNode, getter_AddRefs(srule));
+-    cssRule = do_QueryInterface(srule);
++  for ( ; !ruleNode->IsRoot(); ruleNode = ruleNode->GetParent()) {
++    cssRule = do_QueryInterface(ruleNode->GetRule());
+     if (cssRule) {
+       cssRule->GetDOMRule(getter_AddRefs(domRule));
+       if (domRule)
+         rules->InsertElementAt(domRule, 0);
+     }
+   }
+ 
+   *_retval = rules;
+diff --git a/layout/style/nsIInspectorCSSUtils.h b/layout/style/nsIInspectorCSSUtils.h
+--- a/layout/style/nsIInspectorCSSUtils.h
++++ b/layout/style/nsIInspectorCSSUtils.h
+@@ -47,37 +47,26 @@
+ class nsRuleNode;
+ class nsIStyleRule;
+ class nsIFrame;
+ struct nsRect;
+ class nsIContent;
+ class nsIDOMElement;
+ class nsIArray;
+ 
+-// 5cfdb02f-0962-454c-b015-b05123927021
++// afb608b5-96ac-440e-a203-52cac9f188e1
+ #define NS_IINSPECTORCSSUTILS_IID \
+-  { 0x5cfdb02f, 0x0962, 0x454c, \
+-    { 0xb0, 0x15, 0xb0, 0x51, 0x23, 0x92, 0x70, 0x21 } }
++  { 0xafb608b5, 0x96ac, 0x440e, \
++    { 0xa2, 0x03, 0x52, 0xca, 0xc9, 0xf1, 0x88, 0xe1 } }
+ 
+ // 7ef2f07f-6e34-410b-8336-88acd1cd16b7
+ #define NS_INSPECTORCSSUTILS_CID \
+   { 0x7ef2f07f, 0x6e34, 0x410b, \
+     {0x83, 0x36, 0x88, 0xac, 0xd1, 0xcd, 0x16, 0xb7 } }
+ 
+ class nsIInspectorCSSUtils : public nsISupports {
+ public:
+     NS_DECLARE_STATIC_IID_ACCESSOR(NS_IINSPECTORCSSUTILS_IID)
+-
+-    // Hooks to nsCSSProps static methods from another library (the
+-    // AddRefTable and ReleaseTable should be handled by the
+-    // implementation of this interface).
+-    NS_IMETHOD LookupCSSProperty(const nsAString& aName, nsCSSProperty *aProp) = 0;
+-
+-    // Hooks to inline methods on nsRuleNode that have trouble linking
+-    // on certain debug builds (MacOSX Mach-O with gcc).
+-    NS_IMETHOD GetRuleNodeParent(nsRuleNode *aNode, nsRuleNode **aParent) = 0;
+-    NS_IMETHOD GetRuleNodeRule(nsRuleNode *aNode, nsIStyleRule **aRule) = 0;
+-    NS_IMETHOD IsRuleNodeRoot(nsRuleNode *aNode, PRBool *aIsRoot) = 0;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsIInspectorCSSUtils, NS_IINSPECTORCSSUTILS_IID)
+ 
+ #endif /* nsIInspectorCSSUtils_h___ */
+diff --git a/layout/style/nsInspectorCSSUtils.cpp b/layout/style/nsInspectorCSSUtils.cpp
+--- a/layout/style/nsInspectorCSSUtils.cpp
++++ b/layout/style/nsInspectorCSSUtils.cpp
+@@ -35,56 +35,18 @@
+  * the provisions above, a recipient may use your version of this file under
+  * the terms of any one of the MPL, the GPL or the LGPL.
+  *
+  * ***** END LICENSE BLOCK ***** */
+ 
+ /* XPCOM interface to provide some internal information to DOM inspector */
+ 
+ #include "nsInspectorCSSUtils.h"
+-#include "nsIStyleRule.h"
+-#include "nsRuleNode.h"
+-#include "nsString.h"
+-#include "nsGkAtoms.h"
+-#include "nsAutoPtr.h"
+-#include "nsIFrame.h"
+-#include "nsStyleSet.h"
+ 
+ nsInspectorCSSUtils::nsInspectorCSSUtils()
+ {
+-    nsCSSProps::AddRefTable();
+ }
+ 
+ nsInspectorCSSUtils::~nsInspectorCSSUtils()
+ {
+-    nsCSSProps::ReleaseTable();
+ }
+ 
+ NS_IMPL_ISUPPORTS1(nsInspectorCSSUtils, nsIInspectorCSSUtils)
+-
+-NS_IMETHODIMP
+-nsInspectorCSSUtils::LookupCSSProperty(const nsAString& aName, nsCSSProperty *aProp)
+-{
+-    *aProp = nsCSSProps::LookupProperty(aName);
+-    return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsInspectorCSSUtils::GetRuleNodeParent(nsRuleNode *aNode, nsRuleNode **aParent)
+-{
+-    *aParent = aNode->GetParent();
+-    return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsInspectorCSSUtils::GetRuleNodeRule(nsRuleNode *aNode, nsIStyleRule **aRule)
+-{
+-    *aRule = aNode->GetRule();
+-    NS_IF_ADDREF(*aRule);
+-    return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-nsInspectorCSSUtils::IsRuleNodeRoot(nsRuleNode *aNode, PRBool *aIsRoot)
+-{
+-    *aIsRoot = aNode->IsRoot();
+-    return NS_OK;
+-}
+diff --git a/layout/style/nsInspectorCSSUtils.h b/layout/style/nsInspectorCSSUtils.h
+--- a/layout/style/nsInspectorCSSUtils.h
++++ b/layout/style/nsInspectorCSSUtils.h
+@@ -38,30 +38,21 @@
+  * ***** END LICENSE BLOCK ***** */
+ 
+ /* XPCOM interface to provide some internal information to DOM inspector */
+ 
+ #ifndef nsInspectorCSSUtils_h___
+ #define nsInspectorCSSUtils_h___
+ 
+ #include "nsIInspectorCSSUtils.h"
+-#include "nsStyleContext.h"
+-#include "nsAutoPtr.h"
+-
+-class nsIPresShell;
+ 
+ class nsInspectorCSSUtils : public nsIInspectorCSSUtils {
+ 
+ public:
+ 
+     nsInspectorCSSUtils();
+     virtual ~nsInspectorCSSUtils();
+ 
+     NS_DECL_ISUPPORTS
+ 
+-    // nsIInspectorCSSUtils
+-    NS_IMETHOD LookupCSSProperty(const nsAString& aName, nsCSSProperty *aProp);
+-    NS_IMETHOD GetRuleNodeParent(nsRuleNode *aNode, nsRuleNode **aParent);
+-    NS_IMETHOD GetRuleNodeRule(nsRuleNode *aNode, nsIStyleRule **aRule);
+-    NS_IMETHOD IsRuleNodeRoot(nsRuleNode *aNode, PRBool *aIsRoot);
+ };
+ 
+ #endif /* nsInspectorCSSUtils_h___ */
