@@ -1,0 +1,355 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Remove InspectorCSSUtils, part 1:  Move GetStyleContextForContent to nsComputedDOMStyle.  (Bug 371655)
+
+diff --git a/content/canvas/src/nsCanvasRenderingContext2D.cpp b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+--- a/content/canvas/src/nsCanvasRenderingContext2D.cpp
++++ b/content/canvas/src/nsCanvasRenderingContext2D.cpp
+@@ -61,17 +61,17 @@
+ #include "nsIInterfaceRequestorUtils.h"
+ #include "nsIFrame.h"
+ #include "nsDOMError.h"
+ #include "nsIScriptError.h"
+ 
+ #include "nsICSSParser.h"
+ #include "nsICSSStyleRule.h"
+ #include "nsCSSDeclaration.h"
+-#include "nsInspectorCSSUtils.h"
++#include "nsComputedDOMStyle.h"
+ #include "nsStyleSet.h"
+ 
+ #include "nsPrintfCString.h"
+ 
+ #include "nsReadableUtils.h"
+ 
+ #include "nsColor.h"
+ #include "nsIRenderingContext.h"
+@@ -1936,17 +1936,17 @@ nsCanvasRenderingContext2D::SetFont(cons
+     nsStyleSet* styleSet = presShell->StyleSet();
+ 
+     // have to get a parent style context for inherit-like relative
+     // values (2em, bolder, etc.)
+     nsRefPtr<nsStyleContext> parentContext;
+ 
+     if (content && content->IsInDoc()) {
+         // inherit from the canvas element
+-        parentContext = nsInspectorCSSUtils::GetStyleContextForContent(
++        parentContext = nsComputedDOMStyle::GetStyleContextForContent(
+                 content,
+                 nsnull,
+                 presShell);
+     } else {
+         // otherwise inherit from default (10px sans-serif)
+         nsCOMPtr<nsICSSStyleRule> parentRule;
+         rv = CreateFontStyleRule(NS_LITERAL_STRING("10px sans-serif"),
+                                  mCSSParser, document,
+@@ -2296,19 +2296,19 @@ nsCanvasRenderingContext2D::DrawOrMeasur
+     TextReplaceWhitespaceCharacters(textToDraw);
+ 
+     // for now, default to ltr if not in doc
+     PRBool isRTL = PR_FALSE;
+ 
+     if (content && content->IsInDoc()) {
+         // try to find the closest context
+         nsRefPtr<nsStyleContext> canvasStyle =
+-            nsInspectorCSSUtils::GetStyleContextForContent(content,
+-                                                           nsnull,
+-                                                           presShell);
++            nsComputedDOMStyle::GetStyleContextForContent(content,
++                                                          nsnull,
++                                                          presShell);
+         if (!canvasStyle)
+             return NS_ERROR_FAILURE;
+         isRTL = canvasStyle->GetStyleVisibility()->mDirection ==
+             NS_STYLE_DIRECTION_RTL;
+     } else {
+       isRTL = GET_BIDI_OPTION_DIRECTION(document->GetBidiOptions()) == IBMBIDI_TEXTDIRECTION_RTL;
+     }
+ 
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -68,17 +68,16 @@
+ #include "nsStyleStructInlines.h"
+ 
+ #include "nsPresContext.h"
+ #include "nsIDocument.h"
+ 
+ #include "nsCSSPseudoElements.h"
+ #include "nsStyleSet.h"
+ #include "imgIRequest.h"
+-#include "nsInspectorCSSUtils.h"
+ #include "nsLayoutUtils.h"
+ #include "nsFrameManager.h"
+ #include "prlog.h"
+ #include "nsCSSKeywords.h"
+ #include "nsStyleCoord.h"
+ #include "nsDisplayList.h"
+ #include "nsDOMCSSDeclaration.h"
+ 
+@@ -322,16 +321,78 @@ nsComputedDOMStyle::GetPropertyValue(con
+ 
+   if (val) {
+     rv = val->GetCssText(aReturn);
+   }
+ 
+   return rv;
+ }
+ 
++static nsStyleContext*
++GetStyleContextForFrame(nsIFrame* aFrame)
++{
++  nsStyleContext* styleContext = aFrame->GetStyleContext();
++
++  /* For tables the primary frame is the "outer frame" but the style
++   * rules are applied to the "inner frame".  Luckily, the "outer
++   * frame" actually inherits style from the "inner frame" so we can
++   * just move one level up in the style context hierarchy....
++   */
++  if (aFrame->GetType() == nsGkAtoms::tableOuterFrame)
++    return styleContext->GetParent();
++
++  return styleContext;
++}    
++
++/* static */
++already_AddRefed<nsStyleContext>
++nsComputedDOMStyle::GetStyleContextForContent(nsIContent* aContent,
++                                              nsIAtom* aPseudo,
++                                              nsIPresShell* aPresShell)
++{
++  if (!aPseudo) {
++    aPresShell->FlushPendingNotifications(Flush_Style);
++    nsIFrame* frame = aPresShell->GetPrimaryFrameFor(aContent);
++    if (frame) {
++      nsStyleContext* result = GetStyleContextForFrame(frame);
++      // Don't use the style context if it was influenced by
++      // pseudo-elements, since then it's not the primary style
++      // for this element.
++      if (!result->HasPseudoElementData()) {
++        // this function returns an addrefed style context
++        result->AddRef();
++        return result;
++      }
++    }
++  }
++
++  // No frame has been created or we have a pseudo, so resolve the
++  // style ourselves
++  nsRefPtr<nsStyleContext> parentContext;
++  nsIContent* parent = aPseudo ? aContent : aContent->GetParent();
++  if (parent)
++    parentContext = GetStyleContextForContent(parent, nsnull, aPresShell);
++
++  nsPresContext *presContext = aPresShell->GetPresContext();
++  if (!presContext)
++    return nsnull;
++
++  nsStyleSet *styleSet = aPresShell->StyleSet();
++
++  if (!aContent->IsNodeOfType(nsINode::eELEMENT)) {
++    NS_ASSERTION(!aPseudo, "Shouldn't have a pseudo for a non-element!");
++    return styleSet->ResolveStyleForNonElement(parentContext);
++  }
++
++  if (aPseudo) {
++    return styleSet->ResolvePseudoStyleFor(aContent, aPseudo, parentContext);
++  }
++
++  return styleSet->ResolveStyleFor(aContent, parentContext);
++}
+ 
+ NS_IMETHODIMP
+ nsComputedDOMStyle::GetPropertyCSSValue(const nsAString& aPropertyName,
+                                         nsIDOMCSSValue** aReturn)
+ {
+   NS_ASSERTION(!mStyleContextHolder, "bad state");
+ 
+   *aReturn = nsnull;
+@@ -408,19 +469,19 @@ nsComputedDOMStyle::GetPropertyCSSValue(
+       NS_ASSERTION(nsCSSPseudoElements::PseudoElementContainsElements(
+                      topWithPseudoElementData->GetPseudoType()),
+                    "we should be in a pseudo-element that is expected to "
+                    "contain elements");
+     }
+ #endif
+     // Need to resolve a style context
+     mStyleContextHolder =
+-      nsInspectorCSSUtils::GetStyleContextForContent(mContent,
+-                                                     mPseudo,
+-                                                     mPresShell);
++      nsComputedDOMStyle::GetStyleContextForContent(mContent,
++                                                    mPseudo,
++                                                    mPresShell);
+     NS_ENSURE_TRUE(mStyleContextHolder, NS_ERROR_OUT_OF_MEMORY);
+     NS_ASSERTION(mPseudo || !mStyleContextHolder->HasPseudoElementData(),
+                  "should not have pseudo-element data");
+   }
+ 
+   // Call our pointer-to-member-function.
+   nsresult rv = (this->*(propEntry->mGetter))(aReturn);
+ 
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -77,16 +77,20 @@ public:
+ 
+   static void Shutdown();
+ 
+   virtual nsISupports *GetParentObject()
+   {
+     return mContent;
+   }
+ 
++  static already_AddRefed<nsStyleContext>
++  GetStyleContextForContent(nsIContent* aContent, nsIAtom* aPseudo,
++                            nsIPresShell* aPresShell);
++
+ private:
+   void AssertFlushedPendingReflows() {
+     NS_ASSERTION(mFlushedPendingReflows,
+                  "property getter should have been marked layout-dependent");
+   }
+   
+ #define STYLE_STRUCT(name_, checkdata_cb_, ctor_args_)                  \
+   const nsStyle##name_ * GetStyle##name_() {                            \
+diff --git a/layout/style/nsInspectorCSSUtils.cpp b/layout/style/nsInspectorCSSUtils.cpp
+--- a/layout/style/nsInspectorCSSUtils.cpp
++++ b/layout/style/nsInspectorCSSUtils.cpp
+@@ -49,16 +49,17 @@
+ #include "nsAutoPtr.h"
+ #include "nsIFrame.h"
+ #include "nsStyleSet.h"
+ #include "nsXBLBinding.h"
+ #include "nsXBLPrototypeBinding.h"
+ #include "nsIDOMElement.h"
+ #include "nsIMutableArray.h"
+ #include "nsBindingManager.h"
++#include "nsComputedDOMStyle.h"
+ 
+ nsInspectorCSSUtils::nsInspectorCSSUtils()
+ {
+     nsCSSProps::AddRefTable();
+ }
+ 
+ nsInspectorCSSUtils::~nsInspectorCSSUtils()
+ {
+@@ -91,94 +92,31 @@ nsInspectorCSSUtils::GetRuleNodeRule(nsR
+ 
+ NS_IMETHODIMP
+ nsInspectorCSSUtils::IsRuleNodeRoot(nsRuleNode *aNode, PRBool *aIsRoot)
+ {
+     *aIsRoot = aNode->IsRoot();
+     return NS_OK;
+ }
+ 
+-/* static */
+-nsStyleContext*
+-nsInspectorCSSUtils::GetStyleContextForFrame(nsIFrame* aFrame)
+-{
+-    nsStyleContext* styleContext = aFrame->GetStyleContext();
+-
+-    /* For tables the primary frame is the "outer frame" but the style
+-     * rules are applied to the "inner frame".  Luckily, the "outer
+-     * frame" actually inherits style from the "inner frame" so we can
+-     * just move one level up in the style context hierarchy....
+-     */
+-    if (aFrame->GetType() == nsGkAtoms::tableOuterFrame)
+-        return styleContext->GetParent();
+-
+-    return styleContext;
+-}    
+-
+-/* static */
+-already_AddRefed<nsStyleContext>
+-nsInspectorCSSUtils::GetStyleContextForContent(nsIContent* aContent,
+-                                               nsIAtom* aPseudo,
+-                                               nsIPresShell* aPresShell)
+-{
+-    if (!aPseudo) {
+-        aPresShell->FlushPendingNotifications(Flush_Style);
+-        nsIFrame* frame = aPresShell->GetPrimaryFrameFor(aContent);
+-        if (frame) {
+-            nsStyleContext* result = GetStyleContextForFrame(frame);
+-            // Don't use the style context if it was influenced by
+-            // pseudo-elements, since then it's not the primary style
+-            // for this element.
+-            if (!result->HasPseudoElementData()) {
+-                // this function returns an addrefed style context
+-                result->AddRef();
+-                return result;
+-            }
+-        }
+-    }
+-
+-    // No frame has been created or we have a pseudo, so resolve the
+-    // style ourselves
+-    nsRefPtr<nsStyleContext> parentContext;
+-    nsIContent* parent = aPseudo ? aContent : aContent->GetParent();
+-    if (parent)
+-        parentContext = GetStyleContextForContent(parent, nsnull, aPresShell);
+-
+-    nsPresContext *presContext = aPresShell->GetPresContext();
+-    if (!presContext)
+-        return nsnull;
+-
+-    nsStyleSet *styleSet = aPresShell->StyleSet();
+-
+-    if (!aContent->IsNodeOfType(nsINode::eELEMENT)) {
+-        NS_ASSERTION(!aPseudo, "Shouldn't have a pseudo for a non-element!");
+-        return styleSet->ResolveStyleForNonElement(parentContext);
+-    }
+-
+-    if (aPseudo) {
+-        return styleSet->ResolvePseudoStyleFor(aContent, aPseudo, parentContext);
+-    }
+-    
+-    return styleSet->ResolveStyleFor(aContent, parentContext);
+-}
+-
+ NS_IMETHODIMP
+ nsInspectorCSSUtils::GetRuleNodeForContent(nsIContent* aContent,
+                                            nsRuleNode** aRuleNode)
+ {
+     *aRuleNode = nsnull;
+ 
+     nsIDocument* doc = aContent->GetDocument();
+     NS_ENSURE_TRUE(doc, NS_ERROR_UNEXPECTED);
+ 
+     nsIPresShell *presShell = doc->GetPrimaryShell();
+     NS_ENSURE_TRUE(presShell, NS_ERROR_UNEXPECTED);
+ 
+     nsRefPtr<nsStyleContext> sContext =
+-        GetStyleContextForContent(aContent, nsnull, presShell);
++        nsComputedDOMStyle::GetStyleContextForContent(aContent, nsnull,
++                                                      presShell);
+     *aRuleNode = sContext->GetRuleNode();
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsInspectorCSSUtils::GetBindingURLs(nsIDOMElement *aElement,
+                                     nsIArray **aResult)
+ {
+diff --git a/layout/style/nsInspectorCSSUtils.h b/layout/style/nsInspectorCSSUtils.h
+--- a/layout/style/nsInspectorCSSUtils.h
++++ b/layout/style/nsInspectorCSSUtils.h
+@@ -60,18 +60,11 @@ public:
+     // nsIInspectorCSSUtils
+     NS_IMETHOD LookupCSSProperty(const nsAString& aName, nsCSSProperty *aProp);
+     NS_IMETHOD GetRuleNodeParent(nsRuleNode *aNode, nsRuleNode **aParent);
+     NS_IMETHOD GetRuleNodeRule(nsRuleNode *aNode, nsIStyleRule **aRule);
+     NS_IMETHOD IsRuleNodeRoot(nsRuleNode *aNode, PRBool *aIsRoot);
+     NS_IMETHOD GetRuleNodeForContent(nsIContent* aContent,
+                                      nsRuleNode** aRuleNode);
+     NS_IMETHOD GetBindingURLs(nsIDOMElement *aElement, nsIArray **aResult);
+-
+-    static already_AddRefed<nsStyleContext>
+-    GetStyleContextForContent(nsIContent* aContent, nsIAtom* aPseudo,
+-                              nsIPresShell* aPresShell);
+-
+-private:
+-    static nsStyleContext* GetStyleContextForFrame(nsIFrame* aFrame);
+ };
+ 
+ #endif /* nsInspectorCSSUtils_h___ */
