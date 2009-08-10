@@ -2,28 +2,132 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Make lines with only a bullet take up height.  (Bug 179596 / Bug 507187)
 
-diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
---- a/layout/generic/nsBlockFrame.cpp
-+++ b/layout/generic/nsBlockFrame.cpp
-@@ -4254,17 +4254,17 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
-   // Inline lines do not have margins themselves; however they are
-   // impacted by prior block margins. If this line ends up having some
-   // height then we zero out the previous bottom margin value that was
-   // already applied to the line's starting Y coordinate. Otherwise we
-   // leave it be so that the previous blocks bottom margin can be
-   // collapsed with a block that follows.
-   nscoord newY;
- 
--  if (!aLine->CachedIsEmpty()) {
-+  if (!aLine->CachedIsEmpty() || addedBullet) {
-     // This line has some height. Therefore the application of the
-     // previous-bottom-margin should stick.
-     aState.mPrevBottomMargin.Zero();
-     newY = aLine->mBounds.YMost();
+diff --git a/layout/generic/nsLineBox.cpp b/layout/generic/nsLineBox.cpp
+--- a/layout/generic/nsLineBox.cpp
++++ b/layout/generic/nsLineBox.cpp
+@@ -281,16 +281,19 @@ nsLineBox::IsEmpty() const
+   nsIFrame *kid;
+   for (n = GetChildCount(), kid = mFirstChild;
+        n > 0;
+        --n, kid = kid->GetNextSibling())
+   {
+     if (!kid->IsEmpty())
+       return PR_FALSE;
    }
-   else {
-     // Don't let the previous-bottom-margin value affect the newY
-     // coordinate (it was applied in ReflowInlineFrames speculatively)
++  if (HasBullet()) {
++    return PR_FALSE;
++  }
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ nsLineBox::CachedIsEmpty()
+ {
+   if (mFlags.mDirty) {
+     return IsEmpty();
+diff --git a/layout/generic/nsLineBox.h b/layout/generic/nsLineBox.h
+--- a/layout/generic/nsLineBox.h
++++ b/layout/generic/nsLineBox.h
+@@ -312,16 +312,30 @@ public:
+     mFlags.mResizeReflowOptimizationDisabled = PR_TRUE;
+   }
+   void EnableResizeReflowOptimization() {
+     mFlags.mResizeReflowOptimizationDisabled = PR_FALSE;
+   }
+   PRBool ResizeReflowOptimizationDisabled() const {
+     return mFlags.mResizeReflowOptimizationDisabled;
+   }
++
++  // mHasBullet bit
++  void SetHasBullet() {
++    mFlags.mHasBullet = PR_TRUE;
++    InvalidateCachedIsEmpty();
++  }
++  void ClearHasBullet() {
++    mFlags.mHasBullet = PR_FALSE;
++    InvalidateCachedIsEmpty();
++  }
++  PRBool HasBullet() const {
++    return mFlags.mHasBullet;
++  }
++  
+   
+   // mChildCount value
+   PRInt32 GetChildCount() const {
+     return (PRInt32) mFlags.mChildCount;
+   }
+   void SetChildCount(PRInt32 aNewCount) {
+     if (aNewCount < 0) {
+       NS_WARNING("negative child count");
+@@ -479,19 +493,22 @@ public:
+     PRUint32 mHasClearance : 1;
+     PRUint32 mBlock : 1;
+     PRUint32 mImpactedByFloat : 1;
+     PRUint32 mLineWrapped: 1;
+     PRUint32 mInvalidateTextRuns : 1;
+     PRUint32 mResizeReflowOptimizationDisabled: 1;  // default 0 = means that the opt potentially applies to this line. 1 = never skip reflowing this line for a resize reflow
+     PRUint32 mEmptyCacheValid: 1;
+     PRUint32 mEmptyCacheState: 1;
++    // mHasBullet indicates that this is an inline line whose block's
++    // bullet is adjacent to this line.
++    PRUint32 mHasBullet : 1;
+     PRUint32 mBreakType : 4;
+ 
+-    PRUint32 mChildCount : 18;
++    PRUint32 mChildCount : 17;
+   };
+ 
+   struct ExtraData {
+     ExtraData(const nsRect& aBounds) : mCombinedArea(aBounds) {
+     }
+     nsRect mCombinedArea;
+   };
+ 
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -202,16 +202,20 @@ nsLineLayout::BeginLineReflow(nscoord aX
+   SetFlag(LL_ISTOPOFPAGE, aIsTopOfPage);
+   SetFlag(LL_IMPACTEDBYFLOATS, aImpactedByFloats);
+   mTotalPlacedFrames = 0;
+   SetFlag(LL_LINEISEMPTY, PR_TRUE);
+   SetFlag(LL_LINEENDSINBR, PR_FALSE);
+   mSpanDepth = 0;
+   mMaxTopBoxHeight = mMaxBottomBoxHeight = 0;
+ 
++  if (GetFlag(LL_GOTLINEBOX)) {
++    mLineBox->ClearHasBullet();
++  }
++
+   PerSpanData* psd;
+   NewPerSpanData(&psd);
+   mCurrentSpan = mRootSpan = psd;
+   psd->mReflowState = mBlockReflowState;
+   psd->mLeftEdge = aX;
+   psd->mX = aX;
+   psd->mRightEdge = aX + aWidth;
+ 
+@@ -1322,18 +1326,20 @@ nsLineLayout::PlaceFrame(PerFrameData* p
+   }
+ }
+ 
+ nsresult
+ nsLineLayout::AddBulletFrame(nsIFrame* aFrame,
+                              const nsHTMLReflowMetrics& aMetrics)
+ {
+   NS_ASSERTION(mCurrentSpan == mRootSpan, "bad linelayout user");
++  NS_ASSERTION(GetFlag(LL_GOTLINEBOX), "must have line box");
+ 
+   SetFlag(LL_HASBULLET, PR_TRUE);
++  mLineBox->SetHasBullet();
+ 
+   PerFrameData* pfd;
+   nsresult rv = NewPerFrameData(&pfd);
+   if (NS_SUCCEEDED(rv)) {
+     mRootSpan->AppendFrame(pfd);
+     pfd->mFrame = aFrame;
+     pfd->mMargin.SizeTo(0, 0, 0, 0);
+     pfd->mBorderPadding.SizeTo(0, 0, 0, 0);
 diff --git a/layout/reftests/bugs/507187-1-ref.html b/layout/reftests/bugs/507187-1-ref.html
 new file mode 100644
 --- /dev/null
