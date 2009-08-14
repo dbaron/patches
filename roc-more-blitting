@@ -1,0 +1,1525 @@
+From: Robert O'Callahan <robert@ocallahan.org>
+
+Bug 507334, part 2:  Blit multiple rectangles when scrolling rather than blitting only the largest single rectangle, and avoid repainting opaque content that covers the scrolling content.  r=dbaron
+
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -60,16 +60,17 @@
+ 
+ #include "imgIContainer.h"
+ #include "nsIInterfaceRequestorUtils.h"
+ 
+ nsDisplayListBuilder::nsDisplayListBuilder(nsIFrame* aReferenceFrame,
+     PRBool aIsForEvents, PRBool aBuildCaret)
+     : mReferenceFrame(aReferenceFrame),
+       mMovingFrame(nsnull),
++      mSaveVisibleRegionOfMovingContent(nsnull),
+       mIgnoreScrollFrame(nsnull),
+       mCurrentTableItem(nsnull),
+       mBuildCaret(aBuildCaret),
+       mEventDelivery(aIsForEvents),
+       mIsAtRootOfPseudoStackingContext(PR_FALSE),
+       mPaintAllFrames(PR_FALSE),
+       mAccurateVisibleRegions(PR_FALSE),
+       mInTransform(PR_FALSE) {
+@@ -150,16 +151,26 @@ nsDisplayListBuilder::~nsDisplayListBuil
+   NS_ASSERTION(mPresShellStates.Length() == 0,
+                "All presshells should have been exited");
+   NS_ASSERTION(!mCurrentTableItem, "No table item should be active");
+ 
+   PL_FreeArenaPool(&mPool);
+   PL_FinishArenaPool(&mPool);
+ }
+ 
++void
++nsDisplayListBuilder::SubtractFromVisibleRegion(nsRegion* aVisibleRegion,
++                                                const nsRegion& aRegion)
++{
++  aVisibleRegion->Sub(*aVisibleRegion, aRegion);
++  if (!GetAccurateVisibleRegions()) {
++    aVisibleRegion->SimplifyOutward(15);
++  }
++}
++
+ PRBool
+ nsDisplayListBuilder::IsMovingFrame(nsIFrame* aFrame)
+ {
+   return mMovingFrame &&
+      nsLayoutUtils::IsAncestorFrameCrossDoc(mMovingFrame, aFrame, mReferenceFrame);
+ }
+ 
+ nsCaret *
+@@ -231,16 +242,36 @@ nsDisplayListBuilder::MarkFramesForDispl
+ 
+ void*
+ nsDisplayListBuilder::Allocate(size_t aSize) {
+   void *tmp;
+   PL_ARENA_ALLOCATE(tmp, &mPool, aSize);
+   return tmp;
+ }
+ 
++void
++nsDisplayListBuilder::AccumulateVisibleRegionOfMovingContent(const nsRegion& aMovingContent,
++                                                             const nsRegion& aVisibleRegion)
++{
++  if (!mSaveVisibleRegionOfMovingContent)
++    return;
++
++  // Grab the union of aMovingContent (after the move) with
++  // aMovingContent - mMoveDelta (before the move)
++  nsRegion r = aMovingContent;
++  r.MoveBy(-mMoveDelta);
++  r.Or(r, aMovingContent);
++  // Reduce to the part that's visible after the move
++  r.And(r, aVisibleRegion);
++  // Accumulate it into our result
++  mSaveVisibleRegionOfMovingContent->Or(
++      *mSaveVisibleRegionOfMovingContent, r);
++  mSaveVisibleRegionOfMovingContent->SimplifyOutward(15);
++}
++
+ void nsDisplayListSet::MoveTo(const nsDisplayListSet& aDestination) const
+ {
+   aDestination.BorderBackground()->AppendToTop(BorderBackground());
+   aDestination.BlockBorderBackgrounds()->AppendToTop(BlockBorderBackgrounds());
+   aDestination.Floats()->AppendToTop(Floats());
+   aDestination.Content()->AppendToTop(Content());
+   aDestination.PositionedDescendants()->AppendToTop(PositionedDescendants());
+   aDestination.Outlines()->AppendToTop(Outlines());
+@@ -261,21 +292,17 @@ nsDisplayItem::OptimizeVisibility(nsDisp
+     nsRect opaqueArea = bounds;
+     if (aBuilder->IsMovingFrame(f)) {
+       // The display list should include items for both the before and after
+       // states (see nsLayoutUtils::ComputeRepaintRegionForCopy. So the
+       // only area we want to cover is the area that was opaque in the
+       // before state and in the after state.
+       opaqueArea.IntersectRect(bounds - aBuilder->GetMoveDelta(), bounds);
+     }
+-    if (aBuilder->GetAccurateVisibleRegions()) {
+-      aVisibleRegion->Sub(*aVisibleRegion, opaqueArea);
+-    } else {
+-      aVisibleRegion->SimpleSubtract(opaqueArea);
+-    }
++    aBuilder->SubtractFromVisibleRegion(aVisibleRegion, nsRegion(opaqueArea));
+   }
+ 
+   return PR_TRUE;
+ }
+ 
+ void
+ nsDisplayList::FlattenTo(nsTArray<nsDisplayItem*>* aElements) {
+   nsDisplayItem* item;
+@@ -299,32 +326,51 @@ nsDisplayList::GetBounds(nsDisplayListBu
+ }
+ 
+ void
+ nsDisplayList::OptimizeVisibility(nsDisplayListBuilder* aBuilder,
+                                   nsRegion* aVisibleRegion) {
+   nsAutoTArray<nsDisplayItem*, 512> elements;
+   FlattenTo(&elements);
+ 
++  // Accumulate the bounds of all moving content we find in this list
++  nsRect movingContentAccumulatedBounds;
++  // Store an overapproximation of the visible region for the moving
++  // content in this list
++  nsRegion movingContentVisibleRegion;
++
+   for (PRInt32 i = elements.Length() - 1; i >= 0; --i) {
+     nsDisplayItem* item = elements[i];
+     nsDisplayItem* belowItem = i < 1 ? nsnull : elements[i - 1];
+ 
+     if (belowItem && item->TryMerge(aBuilder, belowItem)) {
+       belowItem->~nsDisplayItem();
+       elements.ReplaceElementsAt(i - 1, 1, item);
+       continue;
+     }
+-    
++
++    nsIFrame* f = item->GetUnderlyingFrame();
++    if (f && aBuilder->IsMovingFrame(f)) {
++      if (movingContentAccumulatedBounds.IsEmpty()) {
++        // *aVisibleRegion can only shrink during this loop, so storing
++        // the first one we see is a sound overapproximation
++        movingContentVisibleRegion = *aVisibleRegion;
++      }
++      movingContentAccumulatedBounds.UnionRect(movingContentAccumulatedBounds,
++                                               item->GetBounds(aBuilder));
++    }
+     if (item->OptimizeVisibility(aBuilder, aVisibleRegion)) {
+       AppendToBottom(item);
+     } else {
+       item->~nsDisplayItem();
+     }
+   }
++
++  aBuilder->AccumulateVisibleRegionOfMovingContent(
++      nsRegion(movingContentAccumulatedBounds), movingContentVisibleRegion);
+ }
+ 
+ void nsDisplayList::Paint(nsDisplayListBuilder* aBuilder, nsIRenderingContext* aCtx,
+                           const nsRect& aDirtyRect) const {
+   for (nsDisplayItem* i = GetBottom(); i != nsnull; i = i->GetAbove()) {
+     i->Paint(aBuilder, aCtx, aDirtyRect);
+   }
+   nsCSSRendering::DidPaint();
+@@ -830,17 +876,17 @@ PRBool nsDisplayWrapList::IsVaryingRelat
+ void nsDisplayWrapList::Paint(nsDisplayListBuilder* aBuilder,
+      nsIRenderingContext* aCtx, const nsRect& aDirtyRect) {
+   mList.Paint(aBuilder, aCtx, aDirtyRect);
+ }
+ 
+ static nsresult
+ WrapDisplayList(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+                 nsDisplayList* aList, nsDisplayWrapper* aWrapper) {
+-  if (!aList->GetTop())
++  if (!aList->GetTop() && !aBuilder->HasMovingFrames())
+     return NS_OK;
+   nsDisplayItem* item = aWrapper->WrapList(aBuilder, aFrame, aList);
+   if (!item)
+     return NS_ERROR_OUT_OF_MEMORY;
+   // aList was emptied
+   aList->AppendToTop(item);
+   return NS_OK;
+ }
+@@ -1019,25 +1065,35 @@ void nsDisplayClip::Paint(nsDisplayListB
+   nsDisplayWrapList::Paint(aBuilder, aCtx, dirty);
+   aCtx->PopState();
+ }
+ 
+ PRBool nsDisplayClip::OptimizeVisibility(nsDisplayListBuilder* aBuilder,
+                                          nsRegion* aVisibleRegion) {
+   nsRegion clipped;
+   clipped.And(*aVisibleRegion, mClip);
++
++  if (aBuilder->HasMovingFrames() &&
++      !aBuilder->IsMovingFrame(mClippingFrame)) {
++    // There may be some clipped moving children that were visible before
++    // but are clipped out now. Conservatively assume they were there
++    // and add their possible area to the visible region of moving
++    // content.
++    // Compute the after-move region of moving content that could have been
++    // totally clipped out.
++    nsRegion r;
++    r.Sub(mClip + aBuilder->GetMoveDelta(), mClip);
++    aBuilder->AccumulateVisibleRegionOfMovingContent(r, *aVisibleRegion);
++  }
++
+   nsRegion rNew(clipped);
+   PRBool anyVisible = nsDisplayWrapList::OptimizeVisibility(aBuilder, &rNew);
+   nsRegion subtracted;
+   subtracted.Sub(clipped, rNew);
+-  if (aBuilder->GetAccurateVisibleRegions()) {
+-    aVisibleRegion->Sub(*aVisibleRegion, subtracted);
+-  } else {
+-    aVisibleRegion->SimpleSubtract(subtracted);
+-  }
++  aBuilder->SubtractFromVisibleRegion(aVisibleRegion, subtracted);
+   return anyVisible;
+ }
+ 
+ PRBool nsDisplayClip::TryMerge(nsDisplayListBuilder* aBuilder,
+                                nsDisplayItem* aItem) {
+   if (aItem->GetType() != TYPE_CLIP)
+     return PR_FALSE;
+   nsDisplayClip* other = static_cast<nsDisplayClip*>(aItem);
+diff --git a/layout/base/nsDisplayList.h b/layout/base/nsDisplayList.h
+--- a/layout/base/nsDisplayList.h
++++ b/layout/base/nsDisplayList.h
+@@ -56,16 +56,17 @@
+ #include <stdlib.h>
+ 
+ class nsIPresShell;
+ class nsIContent;
+ class nsRegion;
+ class nsIRenderingContext;
+ class nsIDeviceContext;
+ class nsDisplayTableItem;
++class nsDisplayItem;
+ 
+ /*
+  * An nsIFrame can have many different visual parts. For example an image frame
+  * can have a background, border, and outline, the image itself, and a
+  * translucent selection overlay. In general these parts can be drawn at
+  * discontiguous z-levels; see CSS2.1 appendix E:
+  * http://www.w3.org/TR/CSS21/zindex.html
+  * 
+@@ -155,36 +156,49 @@ public:
+ 
+   /**
+    * Indicate that we'll use this display list to analyze the effects
+    * of aMovingFrame moving by aMoveDelta. The move has already been
+    * applied to the frame tree. Moving frames are not allowed to clip or
+    * cover (during OptimizeVisibility) non-moving frames. E.g. when we're
+    * constructing a display list to see what should be repainted during a
+    * scroll operation, we specify the scrolled frame as the moving frame.
++   * @param aSaveVisibleRegionOfMovingContent if non-null,
++   *   this receives a bounding region for the visible moving content
++   * (considering the moving content both before and after the move)
+    */
+-  void SetMovingFrame(nsIFrame* aMovingFrame, const nsPoint& aMoveDelta) {
++  void SetMovingFrame(nsIFrame* aMovingFrame, const nsPoint& aMoveDelta,
++                      nsRegion* aSaveVisibleRegionOfMovingContent) {
+     mMovingFrame = aMovingFrame;
+     mMoveDelta = aMoveDelta;
++    mSaveVisibleRegionOfMovingContent = aSaveVisibleRegionOfMovingContent;
+   }
+ 
+   /**
+    * @return PR_TRUE if we are doing analysis of moving frames
+    */
+   PRBool HasMovingFrames() { return mMovingFrame != nsnull; }
+   /**
+    * @return the frame that was moved
+    */
+   nsIFrame* GetRootMovingFrame() { return mMovingFrame; }
+   /**
+    * @return the amount by which mMovingFrame was moved.
+    * Only valid when GetRootMovingFrame() returns non-null.
+    */
+   const nsPoint& GetMoveDelta() { return mMoveDelta; }
+   /**
++   * Given the bounds of some moving content, and a visible region,
++   * intersect the bounds with the visible region and add it to the
++   * recorded region of visible moving content.
++   */
++  void AccumulateVisibleRegionOfMovingContent(const nsRegion& aMovingContent,
++                                              const nsRegion& aVisibleRegion);
++
++  /**
+    * @return PR_TRUE if aFrame is, or is a descendant of, the hypothetical
+    * moving frame
+    */
+   PRBool IsMovingFrame(nsIFrame* aFrame);
+   /**
+    * @return the selection that painting should be restricted to (or nsnull
+    * in the normal unrestricted case)
+    */
+@@ -272,16 +286,25 @@ public:
+   PRBool IsInTransform() { return mInTransform; }
+   /**
+    * Indicate whether or not we're directly or indirectly under and
+    * nsDisplayTransform or SVG foreignObject.
+    */
+   void SetInTransform(PRBool aInTransform) { mInTransform = aInTransform; }
+ 
+   /**
++   * Subtracts aRegion from *aVisibleRegion. We avoid letting
++   * aVisibleRegion become overcomplex by simplifying it if necessary ---
++   * unless mAccurateVisibleRegions is set, in which case we let it
++   * get arbitrarily complex.
++   */
++  void SubtractFromVisibleRegion(nsRegion* aVisibleRegion,
++                                 const nsRegion& aRegion);
++
++  /**
+    * Mark the frames in aFrames to be displayed if they intersect aDirtyRect
+    * (which is relative to aDirtyFrame). If the frames have placeholders
+    * that might not be displayed, we mark the placeholders and their ancestors
+    * to ensure that display list construction descends into them
+    * anyway. nsDisplayListBuilder will take care of unmarking them when it is
+    * destroyed.
+    */
+   void MarkFramesForDisplayList(nsIFrame* aDirtyFrame,
+@@ -351,16 +374,17 @@ private:
+   PresShellState* CurrentPresShellState() {
+     NS_ASSERTION(mPresShellStates.Length() > 0,
+                  "Someone forgot to enter a presshell");
+     return &mPresShellStates[mPresShellStates.Length() - 1];
+   }
+   
+   nsIFrame*                      mReferenceFrame;
+   nsIFrame*                      mMovingFrame;
++  nsRegion*                      mSaveVisibleRegionOfMovingContent;
+   nsIFrame*                      mIgnoreScrollFrame;
+   nsPoint                        mMoveDelta; // only valid when mMovingFrame is non-null
+   PLArenaPool                    mPool;
+   nsCOMPtr<nsISelection>         mBoundingSelection;
+   nsAutoTArray<PresShellState,8> mPresShellStates;
+   nsAutoTArray<nsIFrame*,100>    mFramesMarkedForDisplay;
+   nsDisplayTableItem*            mCurrentTableItem;
+   PRPackedBool                   mBuildCaret;
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -1129,39 +1129,39 @@ nsLayoutUtils::PaintFrame(nsIRenderingCo
+   
+   list.Paint(&builder, aRenderingContext, aDirtyRegion.GetBounds());
+   // Flush the list so we don't trigger the IsEmpty-on-destruction assertion
+   list.DeleteAll();
+   return NS_OK;
+ }
+ 
+ static void
+-AccumulateItemInRegion(nsRegion* aRegion, const nsRect& aAreaRect,
++AccumulateItemInRegion(nsRegion* aRegion, const nsRect& aUpdateRect,
+                        const nsRect& aItemRect, const nsRect& aExclude,
+                        nsDisplayItem* aItem)
+ {
+   nsRect damageRect;
+-  if (damageRect.IntersectRect(aAreaRect, aItemRect)) {
++  if (damageRect.IntersectRect(aUpdateRect, aItemRect)) {
+     nsRegion r;
+     r.Sub(damageRect, aExclude);
+ #ifdef DEBUG
+     if (gDumpRepaintRegionForCopy) {
+       nsRect bounds = r.GetBounds();
+       fprintf(stderr, "Adding rect %d,%d,%d,%d for frame %p\n",
+               bounds.x, bounds.y, bounds.width, bounds.height,
+               (void*)aItem->GetUnderlyingFrame());
+     }
+ #endif
+     aRegion->Or(*aRegion, r);
+   }
+ }
+ 
+ static void
+ AddItemsToRegion(nsDisplayListBuilder* aBuilder, nsDisplayList* aList,
+-                 const nsRect& aRect, const nsRect& aClipRect, nsPoint aDelta,
++                 const nsRect& aUpdateRect, const nsRect& aClipRect, nsPoint aDelta,
+                  nsRegion* aRegion)
+ {
+   for (nsDisplayItem* item = aList->GetBottom(); item; item = item->GetAbove()) {
+     nsDisplayList* sublist = item->GetList();
+     if (sublist) {
+       nsDisplayItem::Type type = item->GetType();
+ #ifdef MOZ_SVG
+       if (type == nsDisplayItem::TYPE_SVG_EFFECTS) {
+@@ -1180,67 +1180,68 @@ AddItemsToRegion(nsDisplayListBuilder* a
+         // If the clipping frame is moving, then it isn't clipping any
+         // non-moving content (see ApplyAbsPosClipping), so we don't need
+         // to do anything special, but we should not restrict aClipRect.
+         if (!aBuilder->IsMovingFrame(clipItem->GetClippingFrame())) {
+           clip.IntersectRect(clip, clipItem->GetClipRect());
+ 
+           // Invalidate the translation of the source area that was clipped out
+           nsRegion clippedOutSource;
+-          clippedOutSource.Sub(aRect, clip);
++          clippedOutSource.Sub(aUpdateRect - aDelta, clip);
+           clippedOutSource.MoveBy(aDelta);
+           aRegion->Or(*aRegion, clippedOutSource);
+ 
+           // Invalidate the destination area that is clipped out
+           nsRegion clippedOutDestination;
+-          clippedOutDestination.Sub(aRect + aDelta, clip);
++          clippedOutDestination.Sub(aUpdateRect, clip);
+           aRegion->Or(*aRegion, clippedOutDestination);
+         }
+-        AddItemsToRegion(aBuilder, sublist, aRect, clip, aDelta, aRegion);
++        AddItemsToRegion(aBuilder, sublist, aUpdateRect, clip, aDelta, aRegion);
+       } else {
+         // opacity, or a generic sublist
+-        AddItemsToRegion(aBuilder, sublist, aRect, aClipRect, aDelta, aRegion);
++        AddItemsToRegion(aBuilder, sublist, aUpdateRect, aClipRect, aDelta, aRegion);
+       }
+     } else {
+       nsRect r;
+       if (r.IntersectRect(aClipRect, item->GetBounds(aBuilder))) {
+         nsIFrame* f = item->GetUnderlyingFrame();
+         NS_ASSERTION(f, "Must have an underlying frame for leaf item");
+         nsRect exclude;
+         if (aBuilder->IsMovingFrame(f)) {
+           if (item->IsVaryingRelativeToMovingFrame(aBuilder)) {
+             // something like background-attachment:fixed that varies
+             // its drawing when it moves
+-            AccumulateItemInRegion(aRegion, aRect + aDelta, r, exclude, item);
++            AccumulateItemInRegion(aRegion, aUpdateRect, r, exclude, item);
+           }
+         } else {
+           // not moving.
+           if (item->IsUniform(aBuilder)) {
+             // If it's uniform, we don't need to invalidate where one part
+             // of the item was copied to another part.
+             exclude.IntersectRect(r, r + aDelta);
+           }
+           // area where a non-moving element is visible must be repainted
+-          AccumulateItemInRegion(aRegion, aRect + aDelta, r, exclude, item);
++          AccumulateItemInRegion(aRegion, aUpdateRect, r, exclude, item);
+           // we may have bitblitted an area that was painted by a non-moving
+           // element. This bitblitted data is invalid and was copied to
+           // "r + aDelta".
+-          AccumulateItemInRegion(aRegion, aRect + aDelta, r + aDelta,
++          AccumulateItemInRegion(aRegion, aUpdateRect, r + aDelta,
+                                  exclude, item);
+         }
+       }
+     }
+   }
+ }
+ 
+ nsresult
+ nsLayoutUtils::ComputeRepaintRegionForCopy(nsIFrame* aRootFrame,
+                                            nsIFrame* aMovingFrame,
+                                            nsPoint aDelta,
+-                                           const nsRect& aCopyRect,
++                                           const nsRect& aUpdateRect,
++                                           nsRegion* aBlitRegion,
+                                            nsRegion* aRepaintRegion)
+ {
+   NS_ASSERTION(aRootFrame != aMovingFrame,
+                "The root frame shouldn't be the one that's moving, that makes no sense");
+ 
+   nsAutoDisableGetUsedXAssertions disableAssert;
+ 
+   // Build the 'after' display list over the whole area of interest.
+@@ -1251,19 +1252,22 @@ nsLayoutUtils::ComputeRepaintRegionForCo
+   // 'before' display list. So opaque moving items are only considered to
+   // cover the intersection of their old and new bounds (see
+   // nsDisplayItem::OptimizeVisibility). A moving clip item is not allowed
+   // to clip non-moving items --- this is enforced by the code that sets
+   // up nsDisplayClip items, in particular see ApplyAbsPosClipping.
+   // XXX but currently a non-moving clip item can incorrectly clip
+   // moving items! See bug 428156.
+   nsRect rect;
+-  rect.UnionRect(aCopyRect, aCopyRect + aDelta);
++  rect.UnionRect(aUpdateRect, aUpdateRect - aDelta);
+   nsDisplayListBuilder builder(aRootFrame, PR_FALSE, PR_TRUE);
+-  builder.SetMovingFrame(aMovingFrame, aDelta);
++  // Retrieve the area of the moving content that's visible. This is the
++  // only area that needs to be blitted or repainted.
++  nsRegion visibleRegionOfMovingContent;
++  builder.SetMovingFrame(aMovingFrame, aDelta, &visibleRegionOfMovingContent);
+   nsDisplayList list;
+ 
+   builder.EnterPresShell(aRootFrame, rect);
+ 
+   nsresult rv =
+     aRootFrame->BuildDisplayListForStackingContext(&builder, rect, &list);
+ 
+   builder.LeavePresShell(aRootFrame, rect);
+@@ -1275,40 +1279,47 @@ nsLayoutUtils::ComputeRepaintRegionForCo
+             "Repaint region for copy --- before optimization (area %d,%d,%d,%d, frame %p):\n",
+             rect.x, rect.y, rect.width, rect.height, (void*)aMovingFrame);
+     nsIFrameDebug::PrintDisplayList(&builder, list);
+   }
+ #endif
+ 
+   // Optimize for visibility, but frames under aMovingFrame will not be
+   // considered opaque, so they don't cover non-moving frames.
+-  nsRegion visibleRegion(aCopyRect);
+-  visibleRegion.Or(visibleRegion, aCopyRect + aDelta);
++  nsRegion visibleRegion(aUpdateRect);
++  visibleRegion.Or(visibleRegion, aUpdateRect - aDelta);
+   list.OptimizeVisibility(&builder, &visibleRegion);
+ 
+ #ifdef DEBUG
+   if (gDumpRepaintRegionForCopy) {
+     fprintf(stderr, "Repaint region for copy --- after optimization:\n");
+     nsIFrameDebug::PrintDisplayList(&builder, list);
+   }
+ #endif
+ 
+   aRepaintRegion->SetEmpty();
+   // Any visible non-moving display items get added to the repaint region
+   // a) at their current location and b) offset by -aPt (their position in
+   // the 'before' display list) (unless they're uniform and we can exclude them).
+   // Also, any visible position-varying display items get added to the
+-  // repaint region. All these areas are confined to aCopyRect+aDelta.
++  // repaint region. All these areas are confined to aUpdateRect.
+   // We could do more work here: e.g., do another optimize-visibility pass
+   // with the moving items taken into account, either on the before-list
+   // or the after-list, or even both if we cloned the display lists ... but
+   // it's probably not worth it.
+-  AddItemsToRegion(&builder, &list, aCopyRect, rect, aDelta, aRepaintRegion);
++  AddItemsToRegion(&builder, &list, aUpdateRect, rect, aDelta, aRepaintRegion);
+   // Flush the list so we don't trigger the IsEmpty-on-destruction assertion
+   list.DeleteAll();
++
++  // Finalize output regions. The region of moving content that's not
++  // visible --- hidden by overlaid opaque non-moving content --- need not
++  // be blitted or repainted.
++  visibleRegionOfMovingContent.And(visibleRegionOfMovingContent, aUpdateRect);
++  aRepaintRegion->And(*aRepaintRegion, visibleRegionOfMovingContent);
++  aBlitRegion->Sub(visibleRegionOfMovingContent, *aRepaintRegion);
+   return NS_OK;
+ }
+ 
+ PRInt32
+ nsLayoutUtils::GetZIndex(nsIFrame* aFrame) {
+   if (!aFrame->GetStyleDisplay()->IsPositioned())
+     return 0;
+ 
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -492,57 +492,66 @@ public:
+    */
+   static nsresult PaintFrame(nsIRenderingContext* aRenderingContext, nsIFrame* aFrame,
+                              const nsRegion& aDirtyRegion, nscolor aBackstop,
+                              PRUint32 aFlags = 0);
+ 
+   /**
+    * @param aRootFrame the root frame of the tree to be displayed
+    * @param aMovingFrame a frame that has moved
+-   * @param aPt the amount by which aMovingFrame has moved and the rect will
+-   * be copied
+-   * @param aCopyRect a rectangle that will be copied, relative to aRootFrame
+-   * @param aRepaintRegion a subregion of aCopyRect+aDelta that must be repainted
+-   * after doing the bitblt
++   * @param aPt the amount by which aMovingFrame has moved
++   * @param aUpdateRect a rectangle that bounds the area to be updated,
++   * relative to aRootFrame
++   * @param aRepaintRegion output: a subregion of aUpdateRect that must be
++   * repainted after doing the blit
++   * @param aBlitRegion output: a subregion of aUpdateRect that should
++   * be repainted by blitting
+    * 
+-   * Ideally this function would actually have the rect-to-copy as an output
+-   * rather than an input, but for now, scroll bitblitting is limited to
+-   * the whole of a single widget, so we cannot choose the rect.
++   * If the caller does a bitblt copy of aBlitRegion-aPt to aBlitRegion,
++   * and then repaint aRepaintRegion; then the area aUpdateRect will be
++   * correctly up to date. aBlitRegion and aRepaintRegion do not intersect
++   * and are both contained within aUpdateRect.
+    * 
+-   * This function assumes that the caller will do a bitblt copy of aCopyRect
+-   * to aCopyRect+aPt. It computes a region that must be repainted in order
+-   * for the resulting rendering to be correct. Frame geometry must have
+-   * already been adjusted for the scroll/copy operation.
++   * Frame geometry must have already been adjusted for the scroll/copy
++   * operation before this function is called.
+    * 
+    * Conceptually it works by computing a display list in the before-state
+    * and a display list in the after-state and analyzing them to find the
+    * differences. In practice it is only feasible to build a display list
+    * in the after-state (plus building two display lists would be less
+    * efficient), so we use some unfortunately tricky techniques to get by
+    * with just the after-list.
+    * 
+-   * The output region consists of:
++   * We compute the "visible moving area": aUpdateRect minus any opaque
++   * areas of non-moving content that are above all moving content in
++   * z-order.
++   *
++   * The aRepaintRegion region consists of the visible moving area
++   * intersected with the following areas:
+    * a) any visible background-attachment:fixed areas in the after-move display
+    * list
+    * b) any visible areas of the before-move display list corresponding to
+    * frames that will not move (translated by aDelta)
+    * c) any visible areas of the after-move display list corresponding to
+    * frames that did not move
+    * d) except that if the same display list element is visible in b) and c)
+    * for a frame that did not move and paints a uniform color within its
+    * bounds, then the intersection of its old and new bounds can be excluded
+    * when it is processed by b) and c).
+    * 
+-   * We may return a larger region if computing the above region precisely is
+-   * too expensive.
++   * aBlitRegion is the visible moving area minus aRepaintRegion.
++   * 
++   * We may return a larger region for aRepaintRegion and/or aBlitRegion
++   * if computing the above regions precisely is too expensive.
+    */
+   static nsresult ComputeRepaintRegionForCopy(nsIFrame* aRootFrame,
+                                               nsIFrame* aMovingFrame,
+                                               nsPoint aDelta,
+-                                              const nsRect& aCopyRect,
++                                              const nsRect& aUpdateRect,
++                                              nsRegion* aBlitRegion,
+                                               nsRegion* aRepaintRegion);
+ 
+   /**
+    * Compute the used z-index of aFrame; returns zero for elements to which
+    * z-index does not apply, and for z-index:auto
+    */
+   static PRInt32 GetZIndex(nsIFrame* aFrame);
+ 
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -908,17 +908,18 @@ public:
+                    nsIRenderingContext* aRenderingContext,
+                    const nsRegion& aDirtyRegion);
+   NS_IMETHOD PaintDefaultBackground(nsIView *aView,
+                                     nsIRenderingContext* aRenderingContext,
+                                     const nsRect& aDirtyRect);
+   NS_IMETHOD ComputeRepaintRegionForCopy(nsIView*      aRootView,
+                                          nsIView*      aMovingView,
+                                          nsPoint       aDelta,
+-                                         const nsRect& aCopyRect,
++                                         const nsRect& aUpdateRect,
++                                         nsRegion*     aBlitRegion,
+                                          nsRegion*     aRepaintRegion);
+   NS_IMETHOD HandleEvent(nsIView*        aView,
+                          nsGUIEvent*     aEvent,
+                          nsEventStatus*  aEventStatus);
+   NS_IMETHOD HandleDOMEventWithTarget(nsIContent* aTargetContent,
+                                       nsEvent* aEvent,
+                                       nsEventStatus* aStatus);
+   NS_IMETHOD HandleDOMEventWithTarget(nsIContent* aTargetContent,
+@@ -5219,23 +5220,24 @@ PresShell::GetPlaceholderFrameFor(nsIFra
+ }
+ 
+ //nsIViewObserver
+ 
+ NS_IMETHODIMP
+ PresShell::ComputeRepaintRegionForCopy(nsIView*      aRootView,
+                                        nsIView*      aMovingView,
+                                        nsPoint       aDelta,
+-                                       const nsRect& aCopyRect,
++                                       const nsRect& aUpdateRect,
++                                       nsRegion*     aBlitRegion,
+                                        nsRegion*     aRepaintRegion)
+ {
+   return nsLayoutUtils::ComputeRepaintRegionForCopy(
+       static_cast<nsIFrame*>(aRootView->GetClientData()),
+       static_cast<nsIFrame*>(aMovingView->GetClientData()),
+-      aDelta, aCopyRect, aRepaintRegion);
++      aDelta, aUpdateRect, aBlitRegion, aRepaintRegion);
+ }
+ 
+ NS_IMETHODIMP
+ PresShell::RenderDocument(const nsRect& aRect, PRUint32 aFlags,
+                           nscolor aBackgroundColor,
+                           gfxContext* aThebesContext)
+ {
+   NS_ENSURE_TRUE(!(aFlags & RENDER_IS_UNTRUSTED), NS_ERROR_NOT_IMPLEMENTED);
+diff --git a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+--- a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
++++ b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+@@ -4124,25 +4124,27 @@ nsTreeBodyFrame::ScrollInternal(const Sc
+       PR_ABS(delta)*mRowHeight >= mRect.height) {
+     Invalidate();
+   } else {
+     nsIWidget* widget = nsLeafBoxFrame::GetView()->GetWidget();
+     if (widget) {
+       nscoord rowHeightAsPixels =
+         PresContext()->AppUnitsToDevPixels(mRowHeight);
+       nsIntPoint deltaPt = nsIntPoint(0, -delta*rowHeightAsPixels);
++
+       nsIntRect bounds;
+       widget->GetBounds(bounds);
+       bounds.x = bounds.y = 0;
+-      nsIntRect source;
+-      source.IntersectRect(bounds, bounds - deltaPt);
++      nsTArray<nsIntRect> destRects;
++      destRects.AppendElement(bounds);
++
+       // No plugins have a tree widget as a parent so we don't need
+       // configurations here.
+       nsTArray<nsIWidget::Configuration> emptyConfigurations;
+-      widget->Scroll(deltaPt, source, emptyConfigurations);
++      widget->Scroll(deltaPt, destRects, emptyConfigurations);
+       nsIntRect invalid = bounds;
+       if (deltaPt.y < 0) {
+         invalid.y = bounds.height + deltaPt.y;
+         invalid.height = -deltaPt.y;
+       } else {
+         invalid.height = deltaPt.y;
+       }
+       widget->Invalidate(invalid, PR_FALSE);
+@@ -4179,25 +4181,27 @@ nsTreeBodyFrame::ScrollHorzInternal(cons
+       background->mImageCount > 1 ||
+       NS_GET_A(background->mBackgroundColor) < 255 ||
+       PR_ABS(delta) >= mRect.width) {
+     Invalidate();
+   } else {
+     nsIWidget* widget = nsLeafBoxFrame::GetView()->GetWidget();
+     if (widget) {
+       nsIntPoint deltaPt(PresContext()->AppUnitsToDevPixels(-delta), 0);
++
+       nsIntRect bounds;
+       widget->GetBounds(bounds);
+       bounds.x = bounds.y = 0;
+-      nsIntRect source;
+-      source.IntersectRect(bounds, bounds - deltaPt);
++      nsTArray<nsIntRect> destRects;
++      destRects.AppendElement(bounds);
++
+       // No plugins have a tree widget as a parent so we don't need
+       // configurations here.
+       nsTArray<nsIWidget::Configuration> emptyConfigurations;
+-      widget->Scroll(deltaPt, source, emptyConfigurations);
++      widget->Scroll(deltaPt, destRects, emptyConfigurations);
+       nsIntRect invalid = bounds;
+       if (deltaPt.x < 0) {
+         invalid.x = bounds.width + deltaPt.x;
+         invalid.width = -deltaPt.x;
+       } else {
+         invalid.width = deltaPt.x;
+       }
+       widget->Invalidate(invalid, PR_FALSE);
+diff --git a/view/public/nsIViewObserver.h b/view/public/nsIViewObserver.h
+--- a/view/public/nsIViewObserver.h
++++ b/view/public/nsIViewObserver.h
+@@ -92,17 +92,18 @@ public:
+                                     const nsRect&        aDirtyRect) = 0;
+ 
+   /**
+    * @see nsLayoutUtils::ComputeRepaintRegionForCopy
+    */
+   NS_IMETHOD ComputeRepaintRegionForCopy(nsIView*      aRootView,
+                                          nsIView*      aMovingView,
+                                          nsPoint       aDelta,
+-                                         const nsRect& aCopyRect,
++                                         const nsRect& aUpdateRect,
++                                         nsRegion*     aBlitRegion,
+                                          nsRegion*     aRepaintRegion) = 0;
+ 
+   /* called when the observer needs to handle an event
+    * @param aView  - where to start processing the event; the root view,
+    * or the view that's currently capturing this sort of event; must be a view
+    * for this presshell
+    * @param aEvent - event notification
+    * @param aEventStatus - out parameter for event handling
+diff --git a/view/src/nsScrollPortView.cpp b/view/src/nsScrollPortView.cpp
+--- a/view/src/nsScrollPortView.cpp
++++ b/view/src/nsScrollPortView.cpp
+@@ -536,89 +536,194 @@ NS_IMETHODIMP nsScrollPortView::CanScrol
+   }
+ 
+   // Can scroll to Bottom or to Right?
+   aResult = (offset < max) ? PR_TRUE : PR_FALSE;
+ 
+   return NS_OK;
+ }
+ 
++/**
++ * Given aBlitRegion in appunits, create an nsRegion in device pixels
++ * that represents the device pixels that are wholly contained in
++ * aBlitRegion. Whatever appunit area was removed in that process is
++ * added to aRepaintRegion.
++ */
++static nsRegion
++ConvertToInnerPixelRegion(const nsRegion& aBlitRegion,
++                          nscoord aAppUnitsPerPixel,
++                          nsRegion* aRepaintRegion)
++{
++  // Basically we compute the inverse of aBlitRegion,
++  // expand each of its rectangles out to device pixel boundaries, then
++  // invert that.
++  nsIntRect boundingBoxPixels =
++    aBlitRegion.GetBounds().ToOutsidePixels(aAppUnitsPerPixel);
++  nsRect boundingBox = boundingBoxPixels.ToAppUnits(aAppUnitsPerPixel);
++  nsRegion outside;
++  outside.Sub(boundingBox, aBlitRegion);
++
++  nsRegion outsidePixels;
++  nsRegion outsideAppUnits;
++  const nsRect* r;
++  for (nsRegionRectIterator iter(outside); (r = iter.Next());) {
++    nsIntRect pixRect = r->ToOutsidePixels(aAppUnitsPerPixel);
++    outsidePixels.Or(outsidePixels,
++                     nsRect(pixRect.x, pixRect.y, pixRect.width, pixRect.height));
++    outsideAppUnits.Or(outsideAppUnits,
++                       pixRect.ToAppUnits(aAppUnitsPerPixel));
++  }
++
++  nsRegion repaint;
++  repaint.And(aBlitRegion, outsideAppUnits);
++  aRepaintRegion->Or(*aRepaintRegion, repaint);
++
++  nsRegion result;
++  result.Sub(nsRect(boundingBoxPixels.x, boundingBoxPixels.y,
++                    boundingBoxPixels.width, boundingBoxPixels.height),
++             outsidePixels);
++  return result;
++}
++
++/**
++ * An nsTArray comparator that lets us sort nsIntRects by their right edge.
++ */
++class RightEdgeComparator {
++public:
++  /** @return True if the elements are equals; false otherwise. */
++  PRBool Equals(const nsIntRect& aA, const nsIntRect& aB) const
++  {
++    return aA.XMost() == aB.XMost();
++  }
++  /** @return True if (a < b); false otherwise. */
++  PRBool LessThan(const nsIntRect& aA, const nsIntRect& aB) const
++  {
++    return aA.XMost() < aB.XMost();
++  }
++};
++
++// If aPixDelta has a negative component, flip aRect across the
++// axis in that direction. We do this so we can assume all scrolling is
++// down and to the right to simplify SortBlitRectsForCopy
++static nsIntRect
++FlipRect(const nsIntRect& aRect, nsIntPoint aPixDelta)
++{
++  nsIntRect r = aRect;
++  if (aPixDelta.x < 0) {
++    r.x = -r.XMost();
++  }
++  if (aPixDelta.y < 0) {
++    r.y = -r.YMost();
++  }
++  return r;
++}
++
++// Extract the rectangles from aInnerPixRegion, and sort them into aRects
++// so that moving rectangle aRects[i] - aPixDelta to aRects[i] will not
++// cause the rectangle to overlap any rectangles that haven't moved yet. See
++// http://weblogs.mozillazine.org/roc/archives/2009/08/homework_answer.html
++static void
++SortBlitRectsForCopy(const nsRegion& aInnerPixRegion,
++                     nsIntPoint aPixDelta,
++                     nsTArray<nsIntRect>* aResult)
++{
++  nsTArray<nsIntRect> rects;
++
++  const nsRect* r;
++  for (nsRegionRectIterator iter(aInnerPixRegion); (r = iter.Next());) {
++    nsIntRect rect =
++      FlipRect(nsIntRect(r->x, r->y, r->width, r->height), aPixDelta);
++    rects.AppendElement(rect);
++  }
++  rects.Sort(RightEdgeComparator());
++
++  // This could probably be improved a bit for some worst-case scenarios.
++  // But in common cases this should be very fast, and we shouldn't
++  // make it more complex unless we really need to.
++  while (!rects.IsEmpty()) {
++    PRInt32 i = rects.Length() - 1;
++    PRBool overlappedBelow;
++    do {
++      overlappedBelow = PR_FALSE;
++      const nsIntRect& rectI = rects[i];
++      // see if any rectangle < i overlaps rectI horizontally and is below
++      // rectI
++      for (PRInt32 j = i - 1; j >= 0; --j) {
++        if (rects[j].XMost() <= rectI.x) {
++          // No rectangle with index <= j can overlap rectI horizontally
++          break;
++        }
++        // Rectangle j overlaps rectI horizontally.
++        if (rects[j].y >= rectI.y) {
++          // Rectangle j is below rectangle i. This is the rightmost such
++          // rectangle, so set i to this rectangle and continue.
++          i = j;
++          overlappedBelow = PR_TRUE;
++          break;
++        }
++      }
++    } while (overlappedBelow); 
++
++    // Rectangle i has no rectangles to the right or below.
++    // Flip it back before saving the result.
++    aResult->AppendElement(FlipRect(rects[i], aPixDelta));
++    rects.RemoveElementAt(i);
++  }
++}
++
+ void nsScrollPortView::Scroll(nsView *aScrolledView, nsPoint aTwipsDelta,
+                               nsIntPoint aPixDelta, PRInt32 aP2A,
+                               const nsTArray<nsIWidget::Configuration>& aConfigurations)
+ {
+   if (aTwipsDelta.x != 0 || aTwipsDelta.y != 0)
+   {
+     /* If we should invalidate our wrapped view, we should do so at this
+      * point.
+      */
+     if (aScrolledView->NeedsInvalidateFrameOnScroll())
+       GetViewManager()->GetViewObserver()->InvalidateFrameForView(aScrolledView);
+     
+     nsPoint nearestWidgetOffset;
+     nsIWidget *nearestWidget = GetNearestWidget(&nearestWidgetOffset);
+-    nsRegion updateRegion;
+-    PRBool canBitBlit = nearestWidget &&
+-                        mViewManager->CanScrollWithBitBlt(aScrolledView, aTwipsDelta, &updateRegion) &&
+-                        nearestWidget->GetTransparencyMode() != eTransparencyTransparent;
+-
+-    if (!canBitBlit) {
+-      // We can't blit for some reason.
++    if (!nearestWidget ||
++        nearestWidget->GetTransparencyMode() == eTransparencyTransparent) {
+       // Just update the view and adjust widgets
+       // Recall that our widget's origin is at our bounds' top-left
+       if (nearestWidget) {
+         nearestWidget->ConfigureChildren(aConfigurations);
+       }
+       nsRect bounds(GetBounds());
+       nsPoint topLeft(bounds.x, bounds.y);
+       AdjustChildWidgets(aScrolledView,
+                          GetPosition() - topLeft, aP2A, PR_FALSE);
+       // We should call this after fixing up the widget positions to be
+       // consistent with the view hierarchy.
+       mViewManager->UpdateView(this, NS_VMREFRESH_DEFERRED);
+     } else {
++      nsRegion blitRegion;
++      nsRegion repaintRegion;
++      mViewManager->GetRegionsForBlit(aScrolledView, aTwipsDelta,
++                                      &blitRegion, &repaintRegion);
++      blitRegion.MoveBy(nearestWidgetOffset);
++      repaintRegion.MoveBy(nearestWidgetOffset);
++
+       // We're going to bit-blit.  Let the viewmanager know so it can
+       // adjust dirty regions appropriately.
+       mViewManager->WillBitBlit(this, aTwipsDelta);
+ 
+-      // Compute the region that needs to be updated by the bit-blit scroll
+-      nsRect bounds(nsPoint(0,0), GetBounds().Size());
+-      nsRegion regionToScroll;
+-      regionToScroll.Sub(bounds, updateRegion);
+-      // Only the area corresponding to the widget bounds, translated
+-      // by the scroll amount, will actually be filled by the blit
+-      regionToScroll.And(regionToScroll, bounds - aTwipsDelta);
+-      // Find the largest rectangle in that region
+-      nsRegionRectIterator iter(regionToScroll);
+-      nsRect biggestRect(0,0,0,0);
+-      const nsRect* r;
+-      for (r = iter.Next(); r; r = iter.Next()) {
+-        if (PRInt64(r->width)*PRInt64(r->height) > PRInt64(biggestRect.width)*PRInt64(biggestRect.height)) {
+-          biggestRect = *r;
+-        }
+-      }
+-      // Convert the largest rectangle to widget device pixel coordinates
+-      nsIntRect destScroll = (biggestRect + nearestWidgetOffset).ToInsidePixels(aP2A);
+-      // Convert it back to view-relative appunits, since we shrank it in
+-      // ToInsidePixels
+-      biggestRect = destScroll.ToAppUnits(aP2A) - nearestWidgetOffset;
+-      // Make sure we repaint the area we've decided not to bit-blit to
+-      regionToScroll.Sub(regionToScroll, biggestRect);
+-      updateRegion.Or(updateRegion, regionToScroll);
++      // innerPixRegion is in device pixels
++      nsRegion innerPixRegion =
++        ConvertToInnerPixelRegion(blitRegion, aP2A, &repaintRegion);
++      nsTArray<nsIntRect> blitRects;
++      SortBlitRectsForCopy(innerPixRegion, aPixDelta, &blitRects);
+ 
+-      // Compute the area that's being exposed by the scroll operation
+-      // and make sure it gets repainted
+-      nsRegion exposedArea;
+-      exposedArea.Sub(bounds, bounds - aTwipsDelta);
+-      updateRegion.Or(updateRegion, exposedArea);
+-
+-      nearestWidget->Scroll(aPixDelta, destScroll - aPixDelta,
+-                            aConfigurations);
++      nearestWidget->Scroll(aPixDelta, blitRects, aConfigurations);
+       AdjustChildWidgets(aScrolledView, nearestWidgetOffset, aP2A, PR_TRUE);
+-      mViewManager->UpdateViewAfterScroll(this, updateRegion);
++      repaintRegion.MoveBy(-nearestWidgetOffset);
++      mViewManager->UpdateViewAfterScroll(this, repaintRegion);
+     }
+   }
+ }
+ 
+ NS_IMETHODIMP nsScrollPortView::ScrollToImpl(nscoord aX, nscoord aY)
+ {
+   PRInt32           dxPx = 0, dyPx = 0;
+ 
+diff --git a/view/src/nsViewManager.cpp b/view/src/nsViewManager.cpp
+--- a/view/src/nsViewManager.cpp
++++ b/view/src/nsViewManager.cpp
+@@ -1513,45 +1513,45 @@ NS_IMETHODIMP nsViewManager::ResizeView(
+   // region set, then we expect layout to update the clip region too. Thus
+   // in the case where mClipRect has been optimized away to just be a null
+   // pointer, and this resize is implicitly changing the clip rect, it's OK
+   // because layout will change it back again if necessary.
+ 
+   return NS_OK;
+ }
+ 
+-static double GetArea(const nsRect& aRect)
+-{
+-  return double(aRect.width)*double(aRect.height);
+-}
+-
+-PRBool nsViewManager::CanScrollWithBitBlt(nsView* aView, nsPoint aDelta,
+-                                          nsRegion* aUpdateRegion)
++void nsViewManager::GetRegionsForBlit(nsView* aView, nsPoint aDelta,
++                                      nsRegion* aBlitRegion,
++                                      nsRegion* aRepaintRegion)
+ {
+   NS_ASSERTION(!IsPainting(),
+                "View manager shouldn't be scrolling during a paint");
+-  if (IsPainting() || !mObserver) {
+-    return PR_FALSE; // do the safe thing
+-  }
+ 
+   nsView* displayRoot = GetDisplayRootFor(aView);
+   nsPoint displayOffset = aView->GetParent()->GetOffsetTo(displayRoot);
+   nsRect parentBounds = aView->GetParent()->GetDimensions() + displayOffset;
+-  // The rect we're going to scroll is intersection of the parent bounds with its
+-  // preimage
+-  nsRect toScroll;
+-  toScroll.IntersectRect(parentBounds + aDelta, parentBounds);
+-  nsresult rv =
+-    mObserver->ComputeRepaintRegionForCopy(displayRoot, aView, -aDelta, toScroll,
+-                                           aUpdateRegion);
+-  NS_ENSURE_SUCCESS(rv, PR_FALSE);
++  if (IsPainting() || !mObserver) {
++    // Be simple and safe
++    aBlitRegion->SetEmpty();
++    *aRepaintRegion = parentBounds;
++  } else {
++    nsresult rv =
++      mObserver->ComputeRepaintRegionForCopy(displayRoot, aView, -aDelta,
++                                             parentBounds,
++                                             aBlitRegion,
++                                             aRepaintRegion);
++    if (NS_FAILED(rv)) {
++      aBlitRegion->SetEmpty();
++      *aRepaintRegion = nsRegion(parentBounds);
++      return;
++    }
++  }
+ 
+-  aUpdateRegion->MoveBy(-displayOffset);
+-
+-  return GetArea(aUpdateRegion->GetBounds()) < GetArea(parentBounds)/2;
++  aBlitRegion->MoveBy(-displayOffset);
++  aRepaintRegion->MoveBy(-displayOffset);
+ }
+ 
+ NS_IMETHODIMP nsViewManager::SetViewFloating(nsIView *aView, PRBool aFloating)
+ {
+   nsView* view = static_cast<nsView*>(aView);
+ 
+   NS_ASSERTION(!(nsnull == view), "no view");
+ 
+diff --git a/view/src/nsViewManager.h b/view/src/nsViewManager.h
+--- a/view/src/nsViewManager.h
++++ b/view/src/nsViewManager.h
+@@ -351,21 +351,22 @@ public: // NOT in nsIViewManager, so pri
+    * to be rerendered.
+    * @param aView view to paint. should be the nsScrollPortView that
+    * got scrolled.
+    * @param aUpdateRegion ensure that this part of the view is repainted
+    */
+   void UpdateViewAfterScroll(nsView *aView, const nsRegion& aUpdateRegion);
+ 
+   /**
+-   * Asks whether we can scroll a view using bitblt. If we say 'yes', we
+-   * return in aUpdateRegion an area that must be updated (relative to aView
+-   * after it has been scrolled).
++   * Given that the view aView has being moved by scrolling by aDelta
++   * (so we want to blit pixels by -aDelta), compute the regions that
++   * must be blitted and repainted to correctly update the screen.
+    */
+-  PRBool CanScrollWithBitBlt(nsView* aView, nsPoint aDelta, nsRegion* aUpdateRegion);
++  void GetRegionsForBlit(nsView* aView, nsPoint aDelta,
++                         nsRegion* aBlitRegion, nsRegion* aRepaintRegion);
+ 
+   nsresult CreateRegion(nsIRegion* *result);
+ 
+   PRBool IsRefreshEnabled() { return RootViewManager()->mRefreshEnabled; }
+ 
+   nsIViewObserver* GetViewObserver() { return mObserver; }
+ 
+   // Call this when you need to let the viewmanager know that it now has
+diff --git a/widget/public/nsIWidget.h b/widget/public/nsIWidget.h
+--- a/widget/public/nsIWidget.h
++++ b/widget/public/nsIWidget.h
+@@ -97,20 +97,19 @@ typedef nsEventStatus (* EVENT_CALLBACK)
+ #define NS_NATIVE_PLUGIN_PORT_CG    101
+ #endif
+ #ifdef XP_WIN
+ #define NS_NATIVE_TSF_THREAD_MGR       100
+ #define NS_NATIVE_TSF_CATEGORY_MGR     101
+ #define NS_NATIVE_TSF_DISPLAY_ATTR_MGR 102
+ #endif
+ 
+-// {A16A3387-A529-439C-A127-A5893351FD24}
+ #define NS_IWIDGET_IID \
+-{ 0xA16A3387, 0xA529, 0x439C, \
+-  { 0xA1, 0x27, 0xA5, 0x89, 0x33, 0x51, 0xFD, 0x24 } }
++  { 0xb681539f, 0x5dac, 0x45af, \
++    { 0x8a, 0x25, 0xdf, 0xd7, 0x14, 0xe0, 0x9f, 0x43 } }
+ 
+ /*
+  * Window shadow styles
+  * Also used for the -moz-window-shadow CSS property
+  */
+ 
+ #define NS_STYLE_WINDOW_SHADOW_NONE             0
+ #define NS_STYLE_WINDOW_SHADOW_DEFAULT          1
+@@ -711,34 +710,41 @@ class nsIWidget : public nsISupports {
+      * An AddRef has NOT been done for the caller.
+      *
+      * @return the toolkit this widget was created in. See nsToolkit.
+      */
+ 
+     virtual nsIToolkit* GetToolkit() = 0;    
+ 
+     /**
+-     * Scroll a rectangle in this widget and (as simultaneously as
++     * Scroll a set of rectangles in this widget and (as simultaneously as
+      * possible) modify the specified child widgets.
+      * 
+      * This will invalidate areas of the children that have changed, unless
+      * they have just moved by the scroll amount, but does not need to
+      * invalidate any part of this widget, except where the scroll
+      * operation fails to blit because part of the window is unavailable
+      * (e.g. partially offscreen).
++     * 
++     * The caller guarantees that the rectangles in aDestRects are ordered
++     * so that copying from aDestRects[i] - aDelta to aDestRects[i] does
++     * not alter anything in aDestRects[j] - aDelta for j > i. That is,
++     * it's safe to just copy the rectangles in the order given in
++     * aDestRects.
+      *
+      * @param aDelta amount to scroll (device pixels)
+-     * @param aSource rectangle to copy (device pixels relative to this
+-     * widget)
++     * @param aDestRects rectangles to copy into
++     * (device pixels relative to this widget)
+      * @param aReconfigureChildren commands to set the bounds and clip
+      * region of a subset of the children of this widget; these should
+      * be performed simultaneously with the scrolling, as far as possible,
+      * to avoid visual artifacts.
+      */
+-    virtual void Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++    virtual void Scroll(const nsIntPoint& aDelta,
++                        const nsTArray<nsIntRect>& aDestRects,
+                         const nsTArray<Configuration>& aReconfigureChildren) = 0;
+ 
+     /** 
+      * Internal methods
+      */
+ 
+     //@{
+     virtual void AddChild(nsIWidget* aChild) = 0;
+diff --git a/widget/src/cocoa/nsChildView.h b/widget/src/cocoa/nsChildView.h
+--- a/widget/src/cocoa/nsChildView.h
++++ b/widget/src/cocoa/nsChildView.h
+@@ -346,17 +346,17 @@ public:
+ 
+   NS_IMETHOD              Invalidate(PRBool aIsSynchronous);
+   NS_IMETHOD              Invalidate(const nsIntRect &aRect, PRBool aIsSynchronous);
+   NS_IMETHOD              Validate();
+ 
+   virtual void*           GetNativeData(PRUint32 aDataType);
+   virtual nsresult        ConfigureChildren(const nsTArray<Configuration>& aConfigurations);
+   virtual void            Scroll(const nsIntPoint& aDelta,
+-                                 const nsIntRect& aSource,
++                                 const nsTArray<nsIntRect>& aDestRects,
+                                  const nsTArray<Configuration>& aConfigurations);
+   virtual nsIntPoint      WidgetToScreenOffset();
+   virtual PRBool          ShowsResizeIndicator(nsIntRect* aResizerRect);
+ 
+   static  PRBool          ConvertStatus(nsEventStatus aStatus)
+                           { return aStatus == nsEventStatus_eConsumeNoDefault; }
+   NS_IMETHOD              DispatchEvent(nsGUIEvent* event, nsEventStatus & aStatus);
+ 
+diff --git a/widget/src/cocoa/nsChildView.mm b/widget/src/cocoa/nsChildView.mm
+--- a/widget/src/cocoa/nsChildView.mm
++++ b/widget/src/cocoa/nsChildView.mm
+@@ -1706,33 +1706,36 @@ void nsChildView::ApplyConfiguration(nsI
+ nsresult nsChildView::ConfigureChildren(const nsTArray<Configuration>& aConfigurations)
+ {
+   for (PRUint32 i = 0; i < aConfigurations.Length(); ++i) {
+     nsChildView::ApplyConfiguration(this, aConfigurations[i], PR_TRUE);
+   }
+   return NS_OK;
+ }  
+ 
+-void nsChildView::Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++void nsChildView::Scroll(const nsIntPoint& aDelta,
++                         const nsTArray<nsIntRect>& aDestRects,
+                          const nsTArray<Configuration>& aConfigurations)
+ {
+   NS_OBJC_BEGIN_TRY_ABORT_BLOCK;
+ 
+   NS_ASSERTION(mParentView, "Attempting to scroll a view that does not have a parent");
+   if (!mParentView)
+     return;
+ 
+   BOOL viewWasDirty = NO;
+   if (mVisible) {
+     viewWasDirty = [mView needsDisplay];
+ 
+-    NSRect rect;
+-    GeckoRectToNSRect(aSource, rect);
+-    NSSize scrollVector = {aDelta.x, aDelta.y};
+-    [mView scrollRect:rect by:scrollVector];
++    for (PRUint32 i = 0; i < aDestRects.Length(); ++i) {
++      NSRect rect;
++      GeckoRectToNSRect(aDestRects[i] - aDelta, rect);
++      NSSize scrollVector = {aDelta.x, aDelta.y};
++      [mView scrollRect:rect by:scrollVector];
++    }
+   }
+ 
+   // Don't force invalidation of the child if it's moving by the scroll
+   // amount and not changing size
+   for (PRUint32 i = 0; i < aConfigurations.Length(); ++i) {
+     const Configuration& configuration = aConfigurations[i];
+     nsIntRect oldBounds;
+     configuration.mChild->GetBounds(oldBounds);
+diff --git a/widget/src/cocoa/nsCocoaWindow.h b/widget/src/cocoa/nsCocoaWindow.h
+--- a/widget/src/cocoa/nsCocoaWindow.h
++++ b/widget/src/cocoa/nsCocoaWindow.h
+@@ -221,17 +221,18 @@ public:
+     void                    ReportSizeEvent(NSRect *overrideRect = nsnull);
+ 
+     NS_IMETHOD              SetTitle(const nsAString& aTitle);
+ 
+     NS_IMETHOD Invalidate(const nsIntRect &aRect, PRBool aIsSynchronous);
+     NS_IMETHOD Invalidate(PRBool aIsSynchronous);
+     NS_IMETHOD Update();
+     virtual nsresult ConfigureChildren(const nsTArray<Configuration>& aConfigurations);
+-    virtual void Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++    virtual void Scroll(const nsIntPoint& aDelta,
++                        const nsTArray<nsIntRect>& aDestRects,
+                         const nsTArray<Configuration>& aConfigurations);
+     NS_IMETHOD DispatchEvent(nsGUIEvent* event, nsEventStatus & aStatus) ;
+     NS_IMETHOD CaptureRollupEvents(nsIRollupListener * aListener, PRBool aDoCapture, PRBool aConsumeRollupEvent);
+     NS_IMETHOD GetAttention(PRInt32 aCycleCount);
+     virtual PRBool HasPendingInputEvent();
+     virtual nsTransparencyMode GetTransparencyMode();
+     virtual void SetTransparencyMode(nsTransparencyMode aMode);
+     NS_IMETHOD SetWindowShadowStyle(PRInt32 aStyle);
+diff --git a/widget/src/cocoa/nsCocoaWindow.mm b/widget/src/cocoa/nsCocoaWindow.mm
+--- a/widget/src/cocoa/nsCocoaWindow.mm
++++ b/widget/src/cocoa/nsCocoaWindow.mm
+@@ -847,21 +847,22 @@ nsCocoaWindow::ConfigureChildren(const n
+ {
+   if (mPopupContentView) {
+     mPopupContentView->ConfigureChildren(aConfigurations);
+   }
+   return NS_OK;
+ }
+ 
+ void
+-nsCocoaWindow::Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++nsCocoaWindow::Scroll(const nsIntPoint& aDelta,
++                      const nsTArray<nsIntRect>& aDestRects,
+                       const nsTArray<Configuration>& aConfigurations)
+ {
+   if (mPopupContentView) {
+-    mPopupContentView->Scroll(aDelta, aSource, aConfigurations);
++    mPopupContentView->Scroll(aDelta, aDestRects, aConfigurations);
+   }
+ }
+ 
+ void nsCocoaWindow::MakeBackgroundTransparent(PRBool aTransparent)
+ {
+   NS_OBJC_BEGIN_TRY_ABORT_BLOCK;
+ 
+   BOOL currentTransparency = ![mWindow isOpaque];
+diff --git a/widget/src/gtk2/nsWindow.cpp b/widget/src/gtk2/nsWindow.cpp
+--- a/widget/src/gtk2/nsWindow.cpp
++++ b/widget/src/gtk2/nsWindow.cpp
+@@ -1736,17 +1736,18 @@ nsWindow::Update()
+     if (!mGdkWindow)
+         return NS_OK;
+ 
+     gdk_window_process_updates(mGdkWindow, FALSE);
+     return NS_OK;
+ }
+ 
+ void
+-nsWindow::Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++nsWindow::Scroll(const nsIntPoint& aDelta,
++                 const nsTArray<nsIntRect>& aDestRects,
+                  const nsTArray<Configuration>& aConfigurations)
+ {
+     if (!mGdkWindow) {
+         NS_ERROR("Cannot scroll widget");
+         return;
+     }
+ 
+     nsAutoTArray<nsWindow*,1> windowsToShow;
+@@ -1763,21 +1764,28 @@ nsWindow::Scroll(const nsIntPoint& aDelt
+         if (w->mIsShown &&
+             (configuration.mClipRegion.IsEmpty() ||
+              configuration.mBounds != w->mBounds)) {
+             w->NativeShow(PR_FALSE);
+             windowsToShow.AppendElement(w);
+         }
+     }
+ 
+-    GdkRectangle gdkSource =
+-      { aSource.x, aSource.y, aSource.width, aSource.height };
+-    GdkRegion* region = gdk_region_rectangle(&gdkSource);
+-    gdk_window_move_region(GDK_WINDOW(mGdkWindow), region, aDelta.x, aDelta.y);
+-    gdk_region_destroy(region);
++    // gdk_window_move_region, up to GDK 2.16 at least, has a ghastly bug
++    // where it doesn't restrict blitting to the given region, and blits
++    // its full bounding box. So we have to work around that by
++    // blitting one rectangle at a time.
++    for (PRUint32 i = 0; i < aDestRects.Length(); ++i) {
++        const nsIntRect& r = aDestRects[i];
++        GdkRectangle gdkSource =
++            { r.x - aDelta.x, r.y - aDelta.y, r.width, r.height };
++        GdkRegion* region = gdk_region_rectangle(&gdkSource);
++        gdk_window_move_region(GDK_WINDOW(mGdkWindow), region, aDelta.x, aDelta.y);
++        gdk_region_destroy(region);
++    }
+ 
+     ConfigureChildren(aConfigurations);
+ 
+     for (PRUint32 i = 0; i < windowsToShow.Length(); ++i) {
+         windowsToShow[i]->NativeShow(PR_TRUE);
+     }
+ }
+ 
+diff --git a/widget/src/gtk2/nsWindow.h b/widget/src/gtk2/nsWindow.h
+--- a/widget/src/gtk2/nsWindow.h
++++ b/widget/src/gtk2/nsWindow.h
+@@ -181,17 +181,18 @@ public:
+     NS_IMETHOD         SetCursor(nsCursor aCursor);
+     NS_IMETHOD         SetCursor(imgIContainer* aCursor,
+                                  PRUint32 aHotspotX, PRUint32 aHotspotY);
+     NS_IMETHOD         Validate();
+     NS_IMETHOD         Invalidate(PRBool aIsSynchronous);
+     NS_IMETHOD         Invalidate(const nsIntRect &aRect,
+                                   PRBool           aIsSynchronous);
+     NS_IMETHOD         Update();
+-    virtual void       Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++    virtual void       Scroll(const nsIntPoint& aDelta,
++                              const nsTArray<nsIntRect>& aDestRects,
+                               const nsTArray<Configuration>& aReconfigureChildren);
+     virtual void*      GetNativeData(PRUint32 aDataType);
+     NS_IMETHOD         SetBorderStyle(nsBorderStyle aBorderStyle);
+     NS_IMETHOD         SetTitle(const nsAString& aTitle);
+     NS_IMETHOD         SetIcon(const nsAString& aIconSpec);
+     NS_IMETHOD         SetWindowClass(const nsAString& xulWinType);
+     virtual nsIntPoint WidgetToScreenOffset();
+     NS_IMETHOD         EnableDragDrop(PRBool aEnable);
+diff --git a/widget/src/windows/nsWindow.cpp b/widget/src/windows/nsWindow.cpp
+--- a/widget/src/windows/nsWindow.cpp
++++ b/widget/src/windows/nsWindow.cpp
+@@ -2175,17 +2175,18 @@ ClipRegionContainedInRect(const nsTArray
+   for (PRUint32 i = 0; i < aClipRects.Length(); ++i) {
+     if (!aRect.Contains(aClipRects[i]))
+       return PR_FALSE;
+   }
+   return PR_TRUE;
+ }
+ 
+ void
+-nsWindow::Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++nsWindow::Scroll(const nsIntPoint& aDelta,
++                 const nsTArray<nsIntRect>& aDestRects,
+                  const nsTArray<Configuration>& aConfigurations)
+ {
+   // We use SW_SCROLLCHILDREN if all the windows that intersect the
+   // affected area are moving by the scroll amount.
+   // First, build the set of widgets that are to be moved by the scroll
+   // amount.
+   // At the same time, set the clip region of all changed windows to the
+   // intersection of the current and new regions.
+@@ -2197,53 +2198,68 @@ nsWindow::Scroll(const nsIntPoint& aDelt
+     NS_ASSERTION(w->GetParent() == this,
+                  "Configured widget is not a child");
+     if (configuration.mBounds == w->mBounds + aDelta) {
+       scrolledWidgets.PutEntry(w);
+     }
+     w->SetWindowClipRegion(configuration.mClipRegion, PR_TRUE);
+   }
+ 
+-  // Now check if any of our children would be affected by
+-  // SW_SCROLLCHILDREN but not supposed to scroll.
+-  nsIntRect affectedRect;
+-  affectedRect.UnionRect(aSource, aSource + aDelta);
+-  // We pass SW_INVALIDATE because areas that get scrolled into view
+-  // from offscreen (but inside the scroll area) need to be repainted.
+-  UINT flags = SW_SCROLLCHILDREN | SW_INVALIDATE;
+-  for (nsWindow* w = static_cast<nsWindow*>(GetFirstChild()); w;
+-       w = static_cast<nsWindow*>(w->GetNextSibling())) {
+-    if (w->mBounds.Intersects(affectedRect) &&
+-        !scrolledWidgets.GetEntry(w)) {
+-      flags &= ~SW_SCROLLCHILDREN;
+-      break;
+-    }
+-  }
+-
+-  if (flags & SW_SCROLLCHILDREN) {
+-    for (PRUint32 i = 0; i < aConfigurations.Length(); ++i) {
+-      const Configuration& configuration = aConfigurations[i];
+-      nsWindow* w = static_cast<nsWindow*>(configuration.mChild);
+-      // Widgets that will be scrolled by SW_SCROLLCHILDREN but which
+-      // will be partly visible outside the scroll area after scrolling
+-      // must be invalidated, because SW_SCROLLCHILDREN doesn't
+-      // update parts of widgets outside the area it scrolled, even
+-      // if it moved them.
+-      if (w->mBounds.Intersects(affectedRect) &&
+-          !ClipRegionContainedInRect(configuration.mClipRegion,
+-                                     affectedRect - (w->mBounds.TopLeft() + aDelta))) {
+-        w->Invalidate(PR_FALSE);
+-      }
+-    }
+-  }
+-
+-  // Note that when SW_SCROLLCHILDREN is used, WM_MOVE messages are sent
+-  // which will update the mBounds of the children.
+-  RECT clip = { affectedRect.x, affectedRect.y, affectedRect.XMost(), affectedRect.YMost() };
+-  ::ScrollWindowEx(mWnd, aDelta.x, aDelta.y, &clip, &clip, NULL, NULL, flags);
++  for (PRUint32 i = 0; i < aDestRects.Length(); ++i) {
++    nsIntRect affectedRect;
++    affectedRect.UnionRect(aDestRects[i], aDestRects[i] - aDelta);
++    // We pass SW_INVALIDATE because areas that get scrolled into view
++    // from offscreen (but inside the scroll area) need to be repainted.
++    UINT flags = SW_SCROLLCHILDREN | SW_INVALIDATE;
++    // Now check if any of our children would be affected by
++    // SW_SCROLLCHILDREN but not supposed to scroll.
++    for (nsWindow* w = static_cast<nsWindow*>(GetFirstChild()); w;
++         w = static_cast<nsWindow*>(w->GetNextSibling())) {
++      if (w->mBounds.Intersects(affectedRect)) {
++        // This child will be affected
++        nsPtrHashKey<nsWindow>* entry = scrolledWidgets.GetEntry(w);
++        if (entry) {
++          // It's supposed to be scrolled, so we can still use
++          // SW_SCROLLCHILDREN. But don't allow SW_SCROLLCHILDREN to be
++          // used on it again by a later rectangle in aDestRects, we
++          // don't want it to move twice!
++          scrolledWidgets.RawRemoveEntry(entry);
++        } else {
++          flags &= ~SW_SCROLLCHILDREN;
++          // We may have removed some children from scrolledWidgets even
++          // though we decide here to not use SW_SCROLLCHILDREN. That's OK,
++          // it just means that we might not use SW_SCROLLCHILDREN
++          // for a later rectangle when we could have.
++          break;
++        }
++      }
++    }
++
++    if (flags & SW_SCROLLCHILDREN) {
++      for (PRUint32 i = 0; i < aConfigurations.Length(); ++i) {
++        const Configuration& configuration = aConfigurations[i];
++        nsWindow* w = static_cast<nsWindow*>(configuration.mChild);
++        // Widgets that will be scrolled by SW_SCROLLCHILDREN but which
++        // will be partly visible outside the scroll area after scrolling
++        // must be invalidated, because SW_SCROLLCHILDREN doesn't
++        // update parts of widgets outside the area it scrolled, even
++        // if it moved them.
++        if (w->mBounds.Intersects(affectedRect) &&
++            !ClipRegionContainedInRect(configuration.mClipRegion,
++                                       affectedRect - (w->mBounds.TopLeft() + aDelta))) {
++          w->Invalidate(PR_FALSE);
++        }
++      }
++    }
++
++    // Note that when SW_SCROLLCHILDREN is used, WM_MOVE messages are sent
++    // which will update the mBounds of the children.
++    RECT clip = { affectedRect.x, affectedRect.y, affectedRect.XMost(), affectedRect.YMost() };
++    ::ScrollWindowEx(mWnd, aDelta.x, aDelta.y, &clip, &clip, NULL, NULL, flags);
++  }
+ 
+   // Now make sure all children actually get positioned, sized and clipped
+   // correctly. If SW_SCROLLCHILDREN already moved widgets to their correct
+   // locations, then the SetWindowPos calls this triggers will just be
+   // no-ops.
+   ConfigureChildren(aConfigurations);
+ }
+ 
+diff --git a/widget/src/windows/nsWindow.h b/widget/src/windows/nsWindow.h
+--- a/widget/src/windows/nsWindow.h
++++ b/widget/src/windows/nsWindow.h
+@@ -140,17 +140,18 @@ public:
+   NS_IMETHOD              SetCursor(nsCursor aCursor);
+   virtual nsresult        ConfigureChildren(const nsTArray<Configuration>& aConfigurations);
+   NS_IMETHOD              MakeFullScreen(PRBool aFullScreen);
+   NS_IMETHOD              HideWindowChrome(PRBool aShouldHide);
+   NS_IMETHOD              Validate();
+   NS_IMETHOD              Invalidate(PRBool aIsSynchronous);
+   NS_IMETHOD              Invalidate(const nsIntRect & aRect, PRBool aIsSynchronous);
+   NS_IMETHOD              Update();
+-  virtual void            Scroll(const nsIntPoint& aDelta, const nsIntRect& aSource,
++  virtual void            Scroll(const nsIntPoint& aDelta,
++                                 const nsTArray<nsIntRect>& aDestRects,
+                                  const nsTArray<Configuration>& aReconfigureChildren);
+   virtual void*           GetNativeData(PRUint32 aDataType);
+   virtual void            FreeNativeData(void * data, PRUint32 aDataType);
+   NS_IMETHOD              SetTitle(const nsAString& aTitle);
+   NS_IMETHOD              SetIcon(const nsAString& aIconSpec);
+   virtual nsIntPoint      WidgetToScreenOffset();
+   NS_IMETHOD              DispatchEvent(nsGUIEvent* event, nsEventStatus & aStatus);
+   NS_IMETHOD              EnableDragDrop(PRBool aEnable);
