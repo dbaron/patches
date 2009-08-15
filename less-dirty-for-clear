@@ -1,0 +1,120 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Avoid marking lines dirty because of clearance inside during append-only reflows.  (Bug 481128)  (NOT YET COMPATIBLE WITH IREFLOW)
+
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -2120,16 +2120,18 @@ nsPresContext::ReflowStarted(PRBool aInt
+   // we ever change that, then we need to update the code in
+   // PresShell::DoReflow to only add the just-reflown root to dirty roots if
+   // it's actually dirty.  Otherwise we can end up adding a root that has no
+   // interruptible descendants, just because we detected an interrupt at reflow
+   // start.
+   mHasPendingInterrupt = PR_FALSE;
+ 
+   mInterruptChecksToSkip = sInterruptChecksToSkip;
++
++  mBelowSomethingDirty = PR_FALSE;
+ }
+ 
+ PRBool
+ nsPresContext::CheckForInterrupt(nsIFrame* aFrame)
+ {
+   if (mHasPendingInterrupt) {
+     mShell->FrameNeedsToContinueReflow(aFrame);
+     return PR_TRUE;
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -887,16 +887,25 @@ public:
+    */
+   PRBool CheckForInterrupt(nsIFrame* aFrame);
+   /**
+    * Returns true if CheckForInterrupt has returned true since the last
+    * ReflowStarted call. Cannot itself trigger an interrupt check.
+    */
+   PRBool HasPendingInterrupt() { return mHasPendingInterrupt; }
+ 
++  /**
++   * State that is cleared each reflow, to indicate that something
++   * earlier in the document was dirty during this reflow.  This is
++   * helpful for optimizing incremental reflows that occur during
++   * document loading to avoid O(N^2) algorithms.
++   */
++  void SetBelowSomethingDirty() { mBelowSomethingDirty = PR_TRUE; }
++  PRBool IsBelowSomethingDirty() { return mBelowSomethingDirty; }
++
+ protected:
+   friend class nsRunnableMethod<nsPresContext>;
+   NS_HIDDEN_(void) ThemeChangedInternal();
+   NS_HIDDEN_(void) SysColorChangedInternal();
+ 
+   NS_HIDDEN_(void) SetImgAnimations(nsIContent *aParent, PRUint16 aMode);
+ #ifdef MOZ_SMIL
+   NS_HIDDEN_(void) SetSMILAnimations(nsIDocument *aDoc, PRUint16 aNewMode,
+@@ -1047,16 +1056,18 @@ protected:
+   // resize reflow is supressed when the only change has been to zoom
+   // the document rather than to change the document's dimensions
+   unsigned              mSupressResizeReflow : 1;
+ 
+   unsigned              mIsVisual : 1;
+ 
+   unsigned              mProcessingAnimationStyleChange : 1;
+ 
++  unsigned              mBelowSomethingDirty : 1;
++
+ #ifdef DEBUG
+   PRBool                mInitialized;
+ #endif
+ 
+ 
+ protected:
+ 
+   virtual ~nsPresContext() NS_HIDDEN;
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1796,16 +1796,17 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+ 
+     if (selfDirty)
+       line->MarkDirty();
+ 
+     // This really sucks, but we have to look inside any blocks that have clear
+     // elements inside them.
+     // XXX what can we do smarter here?
+     if (!line->IsDirty() && line->IsBlock() &&
++        state.mPresContext->IsBelowSomethingDirty() &&
+         (line->mFirstChild->GetStateBits() & NS_BLOCK_HAS_CLEAR_CHILDREN)) {
+       line->MarkDirty();
+     }
+ 
+     nsIFrame *replacedBlock = nsnull;
+     if (line->IsBlock() &&
+         !nsBlockFrame::BlockCanIntersectFloats(line->mFirstChild)) {
+       replacedBlock = line->mFirstChild;
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3300,16 +3300,21 @@ nsFrame::WillReflow(nsPresContext* aPres
+   // bug 81268
+   NS_ASSERTION(!(mState & NS_FRAME_IN_REFLOW),
+                "nsFrame::WillReflow: frame is already in reflow");
+ #endif
+ 
+   NS_FRAME_TRACE_MSG(NS_FRAME_TRACE_CALLS,
+                      ("WillReflow: oldState=%x", mState));
+   mState |= NS_FRAME_IN_REFLOW;
++
++  if (mState & NS_FRAME_IS_DIRTY) {
++    PresContext()->SetBelowSomethingDirty();
++  }
++
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsFrame::DidReflow(nsPresContext*           aPresContext,
+                    const nsHTMLReflowState*  aReflowState,
+                    nsDidReflowStatus         aStatus)
+ {
