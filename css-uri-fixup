@@ -1,0 +1,1110 @@
+From: Ben Karel <eschew@gmail.com>
+
+Fixup URIs in CSS style sheets during "Save Page As, Complete" by serializing the style sheets from our data structures and performing URI fixup on URIs in them.  (Bug 115107)
+
+diff --git a/content/base/public/nsIDocumentEncoder.idl b/content/base/public/nsIDocumentEncoder.idl
+--- a/content/base/public/nsIDocumentEncoder.idl
++++ b/content/base/public/nsIDocumentEncoder.idl
+@@ -39,31 +39,39 @@
+ #include "nsISupports.idl"
+ 
+ interface nsIDOMDocument;
+ interface nsIDOMRange;
+ interface nsISelection;
+ interface nsIDOMNode;
+ interface nsIOutputStream;
+ 
+-[scriptable, uuid(3c556e41-0f73-4e1d-b724-1474884fe2e3)]
+-interface nsIDocumentEncoderNodeFixup : nsISupports
++[scriptable, uuid(24cf5707-3805-4b65-a85d-ea80f5665659)]
++interface nsIDocumentEncoderFixup : nsISupports
+ {
+   /**
+    * Create a fixed up version of a node. This method is called before
+    * each node in a document is about to be persisted. The implementor
+    * may return a new node with fixed up attributes or null. If null is
+    * returned the node should be used as-is.
+    * @param aNode Node to fixup.
+    * @param [OUT] aSerializeCloneKids True if the document encoder should
+    * apply recursive serialization to the children of the fixed up node
+    * instead of the children of the original node.
+    * @return The resulting fixed up node.
+    */
+   nsIDOMNode fixupNode(in nsIDOMNode aNode, out boolean aSerializeCloneKids);
++  /**
++   * Determine better URI to use when persisting linked content.
++   * @param aURI URI to fixup.
++   * @param aMimeType A mime type to use as a suggestion for determining
++     the file extension to use when persisting aURI.
++   * @return A string to be serialized in place of aURI's spec.
++   */
++  AString fixupURI(in nsIURI aURI, in ACString aMimeType);
+ };
+ 
+ [scriptable, uuid(f85c5a20-258d-11db-a98b-0800200c9a66)]
+ interface nsIDocumentEncoder : nsISupports
+ {
+   // Output methods flag bits. There are a frightening number of these,
+   // because everyone wants something a little bit different
+    
+@@ -304,10 +312,10 @@ interface nsIDocumentEncoder : nsISuppor
+    */
+   AString encodeToStringWithContext( out AString aContextString,
+                                      out AString aInfoString);
+ 
+   /**
+    * Set the fixup object associated with node persistence.
+    * @param aFixup The fixup object.
+    */
+-  void setNodeFixup(in nsIDocumentEncoderNodeFixup aFixup);
++  void setNodeFixup(in nsIDocumentEncoderFixup aFixup);
+ };
+diff --git a/embedding/components/webbrowserpersist/src/nsWebBrowserPersist.cpp b/embedding/components/webbrowserpersist/src/nsWebBrowserPersist.cpp
+--- a/embedding/components/webbrowserpersist/src/nsWebBrowserPersist.cpp
++++ b/embedding/components/webbrowserpersist/src/nsWebBrowserPersist.cpp
+@@ -59,16 +59,17 @@
+ #include "nsEscape.h"
+ #include "nsUnicharUtils.h"
+ #include "nsIStringEnumerator.h"
+ #include "nsCRT.h"
+ #include "nsSupportsArray.h"
+ #include "nsInt64.h"
+ #include "nsContentCID.h"
+ #include "nsStreamUtils.h"
++#include "nsIConverterOutputStream.h"
+ 
+ #include "nsCExternalHandlerService.h"
+ 
+ #include "nsIURL.h"
+ #include "nsIFileURL.h"
+ #include "nsIDocument.h"
+ #include "nsIDOMDocument.h"
+ #include "nsIDOMXMLDocument.h"
+@@ -104,16 +105,25 @@
+ #include "nsIDOMHTMLInputElement.h"
+ #include "nsIDOMHTMLEmbedElement.h"
+ #include "nsIDOMHTMLObjectElement.h"
+ #include "nsIDOMHTMLAppletElement.h"
+ #include "nsIDOMHTMLOptionElement.h"
+ #include "nsIDOMHTMLTextAreaElement.h"
+ #include "nsIDOMHTMLDocument.h"
+ #include "nsIDOMText.h"
++
++#include "nsIDOMHTMLStyleElement.h"
++#include "nsIStyleSheet.h"
++#include "nsIDOMCSSStyleSheet.h"
++#include "nsICSSStyleSheet.h"
++#include "nsIDOMLinkStyle.h"
++#include "nsIDOMStyleSheet.h"
++#include "nsIStyleSheetLinkingElement.h"
++
+ #ifdef MOZ_SVG
+ #include "nsIDOMSVGImageElement.h"
+ #include "nsIDOMSVGScriptElement.h"
+ #endif // MOZ_SVG
+ 
+ #include "nsIImageLoadingContent.h"
+ 
+ #include "ftpCore.h"
+@@ -150,16 +160,19 @@ struct URIData
+     PRPackedBool mDataPathIsRelative;
+     PRPackedBool mNeedsFixup;
+     nsString mFilename;
+     nsString mSubFrameExt;
+     nsCOMPtr<nsIURI> mFile;
+     nsCOMPtr<nsIURI> mDataPath;
+     nsCString mRelativePathToData;
+     nsCString mCharset;
++    // mContents and mContentsType should be set together.
++    nsString mContents; // possibly pre-serialized file contents
++    nsCString mContentsType; // possibly a mime type, to get file extension
+ };
+ 
+ // Information about the output stream
+ struct OutputData
+ {
+     nsCOMPtr<nsIURI> mFile;
+     nsCOMPtr<nsIURI> mOriginalLocation;
+     nsCOMPtr<nsIOutputStream> mStream;
+@@ -236,16 +249,18 @@ nsWebBrowserPersist::nsWebBrowserPersist
+     mStartSaving(PR_FALSE),
+     mReplaceExisting(PR_TRUE),
+     mSerializingOutput(PR_FALSE),
+     mPersistFlags(kDefaultPersistFlags),
+     mPersistResult(NS_OK),
+     mWrapColumn(72),
+     mEncodingFlags(0)
+ {
++    mFixup = new nsEncoderFixup;
++    mFixup->mWebBrowserPersist = this;
+ }
+ 
+ nsWebBrowserPersist::~nsWebBrowserPersist()
+ {
+     Cleanup();
+ }
+ 
+ //*****************************************************************************
+@@ -469,21 +484,22 @@ NS_IMETHODIMP nsWebBrowserPersist::SaveD
+     
+     if (aOutputContentType)
+     {
+         mContentType.AssignASCII(aOutputContentType);
+     }
+ 
+     rv = SaveDocumentInternal(aDocument, fileAsURI, datapathAsURI);
+ 
++    mFileAsURI = fileAsURI;
+     // Now save the URIs that have been gathered
+ 
+     if (NS_SUCCEEDED(rv) && datapathAsURI)
+     {
+-        rv = SaveGatheredURIs(fileAsURI);
++        rv = SaveGatheredURIs(mFileAsURI);
+     }
+     else if (mProgressListener)
+     {
+         // tell the listener we're done
+         mProgressListener->OnStateChange(nsnull, nsnull,
+                                          nsIWebProgressListener::STATE_START |
+                                          nsIWebProgressListener::STATE_IS_NETWORK,
+                                          NS_OK);
+@@ -1681,19 +1697,16 @@ nsresult nsWebBrowserPersist::SaveDocume
+                     mCurrentBaseURI->GetSpec(url);
+                     localFileOS2->SetFileSource(url);
+                 }
+ #endif
+             }
+         }
+ 
+         mCurrentThingsToPersist = oldThingsToPersist;
+-        mCurrentDataPath = oldDataPath;
+-        mCurrentDataPathIsRelative = oldDataPathIsRelative;
+-        mCurrentRelativePathToData = oldCurrentRelativePathToData;
+     }
+     else
+     {
+         // Set the document base to ensure relative links still work
+         SetDocumentBase(aDocument, mCurrentBaseURI);
+ 
+         // Get the content type to save with
+         nsXPIDLString realContentType;
+@@ -1740,35 +1753,30 @@ nsresult nsWebBrowserPersist::SaveDocume
+             rv = NS_ERROR_FAILURE;
+             break;
+         }
+ 
+         mCurrentBaseURI = docData->mBaseURI;
+         mCurrentCharset = docData->mCharset;
+ 
+         // Save the document, fixing it up with the new URIs as we do
+-        
+-        nsEncoderNodeFixup *nodeFixup;
+-        nodeFixup = new nsEncoderNodeFixup;
+-        if (nodeFixup)
+-            nodeFixup->mWebBrowserPersist = this;
+ 
+         // Get the content type
+         nsXPIDLString realContentType;
+         GetDocEncoderContentType(docData->mDocument,
+             !mContentType.IsEmpty() ? mContentType.get() : nsnull,
+             getter_Copies(realContentType));
+ 
+         nsCAutoString contentType; contentType.AssignWithConversion(realContentType.get());
+         nsCAutoString charType; // Empty
+ 
+         // Save the document, fixing up the links as it goes out
+         rv = SaveDocumentWithFixup(
+             docData->mDocument,
+-            nodeFixup,
++            mFixup,
+             docData->mFile,
+             mReplaceExisting,
+             contentType,
+             charType,
+             mEncodingFlags);
+ 
+         if (NS_FAILED(rv))
+             break;
+@@ -1790,16 +1798,19 @@ nsresult nsWebBrowserPersist::SaveDocume
+         }
+     }
+ 
+     if (!mSerializingOutput)
+     {
+         mDocList.Clear();
+     }
+ 
++    // In case anything was queued for persisting from node/URI fixup...
++    rv = SaveGatheredURIs(nsnull);
++
+     return rv;
+ }
+ 
+ void nsWebBrowserPersist::Cleanup()
+ {
+     mURIMap.Enumerate(EnumCleanupURIMap, this);
+     mURIMap.Reset();
+     mOutputMap.Enumerate(EnumCleanupOutputMap, this);
+@@ -2174,16 +2185,30 @@ nsWebBrowserPersist::CalculateAndAppendF
+     // Get the content type from the MIME service
+     if (contentType.IsEmpty())
+     {
+         nsCOMPtr<nsIURI> uri;
+         aChannel->GetOriginalURI(getter_AddRefs(uri));
+         mMIMEService->GetTypeFromURI(uri, contentType);
+     }
+ 
++    return AppendFileExt(contentType, aURI, aOriginalURIWithExtension);
++}
++
++nsresult
++nsWebBrowserPersist::AppendFileExt(nsACString& contentType, nsIURI *aURI, nsIURI *aOriginalURIWithExtension)
++{
++    nsresult rv;
++
++    if (!mMIMEService)
++    {
++        mMIMEService = do_GetService(NS_MIMESERVICE_CONTRACTID, &rv);
++        NS_ENSURE_TRUE(mMIMEService, NS_ERROR_FAILURE);
++    }
++
+     // Append the extension onto the file
+     if (!contentType.IsEmpty())
+     {
+         nsCOMPtr<nsIMIMEInfo> mimeInfo;
+         mMIMEService->GetFromTypeAndExtension(
+             contentType, EmptyCString(), getter_AddRefs(mimeInfo));
+ 
+         nsCOMPtr<nsILocalFile> localFile;
+@@ -2206,22 +2231,25 @@ nsWebBrowserPersist::CalculateAndAppendF
+             }
+ 
+             // Append the mime file extension
+             nsCAutoString fileExt;
+             if (!hasExtension)
+             {
+                 // Test if previous extension is acceptable
+                 nsCOMPtr<nsIURL> oldurl(do_QueryInterface(aOriginalURIWithExtension));
+-                NS_ENSURE_TRUE(oldurl, NS_ERROR_FAILURE);
+-                oldurl->GetFileExtension(fileExt);
++                          
+                 PRBool useOldExt = PR_FALSE;
+-                if (!fileExt.IsEmpty())
+-                {
+-                    mimeInfo->ExtensionExists(fileExt, &useOldExt);
++                if (oldurl)
++                {
++                  oldurl->GetFileExtension(fileExt);
++                  if (!fileExt.IsEmpty())
++                  {
++                      mimeInfo->ExtensionExists(fileExt, &useOldExt);
++                  }
+                 }
+ 
+                 // can't use old extension so use primary extension
+                 if (!useOldExt)
+                 {
+                     mimeInfo->GetPrimaryExtension(fileExt);
+                 } 
+ 
+@@ -2517,17 +2545,38 @@ nsWebBrowserPersist::EnumPersistURIs(nsH
+ 
+     // Make a URI to save the data to
+     nsCOMPtr<nsIURI> fileAsURI;
+     rv = data->mDataPath->Clone(getter_AddRefs(fileAsURI));
+     NS_ENSURE_SUCCESS(rv, PR_FALSE);
+     rv = pthis->AppendPathToURI(fileAsURI, data->mFilename);
+     NS_ENSURE_SUCCESS(rv, PR_FALSE);
+ 
+-    rv = pthis->SaveURIInternal(uri, nsnull, nsnull, nsnull, nsnull, fileAsURI, PR_TRUE);
++    // Common case: no pre-serialized content, so persist by downloading from URL
++    if (data->mContents.IsEmpty())
++        rv = pthis->SaveURIInternal(uri, nsnull, nsnull, nsnull, nsnull, fileAsURI, PR_TRUE);
++    else {
++        // flush string to stream
++        nsCOMPtr<nsIOutputStream> outputStream;
++        rv = pthis->MakeOutputStream(fileAsURI, getter_AddRefs(outputStream));
++        NS_ENSURE_SUCCESS(rv, rv);
++
++        nsCOMPtr<nsIConverterOutputStream> cos
++          = do_CreateInstance("@mozilla.org/intl/converter-output-stream;1", &rv);
++        NS_ENSURE_SUCCESS(rv, rv);
++
++        rv = cos->Init(outputStream, nsnull, 0, 0);
++        NS_ENSURE_SUCCESS(rv, rv);
++
++        PRBool wroteFullString = PR_FALSE;
++        cos->WriteString(data->mContents, &wroteFullString);
++        cos->Flush();
++        outputStream->Flush();
++        cos->Close();
++    }
+     // if SaveURIInternal fails, then it will have called EndDownload,
+     // which means that |aData| is no longer valid memory.  we MUST bail.
+     NS_ENSURE_SUCCESS(rv, PR_FALSE);
+ 
+     if (rv == NS_OK)
+     {
+         // Store the actual object because once it's persisted this
+         // will be fixed up with the right file extension.
+@@ -2831,22 +2880,19 @@ nsresult nsWebBrowserPersist::OnWalkDOMN
+     if (nodeAsApplet)
+     {
+         // For an applet, relative URIs are resolved relative to the
+         // codebase (which is resolved relative to the base URI).
+         nsCOMPtr<nsIURI> oldBase = mCurrentBaseURI;
+         nsAutoString codebase;
+         nodeAsApplet->GetCodeBase(codebase);
+         if (!codebase.IsEmpty()) {
+-            nsCOMPtr<nsIURI> baseURI;
+-            NS_NewURI(getter_AddRefs(baseURI), codebase,
+-                      mCurrentCharset.get(), mCurrentBaseURI);
+-            if (baseURI) {
++            nsCOMPtr<nsIURI> baseURI = ResolveSpec(codebase);
++            if (baseURI)
+                 mCurrentBaseURI = baseURI;
+-            }
+         }
+ 
+         URIData *archiveURIData = nsnull;
+         StoreURIAttribute(aNode, "archive", PR_TRUE, &archiveURIData);
+         // We only store 'code' locally if there is no 'archive',
+         // otherwise we assume the archive file(s) contains it (bug 430283).
+         if (!archiveURIData)
+             StoreURIAttribute(aNode, "code");
+@@ -2883,17 +2929,64 @@ nsresult nsWebBrowserPersist::OnWalkDOMN
+                     ++current;
+                 } while (current != end && !nsCRT::IsAsciiSpace(*current));
+ 
+                 // Store the link for fix up if it says "stylesheet"
+                 if (Substring(startWord, current)
+                         .LowerCaseEqualsLiteral("stylesheet"))
+                 {
+                     StoreURIAttribute(aNode, "href");
+-                    return NS_OK;
++                    
++                    // Instead of just (re-)downloading the linked file directly,
++                    // we want to let the link's stylesheet serialize itself
++                    // (with URI fixup from us) to a string.
++
++                    nsCOMPtr<nsIDOMLinkStyle> domlink = do_QueryInterface(aNode);
++                    if (!domlink) return NS_OK;
++
++                    nsCOMPtr<nsIDOMStyleSheet> domss;
++                    domlink->GetSheet(getter_AddRefs(domss));
++                    if (!domss) return NS_OK; // No DOM stylesheet means nothing to serialize 
++                    
++                    nsCOMPtr<nsICSSStyleSheet> ss = do_QueryInterface(domss);
++                    if (!ss) return NS_OK;
++
++                    // Set the node's file contents in the URI map
++                    nsAutoString href;
++                    nodeAsLink->GetHref(href);
++                    URIData *data = GetDataForURI(href);
++                    if (!data) return NS_OK;
++
++                    ss->Serialize(data->mContents, mFixup);
++
++                    // Literal type OK if we only serialize CSS stylesheets.
++                    // This MIME type will eventually be used to get the
++                    // right extension when we need a filename to return
++                    // to serialized content through FixupURI.
++                    data->mContentsType.AssignLiteral("text/css");
++
++                    // We won't get a chance to call FixupURI before we
++                    // persist the link (from SaveGatheredURIs) so instead,
++                    // since we know the proper file extension already,
++                    // we'll just append it by hand.
++                    // Yes, this is a hack, but it's easier than tearing
++                    // apart and rewriting all of webbrowserpersist...
++                    nsXPIDLString ext;
++                    GetExtensionForContentType(NS_LITERAL_STRING("text/css").get(),
++                                               getter_Copies(ext));
++                    // At this point, data->mFilename has no extension, and we
++                    // need it to have the right extension when it is persisted.
++                    // For downloaded content like images, the extension is
++                    // derived from the channel MIME type and added to the
++                    // filename when it is being downloaded.
++                    // We don't download stylesheets, we fix up their in-memory
++                    // representation and persist that; therefore, we need to
++                    // add the correct extension to the 
++                    data->mFilename.AppendLiteral(".");
++                    data->mFilename.Append(ext);
+                 }
+                 if (current == end)
+                     break;
+             }
+         }
+         return NS_OK;
+     }
+ 
+@@ -3193,22 +3286,19 @@ nsWebBrowserPersist::CloneNodeWithFixedU
+             nsCOMPtr<nsIDOMHTMLAppletElement> newApplet =
+                 do_QueryInterface(*aNodeOut);
+             // For an applet, relative URIs are resolved relative to the
+             // codebase (which is resolved relative to the base URI).
+             nsCOMPtr<nsIURI> oldBase = mCurrentBaseURI;
+             nsAutoString codebase;
+             nodeAsApplet->GetCodeBase(codebase);
+             if (!codebase.IsEmpty()) {
+-                nsCOMPtr<nsIURI> baseURI;
+-                NS_NewURI(getter_AddRefs(baseURI), codebase,
+-                          mCurrentCharset.get(), mCurrentBaseURI);
+-                if (baseURI) {
++                nsCOMPtr<nsIURI> baseURI = ResolveSpec(codebase);
++                if (baseURI)
+                     mCurrentBaseURI = baseURI;
+-                }
+             }
+             // Unset the codebase too, since we'll correctly relativize the
+             // code and archive paths.
+             newApplet->RemoveAttribute(NS_LITERAL_STRING("codebase"));
+             FixupNodeAttribute(*aNodeOut, "code");
+             FixupNodeAttribute(*aNodeOut, "archive");
+             // restore the base URI we really want to have
+             mCurrentBaseURI = oldBase;
+@@ -3224,18 +3314,16 @@ nsWebBrowserPersist::CloneNodeWithFixedU
+         {
+             // First see if the link represents linked content
+             rv = FixupNodeAttribute(*aNodeOut, "href");
+             if (NS_FAILED(rv))
+             {
+                 // Perhaps this link is actually an anchor to related content
+                 FixupAnchor(*aNodeOut);
+             }
+-            // TODO if "type" attribute == "text/css"
+-            //        fixup stylesheet
+         }
+         return rv;
+     }
+ 
+     nsCOMPtr<nsIDOMHTMLFrameElement> nodeAsFrame = do_QueryInterface(aNodeIn);
+     if (nodeAsFrame)
+     {
+         rv = GetNodeToFixup(aNodeIn, aNodeOut);
+@@ -3325,32 +3413,56 @@ nsWebBrowserPersist::CloneNodeWithFixedU
+             nsCOMPtr<nsIDOMHTMLOptionElement> outElt = do_QueryInterface(*aNodeOut);
+             PRBool selected;
+             nodeAsOption->GetSelected(&selected);
+             outElt->SetDefaultSelected(selected);
+         }
+         return rv;
+     }
+ 
++    nsCOMPtr<nsIDOMHTMLStyleElement> nodeAsStyle = do_QueryInterface(aNodeIn);
++    if (nodeAsStyle)
++    {
++        rv = GetNodeToFixup(aNodeIn, aNodeOut);
++        if (NS_SUCCEEDED(rv) && *aNodeOut)
++        {
++            // Tell the document encoder to serialize the text child we create below
++            *aSerializeCloneKids = PR_TRUE;
++
++            nsCOMPtr<nsIDOMLinkStyle> domlink(do_QueryInterface(aNodeIn));
++            nsCOMPtr<nsIDOMStyleSheet> domss;
++            if (!domlink)
++              return NS_OK;
++            domlink->GetSheet(getter_AddRefs(domss));
++            nsCOMPtr<nsICSSStyleSheet> ss(do_QueryInterface(domss));
++       
++            nsAutoString content;
++            ss->Serialize(content, mFixup);
++
++            nsCOMPtr<nsIDOM3Node> out = do_QueryInterface(*aNodeOut);
++            if (!out)
++              return NS_ERROR_FAILURE;
++            out->SetTextContent(content);
++        }
++    }
++
+     return NS_OK;
+ }
+ 
+ nsresult
+ nsWebBrowserPersist::StoreURI(
+     const char *aURI, PRBool aNeedsPersisting, URIData **aData)
+ {
+     NS_ENSURE_ARG_POINTER(aURI);
+ 
+     nsCOMPtr<nsIURI> uri;
+     nsresult rv = NS_NewURI(getter_AddRefs(uri),
+                             nsDependentCString(aURI),
+                             mCurrentCharset.get(),
+                             mCurrentBaseURI);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+     return StoreURI(uri, aNeedsPersisting, aData);
+ }
+ 
+ nsresult
+ nsWebBrowserPersist::StoreURI(
+     nsIURI *aURI, PRBool aNeedsPersisting, URIData **aData)
+ {
+     NS_ENSURE_ARG_POINTER(aURI);
+@@ -3416,87 +3528,120 @@ nsWebBrowserPersist::StoreURIAttributeNS
+             NS_ConvertUTF16toUTF8 oldCValue(oldValue);
+             return StoreURI(oldCValue.get(), aNeedsPersisting, aData);
+         }
+     }
+ 
+     return NS_OK;
+ }
+ 
+-nsresult
+-nsWebBrowserPersist::FixupURI(nsAString &aURI)
++already_AddRefed<nsIURI>
++nsWebBrowserPersist::ResolveSpec(nsAString& aSpec) {
++    nsIURI *result = nsnull;
++    nsresult rv = NS_NewURI(&result, aSpec, 
++                            mCurrentCharset.get(), mCurrentBaseURI);
++    return result;
++}
++
++URIData*
++nsWebBrowserPersist::GetDataForURI(nsAString &aURI)
+ {
+     // get the current location of the file (absolutized)
+-    nsCOMPtr<nsIURI> uri;
+-    nsresult rv = NS_NewURI(getter_AddRefs(uri), aURI, 
+-                            mCurrentCharset.get(), mCurrentBaseURI);
+-    NS_ENSURE_SUCCESS(rv, rv);
++    nsCOMPtr<nsIURI> uri = ResolveSpec(aURI);
++    return GetDataForURI(uri);
++}
++
++URIData*
++nsWebBrowserPersist::GetDataForURI(nsIURI* aURI)
++{
+     nsCAutoString spec;
+-    rv = uri->GetSpec(spec);
+-    NS_ENSURE_SUCCESS(rv, rv);
+-
+-    // Search for the URI in the map and replace it with the local file
++    nsresult rv = aURI->GetSpec(spec);
++    NS_ENSURE_SUCCESS(rv, nsnull);
++
+     nsCStringKey key(spec.get());
+     if (!mURIMap.Exists(&key))
+     {
+-        return NS_ERROR_FAILURE;
+-    }
+-    URIData *data = (URIData *) mURIMap.Get(&key);
+-    if (!data->mNeedsFixup)
+-    {
+-        return NS_OK;
+-    }
+-    nsCOMPtr<nsIURI> fileAsURI;
+-    if (data->mFile)
+-    {
+-        rv = data->mFile->Clone(getter_AddRefs(fileAsURI)); 
+-        NS_ENSURE_SUCCESS(rv, rv);
+-    }
+-    else
+-    {
+-        rv = data->mDataPath->Clone(getter_AddRefs(fileAsURI));
+-        NS_ENSURE_SUCCESS(rv, rv);
+-        rv = AppendPathToURI(fileAsURI, data->mFilename);
+-        NS_ENSURE_SUCCESS(rv, rv);
++        return nsnull;
++    }
++    return (URIData *) mURIMap.Get(&key);
++}
++
++nsresult
++nsWebBrowserPersist::FixupURI(nsAString &aSpec)
++{
++    URIData *data = GetDataForURI(aSpec);
++    return FixupURIData(data, nsnull, aSpec);
++}
++
++nsresult
++nsWebBrowserPersist::FixupURIData(URIData *aData, nsIURI *aOriginalURI, nsAString &aSpec)
++{
++    nsresult rv;
++
++    if (!aData)
++        return NS_ERROR_FAILURE;
++
++    if (!aData->mNeedsFixup)
++        return NS_OK;
++
++    // Replace the URI from the map with the local file
++    nsCOMPtr<nsIURI> fileAsURI;
++    if (aData->mFile)
++    {
++        rv = aData->mFile->Clone(getter_AddRefs(fileAsURI)); 
++        NS_ENSURE_SUCCESS(rv, rv);
++    }
++    else
++    {
++        rv = aData->mDataPath->Clone(getter_AddRefs(fileAsURI));
++        NS_ENSURE_SUCCESS(rv, rv);
++        rv = AppendPathToURI(fileAsURI, aData->mFilename);
++        NS_ENSURE_SUCCESS(rv, rv);
++        // This doesn't affect the the downloaded file name, it only affects the
++        // out string
++        if (!aData->mContentsType.IsEmpty()) {
++          rv = AppendFileExt(aData->mContentsType, fileAsURI, aOriginalURI);
++          NS_ENSURE_SUCCESS(rv, rv);
++        }
+     }
+     nsAutoString newValue;
+ 
+     // remove username/password if present
+     fileAsURI->SetUserPass(EmptyCString());
+ 
+     // reset node attribute 
+     // Use relative or absolute links
+-    if (data->mDataPathIsRelative)
++    if (aData->mDataPathIsRelative)
+     {
+         nsCOMPtr<nsIURL> url(do_QueryInterface(fileAsURI));
+         if (!url)
+           return NS_ERROR_FAILURE;
+           
+         nsCAutoString filename;
+         url->GetFileName(filename);
+ 
+-        nsCAutoString rawPathURL(data->mRelativePathToData);
++        nsCAutoString rawPathURL(aData->mRelativePathToData);
+         rawPathURL.Append(filename);
+ 
+         nsCAutoString buf;
+         AppendUTF8toUTF16(NS_EscapeURL(rawPathURL, esc_FilePath, buf),
+                           newValue);
+     }
+     else
+     {
+         nsCAutoString fileurl;
+         fileAsURI->GetSpec(fileurl);
+         AppendUTF8toUTF16(fileurl, newValue);
+     }
+-    if (data->mIsSubFrame)
+-    {
+-        newValue.Append(data->mSubFrameExt);
+-    }
+-
+-    aURI = newValue;
++    if (aData->mIsSubFrame)
++    {
++        newValue.Append(aData->mSubFrameExt);
++    }
++
++    aSpec = newValue;
+     return NS_OK;
+ }
+ 
+ nsresult
+ nsWebBrowserPersist::FixupNodeAttributeNS(nsIDOMNode *aNode,
+                                         const char *aNamespaceURI,
+                                         const char *aAttribute)
+ {
+@@ -3520,16 +3665,18 @@ nsWebBrowserPersist::FixupNodeAttributeN
+     if (attrNode)
+     {
+         nsString uri;
+         attrNode->GetNodeValue(uri);
+         rv = FixupURI(uri);
+         if (NS_SUCCEEDED(rv))
+         {
+             attrNode->SetNodeValue(uri);
++        } else {
++            attrNode = nsnull; // URI not in map?
+         }
+     }
+ 
+     return rv;
+ }
+ 
+ nsresult
+ nsWebBrowserPersist::FixupAnchor(nsIDOMNode *aNode)
+@@ -3722,17 +3869,17 @@ nsWebBrowserPersist::CreateChannelFromUR
+ 
+     rv = (*aChannel)->SetNotificationCallbacks(static_cast<nsIInterfaceRequestor *>(this));
+     NS_ENSURE_SUCCESS(rv, rv);
+     return NS_OK;
+ } 
+ 
+ nsresult
+ nsWebBrowserPersist::SaveDocumentWithFixup(
+-    nsIDOMDocument *aDocument, nsIDocumentEncoderNodeFixup *aNodeFixup,
++    nsIDOMDocument *aDocument, nsIDocumentEncoderFixup *aNodeFixup,
+     nsIURI *aFile, PRBool aReplaceExisting, const nsACString &aFormatType,
+     const nsCString &aSaveCharset, PRUint32 aFlags)
+ {
+     NS_ENSURE_ARG_POINTER(aFile);
+     
+     nsresult  rv = NS_OK;
+     nsCOMPtr<nsILocalFile> localFile;
+     GetLocalFileFromURI(aFile, getter_AddRefs(localFile));
+@@ -3851,25 +3998,30 @@ nsWebBrowserPersist::MakeAndStoreLocalFi
+     nsString filename;
+     rv = MakeFilenameFromURI(aURI, filename);
+     NS_ENSURE_SUCCESS(rv, NS_ERROR_FAILURE);
+ 
+     // Store the file name
+     data = new URIData;
+     NS_ENSURE_TRUE(data, NS_ERROR_OUT_OF_MEMORY);
+ 
++    nsString contents;
++    nsCString contentsType;
++
+     data->mNeedsPersisting = aNeedsPersisting;
+     data->mNeedsFixup = PR_TRUE;
+     data->mFilename = filename;
+     data->mSaved = PR_FALSE;
+     data->mIsSubFrame = PR_FALSE;
+     data->mDataPath = mCurrentDataPath;
+     data->mDataPathIsRelative = mCurrentDataPathIsRelative;
+     data->mRelativePathToData = mCurrentRelativePathToData;
+     data->mCharset = mCurrentCharset;
++    data->mContents = contents;
++    data->mContentsType = contentsType;
+ 
+     if (aNeedsPersisting)
+         mCurrentThingsToPersist++;
+ 
+     mURIMap.Put(&key, data);
+     if (aData)
+     {
+         *aData = data;
+@@ -4137,37 +4289,28 @@ void nsWebBrowserPersist::SetApplyConver
+                 encChannel->SetApplyConversion(applyConversion);
+         }
+     }
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ 
+-nsEncoderNodeFixup::nsEncoderNodeFixup() : mWebBrowserPersist(nsnull)
+-{
+-}
+-
+-
+-nsEncoderNodeFixup::~nsEncoderNodeFixup()
+-{
+-}
+-
+-
+-NS_IMPL_ADDREF(nsEncoderNodeFixup)
+-NS_IMPL_RELEASE(nsEncoderNodeFixup)
+-
+-
+-NS_INTERFACE_MAP_BEGIN(nsEncoderNodeFixup)
+-    NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIDocumentEncoderNodeFixup)
+-    NS_INTERFACE_MAP_ENTRY(nsIDocumentEncoderNodeFixup)
+-NS_INTERFACE_MAP_END
+-
+-
+-NS_IMETHODIMP nsEncoderNodeFixup::FixupNode(
++nsEncoderFixup::nsEncoderFixup() : mWebBrowserPersist(nsnull)
++{
++}
++
++
++nsEncoderFixup::~nsEncoderFixup()
++{
++}
++
++NS_IMPL_ISUPPORTS1(nsEncoderFixup, nsIDocumentEncoderFixup)
++
++NS_IMETHODIMP nsEncoderFixup::FixupNode(
+     nsIDOMNode *aNode, PRBool *aSerializeCloneKids, nsIDOMNode **aOutNode)
+ {
+     NS_ENSURE_ARG_POINTER(aNode);
+     NS_ENSURE_ARG_POINTER(aOutNode);
+     NS_ENSURE_TRUE(mWebBrowserPersist, NS_ERROR_FAILURE);
+ 
+     *aOutNode = nsnull;
+     
+@@ -4177,8 +4320,15 @@ NS_IMETHODIMP nsEncoderNodeFixup::FixupN
+     if (type == nsIDOMNode::ELEMENT_NODE ||
+         type == nsIDOMNode::PROCESSING_INSTRUCTION_NODE)
+     {
+         return mWebBrowserPersist->CloneNodeWithFixedUpAttributes(aNode, aSerializeCloneKids, aOutNode);
+     }
+ 
+     return NS_OK;
+ }
++
++NS_IMETHODIMP nsEncoderFixup::FixupURI(nsIURI *aURI, const nsACString& aMimeType, nsAString& aSpec) {
++    URIData *data;
++    mWebBrowserPersist->StoreURI(aURI, PR_TRUE, &data);
++    data->mContentsType.Assign(aMimeType);
++    return mWebBrowserPersist->FixupURIData(data, aURI, aSpec);
++}
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -49,18 +49,20 @@
+ #include "nsIAtom.h"
+ #include "nsUnicharUtils.h"
+ #include "nsReadableUtils.h"
+ #include "nsCRT.h"
+ #include "nsCSSProps.h"
+ #include "nsFont.h"
+ #include "nsReadableUtils.h"
+ #include "nsStyleUtil.h"
++#include "imgIRequest.h"
+ 
+ #include "nsStyleConsts.h"
++#include "nsIDocumentEncoder.h"
+ 
+ #include "nsCOMPtr.h"
+ 
+ nsCSSDeclaration::nsCSSDeclaration() 
+   : mData(nsnull),
+     mImportantData(nsnull)
+ {
+   // check that we can fit all the CSS properties into a PRUint8
+@@ -124,26 +126,28 @@ nsCSSDeclaration::RemoveProperty(nsCSSPr
+ }
+ 
+ nsresult
+ nsCSSDeclaration::AppendComment(const nsAString& aComment)
+ {
+   return /* NS_ERROR_NOT_IMPLEMENTED, or not any longer that is */ NS_OK;
+ }
+ 
+-PRBool nsCSSDeclaration::AppendValueToString(nsCSSProperty aProperty, nsAString& aResult) const
++PRBool nsCSSDeclaration::AppendValueToString(nsCSSProperty aProperty,
++                                             nsAString& aResult,
++                                             nsIDocumentEncoderFixup *aFixup) const
+ {
+   nsCSSCompressedDataBlock *data = GetValueIsImportant(aProperty)
+                                       ? mImportantData : mData;
+   const void *storage = data->StorageFor(aProperty);
+   if (storage) {
+     switch (nsCSSProps::kTypeTable[aProperty]) {
+       case eCSSType_Value: {
+         const nsCSSValue *val = static_cast<const nsCSSValue*>(storage);
+-        AppendCSSValueToString(aProperty, *val, aResult);
++        AppendCSSValueToString(aProperty, *val, aResult, aFixup);
+       } break;
+       case eCSSType_Rect: {
+         const nsCSSRect *rect = static_cast<const nsCSSRect*>(storage);
+         const nsCSSUnit topUnit = rect->mTop.GetUnit();
+         if (topUnit == eCSSUnit_Inherit ||
+             topUnit == eCSSUnit_Initial ||
+             topUnit == eCSSUnit_RectIsAuto) {
+           NS_ASSERTION(rect->mRight.GetUnit() == topUnit &&
+@@ -227,17 +231,18 @@ PRBool nsCSSDeclaration::AppendValueToSt
+     }
+   }
+   return storage != nsnull;
+ }
+ 
+ /* static */ PRBool
+ nsCSSDeclaration::AppendCSSValueToString(nsCSSProperty aProperty,
+                                          const nsCSSValue& aValue,
+-                                         nsAString& aResult)
++                                         nsAString& aResult,
++                                         nsIDocumentEncoderFixup *aFixup)
+ {
+   nsCSSUnit unit = aValue.GetUnit();
+ 
+   if (eCSSUnit_Null == unit) {
+     return PR_FALSE;
+   }
+ 
+   if (eCSSUnit_String <= unit && unit <= eCSSUnit_Attr) {
+@@ -394,18 +399,37 @@ nsCSSDeclaration::AppendCSSValueToString
+       }
+       tmpStr.Append(PRUnichar(')'));
+ 
+       aResult.Append(tmpStr);
+     }
+   }
+   else if (eCSSUnit_URL == unit || eCSSUnit_Image == unit) {
+     aResult.Append(NS_LITERAL_STRING("url("));
+-    nsStyleUtil::AppendEscapedCSSString(
+-      nsDependentString(aValue.GetOriginalURLValue()), aResult);
++
++    if (aFixup) {
++      nsXPIDLCString type;
++      if (eCSSUnit_Image == unit) {
++        imgIRequest *req = aValue.GetImageValue();
++        if (req) {
++          req->GetMimeType(getter_Copies(type));
++        }
++      }
++
++      nsIURI *uri = aValue.GetURLValue();
++      nsAutoString fixedSpec;
++      nsresult rv = aFixup->FixupURI(uri, type, fixedSpec);
++      NS_ENSURE_SUCCESS(rv, rv);
++                    
++      nsStyleUtil::AppendEscapedCSSString(fixedSpec, aResult);
++    } else {
++      nsStyleUtil::AppendEscapedCSSString(
++        nsDependentString(aValue.GetOriginalURLValue()), aResult);
++    }
++
+     aResult.Append(NS_LITERAL_STRING(")"));
+   }
+   else if (eCSSUnit_Percent == unit) {
+     nsAutoString tmpStr;
+     tmpStr.AppendFloat(aValue.GetPercentValue() * 100.0f);
+     aResult.Append(tmpStr);
+   }
+   else if (eCSSUnit_Percent < unit) {  // length unit
+@@ -1077,17 +1101,18 @@ nsCSSDeclaration::AppendPropertyAndValue
+   else
+     aResult.Append(aValue);
+   PRBool  isImportant = GetValueIsImportant(aProperty);
+   AppendImportanceToString(isImportant, aResult);
+   aResult.AppendLiteral("; ");
+ }
+ 
+ nsresult
+-nsCSSDeclaration::ToString(nsAString& aString) const
++nsCSSDeclaration::ToString(nsAString& aString,
++                           nsIDocumentEncoderFixup *aFixup) const
+ {
+   nsCSSCompressedDataBlock *systemFontData =
+     GetValueIsImportant(eCSSProperty__x_system_font) ? mImportantData : mData;
+   const nsCSSValue *systemFont = 
+     systemFontData->ValueStorageFor(eCSSProperty__x_system_font);
+   const PRBool haveSystemFont = systemFont &&
+                                 systemFont->GetUnit() != eCSSUnit_None &&
+                                 systemFont->GetUnit() != eCSSUnit_Null;
+diff --git a/layout/style/nsCSSDeclaration.h b/layout/style/nsCSSDeclaration.h
+--- a/layout/style/nsCSSDeclaration.h
++++ b/layout/style/nsCSSDeclaration.h
+@@ -50,16 +50,18 @@
+ #include "nsString.h"
+ #include "nsCoord.h"
+ #include "nsCSSValue.h"
+ #include "nsCSSProps.h"
+ #include "nsTArray.h"
+ #include "nsCSSDataBlock.h"
+ #include "nsCSSStruct.h"
+ 
++class nsIDocumentEncoderFixup;
++
+ class nsCSSDeclaration {
+ public:
+   /**
+    * Construct an |nsCSSDeclaration| that is in an invalid state (null
+    * |mData|) and cannot be used until its |CompressFrom| method or
+    * |InitializeEmpty| method is called.
+    */
+   nsCSSDeclaration();
+@@ -82,17 +84,18 @@ public:
+   PRBool GetValueIsImportant(nsCSSProperty aProperty) const;
+   PRBool GetValueIsImportant(const nsAString& aProperty) const;
+ 
+   PRUint32 Count() const {
+     return mOrder.Length(); 
+   }
+   nsresult GetNthProperty(PRUint32 aIndex, nsAString& aReturn) const;
+ 
+-  nsresult ToString(nsAString& aString) const;
++  nsresult ToString(nsAString& aString,
++                    nsIDocumentEncoderFixup *aFixup = nsnull) const;
+ 
+   nsCSSDeclaration* Clone() const;
+ 
+   nsresult MapRuleInfoInto(nsRuleData *aRuleData) const {
+     return mData->MapRuleInfoInto(aRuleData);
+   }
+ 
+   nsresult MapImportantRuleInfoInto(nsRuleData *aRuleData) const {
+@@ -168,26 +171,29 @@ public:
+ 
+ #ifdef DEBUG
+   void List(FILE* out = stdout, PRInt32 aIndent = 0) const;
+ #endif
+   
+   // return whether there was a value in |aValue| (i.e., it had a non-null unit)
+   static PRBool AppendCSSValueToString(nsCSSProperty aProperty,
+                                        const nsCSSValue& aValue,
+-                                       nsAString& aResult);
++                                       nsAString& aResult,
++                                       nsIDocumentEncoderFixup *aFixup = nsnull);
+ 
+ private:
+   // Not implemented, and not supported.
+   nsCSSDeclaration& operator=(const nsCSSDeclaration& aCopy);
+   PRBool operator==(const nsCSSDeclaration& aCopy) const;
+ 
+   static void AppendImportanceToString(PRBool aIsImportant, nsAString& aString);
+   // return whether there was a value in |aValue| (i.e., it had a non-null unit)
+-  PRBool   AppendValueToString(nsCSSProperty aProperty, nsAString& aResult) const;
++  PRBool   AppendValueToString(nsCSSProperty aProperty,
++                               nsAString& aResult,
++                               nsIDocumentEncoderFixup *aFixup = nsnull) const;
+   // Helper for ToString with strange semantics regarding aValue.
+   void     AppendPropertyAndValueToString(nsCSSProperty aProperty,
+                                           nsAutoString& aValue,
+                                           nsAString& aResult) const;
+ 
+ private:
+     //
+     // Specialized ref counting.
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -1259,16 +1259,39 @@ nsCSSStyleSheet::SetOwningDocument(nsIDo
+     if (child->mParent == this) {
+       child->SetOwningDocument(aDocument);
+     }
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++nsCSSStyleSheet::Serialize(nsAString& aContent, nsIDocumentEncoderFixup *aFixup)
++{
++  nsresult rv;
++
++  PRInt32 styleRules = 0;
++  StyleRuleCount(styleRules);
++  for (PRInt32 i = 0; i < styleRules; ++i) {
++    nsCOMPtr<nsICSSRule> rule;
++    rv = GetStyleRuleAt(i, *getter_AddRefs(rule));
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    nsCOMPtr<nsICSSStyleRule> srule = do_QueryInterface(rule);
++    if (srule) {
++      nsAutoString ruleText;
++      srule->Serialize(ruleText, aFixup);
++      aContent.Append(ruleText);
++      aContent.Append(NS_LITERAL_STRING("\n"));
++    }
++  }
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ nsCSSStyleSheet::SetOwningNode(nsIDOMNode* aOwningNode)
+ { // not ref counted
+   mOwningNode = aOwningNode;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSStyleSheet::SetOwnerRule(nsICSSImportRule* aOwnerRule)
+diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
+--- a/layout/style/nsCSSStyleSheet.h
++++ b/layout/style/nsCSSStyleSheet.h
+@@ -123,16 +123,17 @@ public:
+   NS_IMETHOD_(PRBool) HasRules() const;
+   NS_IMETHOD GetApplicable(PRBool& aApplicable) const;
+   NS_IMETHOD SetEnabled(PRBool aEnabled);
+   NS_IMETHOD GetComplete(PRBool& aComplete) const;
+   NS_IMETHOD SetComplete();
+   NS_IMETHOD GetParentSheet(nsIStyleSheet*& aParent) const;  // may be null
+   NS_IMETHOD GetOwningDocument(nsIDocument*& aDocument) const;  // may be null
+   NS_IMETHOD SetOwningDocument(nsIDocument* aDocument);
++  NS_IMETHOD Serialize(nsAString& aContent, nsIDocumentEncoderFixup *aFixup);
+ #ifdef DEBUG
+   virtual void List(FILE* out = stdout, PRInt32 aIndent = 0) const;
+ #endif
+   
+   // nsICSSStyleSheet interface
+   NS_IMETHOD AppendStyleSheet(nsICSSStyleSheet* aSheet);
+   NS_IMETHOD InsertStyleSheetAt(nsICSSStyleSheet* aSheet, PRInt32 aIndex);
+   NS_IMETHOD PrependStyleRule(nsICSSRule* aRule);
