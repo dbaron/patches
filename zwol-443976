@@ -1,0 +1,636 @@
+From: Zack Weinberg <zweinberg@mozilla.com>
+
+Bug 443976: Parsing support for the unicode-range: descriptor in @font-face.  r=dbaron
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -7931,18 +7931,61 @@ CSSParserImpl::ParseFontSrcFormat(nsTArr
+ 
+   return PR_TRUE;
+ }
+ 
+ // font-ranges: urange ( ',' urange )*
+ PRBool
+ CSSParserImpl::ParseFontRanges(nsCSSValue& aValue)
+ {
+-  // not currently implemented (bug 443976)
+-  return PR_FALSE;
++  nsTArray<PRUint32> ranges;
++  for (;;) {
++    if (!GetToken(PR_TRUE))
++      break;
++
++    if (mToken.mType != eCSSToken_URange)
++      break;
++
++    // An invalid range token is a parsing error, causing the entire
++    // descriptor to be ignored.
++    if (!mToken.mIntegerValid)
++      return PR_FALSE;
++
++    PRUint32 low = mToken.mInteger;
++    PRUint32 high = mToken.mInteger2;
++
++    // A range that descends, or a range that is entirely outside the
++    // current range of Unicode (U+0-10FFFF) is ignored, but does not
++    // invalidate the descriptor.  A range that straddles the high end
++    // is clipped.
++    if (low <= 0x10FFFF && low <= high) {
++      if (high > 0x10FFFF)
++        high = 0x10FFFF;
++
++      ranges.AppendElement(low);
++      ranges.AppendElement(high);
++    }
++    if (!ExpectSymbol(',', PR_TRUE))
++      break;
++  }
++
++  if (ranges.Length() == 0)
++    return PR_FALSE;
++
++  nsRefPtr<nsCSSValue::Array> srcVals
++    = nsCSSValue::Array::Create(ranges.Length());
++  if (!srcVals) {
++    mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++    return PR_FALSE;
++  }
++
++  for (PRUint32 i = 0; i < ranges.Length(); i++)
++    srcVals->Item(i).SetIntValue(ranges[i], eCSSUnit_Integer);
++  aValue.SetArrayValue(srcVals, eCSSUnit_Array);
++  return PR_TRUE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseListStyle()
+ {
+   // 'list-style' can accept 'none' for two different subproperties,
+   // 'list-style-type' and 'list-style-position'.  In order to accept
+   // 'none' as the value of either but still allow another value for
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -66,16 +66,17 @@
+ #include "nsIDocument.h"
+ #include "nsPresContext.h"
+ 
+ #include "nsContentUtils.h"
+ #include "nsStyleConsts.h"
+ #include "nsDOMError.h"
+ #include "nsStyleUtil.h"
+ #include "nsCSSDeclaration.h"
++#include "nsPrintfCString.h"
+ 
+ #define IMPL_STYLE_RULE_INHERIT(_class, super) \
+ NS_IMETHODIMP _class::GetStyleSheet(nsIStyleSheet*& aSheet) const { return super::GetStyleSheet(aSheet); }  \
+ NS_IMETHODIMP _class::SetStyleSheet(nsICSSStyleSheet* aSheet) { return super::SetStyleSheet(aSheet); }  \
+ NS_IMETHODIMP _class::SetParentRule(nsICSSGroupRule* aRule) { return super::SetParentRule(aRule); }  \
+ nsIDOMCSSRule* _class::GetDOMRuleWeak(nsresult *aResult) { *aResult = NS_OK; return this; }  \
+ NS_IMETHODIMP _class::MapRuleInfoInto(nsRuleData* aRuleData) { return NS_OK; } 
+ 
+@@ -1529,16 +1530,62 @@ AppendSerializedFontSrc(const nsCSSValue
+       aResult.Append(formats);
+       aResult.Append(')');
+     }
+     aResult.AppendLiteral(", ");
+   }
+   aResult.Truncate(aResult.Length() - 2); // remove the last comma-space
+ }
+ 
++// print all characters with at least four hex digits
++static void
++AppendSerializedUnicodePoint(PRUint32 aCode, nsACString &aBuf NS_OUTPARAM)
++{
++  aBuf.Append(nsPrintfCString("%04X", aCode));
++}
++
++// A unicode-range: descriptor is represented as an array of integers,
++// to be interpreted as a sequence of pairs: min max min max ...
++// It is in source order.  (Possibly it should be sorted and overlaps
++// consolidated, but right now we don't do that.)
++static void
++AppendSerializedUnicodeRange(nsCSSValue const & aValue,
++                             nsAString & aResult NS_OUTPARAM)
++{
++  NS_PRECONDITION(aValue.GetUnit() == eCSSUnit_Null ||
++                  aValue.GetUnit() == eCSSUnit_Array,
++                  "improper value unit for unicode-range:");
++  aResult.Truncate();
++  if (aValue.GetUnit() != eCSSUnit_Array)
++    return;
++
++  nsCSSValue::Array const & sources = *aValue.GetArrayValue();
++  nsCAutoString buf;
++
++  NS_ABORT_IF_FALSE(sources.Count() % 2 == 0,
++                    "odd number of entries in a unicode-range: array");
++
++  for (PRUint32 i = 0; i < sources.Count(); i += 2) {
++    PRUint32 min = sources[i].GetIntValue();
++    PRUint32 max = sources[i+1].GetIntValue();
++
++    // We don't try to replicate the U+XX?? notation.
++    buf.AppendLiteral("U+");
++    AppendSerializedUnicodePoint(min, buf);
++
++    if (min != max) {
++      buf.Append('-');
++      AppendSerializedUnicodePoint(max, buf);
++    }
++    buf.AppendLiteral(", ");
++  }
++  buf.Truncate(buf.Length() - 2); // remove the last comma-space
++  CopyASCIItoUTF16(buf, aResult);
++}
++
+ // Mapping from nsCSSFontDesc codes to nsCSSFontFaceStyleDecl fields.
+ // Keep this in sync with enum nsCSSFontDesc in nsCSSProperty.h.
+ nsCSSValue nsCSSFontFaceStyleDecl::* const
+ nsCSSFontFaceStyleDecl::Fields[] = {
+     &nsCSSFontFaceStyleDecl::mFamily,
+     &nsCSSFontFaceStyleDecl::mStyle,
+     &nsCSSFontFaceStyleDecl::mWeight,
+     &nsCSSFontFaceStyleDecl::mStretch,
+@@ -1601,17 +1648,17 @@ nsCSSFontFaceStyleDecl::GetPropertyValue
+                                              aResult);
+     return NS_OK;
+ 
+   case eCSSFontDesc_Src:
+     AppendSerializedFontSrc(val, aResult);
+     return NS_OK;
+ 
+   case eCSSFontDesc_UnicodeRange:
+-    // these are not implemented, so always return an empty string
++    AppendSerializedUnicodeRange(val, aResult);
+     return NS_OK;
+ 
+   case eCSSFontDesc_UNKNOWN:
+   case eCSSFontDesc_COUNT:
+     ;
+   }
+   NS_NOTREACHED("nsCSSFontFaceStyleDecl::GetPropertyValue: "
+                 "out-of-range value got to the switch");
+diff --git a/layout/style/nsCSSScanner.cpp b/layout/style/nsCSSScanner.cpp
+--- a/layout/style/nsCSSScanner.cpp
++++ b/layout/style/nsCSSScanner.cpp
+@@ -138,33 +138,53 @@ IsHexDigit(PRInt32 ch) {
+   return PRUint32(ch) < 256 && (gLexTable[ch] & IS_HEX_DIGIT) != 0;
+ }
+ 
+ static inline PRBool
+ IsIdent(PRInt32 ch) {
+   return ch >= 0 && (ch >= 256 || (gLexTable[ch] & IS_IDENT) != 0);
+ }
+ 
++static inline PRUint32
++DecimalDigitValue(PRInt32 ch)
++{
++  return ch - '0';
++}
++
++static inline PRUint32
++HexDigitValue(PRInt32 ch)
++{
++  if (IsDigit(ch)) {
++    return DecimalDigitValue(ch);
++  } else {
++    // Note: c&7 just keeps the low three bits which causes
++    // upper and lower case alphabetics to both yield their
++    // "relative to 10" value for computing the hex value.
++    return (ch & 0x7) + 9;
++  }
++}
++
+ nsCSSToken::nsCSSToken()
+ {
+   mType = eCSSToken_Symbol;
+ }
+ 
+-void 
++void
+ nsCSSToken::AppendToString(nsString& aBuffer)
+ {
+   switch (mType) {
+     case eCSSToken_AtKeyword:
+       aBuffer.Append(PRUnichar('@')); // fall through intentional
+     case eCSSToken_Ident:
+     case eCSSToken_WhiteSpace:
+     case eCSSToken_Function:
+     case eCSSToken_URL:
+     case eCSSToken_InvalidURL:
+     case eCSSToken_HTMLComment:
++    case eCSSToken_URange:
+       aBuffer.Append(mIdent);
+       break;
+     case eCSSToken_Number:
+       if (mIntegerValid) {
+         aBuffer.AppendInt(mInteger, 10);
+       }
+       else {
+         aBuffer.AppendFloat(mNumber);
+@@ -689,16 +709,20 @@ PRBool
+ nsCSSScanner::Next(nsCSSToken& aToken)
+ {
+   for (;;) { // Infinite loop so we can restart after comments.
+     PRInt32 ch = Read();
+     if (ch < 0) {
+       return PR_FALSE;
+     }
+ 
++    // UNICODE-RANGE
++    if ((ch == 'u' || ch == 'U') && Peek() == '+')
++      return ParseURange(ch, aToken);
++
+     // IDENT
+     if (StartsIdent(ch, Peek()))
+       return ParseIdent(ch, aToken);
+ 
+     // AT_KEYWORD
+     if (ch == '@') {
+       PRInt32 nextChar = Read();
+       if (nextChar >= 0) {
+@@ -916,24 +940,17 @@ nsCSSScanner::ParseAndAppendEscape(nsStr
+       if (ch < 0) {
+         // Whoops: error or premature eof
+         break;
+       }
+       if (!IsHexDigit(ch) && !IsWhitespace(ch)) {
+         Pushback(ch);
+         break;
+       } else if (IsHexDigit(ch)) {
+-        if (IsDigit(ch)) {
+-          rv = rv * 16 + (ch - '0');
+-        } else {
+-          // Note: c&7 just keeps the low three bits which causes
+-          // upper and lower case alphabetics to both yield their
+-          // "relative to 10" value for computing the hex value.
+-          rv = rv * 16 + ((ch & 0x7) + 9);
+-        }
++        rv = rv * 16 + HexDigitValue(ch);
+       } else {
+         NS_ASSERTION(IsWhitespace(ch), "bad control flow");
+         // single space ends escape
+         break;
+       }
+     }
+     if (6 == i) { // look for trailing whitespace and eat it
+       ch = Peek();
+@@ -1064,18 +1081,16 @@ nsCSSScanner::ParseIdent(PRInt32 aChar, 
+ PRBool
+ nsCSSScanner::ParseAtKeyword(PRInt32 aChar, nsCSSToken& aToken)
+ {
+   aToken.mIdent.SetLength(0);
+   aToken.mType = eCSSToken_AtKeyword;
+   return GatherIdent(0, aToken.mIdent);
+ }
+ 
+-#define CHAR_TO_DIGIT(_c) ((_c) - '0')
+-
+ PRBool
+ nsCSSScanner::ParseNumber(PRInt32 c, nsCSSToken& aToken)
+ {
+   NS_PRECONDITION(c == '.' || c == '+' || c == '-' || IsDigit(c),
+                   "Why did we get called?");
+   aToken.mHasSign = (c == '+' || c == '-');
+ 
+   // Our sign.
+@@ -1104,32 +1119,32 @@ nsCSSScanner::ParseNumber(PRInt32 c, nsC
+   }
+ 
+   PRBool gotDot = (c == '.');
+ 
+   if (!gotDot) {
+     // Parse the integer part of the mantisssa
+     NS_ASSERTION(IsDigit(c), "Why did we get called?");
+     do {
+-      intPart = 10*intPart + CHAR_TO_DIGIT(c);
++      intPart = 10*intPart + DecimalDigitValue(c);
+       c = Read();
+       // The IsDigit check will do the right thing even if Read() returns < 0
+     } while (IsDigit(c));
+ 
+     gotDot = (c == '.') && IsDigit(Peek());
+   }
+ 
+   if (gotDot) {
+     // Parse the fractional part of the mantissa.
+     c = Read();
+     NS_ASSERTION(IsDigit(c), "How did we get here?");
+     // Power of ten by which we need to divide our next digit
+     float divisor = 10;
+     do {
+-      fracPart += CHAR_TO_DIGIT(c) / divisor;
++      fracPart += DecimalDigitValue(c) / divisor;
+       divisor *= 10;
+       c = Read();
+       // The IsDigit check will do the right thing even if Read() returns < 0
+     } while (IsDigit(c));
+   }
+ 
+   PRBool gotE = PR_FALSE;
+ #ifdef MOZ_SVG
+@@ -1144,17 +1159,17 @@ nsCSSScanner::ParseNumber(PRInt32 c, nsC
+       gotE = PR_TRUE;
+       if (expSignChar == '-') {
+         expSign = -1;
+       }
+ 
+       c = Read();
+       NS_ASSERTION(IsDigit(c), "Peek() must have lied");
+       do {
+-        exponent = 10*exponent + CHAR_TO_DIGIT(c);
++        exponent = 10*exponent + DecimalDigitValue(c);
+         c = Read();
+         // The IsDigit check will do the right thing even if Read() returns < 0
+       } while (IsDigit(c));
+     } else {
+       if (expSignChar) {
+         Pushback(expSignChar);
+       }
+     }
+@@ -1271,8 +1286,100 @@ nsCSSScanner::ParseString(PRInt32 aStop,
+     if (ch == CSS_ESCAPE) {
+       ParseAndAppendEscape(aToken.mIdent);
+     } else {
+       aToken.mIdent.Append(ch);
+     }
+   }
+   return PR_TRUE;
+ }
++
++// UNICODE-RANGE tokens match the regular expression
++//
++//     u\+[0-9a-f?]{1,6}(-[0-9a-f]{1,6})?
++//
++// However, some such tokens are "invalid".  There are three valid forms:
++//
++//     u+[0-9a-f]{x}              1 <= x <= 6
++//     u+[0-9a-f]{x}\?{y}         1 <= x+y <= 6
++//     u+[0-9a-f]{x}-[0-9a-f]{y}  1 <= x <= 6, 1 <= y <= 6
++//
++// All unicode-range tokens have their text recorded in mIdent; valid ones
++// are also decoded into mInteger and mInteger2, and mIntegerValid is set.
++
++PRBool
++nsCSSScanner::ParseURange(PRInt32 aChar, nsCSSToken& aResult)
++{
++  PRInt32 intro2 = Read();
++  PRInt32 ch = Peek();
++
++  // We should only ever be called if these things are true.
++  NS_ASSERTION(aChar == 'u' || aChar == 'U',
++               "unicode-range called with improper introducer (U)");
++  NS_ASSERTION(intro2 == '+',
++               "unicode-range called with improper introducer (+)");
++
++  // If the character immediately after the '+' is not a hex digit or
++  // '?', this is not really a unicode-range token; push everything
++  // back and scan the U as an ident.
++  if (!IsHexDigit(ch) && ch != '?') {
++    Pushback(intro2);
++    Pushback(aChar);
++    return ParseIdent(aChar, aResult);
++  }
++
++  aResult.mIdent.Truncate();
++  aResult.mIdent.Append(aChar);
++  aResult.mIdent.Append(intro2);
++
++  PRBool valid = PR_TRUE;
++  PRBool haveQues = PR_FALSE;
++  PRUint32 low = 0;
++  PRUint32 high = 0;
++  int i = 0;
++
++  for (;;) {
++    ch = Read();
++    i++;
++    if (i == 7 || !(IsHexDigit(ch) || ch == '?')) {
++      break;
++    }
++
++    aResult.mIdent.Append(ch);
++    if (IsHexDigit(ch)) {
++      if (haveQues) {
++        valid = PR_FALSE; // all question marks should be at the end
++      }
++      low = low*16 + HexDigitValue(ch);
++      high = high*16 + HexDigitValue(ch);
++    } else {
++      haveQues = PR_TRUE;
++      low = low*16 + 0x0;
++      high = high*16 + 0xF;
++    }
++  }
++
++  if (ch == '-' && IsHexDigit(Peek())) {
++    if (haveQues) {
++      valid = PR_FALSE;
++    }
++
++    aResult.mIdent.Append(ch);
++    high = 0;
++    i = 0;
++    for (;;) {
++      ch = Read();
++      i++;
++      if (i == 7 || !IsHexDigit(ch)) {
++        break;
++      }
++      aResult.mIdent.Append(ch);
++      high = high*16 + HexDigitValue(ch);
++    }
++  }
++  Pushback(ch);
++
++  aResult.mInteger = low;
++  aResult.mInteger2 = high;
++  aResult.mIntegerValid = valid;
++  aResult.mType = eCSSToken_URange;
++  return PR_TRUE;
++}
+diff --git a/layout/style/nsCSSScanner.h b/layout/style/nsCSSScanner.h
+--- a/layout/style/nsCSSScanner.h
++++ b/layout/style/nsCSSScanner.h
+@@ -93,28 +93,34 @@ enum nsCSSTokenType {
+   eCSSToken_HTMLComment,    // "<!--" or "-->"
+ 
+   eCSSToken_Includes,       // "~="
+   eCSSToken_Dashmatch,      // "|="
+   eCSSToken_Beginsmatch,    // "^="
+   eCSSToken_Endsmatch,      // "$="
+   eCSSToken_Containsmatch,  // "*="
+ 
++  eCSSToken_URange,         // Low in mInteger, high in mInteger2;
++                            // mIntegerValid is true if the token is a
++                            // valid range; mIdent preserves the textual
++                            // form of the token for error reporting
++
+   // A special token indicating that there was an error in tokenization.
+   // It's always an unterminated string.
+   eCSSToken_Error           // mSymbol + mIdent
+ };
+ 
+ struct nsCSSToken {
+   nsAutoString    mIdent NS_OKONHEAP;
+   float           mNumber;
+   PRInt32         mInteger;
++  PRInt32         mInteger2;
+   nsCSSTokenType  mType;
+   PRUnichar       mSymbol;
+-  PRPackedBool    mIntegerValid; // for number and dimension
++  PRPackedBool    mIntegerValid; // for number, dimension, urange
+   PRPackedBool    mHasSign; // for number, percentage, and dimension
+ 
+   nsCSSToken();
+ 
+   PRBool IsDimension() {
+     return PRBool((eCSSToken_Dimension == mType) ||
+                   ((eCSSToken_Number == mType) && (mNumber == 0.0f)));
+   }
+@@ -214,16 +220,17 @@ protected:
+   void EatWhiteSpace();
+   
+   void ParseAndAppendEscape(nsString& aOutput);
+   PRBool ParseIdent(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseAtKeyword(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseNumber(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseRef(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseString(PRInt32 aChar, nsCSSToken& aResult);
++  PRBool ParseURange(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool SkipCComment();
+ 
+   PRBool GatherIdent(PRInt32 aChar, nsString& aIdent);
+ 
+   // Only used when input is a stream
+   nsCOMPtr<nsIUnicharInputStream> mInputStream;
+   PRUnichar mBuffer[CSS_BUFFER_SIZE];
+ 
+diff --git a/layout/style/test/test_font_face_parser.html b/layout/style/test/test_font_face_parser.html
+--- a/layout/style/test/test_font_face_parser.html
++++ b/layout/style/test/test_font_face_parser.html
+@@ -33,17 +33,17 @@
+     { rule: _("font-family: \"Mouse\""),  d: {"font-family" : "\"Mouse\""},
+       noncanonical: true },
+     { rule: _("font-family: Mouse;"),  d: {"font-family" : "\"Mouse\"" },
+       noncanonical: true },
+     { rule: _("font-family: Mouse"),  d: {"font-family" : "\"Mouse\"" },
+       noncanonical: true },
+ 
+     // Correct but unusual font-family.
+-    { rule: _("font-family: Hoefler Text;"), 
++    { rule: _("font-family: Hoefler Text;"),
+       d: {"font-family" : "\"Hoefler Text\""},
+       noncanonical: true },
+ 
+     // Incorrect font-family.
+     { rule: _("font-family:"),        d: {} },
+     { rule: _("font-family \"Mouse\""), d: {} },
+     { rule: _("font-family: *"),      d: {} },
+     { rule: _("font-family: Mouse, Rat"), d: {} },
+@@ -159,18 +159,101 @@
+ 	      "src: url(\"/fonts/Cat\") format(Cat(); src: local(Rat); )"),
+       d: { "src" : "url(\"/fonts/Mouse\")" },
+       noncanonical: true },
+     { rule: _("src: url(\"/fonts/Mouse\"); " +
+ 	      "src: url(\"/fonts/Cat\") format(\"Cat\"; src: local(Rat); )"),
+       d: { "src" : "url(\"/fonts/Mouse\")" },
+       noncanonical: true },
+ 
+-    // unicode-range is not implemented (bug 443976).
+-    // tests for that omitted for now.
++    // Correct unicode-range:
++    { rule: _("unicode-range: U+00A5;"), d: { "unicode-range" : "U+00A5" } },
++    { rule: _("unicode-range: U+A5;"),
++      d: { "unicode-range" : "U+00A5" }, noncanonical: true },
++    { rule: _("unicode-range: U+00a5;"),
++      d: { "unicode-range" : "U+00A5" }, noncanonical: true },
++    { rule: _("unicode-range: u+00a5;"),
++      d: { "unicode-range" : "U+00A5" }, noncanonical: true },
++    { rule: _("unicode-range: U+0000-00FF;"),
++      d: { "unicode-range" : "U+0000-00FF" } },
++    { rule: _("unicode-range: U+00??;"),
++      d: { "unicode-range" : "U+0000-00FF" }, noncanonical: true },
++    { rule: _("unicode-range: U+?"),
++      d: { "unicode-range" : "U+0000-000F" }, noncanonical: true },
++    { rule: _("unicode-range: U+??????"),
++      d: { "unicode-range" : "U+0000-10FFFF" }, noncanonical: true },
++    { rule: _("unicode-range: U+590-5ff;"),
++      d: { "unicode-range" : "U+0590-05FF" }, noncanonical: true },
++    { rule: _("unicode-range: U+A0000-12FFFF"),
++      d: { "unicode-range" : "U+A0000-10FFFF" }, noncanonical: true },
++
++    { rule: _("unicode-range: U+A5, U+4E00-9FFF, U+30??, U+FF00-FF9F;"),
++      d: { "unicode-range" : "U+00A5, U+4E00-9FFF, U+3000-30FF, U+FF00-FF9F" },
++      noncanonical: true },
++
++    { rule: _("unicode-range: U+104??;"),
++      d: { "unicode-range" : "U+10400-104FF" }, noncanonical: true },
++    { rule: _("unicode-range: U+320??, U+321??, U+322??, U+323??, U+324??, U+325??;"),
++      d: { "unicode-range" : "U+32000-320FF, U+32100-321FF, U+32200-322FF, U+32300-323FF, U+32400-324FF, U+32500-325FF" },
++      noncanonical: true },
++    { rule: _("unicode-range: U+100000-10ABCD;"),
++      d: { "unicode-range" : "U+100000-10ABCD" } },
++    { rule: _("unicode-range: U+0121 , U+1023"),
++      d: { "unicode-range" : "U+0121, U+1023" }, noncanonical: true },
++    { rule: _("unicode-range: U+0121/**/, U+1023"),
++      d: { "unicode-range" : "U+0121, U+1023" }, noncanonical: true },
++
++    // Incorrect unicode-range:
++    { rule: _("unicode-range:"), d: {} },
++    { rule: _("unicode-range: U+"), d: {} },
++    { rule: _("unicode-range: U+8FFFFFFF"), d: {} },
++    { rule: _("unicode-range: U+8FFF-7000"), d: {} },
++    { rule: _("unicode-range: U+8F??-9000"), d: {} },
++    { rule: _("unicode-range: U+9000-9???"), d: {} },
++    { rule: _("unicode-range: U+??00"), d: {} },
++    { rule: _("unicode-range: U+12345678?"), d: {} },
++    { rule: _("unicode-range: U+1????????"), d: {} },
++    { rule: _("unicode-range: twelve"), d: {} },
++    { rule: _("unicode-range: 1000"), d: {} },
++    { rule: _("unicode-range: 13??"), d: {} },
++    { rule: _("unicode-range: 1300-1377"), d: {} },
++    { rule: _("unicode-range: U-1000"), d: {} },
++    { rule: _("unicode-range: U+nnnn"), d: {} },
++    { rule: _("unicode-range: U+0121 U+1023"), d: {} },
++    { rule: _("unicode-range: U+ 0121"), d: {} },
++    { rule: _("unicode-range: U +0121"), d: {} },
++    { rule: _("unicode-range: U+0121-"), d: {} },
++    { rule: _("unicode-range: U+0121- 1023"), d: {} },
++    { rule: _("unicode-range: U+0121 -1023"), d: {} },
++    { rule: _("unicode-range: U+012 ?"), d: {} },
++    { rule: _("unicode-range: U+01 2?"), d: {} },
++
++    // Thorough test of seven-digit rejection: all these are syntax errors
++    { rule: _("unicode-range: U+1034560, U+A5"), d: {} },
++    { rule: _("unicode-range: U+1034569, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456a, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456f, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456?, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456-1034560, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456-1034569, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456-103456a, U+A5"), d: {} },
++    { rule: _("unicode-range: U+103456-103456f, U+A5"), d: {} },
++
++    // Syntactically invalid unicode-range tokens invalidate the
++    // entire descriptor
++    { rule: _("unicode-range: U+1, U+2, U+X"), d: {} },
++    { rule: _("unicode-range: U+A5, U+0?F"), d: {} },
++    { rule: _("unicode-range: U+A5, U+0F?-E00"), d: {} },
++
++    // Descending ranges and ranges outside 0-10FFFF are ignored
++    // but do not invalidate the descriptor
++    { rule: _("unicode-range: U+A5, U+90-30"),
++      d: { "unicode-range" : "U+00A5" }, noncanonical: true },
++    { rule: _("unicode-range: U+A5, U+220043"),
++      d: { "unicode-range" : "U+00A5" }, noncanonical: true },
+   ];
+ 
+   var display = document.getElementById("display");
+   var sheet = document.styleSheets[1];
+ 
+   for (var curTest = 0; curTest < testset.length; curTest++) {
+     try {
+       while(sheet.cssRules.length > 0)
