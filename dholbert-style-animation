@@ -1,0 +1,543 @@
+From: Daniel Holbert <dholbert@mozilla.com>
+
+Create nsStyleAnimation class for common interpolation and value conversion code.  (Bug 504652)
+
+diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
+--- a/layout/style/Makefile.in
++++ b/layout/style/Makefile.in
+@@ -110,16 +110,17 @@ EXPORTS		= \
+ 		nsIStyleRule.h \
+ 		nsIStyleRuleProcessor.h \
+ 		nsIStyleSheet.h \
+ 		nsLayoutStylesheetCache.h \
+ 		nsRuleData.h \
+ 		nsRuleNode.h \
+ 		nsRuleProcessorData.h \
+ 		nsRuleWalker.h \
++		nsStyleAnimation.h \
+ 		nsStyleContext.h \
+ 		nsStyleCoord.h \
+ 		nsStyleSet.h \
+ 		nsStyleStruct.h \
+ 		nsStyleStructFwd.h \
+ 		nsStyleStructInlines.h \
+ 		nsStyleStructList.h \
+ 		nsStyleTransformMatrix.h \
+@@ -152,16 +153,17 @@ CPPSRCS		= \
+ 		nsDOMCSSValueList.cpp \
+ 		nsFontFaceLoader.cpp \
+ 		nsHTMLCSSStyleSheet.cpp \
+ 		nsHTMLStyleSheet.cpp \
+ 		nsLayoutStylesheetCache.cpp \
+ 		nsMediaFeatures.cpp \
+ 		nsROCSSPrimitiveValue.cpp \
+ 		nsRuleNode.cpp \
++		nsStyleAnimation.cpp \
+ 		nsStyleContext.cpp \
+ 		nsStyleCoord.cpp \
+ 		nsStyleSet.cpp \
+ 		nsStyleStruct.cpp \
+ 		nsStyleTransformMatrix.cpp \
+ 		nsStyleUtil.cpp \
+ 		$(NULL)
+ 
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -0,0 +1,312 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsStyleAnimation.
++ *
++ * The Initial Developer of the Original Code is
++ * The Mozilla Corporation.
++ * Portions created by the Initial Developer are Copyright (C) 2009
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   Daniel Holbert <dholbert@mozilla.com>, Mozilla Corporation
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++#include "nsCOMArray.h"
++#include "nsIStyleRule.h"
++#include "nsString.h"
++#include "nsStyleAnimation.h"
++#include "nsStyleCoord.h"
++#include "nsStyleContext.h"
++#include "nsStyleSet.h"
++#include "nsCSSDataBlock.h"
++#include "nsCSSDeclaration.h"
++
++/**
++ * Helper Class: StyleRuleImpl
++ * This class is a simple nsIStyleRule implementation, which simply wraps a
++ * nsCSSDeclaration.
++ */
++class StyleRuleImpl : public nsIStyleRule {
++public:
++  StyleRuleImpl(const nsCSSDeclaration& aDeclaration);
++
++  NS_DECL_ISUPPORTS
++  
++  // nsIStyleRule methods
++  NS_IMETHOD MapRuleInfoInto(nsRuleData* aRuleData);
++#ifdef DEBUG
++  NS_IMETHOD List(FILE* out = stdout, PRInt32 aIndent = 0) const;
++#endif
++
++protected:
++  const nsCSSDeclaration& mDeclaration;
++};
++
++StyleRuleImpl::StyleRuleImpl(const nsCSSDeclaration& aDeclaration)
++  : mDeclaration(aDeclaration)
++{
++  // Not addref'ing mDeclaration -- assuming that this structure won't last
++  // as long as the declaration does.
++}
++
++NS_IMPL_ISUPPORTS1(StyleRuleImpl, nsIStyleRule)
++
++NS_IMETHODIMP
++StyleRuleImpl::MapRuleInfoInto(nsRuleData* aRuleData)
++{
++  return mDeclaration.MapRuleInfoInto(aRuleData);
++}
++
++#ifdef DEBUG
++NS_IMETHODIMP
++StyleRuleImpl::List(FILE* out, PRInt32 aIndent) const
++{
++  // Indent
++  for (PRInt32 index = aIndent; --index >= 0; ) fputs("  ", out);
++
++  fputs("nsStyleAnimation parsing helper rule ", out);
++  mDeclaration.List(out);
++  fputs("\n", out);
++
++  return NS_OK;
++}
++#endif
++
++// HELPER METHODS
++// --------------
++/*
++ * Given two units, this method returns a common unit that they can both be
++ * converted into, if possible.  This is intended to facilitate
++ * interpolation, distance-computation, and addition between "similar" units.
++ *
++ * The ordering of the arguments should not affect the output of this method.
++ *
++ * If there's no sensible common unit, this method returns eStyleUnit_Null.
++ *
++ * @param   aFirstUnit One unit to resolve.
++ * @param   aFirstUnit The other unit to resolve.
++ * @return  A "common" unit that both source units can be converted into, or
++ *          eStyleUnit_Null if that's not possible.
++ */
++static
++nsStyleUnit
++GetCommonUnit(nsStyleUnit aFirstUnit,
++              nsStyleUnit aSecondUnit)
++{
++  // XXXdholbert Naive implementation for now: simply require that the input
++  // units match.
++  if (aFirstUnit != aSecondUnit) {
++    // XXXdholbert Fail on mismatches for now.
++    // Eventually we'll need to be able to resolve conflicts here, e.g. for
++    // rgb() colors vs. named colors.  Some conflicts can't be resolved,
++    // e.g. percent vs coord, which we'll hopefully handle using CSS calc()
++    // once that's implemented.
++    NS_WARNING("start unit & end unit don't match -- need to resolve this "
++               "and pick which one we want to use");
++    return eStyleUnit_Null;
++  }
++  return aFirstUnit;
++}
++
++// CLASS METHODS
++// -------------
++
++PRBool
++nsStyleAnimation::Add(nsStyleCoord& aDest, const nsStyleCoord& aValueToAdd,
++                      PRUint32 aCount)
++{
++  NS_ABORT_IF_FALSE(aDest.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++  NS_ABORT_IF_FALSE(aValueToAdd.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++  nsStyleUnit commonUnit = GetCommonUnit(aDest.GetUnit(),
++                                         aValueToAdd.GetUnit());
++  PRBool success = PR_TRUE;
++  switch (commonUnit) {
++    case eStyleUnit_Coord: {
++      nscoord destCoord = aDest.GetCoordValue();
++      nscoord valueToAddCoord = aValueToAdd.GetCoordValue();
++      destCoord += aCount * valueToAddCoord;
++      aDest.SetCoordValue(destCoord);
++      break;
++    }
++    case eStyleUnit_Percent: {
++      float destPct = aDest.GetPercentValue();
++      float valueToAddPct = aValueToAdd.GetPercentValue();
++      destPct += aCount * valueToAddPct;
++      aDest.SetPercentValue(destPct);
++      break;
++    }
++    case eStyleUnit_Null:
++      NS_WARNING("Unable to find a common unit for given values");
++      success = PR_FALSE;
++      break;
++    default:
++      NS_NOTREACHED("Can't add nsStyleCoords using the given common unit");
++      success = PR_FALSE;
++      break;
++  }
++  return success;
++}
++
++PRBool
++nsStyleAnimation::ComputeDistance(const nsStyleCoord& aStartValue,
++                                  const nsStyleCoord& aEndValue,
++                                  double& aDistance)
++{
++  // XXXdholbert TODO: Can probably share a lot of code with Interpolate
++  // XXXdholbert Note that the "aDistance = [...];" vs "aResultValue.Set..."
++  // line is the only difference between this and Interpolate...
++
++  NS_ABORT_IF_FALSE(aStartValue.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++  NS_ABORT_IF_FALSE(aEndValue.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++
++  nsStyleUnit commonUnit = GetCommonUnit(aStartValue.GetUnit(),
++                                         aEndValue.GetUnit());
++
++  PRBool success = PR_TRUE;
++  switch (commonUnit) {
++    case eStyleUnit_Coord: {
++      nscoord startCoord = aStartValue.GetCoordValue();
++      nscoord endCoord = aEndValue.GetCoordValue();
++      aDistance = fabs(double(endCoord - startCoord));
++      break;
++    }
++    case eStyleUnit_Percent: {
++      float startPct = aStartValue.GetPercentValue();
++      float endPct = aEndValue.GetPercentValue();
++      aDistance = fabs(double(endPct - startPct));
++      break;
++    }
++    case eStyleUnit_Null:
++      NS_WARNING("Unable to find a common unit for given values");
++      success = PR_FALSE;
++      break;
++    default:
++      NS_NOTREACHED("Can't compute distance using the given common unit");
++      success = PR_FALSE;
++      break;
++  }
++  return success;
++}
++
++PRBool
++nsStyleAnimation::Interpolate(const nsStyleCoord& aStartValue,
++                              const nsStyleCoord& aEndValue,
++                              double aPortion,
++                              nsStyleCoord& aResultValue)
++{
++  NS_ABORT_IF_FALSE(aStartValue.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++  NS_ABORT_IF_FALSE(aEndValue.GetUnit() != eStyleUnit_Null,
++                    "Expecting values with non-null units");
++
++  nsStyleUnit commonUnit = GetCommonUnit(aStartValue.GetUnit(),
++                                         aEndValue.GetUnit());
++  // Maybe need a followup method to convert the inputs into the common
++  // unit-type, if they don't already match it. (Or would it make sense to do
++  // that in GetCommonUnit? in which case maybe ConvertToCommonUnit would be
++  // better.)
++
++  PRBool success = PR_TRUE;
++  switch (commonUnit) {
++    case eStyleUnit_Coord: {
++      nscoord startCoord = aStartValue.GetCoordValue();
++      nscoord endCoord = aEndValue.GetCoordValue();
++      nscoord resultCoord = startCoord +
++        NSToCoordRound(aPortion * (endCoord - startCoord));
++      aResultValue.SetCoordValue(resultCoord);
++      break;
++    }
++    case eStyleUnit_Percent: {
++      float startPct = aStartValue.GetPercentValue();
++      float endPct = aEndValue.GetPercentValue();
++      float resultPct = startPct + aPortion * (endPct - startPct);
++      aResultValue.SetPercentValue(resultPct);
++      break;
++    }
++    case eStyleUnit_Null:
++      NS_WARNING("Unable to find a common unit for given values");
++      success = PR_FALSE;
++      break;
++    default:
++      NS_NOTREACHED("Can't interpolate using the given common unit");
++      success = PR_FALSE;
++      break;
++  }
++  return success;
++}
++
++PRBool
++nsStyleAnimation::ComputeValue(nsCSSProperty aProperty,
++                               nsStyleContext* aStyleContext,
++                               const nsCSSDeclaration& aDeclaration,
++                               nsStyleCoord& aComputedValue)
++{
++  // XXXdholbert Is presContext guaranteed to be non-null here?
++  // (does non-null styleContext imply non-null presContext?
++  nsStyleSet* styleSet = aStyleContext->PresContext()->StyleSet();
++
++  nsCOMPtr<StyleRuleImpl> styleRule = new StyleRuleImpl(aDeclaration);
++  nsCOMArray<nsIStyleRule> ruleArray;
++  ruleArray.AppendObject(styleRule);
++
++  nsRefPtr<nsStyleContext> tmpStyleContext =
++    styleSet->ResolveStyleForRules(aStyleContext->GetParent(),
++                                   aStyleContext->GetPseudoType(),
++                                   aStyleContext->GetRuleNode(), ruleArray);
++
++  return ExtractComputedValue(aProperty, tmpStyleContext, aComputedValue);
++}
++
++PRBool
++nsStyleAnimation::ExtractComputedValue(nsCSSProperty aProperty,
++                                       nsStyleContext* aStyleContext,
++                                       nsStyleCoord& aComputedValue)
++{
++  // XXXdholbert This is a simple implementation that only supports "font-size"
++  // and "stroke-width for now, so that we can test the rest of the
++  // functionality. A full implementation will require modifications to
++  // nsCSSPropList.h, as described in bug 504652 comment 0.
++  switch(aProperty) {
++    case eCSSProperty_font_size: {
++      const nsStyleFont* styleFont = aStyleContext->GetStyleFont();
++      aComputedValue.SetCoordValue(styleFont->mFont.size);
++      return PR_TRUE;
++    }
++    case eCSSProperty_stroke_width: {
++      const nsStyleSVG* styleSVG = aStyleContext->GetStyleSVG();
++      aComputedValue = styleSVG->mStrokeWidth;
++      return PR_TRUE;
++    }
++    default:
++      return PR_FALSE;
++  }
++}
+diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsStyleAnimation.h
+@@ -0,0 +1,141 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsStyleAnimation.
++ *
++ * The Initial Developer of the Original Code is
++ * The Mozilla Corporation.
++ * Portions created by the Initial Developer are Copyright (C) 2009
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   Daniel Holbert <dholbert@mozilla.com>, Mozilla Corporation
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++/* Utility class to handle animated style values */
++
++#ifndef _nsStyleAnimation_h_
++#define _nsStyleAnimation_h_
++
++#include "prtypes.h"
++#include "nsCSSProperty.h"
++
++class nsAString;
++class nsCSSDeclaration;
++class nsStyleCoord;
++class nsStyleContext;
++
++/**
++ * Utility class to handle animated style values
++ */
++class nsStyleAnimation {
++public:
++
++  // Mathematical methods
++  // --------------------
++  /**
++   * Adds |aCount| copies of |aValueToAdd| to |aDest|.  The result of this
++   * addition is stored in aDest.
++   *
++   * Note that if |aCount| is 0, then |aDest| will be unchanged.  Also, if
++   * this method fails, then |aDest| will be unchanged.
++   *
++   * @param   aDest       The value to add to.
++   * @param   aValueToAdd The value to add.
++   * @param   aCount      The number of times to add aValueToAdd.
++   * @return  PR_TRUE on success, PR_FALSE on failure.
++   */
++  static PRBool Add(nsStyleCoord& aDest, const nsStyleCoord& aValueToAdd,
++                    PRUint32 aCount);
++
++  /**
++   * Calculates a measure of 'distance' between two values. This distance
++   * can be used for paced interpolation in SMIL.
++   *
++   * @param   aStartValue  The start of the interval for which the distance
++   *                       should be calculated.
++   * @param   aEndValue    The end of the interval for which the distance
++   *                       should be calculated.
++   * @param   aDistance    The result of the calculation.
++   * @return  PR_TRUE on success, PR_FALSE on failure.
++   */
++  static PRBool ComputeDistance(const nsStyleCoord& aStartValue,
++                                const nsStyleCoord& aEndValue,
++                                double& aDistance);
++
++  /**
++   * Calculates an interpolated value that is the specified |aPortion| between
++   * the two given values.
++   *
++   * @param   aStartValue   The value defining the start of the interval of
++   *                        interpolation.
++   * @param   aEndValue     The value defining the end of the interval of
++   *                        interpolation.
++   * @param   aPortion      A number in the range [0.0, 1.0) defining
++   *                        the distance of the interpolated value in the
++   *                        interval.
++   * @param   aResultValue  The interpolated value. (outparam)
++   * @result  PR_TRUE on success, or PR_FALSE on failure.
++   */
++  static PRBool Interpolate(const nsStyleCoord& aStartValue,
++                            const nsStyleCoord& aEndValue,
++                            double aPortion,
++                            nsStyleCoord& aResultValue);
++
++  // Type-conversion methods
++  // -----------------------
++  /**
++   * Creates a computed value (nsStyleCoord) for the given specified value
++   * (declaration + property ID).  A style context is needed in case the
++   * specified value depends on inherited style.
++   *
++   * @param aProperty      The property whose value we're computing.
++   * @param aStyleContext  The style context for the content node to which our
++   *                       computed value is applicable.
++   * @param aDeclaration   Holds the already-parsed specified value, from which
++   *                       we'll build our computed value.
++   * @param aComputedValue The resulting computed value. (outparam)
++   */
++  static PRBool ComputeValue(nsCSSProperty aProperty,
++                             nsStyleContext* aStyleContext,
++                             const nsCSSDeclaration& aDeclaration,
++                             nsStyleCoord& aComputedValue);
++
++  /**
++   * Gets the computed value for the given property from the given style
++   * context.
++   *
++   * @param aProperty      The property whose value we're looking up.
++   * @param aStyleContext  The style context to check for the computed value.
++   * @param aComputedValue The resulting computed value. (outparam)
++   */
++  static PRBool ExtractComputedValue(nsCSSProperty aProperty,
++                                     nsStyleContext* aStyleContext,
++                                     nsStyleCoord& aComputedValue);
++};
++
++#endif
+diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
+--- a/layout/style/nsStyleCoord.h
++++ b/layout/style/nsStyleCoord.h
+@@ -66,31 +66,32 @@ typedef union {
+ /**
+  * Class that hold a single size specification used by the style
+  * system.  The size specification consists of two parts -- a number
+  * and a unit.  The number is an integer, a floating point value, an
+  * nscoord, or undefined, and the unit is an nsStyleUnit.  Checking
+  * the unit is a must before asking for the value in any particular
+  * form.
+  */
++// XXXdholbert: Need to extend this to be able to hold the computed values of
++// all types we'd like to animate, per bug 504652 comment 0.
+ class nsStyleCoord {
+ public:
+   nsStyleCoord(nsStyleUnit aUnit = eStyleUnit_Null);
+   nsStyleCoord(nscoord aValue);
+   nsStyleCoord(PRInt32 aValue, nsStyleUnit aUnit);
+   nsStyleCoord(float aValue, nsStyleUnit aUnit);
+   inline nsStyleCoord(const nsStyleCoord& aCopy);
+   inline nsStyleCoord(const nsStyleUnion& aValue, nsStyleUnit aUnit);
+ 
+   nsStyleCoord&  operator=(const nsStyleCoord& aCopy);
+   PRBool         operator==(const nsStyleCoord& aOther) const;
+   PRBool         operator!=(const nsStyleCoord& aOther) const;
+ 
+   nsStyleUnit GetUnit(void) const {
+-    NS_ASSERTION(mUnit != eStyleUnit_Null, "reading uninitialized value");
+     return mUnit;
+   }
+   nscoord     GetCoordValue(void) const;
+   PRInt32     GetIntValue(void) const;
+   float       GetPercentValue(void) const;
+   float       GetFactorValue(void) const;
+   void        GetUnionValue(nsStyleUnion& aValue) const;
+ 
