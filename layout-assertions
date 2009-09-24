@@ -5,7 +5,7 @@ Add assertions that we don't execute script, fire events, or mutate the document
 diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsContentUtils.h
 --- a/content/base/public/nsContentUtils.h
 +++ b/content/base/public/nsContentUtils.h
-@@ -1487,16 +1487,26 @@ public:
+@@ -1487,16 +1487,27 @@ public:
                               // If non-null aHolder will keep the jsval alive
                               // while there's a ref to it
                               nsIXPConnectJSObjectHolder** aHolder = nsnull,
@@ -20,6 +20,7 @@ diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsConten
 +   */
 +#ifdef DEBUG
 +  static void AssertLayoutSafeForScript(nsIDocument *aDocument);
++  static PRBool sIsPaintingTree;
 +#else
 +  static inline void AssertLayoutSafeForScript(nsIDocument *aDocument) {}
 +#endif
@@ -55,7 +56,27 @@ diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUti
  #include "nsIPermissionManager.h"
  #include "nsIScriptObjectPrincipal.h"
  #include "nsIRunnable.h"
-@@ -4198,16 +4201,35 @@ nsContentUtils::TriggerLink(nsIContent *
+@@ -183,16 +186,19 @@ static NS_DEFINE_CID(kXTFServiceCID, NS_
+ #include "jsinterp.h"
+ 
+ const char kLoadAsData[] = "loadAsData";
+ 
+ static const char kJSStackContractID[] = "@mozilla.org/js/xpc/ContextStack;1";
+ static NS_DEFINE_CID(kParserServiceCID, NS_PARSERSERVICE_CID);
+ static NS_DEFINE_CID(kCParserCID, NS_PARSER_CID);
+ 
++#ifdef DEBUG
++PRBool nsContentUtils::sIsPaintingTree = PR_FALSE;
++#endif
+ nsIDOMScriptObjectFactory *nsContentUtils::sDOMScriptObjectFactory = nsnull;
+ nsIXPConnect *nsContentUtils::sXPConnect;
+ nsIScriptSecurityManager *nsContentUtils::sSecurityManager;
+ nsIThreadJSContextStack *nsContentUtils::sThreadJSContextStack;
+ nsIParserService *nsContentUtils::sParserService = nsnull;
+ nsINameSpaceManager *nsContentUtils::sNameSpaceManager;
+ nsIIOService *nsContentUtils::sIOService;
+ #ifdef MOZ_XTF
+@@ -4198,16 +4204,37 @@ nsContentUtils::TriggerLink(nsIContent *
    }
  
    // Only pass off the click event if the script security manager says it's ok.
@@ -73,8 +94,10 @@ diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUti
 +  nsCOMPtr<nsIPresShell> shell;
 +  while ((shell = iter.GetNextShell())) {
 +    nsPresContext *presContext = shell->GetPresContext();
-+    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_Paint) == 0,
-+                 "should not execute script during paint");
++    if (!sIsPaintingTree) {
++      NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_Paint) == 0,
++                   "should not execute script during paint");
++    }
 +    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_Reflow) == 0,
 +                 "should not execute script during reflow");
 +    NS_ASSERTION(presContext->LayoutPhaseCount(eLayoutPhase_FrameC) == 0,
@@ -243,3 +266,53 @@ diff --git a/dom/base/nsJSEnvironment.cpp b/dom/base/nsJSEnvironment.cpp
  
      for (nsJSContext::TerminationFuncClosure* cur = start;
           cur;
+diff --git a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+--- a/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
++++ b/layout/xul/base/src/tree/src/nsTreeBodyFrame.cpp
+@@ -102,21 +102,24 @@
+ #include "imgILoader.h"
+ #include "nsINodeInfo.h"
+ #include "nsContentUtils.h"
+ #include "nsLayoutUtils.h"
+ #include "nsIScrollableFrame.h"
+ #include "nsEventDispatcher.h"
+ #include "nsDisplayList.h"
+ #include "nsTreeBoxObject.h"
++#include "mozilla/AutoRestore.h"
+ 
+ #ifdef IBMBIDI
+ #include "nsBidiPresUtils.h"
+ #endif
+ 
++using mozilla::AutoRestore;
++
+ static NS_DEFINE_CID(kWidgetCID, NS_CHILD_CID);
+ 
+ // Enumeration function that cancels all the image requests in our cache
+ static PLDHashOperator
+ CancelImageRequest(const nsAString& aKey,
+                    nsTreeImageCacheEntry aEntry, void* aData)
+ {
+   aEntry.request->CancelAndForgetObserver(NS_BINDING_ABORTED);
+@@ -2831,16 +2834,21 @@ nsTreeBodyFrame::BuildDisplayList(nsDisp
+   return aLists.Content()->AppendNewToTop(new (aBuilder)
+       nsDisplayGeneric(this, ::PaintTreeBody, "XULTreeBody"));
+ }
+ 
+ void
+ nsTreeBodyFrame::PaintTreeBody(nsIRenderingContext& aRenderingContext,
+                                const nsRect& aDirtyRect, nsPoint aPt)
+ {
++#ifdef DEBUG
++  AutoRestore<PRBool> savePainting(nsContentUtils::sIsPaintingTree);
++  nsContentUtils::sIsPaintingTree = PR_TRUE;
++#endif
++
+   // Update our available height and our page count.
+   CalcInnerBox();
+   aRenderingContext.PushState();
+   aRenderingContext.SetClipRect(mInnerBox + aPt, nsClipCombine_kIntersect);
+   PRInt32 oldPageCount = mPageLength;
+   if (!mHasFixedRowCount)
+     mPageLength = mInnerBox.height/mRowHeight;
+ 
