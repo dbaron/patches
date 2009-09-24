@@ -5,9 +5,14 @@ Add assertions that we don't execute script, fire events, or mutate the document
 diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsContentUtils.h
 --- a/content/base/public/nsContentUtils.h
 +++ b/content/base/public/nsContentUtils.h
-@@ -1096,6 +1096,16 @@ public:
-                           nsIURI *aLinkURI, const nsString& aTargetSpec,
-                           PRBool aClick, PRBool aIsUserTriggered);
+@@ -1487,16 +1487,26 @@ public:
+                              // If non-null aHolder will keep the jsval alive
+                              // while there's a ref to it
+                              nsIXPConnectJSObjectHolder** aHolder = nsnull,
+                              PRBool aAllowWrapping = PR_FALSE)
+   {
+     return WrapNative(cx, scope, native, nsnull, vp, aHolder, aAllowWrapping);
+   }
  
 +  /**
 +   * Assert that no presentation of the given document is currently in
@@ -22,24 +27,43 @@ diff --git a/content/base/public/nsContentUtils.h b/content/base/public/nsConten
  private:
  
    static PRBool InitializeEventTable();
+ 
+   static nsresult doReparentContentWrapper(nsIContent *aChild,
+                                            JSContext *cx,
+                                            JSObject *aOldGlobal,
+                                            JSObject *aNewGlobal,
 diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUtils.cpp
 --- a/content/base/src/nsContentUtils.cpp
 +++ b/content/base/src/nsContentUtils.cpp
-@@ -140,6 +140,9 @@ static NS_DEFINE_CID(kXTFServiceCID, NS_
+@@ -135,16 +135,19 @@ static NS_DEFINE_CID(kXTFServiceCID, NS_
+ #include "nsTPtrArray.h"
+ #include "nsGUIEvent.h"
+ #include "nsMutationEvent.h"
+ #include "nsIMEStateManager.h"
  #include "nsContentErrors.h"
  #include "nsUnicharUtilCIID.h"
  #include "nsICaseConversion.h"
+ #include "nsCompressedCharMap.h"
 +#include "nsIPresShell.h"
 +#include "nsPresContext.h"
 +#include "nsPresShellIterator.h"
+ #include "nsINativeKeyBindings.h"
+ #include "nsIDOMNSUIEvent.h"
+ #include "nsIDOMNSEvent.h"
+ #include "nsIPrivateDOMEvent.h"
+ #include "nsXULPopupManager.h"
+ #include "nsIPermissionManager.h"
+ #include "nsIScriptObjectPrincipal.h"
+ #include "nsIRunnable.h"
+@@ -4198,16 +4201,35 @@ nsContentUtils::TriggerLink(nsIContent *
+   }
  
- #ifdef IBMBIDI
- #include "nsIBidiKeyboard.h"
-@@ -3697,3 +3700,22 @@ nsContentUtils::TriggerLink(nsIContent *
+   // Only pass off the click event if the script security manager says it's ok.
+   if (NS_SUCCEEDED(proceed)) {
      handler->OnLinkClick(aContent, aLinkURI, aTargetSpec.get());
    }
  }
-+
+ 
 +#ifdef DEBUG
 +/* static */
 +void
@@ -58,10 +82,24 @@ diff --git a/content/base/src/nsContentUtils.cpp b/content/base/src/nsContentUti
 +  }
 +}
 +#endif
++
+ /* static */
+ nsIWidget*
+ nsContentUtils::GetTopLevelWidget(nsIWidget* aWidget)
+ {
+   if (!aWidget)
+     return nsnull;
+ 
+   return aWidget->GetTopLevelWidget();
 diff --git a/content/base/src/nsDocument.h b/content/base/src/nsDocument.h
 --- a/content/base/src/nsDocument.h
 +++ b/content/base/src/nsDocument.h
-@@ -703,9 +703,12 @@ protected:
+@@ -1086,19 +1086,22 @@ protected:
+                               PRBool aPersisted);
+ 
+   // nsContentList match functions for GetElementsByClassName
+   static PRBool MatchClassNames(nsIContent* aContent, PRInt32 aNamespaceID,
+                                 nsIAtom* aAtom, void* aData);
  
    static void DestroyClassNameArray(void* aData);
  
@@ -77,17 +115,31 @@ diff --git a/content/base/src/nsDocument.h b/content/base/src/nsDocument.h
    
  #ifdef DEBUG
    void VerifyRootContentState();
+ #endif
+ 
+   nsDocument(const char* aContentType);
+   virtual ~nsDocument();
+ 
 diff --git a/content/base/src/nsNodeUtils.cpp b/content/base/src/nsNodeUtils.cpp
 --- a/content/base/src/nsNodeUtils.cpp
 +++ b/content/base/src/nsNodeUtils.cpp
-@@ -54,28 +54,29 @@
+@@ -53,35 +53,34 @@
+ #include "nsDocument.h"
+ #ifdef MOZ_XUL
  #include "nsXULElement.h"
  #endif
+ #include "nsBindingManager.h"
  
+ // This macro expects the ownerDocument of content_ to be in scope as
+ // |nsIDocument* doc|
 -#define IMPL_MUTATION_NOTIFICATION(func_, content_, params_)      \
 -  PR_BEGIN_MACRO                                                  \
 -  nsINode* node = content_;                                       \
--  nsINode* prev;                                                  \
+-  NS_ASSERTION(node->GetOwnerDoc() == doc, "Bogus document");     \
+-  if (doc) {                                                      \
+-    static_cast<nsIMutationObserver*>(doc->BindingManager())->    \
+-      func_ params_;                                              \
+-  }                                                               \
 -  do {                                                            \
 -    nsINode::nsSlots* slots = node->GetExistingSlots();           \
 -    if (slots && !slots->mMutationObservers.IsEmpty()) {          \
@@ -97,45 +149,43 @@ diff --git a/content/base/src/nsNodeUtils.cpp b/content/base/src/nsNodeUtils.cpp
 -        slots->mMutationObservers, nsIMutationObserver,           \
 -        func_, params_);                                          \
 -    }                                                             \
--    prev = node;                                                  \
 -    node = node->GetNodeParent();                                 \
--                                                                  \
--    if (!node && prev->HasFlag(NODE_FORCE_XBL_BINDINGS)) {        \
--      /* For elements that have the NODE_FORCE_XBL_BINDINGS flag  \
--         set we need to notify the document */                    \
--      node = prev->GetOwnerDoc();                                 \
--    }                                                             \
 -  } while (node);                                                 \
-+#define IMPL_MUTATION_NOTIFICATION(func_, content_, params_)                  \
-+  PR_BEGIN_MACRO                                                              \
-+  nsContentUtils::AssertLayoutSafeForScript(content_->GetOwnerDoc());         \
-+  nsINode* node = content_;                                                   \
-+  nsINode* prev;                                                              \
-+  do {                                                                        \
-+    nsINode::nsSlots* slots = node->GetExistingSlots();                       \
-+    if (slots && !slots->mMutationObservers.IsEmpty()) {                      \
-+      /* No need to explicitly notify the first observer first                \
-+         since that'll happen anyway. */                                      \
-+      NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(                                     \
-+        slots->mMutationObservers, nsIMutationObserver,                       \
-+        func_, params_);                                                      \
-+    }                                                                         \
-+    prev = node;                                                              \
-+    node = node->GetNodeParent();                                             \
-+                                                                              \
-+    if (!node && prev->HasFlag(NODE_FORCE_XBL_BINDINGS)) {                    \
-+      /* For elements that have the NODE_FORCE_XBL_BINDINGS flag              \
-+         set we need to notify the document */                                \
-+      node = prev->GetOwnerDoc();                                             \
-+    }                                                                         \
-+  } while (node);                                                             \
++#define IMPL_MUTATION_NOTIFICATION(func_, content_, params_)                    \
++  PR_BEGIN_MACRO                                                                \
++  nsContentUtils::AssertLayoutSafeForScript(content_->GetOwnerDoc());           \
++  nsINode* node = content_;                                                     \
++  NS_ASSERTION(node->GetOwnerDoc() == doc, "Bogus document");                   \
++  if (doc) {                                                                    \
++    static_cast<nsIMutationObserver*>(doc->BindingManager())-> func_ params_;   \
++  }                                                                             \
++  do {                                                                          \
++    nsINode::nsSlots* slots = node->GetExistingSlots();                         \
++    if (slots && !slots->mMutationObservers.IsEmpty()) {                        \
++      /* No need to explicitly notify the first observer first                  \
++         since that'll happen anyway. */                                        \
++      NS_OBSERVER_ARRAY_NOTIFY_OBSERVERS(                                       \
++        slots->mMutationObservers, nsIMutationObserver, func_, params_);        \
++    }                                                                           \
++    node = node->GetNodeParent();                                               \
++  } while (node);                                                               \
    PR_END_MACRO
  
  
+ void
+ nsNodeUtils::CharacterDataWillChange(nsIContent* aContent,
+                                      CharacterDataChangeInfo* aInfo)
+ {
+   nsIDocument* doc = aContent->GetOwnerDoc();
 diff --git a/content/events/src/nsEventDispatcher.cpp b/content/events/src/nsEventDispatcher.cpp
 --- a/content/events/src/nsEventDispatcher.cpp
 +++ b/content/events/src/nsEventDispatcher.cpp
-@@ -370,6 +370,8 @@ nsEventDispatcher::Dispatch(nsISupports*
+@@ -425,16 +425,18 @@ void NS_ShutdownChainItemPool() { ChainI
+ nsEventDispatcher::Dispatch(nsISupports* aTarget,
+                             nsPresContext* aPresContext,
+                             nsEvent* aEvent,
+                             nsIDOMEvent* aDOMEvent,
+                             nsEventStatus* aEventStatus,
                              nsDispatchingCallback* aCallback)
  {
    NS_ASSERTION(aEvent, "Trying to dispatch without nsEvent!");
@@ -143,11 +193,21 @@ diff --git a/content/events/src/nsEventDispatcher.cpp b/content/events/src/nsEve
 +    nsContentUtils::AssertLayoutSafeForScript(aPresContext->Document());
    NS_ENSURE_TRUE(!NS_IS_EVENT_IN_DISPATCH(aEvent),
                   NS_ERROR_ILLEGAL_VALUE);
-   // This is strange, but nsEvents are sometimes reused and they don't need
-diff --git a/dom/src/base/nsJSEnvironment.cpp b/dom/src/base/nsJSEnvironment.cpp
---- a/dom/src/base/nsJSEnvironment.cpp
-+++ b/dom/src/base/nsJSEnvironment.cpp
-@@ -3191,7 +3191,6 @@ void
+ 
+   nsCOMPtr<nsPIDOMEventTarget> target = do_QueryInterface(aTarget);
+ #ifdef DEBUG
+   if (aDOMEvent) {
+     nsCOMPtr<nsIPrivateDOMEvent> privEvt(do_QueryInterface(aDOMEvent));
+     if (privEvt) {
+diff --git a/dom/base/nsJSEnvironment.cpp b/dom/base/nsJSEnvironment.cpp
+--- a/dom/base/nsJSEnvironment.cpp
++++ b/dom/base/nsJSEnvironment.cpp
+@@ -3458,28 +3458,36 @@ PRBool
+ nsJSContext::IsContextInitialized()
+ {
+   return mIsInitialized;
+ }
+ 
  void
  nsJSContext::FinalizeContext()
  {
@@ -155,7 +215,11 @@ diff --git a/dom/src/base/nsJSEnvironment.cpp b/dom/src/base/nsJSEnvironment.cpp
  }
  
  void
-@@ -3203,6 +3202,15 @@ void
+ nsJSContext::GC()
+ {
+   FireGCTimer(PR_FALSE);
+ }
+ 
  void
  nsJSContext::ScriptEvaluated(PRBool aTerminated)
  {
@@ -171,3 +235,8 @@ diff --git a/dom/src/base/nsJSEnvironment.cpp b/dom/src/base/nsJSEnvironment.cpp
    if (aTerminated && mTerminations) {
      // Make sure to null out mTerminations before doing anything that
      // might cause new termination funcs to be added!
+     nsJSContext::TerminationFuncClosure* start = mTerminations;
+     mTerminations = nsnull;
+ 
+     for (nsJSContext::TerminationFuncClosure* cur = start;
+          cur;
