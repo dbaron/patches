@@ -1,0 +1,229 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add assertions that fire when a JSAutoTempValueRooter is used as a temporary.  (Bug 518633)
+
+diff --git a/js/src/jsarray.cpp b/js/src/jsarray.cpp
+--- a/js/src/jsarray.cpp
++++ b/js/src/jsarray.cpp
+@@ -1713,17 +1713,17 @@ InitArrayElements(JSContext *cx, JSObjec
+         return JS_FALSE;
+ 
+     JS_ASSERT(start == MAXINDEX);
+     jsval tmp[2] = {JSVAL_NULL, JSVAL_NULL};
+     jsdouble* dp = js_NewWeaklyRootedDouble(cx, MAXINDEX);
+     if (!dp)
+         return JS_FALSE;
+     tmp[0] = DOUBLE_TO_JSVAL(dp);
+-    JSAutoTempValueRooter(cx, JS_ARRAY_LENGTH(tmp), tmp);
++    JSAutoTempValueRooter tvr(cx, JS_ARRAY_LENGTH(tmp), tmp);
+     JSAutoTempIdRooter idr(cx);
+     do {
+         tmp[1] = *vector++;
+         if (!js_ValueToStringId(cx, tmp[0], idr.addr()) ||
+             !obj->setProperty(cx, idr.id(), &tmp[1])) {
+             return JS_FALSE;
+         }
+         *dp += 1;
+diff --git a/js/src/jscntxt.h b/js/src/jscntxt.h
+--- a/js/src/jscntxt.h
++++ b/js/src/jscntxt.h
+@@ -1229,34 +1229,134 @@ struct JSContext {
+ static inline JSAtom **
+ FrameAtomBase(JSContext *cx, JSStackFrame *fp)
+ {
+     return fp->imacpc
+            ? COMMON_ATOMS_START(&cx->runtime->atomState)
+            : fp->script->atomMap.vector;
+ }
+ 
++/**
++ * The following classes are designed to cause assertions to detect
++ * inadvertent use of guard objects as temporaries.  In other words,
++ * when we have a guard object whose only purpose is its constructor and
++ * destructor (and is never otherwise referenced), the intended use
++ * might be:
++ *     JSAutoTempValueRooter tvr(cx, 1, &val);
++ * but is is easy to accidentally write:
++ *     JSAutoTempValueRooter(cx, 1, &val);
++ * which compiles just fine, but runs the destructor well before the
++ * intended time.
++ *
++ * They work by adding (#ifdef DEBUG) an additional parameter to the
++ * guard object's constructor, with a default value, so that users of
++ * the guard object's API do not need to do anything.  The default value
++ * of this parameter is a temporary object.  C++ (ISO/IEC 14882:1998),
++ * section 12.2 [class.temporary], clauses 4 and 5 seem to assume a
++ * guarantee that temporaries are destroyed in the reverse of their
++ * construction order, but I actually can't find a statement that that
++ * is true in the general case (beyond the two specific cases mentioned
++ * there).  However, it seems to be true.
++ *
++ * These classes are intended to be used only via the macros immediately
++ * below them:
++ *   JS_DECL_GUARD_OBJECT_NOTIFIER_USER declares (ifdef DEBUG) a member
++ *     variable, and should be put where a declaration of a private
++ *     member variable would be placed.
++ *   JS_GUARD_OBJECT_NOTIFIER_PARAM should be placed at the end of the
++ *     parameters to each constructor of the guard object; it declares
++ *     (ifdef DEBUG) an additional parameter.
++ *   JS_GUARD_OBJECT_NOTIFIER_INIT is a statement that belongs in each
++ *     constructor.  It uses the parameter declared by
++ *     JS_GUARD_OBJECT_NOTIFIER_PARAM.
++ */
++#ifdef DEBUG
++class JSGuardObjectNotifier
++{
++private:
++    JSBool *mStatementDone;
++public:
++    JSGuardObjectNotifier() : mStatementDone(NULL) {}
++    ~JSGuardObjectNotifier()
++    {
++#ifdef __GNUC__
++        // This assert probably isn't valid according to the C++
++        // standard, because I think compilers are allowed to construct
++        // additional temporaries.  But it seems to work correctly on
++        // GCC, so we'll leave it in that case.
++        JS_ASSERT(mStatementDone); // guard object implemented correctly
++#endif
++        if (mStatementDone) {
++            *mStatementDone = PR_TRUE;
++        }
++    }
++
++    void SetStatementDone(PRBool *aStatementDone)
++    {
++        *(mStatementDone = aStatementDone) = PR_FALSE;
++    }
++};
++
++class JSGuardObjectNotificationReceiver
++{
++private:
++    JSBool mStatementDone;
++public:
++    ~JSGuardObjectNotificationReceiver()
++    {
++        JS_ASSERT(mStatementDone); // guard object not used as temporary
++    }
++
++    void Init(JSGuardObjectNotifier &aNotifier)
++    {
++       aNotifier.SetStatementDone(&mStatementDone);
++    }
++};
++
++#define JS_DECL_GUARD_OBJECT_NOTIFIER_USER \
++    JSGuardObjectNotificationReceiver _mCheckNotUsedAsTemporary;
++#define JS_GUARD_OBJECT_NOTIFIER_PARAM \
++    , JSGuardObjectNotifier _notifier = JSGuardObjectNotifier()
++#define JS_GUARD_OBJECT_NOTIFIER_INIT \
++    JS_BEGIN_MACRO _mCheckNotUsedAsTemporary.Init(_notifier); JS_END_MACRO
++
++#else /* defined(DEBUG) */
++
++#define JS_DECL_GUARD_OBJECT_NOTIFIER_USER
++#define JS_GUARD_OBJECT_NOTIFIER_PARAM
++#define JS_GUARD_OBJECT_NOTIFIER_INIT JS_BEGIN_MACRO JS_END_MACRO
++
++#endif /* !defined(DEBUG) */
++
+ /* FIXME(bug 332648): Move this into a public header. */
+ class JSAutoTempValueRooter
+ {
+   public:
+-    JSAutoTempValueRooter(JSContext *cx, size_t len, jsval *vec)
++    JSAutoTempValueRooter(JSContext *cx, size_t len, jsval *vec
++                          JS_GUARD_OBJECT_NOTIFIER_PARAM)
+         : mContext(cx) {
++        JS_GUARD_OBJECT_NOTIFIER_INIT;
+         JS_PUSH_TEMP_ROOT(mContext, len, vec, &mTvr);
+     }
+-    explicit JSAutoTempValueRooter(JSContext *cx, jsval v = JSVAL_NULL)
++    explicit JSAutoTempValueRooter(JSContext *cx, jsval v = JSVAL_NULL
++                                   JS_GUARD_OBJECT_NOTIFIER_PARAM)
+         : mContext(cx) {
++        JS_GUARD_OBJECT_NOTIFIER_INIT;
+         JS_PUSH_SINGLE_TEMP_ROOT(mContext, v, &mTvr);
+     }
+-    JSAutoTempValueRooter(JSContext *cx, JSString *str)
++    JSAutoTempValueRooter(JSContext *cx, JSString *str
++                          JS_GUARD_OBJECT_NOTIFIER_PARAM)
+         : mContext(cx) {
++        JS_GUARD_OBJECT_NOTIFIER_INIT;
+         JS_PUSH_TEMP_ROOT_STRING(mContext, str, &mTvr);
+     }
+-    JSAutoTempValueRooter(JSContext *cx, JSObject *obj)
++    JSAutoTempValueRooter(JSContext *cx, JSObject *obj
++                          JS_GUARD_OBJECT_NOTIFIER_PARAM)
+         : mContext(cx) {
++        JS_GUARD_OBJECT_NOTIFIER_INIT;
+         JS_PUSH_TEMP_ROOT_OBJECT(mContext, obj, &mTvr);
+     }
+ 
+     ~JSAutoTempValueRooter() {
+         JS_POP_TEMP_ROOT(mContext, &mTvr);
+     }
+ 
+     jsval value() { return mTvr.u.value; }
+@@ -1267,16 +1367,17 @@ class JSAutoTempValueRooter
+ 
+   private:
+ #ifndef AIX
+     static void *operator new(size_t);
+     static void operator delete(void *, size_t);
+ #endif
+ 
+     JSTempValueRooter mTvr;
++    JS_DECL_GUARD_OBJECT_NOTIFIER_USER
+ };
+ 
+ class JSAutoTempIdRooter
+ {
+ public:
+     explicit JSAutoTempIdRooter(JSContext *cx, jsid id = INT_TO_JSID(0))
+         : mContext(cx) {
+         JS_PUSH_SINGLE_TEMP_ROOT(mContext, ID_TO_VALUE(id), &mTvr);
+diff --git a/js/src/json.cpp b/js/src/json.cpp
+--- a/js/src/json.cpp
++++ b/js/src/json.cpp
+@@ -92,17 +92,17 @@ JSClass js_JSONClass = {
+ };
+ 
+ JSBool
+ js_json_parse(JSContext *cx, uintN argc, jsval *vp)
+ {
+     JSString *s = NULL;
+     jsval *argv = vp + 2;
+     jsval reviver = JSVAL_NULL;
+-    JSAutoTempValueRooter(cx, 1, &reviver);
++    JSAutoTempValueRooter tvr(cx, 1, &reviver);
+ 
+     if (!JS_ConvertArguments(cx, argc, argv, "S / v", &s, &reviver))
+         return JS_FALSE;
+ 
+     JSONParser *jp = js_BeginJSONParse(cx, vp);
+     JSBool ok = jp != NULL;
+     if (ok) {
+         const jschar *chars;
+@@ -116,18 +116,18 @@ js_json_parse(JSContext *cx, uintN argc,
+ }
+ 
+ JSBool
+ js_json_stringify(JSContext *cx, uintN argc, jsval *vp)
+ {
+     jsval *argv = vp + 2;
+     JSObject *replacer = NULL;
+     jsval space = JSVAL_NULL;
+-    JSAutoTempValueRooter(cx, replacer);
+-    JSAutoTempValueRooter(cx, 1, &space);
++    JSAutoTempValueRooter tvr(cx, replacer);
++    JSAutoTempValueRooter tvr2(cx, 1, &space);
+ 
+     // Must throw an Error if there isn't a first arg
+     if (!JS_ConvertArguments(cx, argc, argv, "v / o v", vp, &replacer, &space))
+         return JS_FALSE;
+ 
+     JSCharBuffer cb(cx);
+ 
+     if (!js_Stringify(cx, vp, replacer, space, cb))
