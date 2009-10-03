@@ -1,0 +1,479 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Eliminate nsStyleAnimation::StoreComputedValue.  (Bug 520396)
+
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -404,40 +404,70 @@ nsStyleAnimation::ComputeValue(nsCSSProp
+   // Extract computed value of our property from the temporary style rule
+   return ExtractComputedValue(aProperty, tmpStyleContext, aComputedValue);
+ }
+ 
+ PRBool
+ nsStyleAnimation::UncomputeValue(nsCSSProperty aProperty,
+                                  nsPresContext* aPresContext,
+                                  const nsStyleCoord& aComputedValue,
++                                 void* aSpecifiedValue)
++{
++  NS_ABORT_IF_FALSE(aPresContext, "null pres context");
++
++  switch (aComputedValue.GetUnit()) {
++    case eStyleUnit_Coord: {
++      NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
++                        "type mismatch");
++      float pxVal = aPresContext->AppUnitsToFloatCSSPixels(
++                                    aComputedValue.GetCoordValue());
++      static_cast<nsCSSValue*>(aSpecifiedValue)->
++        SetFloatValue(pxVal, eCSSUnit_Pixel);
++      break;
++    }
++    case eStyleUnit_Percent:
++      NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
++                        "type mismatch");
++      static_cast<nsCSSValue*>(aSpecifiedValue)->
++        SetPercentValue(aComputedValue.GetPercentValue());
++      break;
++    case eStyleUnit_Color:
++      NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
++                        "type mismatch");
++      static_cast<nsCSSValue*>(aSpecifiedValue)->
++        SetColorValue(aComputedValue.GetColorValue());
++      break;
++    default:
++      return PR_FALSE;
++  }
++  return PR_TRUE;
++}
++
++PRBool
++nsStyleAnimation::UncomputeValue(nsCSSProperty aProperty,
++                                 nsPresContext* aPresContext,
++                                 const nsStyleCoord& aComputedValue,
+                                  nsAString& aSpecifiedValue)
+ {
+   NS_ABORT_IF_FALSE(aPresContext, "null pres context");
+   aSpecifiedValue.Truncate(); // Clear outparam, if it's not already empty
+-
+-  nsCSSValue value;
+-  switch (aComputedValue.GetUnit()) {
+-    case eStyleUnit_Coord: {
+-      float pxVal = aPresContext->AppUnitsToFloatCSSPixels(
+-                                    aComputedValue.GetCoordValue());
+-      value.SetFloatValue(pxVal, eCSSUnit_Pixel);
+-      break;
++  switch (nsCSSProps::kTypeTable[aProperty]) {
++    case eCSSType_Value: {
++      nsCSSValue value;
++      if (!nsStyleAnimation::UncomputeValue(aProperty, aPresContext,
++                                            aComputedValue, &value)) {
++        return PR_FALSE;
++      }
++      return nsCSSDeclaration::AppendCSSValueToString(aProperty, value,
++                                                      aSpecifiedValue);
+     }
+-    case eStyleUnit_Percent:
+-      value.SetPercentValue(aComputedValue.GetPercentValue());
+-      break;
+-    case eStyleUnit_Color:
+-      value.SetColorValue(aComputedValue.GetColorValue());
+-      break;
+-    default:
++    default: {
+       return PR_FALSE;
++    }
+   }
+-  return nsCSSDeclaration::AppendCSSValueToString(aProperty, value,
+-                                                  aSpecifiedValue);
+ }
+ 
+ inline const void*
+ StyleDataAtOffset(const void* aStyleStruct, ptrdiff_t aOffset)
+ {
+   return reinterpret_cast<const char*>(aStyleStruct) + aOffset;
+ }
+ 
+@@ -502,78 +532,8 @@ nsStyleAnimation::ExtractComputedValue(n
+       }
+       return PR_FALSE;
+     }
+     case eStyleAnimType_None:
+       NS_NOTREACHED("shouldn't use on non-animatable properties");
+   }
+   return PR_FALSE;
+ }
+-
+-PRBool
+-nsStyleAnimation::StoreComputedValue(nsCSSProperty aProperty,
+-                                     nsPresContext* aPresContext,
+-                                     void* aStyleStruct,
+-                                     const nsStyleCoord& aComputedValue)
+-{
+-  NS_ABORT_IF_FALSE(0 <= aProperty &&
+-                    aProperty < eCSSProperty_COUNT_no_shorthands,
+-                    "bad property");
+-  ptrdiff_t ssOffset = nsCSSProps::kStyleStructOffsetTable[aProperty];
+-  NS_ABORT_IF_FALSE(0 <= ssOffset, "must be dealing with animatable property");
+-  nsStyleAnimType animType = nsCSSProps::kAnimTypeTable[aProperty];
+-  switch (animType) {
+-    case eStyleAnimType_Coord:
+-      *static_cast<nsStyleCoord*>(StyleDataAtOffset(aStyleStruct, ssOffset)) =
+-        aComputedValue;
+-      return PR_TRUE;
+-    case eStyleAnimType_Sides_Top:
+-    case eStyleAnimType_Sides_Right:
+-    case eStyleAnimType_Sides_Bottom:
+-    case eStyleAnimType_Sides_Left: {
+-      PR_STATIC_ASSERT(0 == NS_SIDE_TOP);
+-      PR_STATIC_ASSERT(eStyleAnimType_Sides_Right - eStyleAnimType_Sides_Top
+-                         == NS_SIDE_RIGHT);
+-      PR_STATIC_ASSERT(eStyleAnimType_Sides_Bottom - eStyleAnimType_Sides_Top
+-                         == NS_SIDE_BOTTOM);
+-      PR_STATIC_ASSERT(eStyleAnimType_Sides_Left - eStyleAnimType_Sides_Top
+-                         == NS_SIDE_LEFT);
+-      static_cast<nsStyleSides*>(StyleDataAtOffset(aStyleStruct, ssOffset))->
+-          Set(animType - eStyleAnimType_Sides_Top, aComputedValue);
+-
+-       nsStyleStructID sid = nsCSSProps::kSIDTable[aProperty];
+-       if (sid == eStyleStruct_Margin) {
+-         static_cast<nsStyleMargin*>(aStyleStruct)->RecalcData();
+-       } else if (sid == eStyleStruct_Padding) {
+-         static_cast<nsStylePadding*>(aStyleStruct)->RecalcData();
+-       }
+-      return PR_TRUE;
+-    }
+-    case eStyleAnimType_nscoord:
+-      *static_cast<nscoord*>(StyleDataAtOffset(aStyleStruct, ssOffset)) =
+-        aComputedValue.GetCoordValue();
+-      if (aProperty == eCSSProperty_font_size) {
+-        nsStyleFont *font = static_cast<nsStyleFont*>(aStyleStruct);
+-        if (!aPresContext->IsChrome()) {
+-          nscoord minimumFontSize =
+-            aPresContext->GetCachedIntPref(kPresContext_MinimumFontSize);
+-          font->mFont.size = NS_MAX(font->mSize, minimumFontSize);
+-        } else {
+-          font->mFont.size = font->mSize;
+-        }
+-      }
+-      return PR_TRUE;
+-    case eStyleAnimType_Color:
+-      *static_cast<nscolor*>(StyleDataAtOffset(aStyleStruct, ssOffset)) =
+-        aComputedValue.GetColorValue();
+-      return PR_TRUE;
+-    case eStyleAnimType_PaintServer: {
+-      nsStyleSVGPaint &paint = *static_cast<nsStyleSVGPaint*>(
+-        StyleDataAtOffset(aStyleStruct, ssOffset));
+-      paint.mType = eStyleSVGPaintType_Color;
+-      paint.mPaint.mColor = aComputedValue.GetColorValue();
+-      return PR_TRUE;
+-    }
+-    case eStyleAnimType_None:
+-      NS_NOTREACHED("shouldn't use on non-animatable properties");
+-  }
+-  return PR_FALSE;
+-}
+diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
+--- a/layout/style/nsStyleAnimation.h
++++ b/layout/style/nsStyleAnimation.h
+@@ -136,53 +136,48 @@ public:
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+   static PRBool ComputeValue(nsCSSProperty aProperty,
+                              nsIContent* aElement,
+                              const nsAString& aSpecifiedValue,
+                              nsStyleCoord& aComputedValue);
+ 
+   /**
+-   * Creates a specified value (nsAString) for the given computed value
++   * Creates a specified value for the given computed value
+    * (nsStyleCoord).
+    *
++   * The first form fills in one of the nsCSSType types into the void*;
++   * for some types this means that the void* is pointing to memory
++   * owned by the nsStyleCoord.  (For all complex types, the
++   * nsStyleCoord owns the necessary objects so that the caller does not
++   * need to do anything to free them.)
++   *
+    * @param aProperty      The property whose value we're uncomputing.
+    * @param aPresContext   The presentation context for the document in
+    *                       which we're working.
+    * @param aComputedValue The computed value to be converted.
+    * @param [out] aSpecifiedValue The resulting specified value.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+   static PRBool UncomputeValue(nsCSSProperty aProperty,
+                                nsPresContext* aPresContext,
+                                const nsStyleCoord& aComputedValue,
++                               void* aSpecifiedValue);
++  static PRBool UncomputeValue(nsCSSProperty aProperty,
++                               nsPresContext* aPresContext,
++                               const nsStyleCoord& aComputedValue,
+                                nsAString& aSpecifiedValue);
+ 
+   /**
+    * Gets the computed value for the given property from the given style
+    * context.
+    *
+    * @param aProperty     The property whose value we're looking up.
+    * @param aStyleContext The style context to check for the computed value.
+    * @param [out] aComputedValue The resulting computed value.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+   static PRBool ExtractComputedValue(nsCSSProperty aProperty,
+                                      nsStyleContext* aStyleContext,
+                                      nsStyleCoord& aComputedValue);
+-
+-  /**
+-   * Sets the computed value for the given property in the given style
+-   * struct.
+-   *
+-   * @param aProperty      The property whose value we're setting.
+-   * @param aPresContext   The pres context associated with aStyleStruct.
+-   * @param aStyleStruct   The style struct in which to set the value.
+-   * @param aComputedValue The computed value.
+-   * @return  PR_TRUE on success, PR_FALSE on failure.
+-   */
+-  static PRBool StoreComputedValue(nsCSSProperty aProperty,
+-                                   nsPresContext* aPresContext,
+-                                   void* aStyleStruct,
+-                                   const nsStyleCoord& aComputedValue);
+ };
+ 
+ #endif
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -47,16 +47,17 @@
+ #include "nsIStyleRule.h"
+ #include "nsRuleWalker.h"
+ #include "nsRuleData.h"
+ #include "nsSMILKeySpline.h"
+ #include "gfxColor.h"
+ #include "nsCSSPseudoElements.h"
+ #include "nsCSSPropertySet.h"
+ #include "nsStyleAnimation.h"
++#include "nsCSSDataBlock.h"
+ 
+ using mozilla::TimeStamp;
+ using mozilla::TimeDuration;
+ 
+ /*****************************************************************************
+  * Per-Element data                                                          *
+  *****************************************************************************/
+ 
+@@ -129,19 +130,16 @@ public:
+ 
+   NS_HIDDEN_(void) CoverValue(nsCSSProperty aProperty,
+                               nsStyleCoord &aStartValue)
+   {
+     CoveredValue v = { aProperty, aStartValue };
+     mCoveredValues.AppendElement(v);
+   }
+ 
+-  NS_HIDDEN_(void)
+-    FillStyleStruct(void* aStyleStruct, nsRuleData* aRuleData) const;
+-
+   struct CoveredValue {
+     nsCSSProperty mProperty;
+     nsStyleCoord mCoveredValue;
+   };
+ 
+ private:
+   nsTArray<CoveredValue> mCoveredValues;
+ };
+@@ -196,58 +194,16 @@ ElementTransitionsPropertyDtor(void     
+                                void           *aData)
+ {
+   ElementTransitions *et = static_cast<ElementTransitions*>(aPropertyValue);
+   delete et;
+ }
+ 
+ NS_IMPL_ISUPPORTS1(ElementTransitionsStyleRule, nsIStyleRule)
+ 
+-static void
+-ElementTransitionsPostResolveCallback(void* aStyleStruct, nsRuleData* aRuleData,
+-                                      nsIStyleRule* aRule)
+-{
+-  ElementTransitionsStyleRule *rule =
+-    static_cast<ElementTransitionsStyleRule*>(aRule);
+-  ElementTransitions *et = rule->ElementData();
+-  for (PRUint32 i = 0, i_end = et->mPropertyTransitions.Length();
+-       i < i_end; ++i)
+-  {
+-    const ElementPropertyTransition &pt = et->mPropertyTransitions[i];
+-    if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+-                             nsCSSProps::kSIDTable[pt.mProperty]))
+-    {
+-      double timePortion =
+-        (rule->RefreshTime() - pt.mStartTime).ToSeconds() /
+-        pt.mDuration.ToSeconds();
+-      if (timePortion < 0.0)
+-        timePortion = 0.0; // use start value during transition-delay
+-      if (timePortion > 1.0)
+-        timePortion = 1.0; // we might be behind on flushing
+-
+-      double valuePortion =
+-        pt.mTimingFunction.GetSplineValue(timePortion);
+-      nsStyleCoord value;
+-#ifdef DEBUG
+-      PRBool ok =
+-#endif
+-        nsStyleAnimation::Interpolate(pt.mStartValue, pt.mEndValue,
+-                                      valuePortion, value);
+-      NS_ABORT_IF_FALSE(ok, "could not interpolate values");
+-#ifdef DEBUG
+-      ok =
+-#endif
+-        nsStyleAnimation::StoreComputedValue(pt.mProperty,
+-                                             aRuleData->mPresContext,
+-                                             aStyleStruct, value);
+-      NS_ABORT_IF_FALSE(ok, "could not store computed value");
+-    }
+-  }
+-}
+-
+ NS_IMETHODIMP
+ ElementTransitionsStyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   nsStyleContext *contextParent = aRuleData->mStyleContext->GetParent();
+   if (contextParent && contextParent->HasPseudoElementData()) {
+     // Don't apply transitions to things inside of pseudo-elements.
+     // FIXME: Add tests for this.
+     return NS_OK;
+@@ -257,25 +213,41 @@ ElementTransitionsStyleRule::MapRuleInfo
+   NS_ENSURE_TRUE(et, NS_OK); // FIXME: Why can this be null?
+   for (PRUint32 i = 0, i_end = et->mPropertyTransitions.Length();
+        i < i_end; ++i)
+   {
+     ElementPropertyTransition &pt = et->mPropertyTransitions[i];
+     if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+                              nsCSSProps::kSIDTable[pt.mProperty]))
+     {
+-      nsPostResolveCallback prc =
+-        { &ElementTransitionsPostResolveCallback, this };
+-      aRuleData->mPostResolveCallbacks.AppendElement(prc);
+-      // This really doesn't matter much, since this ought to be
+-      // the only node with the rule, but it's good practice for
+-      // post-resolve callbacks.
+-      aRuleData->mCanStoreInRuleTree = PR_FALSE;
++      double timePortion =
++        (RefreshTime() - pt.mStartTime).ToSeconds() / pt.mDuration.ToSeconds();
++      if (timePortion < 0.0)
++        timePortion = 0.0; // use start value during transition-delay
++      if (timePortion > 1.0)
++        timePortion = 1.0; // we might be behind on flushing
+ 
+-      return NS_OK;
++      double valuePortion =
++        pt.mTimingFunction.GetSplineValue(timePortion);
++      nsStyleCoord value;
++#ifdef DEBUG
++      PRBool ok =
++#endif
++        nsStyleAnimation::Interpolate(pt.mStartValue, pt.mEndValue,
++                                      valuePortion, value);
++      NS_ABORT_IF_FALSE(ok, "could not interpolate values");
++
++      void *prop =
++        nsCSSExpandedDataBlock::RuleDataPropertyAt(aRuleData, pt.mProperty);
++#ifdef DEBUG
++      ok =
++#endif
++        nsStyleAnimation::UncomputeValue(pt.mProperty, aRuleData->mPresContext,
++                                         value, prop);
++      NS_ABORT_IF_FALSE(ok, "could not store computed value");
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ #ifdef DEBUG
+ NS_IMETHODIMP
+@@ -311,78 +283,47 @@ ElementTransitions::EnsureStyleRuleFor(T
+     mStyleRule = newRule;
+   }
+ 
+   return PR_TRUE;
+ }
+ 
+ NS_IMPL_ISUPPORTS1(CoverTransitionStartStyleRule, nsIStyleRule)
+ 
+-static void
+-CoverTransitionStartPostResolveCallback(void* aStyleStruct,
+-                                        nsRuleData* aRuleData,
+-                                        nsIStyleRule* aRule)
+-{
+-  CoverTransitionStartStyleRule* coverRule =
+-    static_cast<CoverTransitionStartStyleRule*>(aRule);
+-  coverRule->FillStyleStruct(aStyleStruct, aRuleData);
+-}
+-
+ NS_IMETHODIMP
+ CoverTransitionStartStyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   for (PRUint32 i = 0, i_end = mCoveredValues.Length(); i < i_end; ++i) {
+     CoveredValue &cv = mCoveredValues[i];
+     if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+                              nsCSSProps::kSIDTable[cv.mProperty]))
+     {
+-      nsPostResolveCallback prc =
+-        { &CoverTransitionStartPostResolveCallback, this };
+-      aRuleData->mPostResolveCallbacks.AppendElement(prc);
+-      // This really doesn't matter much, since this ought to be
+-      // the only node with the rule, but it's good practice for
+-      // post-resolve callbacks.
+-      aRuleData->mCanStoreInRuleTree = PR_FALSE;
+-
+-      return NS_OK;
++      void *prop =
++        nsCSSExpandedDataBlock::RuleDataPropertyAt(aRuleData, cv.mProperty);
++#ifdef DEBUG
++      PRBool ok =
++#endif
++        nsStyleAnimation::UncomputeValue(cv.mProperty, aRuleData->mPresContext,
++                                         cv.mCoveredValue, prop);
++      NS_ABORT_IF_FALSE(ok, "could not store computed value");
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ #ifdef DEBUG
+ NS_IMETHODIMP
+ CoverTransitionStartStyleRule::List(FILE* out, PRInt32 aIndent) const
+ {
+   // WRITE ME?
+   return NS_OK;
+ }
+ #endif
+ 
+-void
+-CoverTransitionStartStyleRule::FillStyleStruct(void* aStyleStruct,
+-                                               nsRuleData* aRuleData) const
+-{
+-  for (PRUint32 i = 0, i_end = mCoveredValues.Length(); i < i_end; ++i) {
+-    const CoveredValue &cv = mCoveredValues[i];
+-    if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+-                             nsCSSProps::kSIDTable[cv.mProperty]))
+-    {
+-#ifdef DEBUG
+-      PRBool ok =
+-#endif
+-        nsStyleAnimation::StoreComputedValue(cv.mProperty,
+-                                             aRuleData->mPresContext,
+-                                             aStyleStruct, cv.mCoveredValue);
+-      NS_ABORT_IF_FALSE(ok, "could not store computed value");
+-    }
+-  }
+-}
+-
+ /*****************************************************************************
+  * nsTransitionManager                                                       *
+  *****************************************************************************/
+ 
+ nsTransitionManager::nsTransitionManager(nsPresContext *aPresContext)
+   : mPresContext(aPresContext)
+ {
+   PR_INIT_CLIST(&mElementTransitions);
