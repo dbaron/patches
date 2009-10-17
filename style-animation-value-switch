@@ -5,7 +5,458 @@ Switch nsStyleAnimation from using nsStyleCoord to using its own nsStyleAnimatio
 diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
 --- a/layout/style/nsStyleAnimation.cpp
 +++ b/layout/style/nsStyleAnimation.cpp
-@@ -672,8 +672,46 @@ nsStyleAnimation::ExtractComputedValue(n
+@@ -39,17 +39,16 @@
+ 
+ /* Utilities for animation of computed style values */
+ 
+ #include "nsStyleAnimation.h"
+ #include "nsCOMArray.h"
+ #include "nsIStyleRule.h"
+ #include "nsICSSStyleRule.h"
+ #include "nsString.h"
+-#include "nsStyleCoord.h"
+ #include "nsStyleContext.h"
+ #include "nsStyleSet.h"
+ #include "nsComputedDOMStyle.h"
+ #include "nsICSSParser.h"
+ #include "nsICSSLoader.h"
+ #include "nsCSSDataBlock.h"
+ #include "nsCSSDeclaration.h"
+ #include "prlog.h"
+@@ -59,34 +58,34 @@
+ // --------------
+ /*
+  * Given two units, this method returns a common unit that they can both be
+  * converted into, if possible.  This is intended to facilitate
+  * interpolation, distance-computation, and addition between "similar" units.
+  *
+  * The ordering of the arguments should not affect the output of this method.
+  *
+- * If there's no sensible common unit, this method returns eStyleUnit_Null.
++ * If there's no sensible common unit, this method returns eUnit_Null.
+  *
+  * @param   aFirstUnit One unit to resolve.
+  * @param   aFirstUnit The other unit to resolve.
+  * @return  A "common" unit that both source units can be converted into, or
+- *          eStyleUnit_Null if that's not possible.
++ *          eUnit_Null if that's not possible.
+  */
+ static
+-nsStyleUnit
+-GetCommonUnit(nsStyleUnit aFirstUnit,
+-              nsStyleUnit aSecondUnit)
++nsStyleAnimation::Unit
++GetCommonUnit(nsStyleAnimation::Unit aFirstUnit,
++              nsStyleAnimation::Unit aSecondUnit)
+ {
+   // XXXdholbert Naive implementation for now: simply require that the input
+   // units match.
+   if (aFirstUnit != aSecondUnit) {
+     // NOTE: Some unit-pairings will need special handling,
+     // e.g. percent vs coord (bug 520234)
+-    return eStyleUnit_Null;
++    return eUnit_Null;
+   }
+   return aFirstUnit;
+ }
+ 
+ // CLASS METHODS
+ // -------------
+ 
+ #define MAX_PACKED_COLOR_COMPONENT 255
+@@ -94,45 +93,44 @@ GetCommonUnit(nsStyleUnit aFirstUnit,
+ inline PRUint8 ClampColor(PRUint32 aColor)
+ {
+   if (aColor >= MAX_PACKED_COLOR_COMPONENT)
+     return MAX_PACKED_COLOR_COMPONENT;
+   return aColor;
+ }
+ 
+ PRBool
+-nsStyleAnimation::Add(nsStyleCoord& aDest, const nsStyleCoord& aValueToAdd,
++nsStyleAnimation::Add(Value& aDest, const Value& aValueToAdd,
+                       PRUint32 aCount)
+ {
+-  nsStyleUnit commonUnit = GetCommonUnit(aDest.GetUnit(),
+-                                         aValueToAdd.GetUnit());
++  Unit commonUnit = GetCommonUnit(aDest.GetUnit(), aValueToAdd.GetUnit());
+   PRBool success = PR_TRUE;
+   switch (commonUnit) {
+-    case eStyleUnit_Coord: {
++    case eUnit_Coord: {
+       nscoord destCoord = aDest.GetCoordValue();
+       nscoord valueToAddCoord = aValueToAdd.GetCoordValue();
+       destCoord += aCount * valueToAddCoord;
+       aDest.SetCoordValue(destCoord);
+       break;
+     }
+-    case eStyleUnit_Percent: {
++    case eUnit_Percent: {
+       float destPct = aDest.GetPercentValue();
+       float valueToAddPct = aValueToAdd.GetPercentValue();
+       destPct += aCount * valueToAddPct;
+       aDest.SetPercentValue(destPct);
+       break;
+     }
+-    case eStyleUnit_Factor: {
++    case eUnit_Float: {
+       float destFactor = aDest.GetFactorValue();
+       float valueToAddFactor = aValueToAdd.GetFactorValue();
+       destFactor += aCount * valueToAddFactor;
+       aDest.SetFactorValue(destFactor);
+       break;
+     }
+-    case eStyleUnit_Color: {
++    case eUnit_Color: {
+       // Since nscolor doesn't allow out-of-sRGB values, by-animations
+       // of colors don't make much sense in our implementation.
+       // FIXME (bug 515919): Animation of colors should really use
+       // floating point colors (and when it does, ClampColor and the
+       // clamping of aCount should go away).
+       // Also, given RGBA colors, it's not clear whether we want
+       // premultiplication.  Probably we don't, given that's hard to
+       // premultiply aValueToAdd since it's a difference rather than a
+@@ -151,56 +149,55 @@ nsStyleAnimation::Add(nsStyleCoord& aDes
+         ClampColor(NS_GET_G(destColor) + aCount * NS_GET_G(colorToAdd));
+       PRUint8 resultB =
+         ClampColor(NS_GET_B(destColor) + aCount * NS_GET_B(colorToAdd));
+       PRUint8 resultA =
+         ClampColor(NS_GET_A(destColor) + aCount * NS_GET_A(colorToAdd));
+       aDest.SetColorValue(NS_RGBA(resultR, resultG, resultB, resultA));
+       break;
+     }
+-    case eStyleUnit_Null:
++    case eUnit_Null:
+       success = PR_FALSE;
+       break;
+     default:
+-      NS_NOTREACHED("Can't add nsStyleCoords using the given common unit");
++      NS_NOTREACHED("Can't add Values using the given common unit");
+       success = PR_FALSE;
+       break;
+   }
+   return success;
+ }
+ 
+ PRBool
+-nsStyleAnimation::ComputeDistance(const nsStyleCoord& aStartValue,
+-                                  const nsStyleCoord& aEndValue,
++nsStyleAnimation::ComputeDistance(const Value& aStartValue,
++                                  const Value& aEndValue,
+                                   double& aDistance)
+ {
+-  nsStyleUnit commonUnit = GetCommonUnit(aStartValue.GetUnit(),
+-                                         aEndValue.GetUnit());
++  Unit commonUnit = GetCommonUnit(aStartValue.GetUnit(), aEndValue.GetUnit());
+ 
+   PRBool success = PR_TRUE;
+   switch (commonUnit) {
+-    case eStyleUnit_Coord: {
++    case eUnit_Coord: {
+       nscoord startCoord = aStartValue.GetCoordValue();
+       nscoord endCoord = aEndValue.GetCoordValue();
+       aDistance = fabs(double(endCoord - startCoord));
+       break;
+     }
+-    case eStyleUnit_Percent: {
++    case eUnit_Percent: {
+       float startPct = aStartValue.GetPercentValue();
+       float endPct = aEndValue.GetPercentValue();
+       aDistance = fabs(double(endPct - startPct));
+       break;
+     }
+-    case eStyleUnit_Factor: {
++    case eUnit_Float: {
+       float startFactor = aStartValue.GetFactorValue();
+       float endFactor = aEndValue.GetFactorValue();
+       aDistance = fabs(double(endFactor - startFactor));
+       break;
+     }
+-    case eStyleUnit_Color: {
++    case eUnit_Color: {
+       // http://www.w3.org/TR/smil-animation/#animateColorElement says
+       // that we should use Euclidean RGB cube distance.  However, we
+       // have to extend that to RGBA.  For now, we'll just use the
+       // Euclidean distance in the (part of the) 4-cube of premultiplied
+       // colors.
+       // FIXME (spec): The CSS transitions spec doesn't say whether
+       // colors are premultiplied, but things work better when they are,
+       // so use premultiplication.  Spec issue is still open per
+@@ -227,67 +224,66 @@ nsStyleAnimation::ComputeDistance(const 
+       double diffA = startA - endA;
+       double diffR = startR - endR;
+       double diffG = startG - endG;
+       double diffB = startB - endB;
+       aDistance = sqrt(diffA * diffA + diffR * diffR +
+                        diffG * diffG + diffB * diffB);
+       break;
+     }
+-    case eStyleUnit_Null:
++    case eUnit_Null:
+       success = PR_FALSE;
+       break;
+     default:
+       NS_NOTREACHED("Can't compute distance using the given common unit");
+       success = PR_FALSE;
+       break;
+   }
+   return success;
+ }
+ 
+ PRBool
+-nsStyleAnimation::Interpolate(const nsStyleCoord& aStartValue,
+-                              const nsStyleCoord& aEndValue,
++nsStyleAnimation::Interpolate(const Value& aStartValue,
++                              const Value& aEndValue,
+                               double aPortion,
+-                              nsStyleCoord& aResultValue)
++                              Value& aResultValue)
+ {
+   NS_ABORT_IF_FALSE(aPortion >= 0.0 && aPortion <= 1.0,
+                     "aPortion out of bounds");
+-  nsStyleUnit commonUnit = GetCommonUnit(aStartValue.GetUnit(),
+-                                         aEndValue.GetUnit());
++  Unit commonUnit = GetCommonUnit(aStartValue.GetUnit(), aEndValue.GetUnit());
+   // Maybe need a followup method to convert the inputs into the common
+   // unit-type, if they don't already match it. (Or would it make sense to do
+   // that in GetCommonUnit? in which case maybe ConvertToCommonUnit would be
+   // better.)
+ 
+   PRBool success = PR_TRUE;
+   switch (commonUnit) {
+-    case eStyleUnit_Coord: {
++    case eUnit_Coord: {
+       nscoord startCoord = aStartValue.GetCoordValue();
+       nscoord endCoord = aEndValue.GetCoordValue();
+       nscoord resultCoord = startCoord +
+         NSToCoordRound(aPortion * (endCoord - startCoord));
+       aResultValue.SetCoordValue(resultCoord);
+       break;
+     }
+-    case eStyleUnit_Percent: {
++    case eUnit_Percent: {
+       float startPct = aStartValue.GetPercentValue();
+       float endPct = aEndValue.GetPercentValue();
+       float resultPct = startPct + aPortion * (endPct - startPct);
+       aResultValue.SetPercentValue(resultPct);
+       break;
+     }
+-    case eStyleUnit_Factor: {
++    case eUnit_Float: {
+       float startFactor = aStartValue.GetFactorValue();
+       float endFactor = aEndValue.GetFactorValue();
+       float resultFactor = startFactor + aPortion * (endFactor - startFactor);
+       aResultValue.SetFactorValue(resultFactor);
+       break;
+     }
+-    case eStyleUnit_Color: {
++    case eUnit_Color: {
+       double inv = 1.0 - aPortion;
+       nscolor startColor = aStartValue.GetColorValue();
+       nscolor endColor = aEndValue.GetColorValue();
+       // FIXME (spec): The CSS transitions spec doesn't say whether
+       // colors are premultiplied, but things work better when they are,
+       // so use premultiplication.  Spec issue is still open per
+       // http://lists.w3.org/Archives/Public/www-style/2009Jul/0050.html
+ 
+@@ -311,17 +307,17 @@ nsStyleAnimation::Interpolate(const nsSt
+         PRUint8 resR = NSToIntRound((startR * inv + endR * aPortion) * factor);
+         PRUint8 resG = NSToIntRound((startG * inv + endG * aPortion) * factor);
+         PRUint8 resB = NSToIntRound((startB * inv + endB * aPortion) * factor);
+         resultColor = NS_RGBA(resR, resG, resB, resA);
+       }
+       aResultValue.SetColorValue(resultColor);
+       break;
+     }
+-    case eStyleUnit_Null:
++    case eUnit_Null:
+       success = PR_FALSE;
+       break;
+     default:
+       NS_NOTREACHED("Can't interpolate using the given common unit");
+       success = PR_FALSE;
+       break;
+   }
+   return success;
+@@ -379,17 +375,17 @@ LookupStyleContext(nsIContent* aElement)
+   }
+   return nsComputedDOMStyle::GetStyleContextForContent(aElement, nsnull, shell);
+ }
+ 
+ PRBool
+ nsStyleAnimation::ComputeValue(nsCSSProperty aProperty,
+                                nsIContent* aTargetElement,
+                                const nsAString& aSpecifiedValue,
+-                               nsStyleCoord& aComputedValue)
++                               Value& aComputedValue)
+ {
+   NS_ABORT_IF_FALSE(aTargetElement, "null target element");
+   NS_ABORT_IF_FALSE(aTargetElement->GetCurrentDoc(),
+                     "we should only be able to actively animate nodes that "
+                     "are in a document");
+ 
+   // Look up style context for our target element
+   nsRefPtr<nsStyleContext> styleContext = LookupStyleContext(aTargetElement);
+@@ -415,56 +411,56 @@ nsStyleAnimation::ComputeValue(nsCSSProp
+ 
+   // Extract computed value of our property from the temporary style rule
+   return ExtractComputedValue(aProperty, tmpStyleContext, aComputedValue);
+ }
+ 
+ PRBool
+ nsStyleAnimation::UncomputeValue(nsCSSProperty aProperty,
+                                  nsPresContext* aPresContext,
+-                                 const nsStyleCoord& aComputedValue,
++                                 const Value& aComputedValue,
+                                  void* aSpecifiedValue)
+ {
+   NS_ABORT_IF_FALSE(aPresContext, "null pres context");
+ 
+   switch (aComputedValue.GetUnit()) {
+-    case eStyleUnit_None:
++    case eUnit_None:
+       if (nsCSSProps::kAnimTypeTable[aProperty] == eStyleAnimType_PaintServer) {
+         NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                             eCSSType_ValuePair, "type mismatch");
+         static_cast<nsCSSValuePair*>(aSpecifiedValue)->
+           SetBothValuesTo(nsCSSValue(eCSSUnit_None));
+       } else {
+         NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
+                           "type mismatch");
+         static_cast<nsCSSValue*>(aSpecifiedValue)->SetNoneValue();
+       }
+       break;
+-    case eStyleUnit_Coord: {
++    case eUnit_Coord: {
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
+                         "type mismatch");
+       float pxVal = aPresContext->AppUnitsToFloatCSSPixels(
+                                     aComputedValue.GetCoordValue());
+       static_cast<nsCSSValue*>(aSpecifiedValue)->
+         SetFloatValue(pxVal, eCSSUnit_Pixel);
+       break;
+     }
+-    case eStyleUnit_Percent:
++    case eUnit_Percent:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
+                         "type mismatch");
+       static_cast<nsCSSValue*>(aSpecifiedValue)->
+         SetPercentValue(aComputedValue.GetPercentValue());
+       break;
+-    case eStyleUnit_Factor:
++    case eUnit_Float:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
+                         "type mismatch");
+       static_cast<nsCSSValue*>(aSpecifiedValue)->
+         SetFloatValue(aComputedValue.GetFactorValue(), eCSSUnit_Number);
+       break;
+-    case eStyleUnit_Color:
++    case eUnit_Color:
+       // colors can be alone, or part of a paint server
+       if (nsCSSProps::kAnimTypeTable[aProperty] == eStyleAnimType_PaintServer) {
+         NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                             eCSSType_ValuePair, "type mismatch");
+         nsCSSValue val;
+         val.SetColorValue(aComputedValue.GetColorValue());
+         static_cast<nsCSSValuePair*>(aSpecifiedValue)->
+           SetBothValuesTo(val);
+@@ -479,17 +475,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+       return PR_FALSE;
+   }
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ nsStyleAnimation::UncomputeValue(nsCSSProperty aProperty,
+                                  nsPresContext* aPresContext,
+-                                 const nsStyleCoord& aComputedValue,
++                                 const Value& aComputedValue,
+                                  nsAString& aSpecifiedValue)
+ {
+   NS_ABORT_IF_FALSE(aPresContext, "null pres context");
+   aSpecifiedValue.Truncate(); // Clear outparam, if it's not already empty
+ 
+   nsCSSValuePair vp;
+   nsCSSRect rect;
+   void *ptr = nsnull;
+@@ -532,33 +528,33 @@ StyleDataAtOffset(const void* aStyleStru
+ inline void*
+ StyleDataAtOffset(void* aStyleStruct, ptrdiff_t aOffset)
+ {
+   return reinterpret_cast<char*>(aStyleStruct) + aOffset;
+ }
+ 
+ static void
+ ExtractBorderColor(nsStyleContext* aStyleContext, const void* aStyleBorder,
+-                   PRUint8 aSide, nsStyleCoord& aComputedValue)
++                   PRUint8 aSide, Value& aComputedValue)
+ {
+   nscolor color; 
+   PRBool foreground;
+   static_cast<const nsStyleBorder*>(aStyleBorder)->
+     GetBorderColor(aSide, color, foreground);
+   if (foreground) {
+     // FIXME: should add test for this
+     color = aStyleContext->GetStyleColor()->mColor;
+   }
+   aComputedValue.SetColorValue(color);
+ }
+ 
+ PRBool
+ nsStyleAnimation::ExtractComputedValue(nsCSSProperty aProperty,
+                                        nsStyleContext* aStyleContext,
+-                                       nsStyleCoord& aComputedValue)
++                                       Value& aComputedValue)
+ {
+   NS_ABORT_IF_FALSE(0 <= aProperty &&
+                     aProperty < eCSSProperty_COUNT_no_shorthands,
+                     "bad property");
+   const void* styleStruct =
+     aStyleContext->GetStyleData(nsCSSProps::kSIDTable[aProperty]);
+   ptrdiff_t ssOffset = nsCSSProps::kStyleStructOffsetTable[aProperty];
+   nsStyleAnimType animType = nsCSSProps::kAnimTypeTable[aProperty];
+@@ -615,18 +611,39 @@ nsStyleAnimation::ExtractComputedValue(n
+         }
+ 
+         default:
+           NS_ABORT_IF_FALSE(PR_FALSE, "missing property implementation");
+           return PR_FALSE;
+       };
+       return PR_TRUE;
+     case eStyleAnimType_Coord:
+-      aComputedValue = *static_cast<const nsStyleCoord*>(
++      const nsStyleCoord &coord = *static_cast<const nsStyleCoord*>(
+         StyleDataAtOffset(styleStruct, ssOffset));
++      switch (coord.GetUnit()) {
++        case eStyleUnit_Null:
++        case eStyleUnit_Normal:
++        case eStyleUnit_Auto:
++          return PR_FALSE;
++        case eStyleUnit_None:
++          aComputedValue.SetNoneValue();
++          break;
++        case eStyleUnit_Percent:
++          aComputedValue.SetPercentValue(coord.GetPercentValue());
++          break;
++        case eStyleUnit_Factor:
++          aComputedValue.SetFloatValue(coord.GetFloatValue());
++          break;
++        case eStyleUnit_Coord:
++          aComputedValue.SetCoordValue(coord.GetCoordValue());
++          break;
++        case eStyleUnit_Integer:
++        case eStyleUnit_Enumerated:
++          return PR_FALSE;
++      }
+       return PR_TRUE;
+     case eStyleAnimType_Sides_Top:
+     case eStyleAnimType_Sides_Right:
+     case eStyleAnimType_Sides_Bottom:
+     case eStyleAnimType_Sides_Left:
+       PR_STATIC_ASSERT(0 == NS_SIDE_TOP);
+       PR_STATIC_ASSERT(eStyleAnimType_Sides_Right - eStyleAnimType_Sides_Top
+                          == NS_SIDE_RIGHT);
+@@ -672,8 +689,46 @@ nsStyleAnimation::ExtractComputedValue(n
        }
        return PR_FALSE;
      }
@@ -55,7 +506,146 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
 --- a/layout/style/nsStyleAnimation.h
 +++ b/layout/style/nsStyleAnimation.h
-@@ -173,11 +173,64 @@ public:
+@@ -44,57 +44,57 @@
+ 
+ #include "prtypes.h"
+ #include "nsAString.h"
+ #include "nsCSSProperty.h"
+ 
+ class nsCSSDeclaration;
+ class nsIContent;
+ class nsPresContext;
+-class nsStyleCoord;
+ class nsStyleContext;
+ 
+ /**
+  * Utility class to handle animated style values
+  */
+ class nsStyleAnimation {
+ public:
++  class Value;
+ 
+   // Mathematical methods
+   // --------------------
+   /**
+    * Adds |aCount| copies of |aValueToAdd| to |aDest|.  The result of this
+    * addition is stored in aDest.
+    *
+    * Note that if |aCount| is 0, then |aDest| will be unchanged.  Also, if
+    * this method fails, then |aDest| will be unchanged.
+    *
+    * @param aDest       The value to add to.
+    * @param aValueToAdd The value to add.
+    * @param aCount      The number of times to add aValueToAdd.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+-  static PRBool Add(nsStyleCoord& aDest, const nsStyleCoord& aValueToAdd,
++  static PRBool Add(Value& aDest, const Value& aValueToAdd,
+                     PRUint32 aCount);
+ 
+   /**
+    * Calculates a measure of 'distance' between two values.
+    *
+    * If this method succeeds, the returned distance value is guaranteed to be
+    * non-negative.
+    *
+    * @param aStartValue The start of the interval for which the distance
+    *                    should be calculated.
+    * @param aEndValue   The end of the interval for which the distance
+    *                    should be calculated.
+    * @param aDistance   The result of the calculation.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+-  static PRBool ComputeDistance(const nsStyleCoord& aStartValue,
+-                                const nsStyleCoord& aEndValue,
++  static PRBool ComputeDistance(const Value& aStartValue,
++                                const Value& aEndValue,
+                                 double& aDistance);
+ 
+   /**
+    * Calculates an interpolated value that is the specified |aPortion| between
+    * the two given values.
+    *
+    * This really just does the following calculation:
+    *   aResultValue = (1.0 - aPortion) * aStartValue + aPortion * aEndValue
+@@ -103,25 +103,25 @@ public:
+    *                    interpolation.
+    * @param aEndValue   The value defining the end of the interval of
+    *                    interpolation.
+    * @param aPortion    A number in the range [0.0, 1.0] defining the
+    *                    distance of the interpolated value in the interval.
+    * @param [out] aResultValue The resulting interpolated value.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+-  static PRBool Interpolate(const nsStyleCoord& aStartValue,
+-                            const nsStyleCoord& aEndValue,
++  static PRBool Interpolate(const Value& aStartValue,
++                            const Value& aEndValue,
+                             double aPortion,
+-                            nsStyleCoord& aResultValue);
++                            Value& aResultValue);
+ 
+   // Type-conversion methods
+   // -----------------------
+   /**
+-   * Creates a computed value (nsStyleCoord) for the given specified value
++   * Creates a computed value for the given specified value
+    * (property ID + string).  A style context is needed in case the
+    * specified value depends on inherited style or on the values of other
+    * properties.
+    * 
+    * NOTE: This method uses GetPrimaryShell() to access the style system,
+    * so it should only be used for style that applies to all presentations,
+    * rather than for style that only applies to a particular presentation.
+    * XXX Once we get rid of multiple presentations, we can remove the above
+@@ -133,51 +133,103 @@ public:
+    * @param aSpecifiedValue The specified value, from which we'll build our
+    *                        computed value.
+    * @param [out] aComputedValue The resulting computed value.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+   static PRBool ComputeValue(nsCSSProperty aProperty,
+                              nsIContent* aElement,
+                              const nsAString& aSpecifiedValue,
+-                             nsStyleCoord& aComputedValue);
++                             Value& aComputedValue);
+ 
+   /**
+-   * Creates a specified value for the given computed value
+-   * (nsStyleCoord).
++   * Creates a specified value for the given computed value.
+    *
+    * The first form fills in one of the nsCSSType types into the void*;
+    * for some types this means that the void* is pointing to memory
+-   * owned by the nsStyleCoord.  (For all complex types, the
+-   * nsStyleCoord owns the necessary objects so that the caller does not
+-   * need to do anything to free them.)
++   * owned by the nsStyleAnimation::Value.  (For all complex types, the
++   * nsStyleAnimation::Value owns the necessary objects so that the
++   * caller does not need to do anything to free them.)
+    *
+    * @param aProperty      The property whose value we're uncomputing.
+    * @param aPresContext   The presentation context for the document in
+    *                       which we're working.
+    * @param aComputedValue The computed value to be converted.
+    * @param [out] aSpecifiedValue The resulting specified value.
+    * @return PR_TRUE on success, PR_FALSE on failure.
+    */
+   static PRBool UncomputeValue(nsCSSProperty aProperty,
+                                nsPresContext* aPresContext,
+-                               const nsStyleCoord& aComputedValue,
++                               const Value& aComputedValue,
+                                void* aSpecifiedValue);
+   static PRBool UncomputeValue(nsCSSProperty aProperty,
+                                nsPresContext* aPresContext,
+-                               const nsStyleCoord& aComputedValue,
++                               const Value& aComputedValue,
+                                nsAString& aSpecifiedValue);
+ 
+   /**
+    * Gets the computed value for the given property from the given style
+    * context.
+    *
     * @param aProperty     The property whose value we're looking up.
     * @param aStyleContext The style context to check for the computed value.
     * @param [out] aComputedValue The resulting computed value.
@@ -63,7 +653,8 @@ diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
     */
    static PRBool ExtractComputedValue(nsCSSProperty aProperty,
                                       nsStyleContext* aStyleContext,
-                                      nsStyleCoord& aComputedValue);
+-                                     nsStyleCoord& aComputedValue);
++                                     Value& aComputedValue);
 +
 +  /**
 +   * The types and values for the values that we extract and animate.
@@ -120,3 +711,169 @@ diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
  };
  
  #endif
+diff --git a/layout/style/nsStyleCoord.cpp b/layout/style/nsStyleCoord.cpp
+--- a/layout/style/nsStyleCoord.cpp
++++ b/layout/style/nsStyleCoord.cpp
+@@ -116,22 +116,16 @@ void nsStyleCoord::Reset(void)
+ }
+ 
+ void nsStyleCoord::SetCoordValue(nscoord aValue)
+ {
+   mUnit = eStyleUnit_Coord;
+   mValue.mInt = aValue;
+ }
+ 
+-void nsStyleCoord::SetColorValue(nscolor aValue)
+-{
+-  mUnit = eStyleUnit_Color;
+-  mValue.mColor = aValue;
+-}
+-
+ void nsStyleCoord::SetIntValue(PRInt32 aValue, nsStyleUnit aUnit)
+ {
+   NS_ASSERTION((aUnit == eStyleUnit_Enumerated) ||
+                (aUnit == eStyleUnit_Integer), "not an int value");
+   if ((aUnit == eStyleUnit_Enumerated) ||
+       (aUnit == eStyleUnit_Integer)) {
+     mUnit = aUnit;
+     mValue.mInt = aValue;
+diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
+--- a/layout/style/nsStyleCoord.h
++++ b/layout/style/nsStyleCoord.h
+@@ -37,38 +37,35 @@
+ 
+ /* representation of length values in computed style data */
+ 
+ #ifndef nsStyleCoord_h___
+ #define nsStyleCoord_h___
+ 
+ #include "nscore.h"
+ #include "nsCoord.h"
+-#include "nsColor.h"
+ #include "nsCRT.h"
+ #include "nsStyleConsts.h"
+ class nsString;
+ 
+ enum nsStyleUnit {
+   eStyleUnit_Null         = 0,      // (no value) value is not specified
+   eStyleUnit_Normal       = 1,      // (no value)
+   eStyleUnit_Auto         = 2,      // (no value)
+   eStyleUnit_None         = 3,      // (no value)
+   eStyleUnit_Percent      = 10,     // (float) 1.0 == 100%
+   eStyleUnit_Factor       = 11,     // (float) a multiplier
+   eStyleUnit_Coord        = 20,     // (nscoord) value is twips
+   eStyleUnit_Integer      = 30,     // (int) value is simple integer
+-  eStyleUnit_Enumerated   = 32,     // (int) value has enumerated meaning
+-  eStyleUnit_Color        = 40      // (nscolor)
++  eStyleUnit_Enumerated   = 32      // (int) value has enumerated meaning
+ };
+ 
+ typedef union {
+   PRInt32     mInt;   // nscoord is a PRInt32 for now
+   float       mFloat;
+-  nscolor     mColor;
+ } nsStyleUnion;
+ 
+ /**
+  * Class that hold a single size specification used by the style
+  * system.  The size specification consists of two parts -- a number
+  * and a unit.  The number is an integer, a floating point value, an
+  * nscoord, or undefined, and the unit is an nsStyleUnit.  Checking
+  * the unit is a must before asking for the value in any particular
+@@ -76,18 +73,16 @@ typedef union {
+  */
+ class nsStyleCoord {
+ public:
+   nsStyleCoord(nsStyleUnit aUnit = eStyleUnit_Null);
+   enum CoordConstructorType { CoordConstructor };
+   inline nsStyleCoord(nscoord aValue, CoordConstructorType);
+   nsStyleCoord(PRInt32 aValue, nsStyleUnit aUnit);
+   nsStyleCoord(float aValue, nsStyleUnit aUnit);
+-  enum ColorConstructorType { ColorConstructor };
+-  inline nsStyleCoord(nscolor aValue, ColorConstructorType);
+   inline nsStyleCoord(const nsStyleCoord& aCopy);
+   inline nsStyleCoord(const nsStyleUnion& aValue, nsStyleUnit aUnit);
+ 
+   nsStyleCoord&  operator=(const nsStyleCoord& aCopy);
+   PRBool         operator==(const nsStyleCoord& aOther) const;
+   PRBool         operator!=(const nsStyleCoord& aOther) const;
+ 
+   nsStyleUnit GetUnit(void) const {
+@@ -100,28 +95,26 @@ public:
+   PRBool IsNull() const {
+     return mUnit == eStyleUnit_Null;
+   }
+ 
+   nscoord     GetCoordValue(void) const;
+   PRInt32     GetIntValue(void) const;
+   float       GetPercentValue(void) const;
+   float       GetFactorValue(void) const;
+-  nscolor     GetColorValue() const;
+   void        GetUnionValue(nsStyleUnion& aValue) const;
+ 
+   void  Reset(void);  // sets to null
+   void  SetCoordValue(nscoord aValue);
+   void  SetIntValue(PRInt32 aValue, nsStyleUnit aUnit);
+   void  SetPercentValue(float aValue);
+   void  SetFactorValue(float aValue);
+   void  SetNormalValue(void);
+   void  SetAutoValue(void);
+   void  SetNoneValue(void);
+-  void  SetColorValue(nscolor aValue);
+ 
+ public:
+   nsStyleUnit   mUnit;
+   nsStyleUnion  mValue;
+ };
+ 
+ 
+ /**
+@@ -197,22 +190,16 @@ protected:
+ // nsStyleCoord inlines
+ //
+ inline nsStyleCoord::nsStyleCoord(nscoord aValue, CoordConstructorType)
+   : mUnit(eStyleUnit_Coord)
+ {
+   mValue.mInt = aValue;
+ }
+ 
+-inline nsStyleCoord::nsStyleCoord(nscolor aValue, ColorConstructorType)
+-  : mUnit(eStyleUnit_Color)
+-{
+-  mValue.mColor = aValue;
+-}
+-
+ inline nsStyleCoord::nsStyleCoord(const nsStyleCoord& aCopy)
+   : mUnit(aCopy.mUnit)
+ {
+   if ((eStyleUnit_Percent <= mUnit) && (mUnit < eStyleUnit_Coord)) {
+     mValue.mFloat = aCopy.mValue.mFloat;
+   }
+   else {
+     mValue.mInt = aCopy.mValue.mInt;
+@@ -267,25 +254,16 @@ inline float nsStyleCoord::GetFactorValu
+ {
+   NS_ASSERTION(mUnit == eStyleUnit_Factor, "not a factor value");
+   if (mUnit == eStyleUnit_Factor) {
+     return mValue.mFloat;
+   }
+   return 0.0f;
+ }
+ 
+-inline nscolor nsStyleCoord::GetColorValue() const
+-{
+-  NS_ASSERTION((mUnit == eStyleUnit_Color), "not a color value");
+-  if (mUnit == eStyleUnit_Color) {
+-    return mValue.mColor;
+-  }
+-  return NS_RGBA(0, 0, 0, 0);
+-}
+-
+ inline void nsStyleCoord::GetUnionValue(nsStyleUnion& aValue) const
+ {
+   memcpy(&aValue, &mValue, sizeof(nsStyleUnion));
+ }
+ 
+ // -------------------------
+ // nsStyleSides inlines
+ //
