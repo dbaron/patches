@@ -112,7 +112,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        success = PR_FALSE;
        break;
    }
-@@ -224,16 +229,20 @@ nsStyleAnimation::ComputeDistance(const 
+@@ -224,27 +229,97 @@ nsStyleAnimation::ComputeDistance(const 
        double diffA = startA - endA;
        double diffR = startR - endR;
        double diffG = startG - endG;
@@ -133,7 +133,84 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        success = PR_FALSE;
        break;
    }
-@@ -307,16 +316,127 @@ nsStyleAnimation::Interpolate(const Valu
+   return success;
+ }
+ 
++static PRBool
++InterpolateShadowItem(const nsCSSValue &aStartValue,
++                      const nsCSSValue &aEndValue,
++                      double aPortion,
++                      nsCSSValueList **&aResultTail)
++{
++  // X, Y, Radius, Spread, Color, Inset
++  NS_ABORT_IF_FALSE(aStartValue.GetUnit() == eCSSUnit_Array,
++                    "wrong unit");
++  NS_ABORT_IF_FALSE(aEndValue.GetUnit() == eCSSUnit_Array,
++                    "wrong unit");
++  nsCSSValue::Array *startArray = aStartValue.GetArrayValue();
++  nsCSSValue::Array *endArray = aEndValue.GetArrayValue();
++  nsRefPtr<nsCSSValue::Array> resultArray = nsCSSValue::Array::Create(6);
++  if (!resultArray) {
++    return PR_FALSE;
++  }
++
++  for (PRUint32 i = 0; i < 4; ++i) {
++    NS_ABORT_IF_FALSE(startArray->Item(i).GetUnit() == eCSSUnit_Pixel,
++                      "unexpected unit");
++    NS_ABORT_IF_FALSE(endArray->Item(i).GetUnit() == eCSSUnit_Pixel,
++                      "unexpected unit");
++    double startPixel = startArray->Item(i).GetFloatValue();
++    double endPixel = endArray->Item(i).GetFloatValue();
++    resultArray->Item(i).SetFloatValue(
++      startPixel + aPortion * (endPixel - startPixel), eCSSUnit_Pixel);
++  }
++
++  const nsCSSValue& startColor = startArray->Item(4);
++  const nsCSSValue& endColor = endArray->Item(4);
++  const nsCSSValue& startInset = startArray->Item(5);
++  const nsCSSValue& endInset = endArray->Item(5);
++  if (startColor.GetUnit() != endColor.GetUnit() ||
++      startInset.GetUnit() != endInset.GetUnit()) {
++    // We don't know how to animate between color and no-color, or
++    // between inset and not-inset.
++    return PR_FALSE;
++  }
++
++  nsStyleAnimation::Value startColorValue
++    (startColor.GetColorValue(), nsStyleAnimation::Value::ColorConstructor);
++  nsStyleAnimation::Value endColorValue
++    (endColor.GetColorValue(), nsStyleAnimation::Value::ColorConstructor);
++  nsStyleAnimation::Value resultColorValue;
++#ifdef DEBUG
++  PRBool ok =
++#endif
++    nsStyleAnimation::Interpolate(startColorValue, endColorValue,
++                                  aPortion, resultColorValue);
++  NS_ABORT_IF_FALSE(ok, "should not fail");
++  resultArray->Item(4).SetColorValue(resultColorValue.GetColorValue());
++
++  NS_ABORT_IF_FALSE(startInset == endInset, "should match");
++  resultArray->Item(5) = startInset;
++
++  nsCSSValueList *resultItem = new nsCSSValueList;
++  if (!resultItem) {
++    return PR_FALSE;
++  }
++  resultItem->mValue.SetArrayValue(resultArray, eCSSUnit_Array);
++  *aResultTail = resultItem;
++  aResultTail = &resultItem->mNext;
++  return PR_TRUE;
++}
++
+ PRBool
+ nsStyleAnimation::Interpolate(const Value& aStartValue,
+                               const Value& aEndValue,
+                               double aPortion,
+                               Value& aResultValue)
+ {
+   NS_ABORT_IF_FALSE(aPortion >= 0.0 && aPortion <= 1.0,
+                     "aPortion out of bounds");
+@@ -307,16 +382,68 @@ nsStyleAnimation::Interpolate(const Valu
          PRUint8 resR = NSToIntRound((startR * inv + endR * aPortion) * factor);
          PRUint8 resG = NSToIntRound((startG * inv + endG * aPortion) * factor);
          PRUint8 resB = NSToIntRound((startB * inv + endB * aPortion) * factor);
@@ -147,76 +224,17 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +      // http://dev.w3.org/csswg/css3-transitions/#animation-of-property-types-
 +      // and the third item in the summary of:
 +      // http://lists.w3.org/Archives/Public/www-style/2009Jul/0050.html
-+      double inv = 1.0 - aPortion;
 +      const nsCSSValueList *startShadow = aStartValue.GetCSSValueListValue();
 +      const nsCSSValueList *endShadow = aEndValue.GetCSSValueListValue();
 +      nsCSSValueList *result = nsnull;
 +      nsCSSValueList **resultTail = &result;
 +      while (startShadow && endShadow) {
-+        // X, Y, Radius, Spread, Color, Inset
-+        NS_ABORT_IF_FALSE(startShadow->mValue.GetUnit() == eCSSUnit_Array,
-+                          "wrong unit");
-+        NS_ABORT_IF_FALSE(endShadow->mValue.GetUnit() == eCSSUnit_Array,
-+                          "wrong unit");
-+        nsCSSValue::Array *startArray = startShadow->mValue.GetArrayValue();
-+        nsCSSValue::Array *endArray = endShadow->mValue.GetArrayValue();
-+        nsRefPtr<nsCSSValue::Array> resultArray = nsCSSValue::Array::Create(6);
-+        if (!resultArray) {
++        if (!InterpolateShadowItem(startShadow->mValue, endShadow->mValue,
++                                   aPortion, resultTail)) {
 +          delete result;
 +          success = PR_FALSE;
 +          break;
 +        }
-+
-+        for (PRUint32 i = 0; i < 4; ++i) {
-+          NS_ABORT_IF_FALSE(startArray->Item(i).GetUnit() == eCSSUnit_Pixel,
-+                            "unexpected unit");
-+          NS_ABORT_IF_FALSE(endArray->Item(i).GetUnit() == eCSSUnit_Pixel,
-+                            "unexpected unit");
-+          resultArray->Item(i).SetFloatValue(
-+            inv      * startArray->Item(i).GetFloatValue() +
-+              aPortion * endArray->Item(i).GetFloatValue(),
-+            eCSSUnit_Pixel);
-+        }
-+
-+        const nsCSSValue& startColor = startArray->Item(4);
-+        const nsCSSValue& endColor = endArray->Item(4);
-+        const nsCSSValue& startInset = startArray->Item(5);
-+        const nsCSSValue& endInset = endArray->Item(5);
-+        if (startColor.GetUnit() != endColor.GetUnit() ||
-+            startInset.GetUnit() != endInset.GetUnit()) {
-+          // We don't know how to animate between color and no-color, or
-+          // between inset and not-inset.
-+          delete result;
-+          success = PR_FALSE;
-+          break;
-+        }
-+
-+        Value startColorValue(startColor.GetColorValue(),
-+                              Value::ColorConstructor),
-+              endColorValue  (endColor.GetColorValue(),
-+                              Value::ColorConstructor),
-+              resultColorValue;
-+      #ifdef DEBUG
-+        PRBool ok =
-+      #endif
-+          nsStyleAnimation::Interpolate(startColorValue, endColorValue,
-+                                        aPortion, resultColorValue);
-+        NS_ABORT_IF_FALSE(ok, "should not fail");
-+        resultArray->Item(4).SetColorValue(resultColorValue.GetColorValue());
-+
-+        NS_ABORT_IF_FALSE(startInset == endInset, "should match");
-+        resultArray->Item(5) = startInset;
-+
-+        nsCSSValueList *resultItem = new nsCSSValueList;
-+        if (!resultItem) {
-+          delete result;
-+          success = PR_FALSE;
-+          break;
-+        }
-+        resultItem->mValue.SetArrayValue(resultArray, eCSSUnit_Array);
-+        *resultTail = resultItem;
-+        resultTail = &resultItem->mNext;
-+
 +        startShadow = startShadow->mNext;
 +        endShadow = endShadow->mNext;
 +      }
@@ -261,7 +279,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        success = PR_FALSE;
        break;
    }
-@@ -466,16 +586,19 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+@@ -466,16 +593,19 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
            SetBothValuesTo(val);
        } else {
          NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
@@ -281,7 +299,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
  
  PRBool
  nsStyleAnimation::UncomputeValue(nsCSSProperty aProperty,
-@@ -694,16 +817,60 @@ nsStyleAnimation::ExtractComputedValue(n
+@@ -694,16 +824,60 @@ nsStyleAnimation::ExtractComputedValue(n
          return PR_TRUE;
        }
        if (paint.mType == eStyleSVGPaintType_None) {
@@ -342,7 +360,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
  
  nsStyleAnimation::Value::Value(nscoord aLength, CoordConstructorType)
  {
-@@ -746,16 +913,19 @@ nsStyleAnimation::Value::operator=(const
+@@ -746,16 +920,19 @@ nsStyleAnimation::Value::operator=(const
        break;
      case eUnit_Percent:
      case eUnit_Float:
@@ -362,7 +380,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
  void
  nsStyleAnimation::Value::SetNormalValue()
  {
-@@ -805,18 +975,36 @@ void
+@@ -805,18 +982,36 @@ void
  nsStyleAnimation::Value::SetColorValue(nscolor aColor)
  {
    FreeValue();
@@ -399,7 +417,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
    if (mUnit != aOther.mUnit) {
      return PR_FALSE;
    }
-@@ -829,14 +1017,17 @@ nsStyleAnimation::Value::operator==(cons
+@@ -829,14 +1024,17 @@ nsStyleAnimation::Value::operator==(cons
        return PR_TRUE;
      case eUnit_Coord:
        return mValue.mCoord == aOther.mValue.mCoord;
