@@ -1,0 +1,232 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add support for animation of stroke-dasharray to nsStyleAnimation.
+
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -2937,18 +2937,18 @@ CSS_PROP_SVG(
+     stroke-dasharray,
+     stroke_dasharray,
+     StrokeDasharray,
+     CSS_PROPERTY_VALUE_LIST_USES_COMMAS,
+     SVG,
+     mStrokeDasharray,
+     eCSSType_ValueList,
+     nsnull,
+-    CSS_PROP_NO_OFFSET,
+-    eStyleAnimType_None)
++    CSS_PROP_NO_OFFSET, /* property stored in 2 separate members */
++    eStyleAnimType_Custom)
+ CSS_PROP_SVG(
+     stroke-dashoffset,
+     stroke_dashoffset,
+     StrokeDashoffset,
+     0,
+     SVG,
+     mStrokeDashoffset,
+     eCSSType_Value,
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -148,16 +148,21 @@ nsStyleAnimation::ComputeDistance(const 
+       double diffA = startA - endA;
+       double diffR = startR - endR;
+       double diffG = startG - endG;
+       double diffB = startB - endB;
+       aDistance = sqrt(diffA * diffA + diffR * diffR +
+                        diffG * diffG + diffB * diffB);
+       break;
+     }
++    case eUnit_Dasharray: {
++      // FIXME: WRITE ME
++      success = PR_FALSE;
++      break;
++    }
+     case eUnit_Shadow: {
+       // Call AddWeighted to make us lists of the same length.
+       Value normValue1, normValue2;
+       if (!AddWeighted(1.0, aStartValue, 0.0, aEndValue, normValue1) ||
+           !AddWeighted(0.0, aStartValue, 1.0, aEndValue, normValue2)) {
+         success = PR_FALSE;
+         break;
+       }
+@@ -361,16 +366,21 @@ nsStyleAnimation::AddWeighted(double aCo
+         PRUint8 Rres = ClampColor((R1 * aCoeff1 + R2 * aCoeff2) * factor);
+         PRUint8 Gres = ClampColor((G1 * aCoeff1 + G2 * aCoeff2) * factor);
+         PRUint8 Bres = ClampColor((B1 * aCoeff1 + B2 * aCoeff2) * factor);
+         resultColor = NS_RGBA(Rres, Gres, Bres, Ares);
+       }
+       aResultValue.SetColorValue(resultColor);
+       break;
+     }
++    case eUnit_Dasharray: {
++      // FIXME: WRITE ME
++      success = PR_FALSE;
++      break;
++    }
+     case eUnit_Shadow: {
+       // This is implemented according to:
+       // http://dev.w3.org/csswg/css3-transitions/#animation-of-property-types-
+       // and the third item in the summary of:
+       // http://lists.w3.org/Archives/Public/www-style/2009Jul/0050.html
+       const nsCSSValueList *shadow1 = aValue1.GetCSSValueListValue();
+       const nsCSSValueList *shadow2 = aValue2.GetCSSValueListValue();
+       nsCSSValueList *result = nsnull;
+@@ -569,16 +579,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+           SetBothValuesTo(val);
+       } else {
+         NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
+                           "type mismatch");
+         static_cast<nsCSSValue*>(aSpecifiedValue)->
+           SetColorValue(aComputedValue.GetColorValue());
+       }
+       break;
++    case eUnit_Dasharray:
+     case eUnit_Shadow:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                           eCSSType_ValueList, "type mismatch");
+       *static_cast<nsCSSValueList**>(aSpecifiedValue) =
+         aComputedValue.GetCSSValueListValue();
+       break;
+     default:
+       return PR_FALSE;
+@@ -745,16 +756,65 @@ nsStyleAnimation::ExtractComputedValue(n
+         #else
+           if (!styleOutline->GetOutlineColor(color))
+             color = aStyleContext->GetStyleColor()->mColor;
+         #endif
+           aComputedValue.SetColorValue(color);
+           break;
+         }
+ 
++        case eCSSProperty_stroke_dasharray: {
++          const nsStyleSVG *svg = static_cast<const nsStyleSVG*>(styleStruct);
++          NS_ABORT_IF_FALSE((svg->mStrokeDasharray != nsnull) ==
++                            (svg->mStrokeDasharrayLength != 0),
++                            "pointer/length mismatch");
++          if (svg->mStrokeDasharray) {
++            nsCSSValueList *result = nsnull;
++            nsCSSValueList **resultTail = &result;
++            for (PRUint32 i = 0, i_end = svg->mStrokeDasharrayLength;
++                 i != i_end; ++i) {
++              nsCSSValueList *item = new nsCSSValueList;
++              if (!item) {
++                delete result;
++                return PR_FALSE;
++              }
++              const nsStyleCoord &coord = svg->mStrokeDasharray[i];
++              nsCSSValue &value = item->mValue;
++              switch (coord.GetUnit()) {
++                case eStyleUnit_Coord:
++                  // Number means the same thing as length; we want to
++                  // animate them the same way.  Normalize both to number
++                  // since it has more accuracy (float vs nscoord).
++                  value.SetFloatValue(nsPresContext::
++                    AppUnitsToFloatCSSPixels(coord.GetCoordValue()),
++                    eCSSUnit_Number);
++                  break;
++                case eStyleUnit_Factor:
++                  value.SetFloatValue(coord.GetFactorValue(),
++                                      eCSSUnit_Number);
++                  break;
++                case eStyleUnit_Percent:
++                  value.SetPercentValue(coord.GetPercentValue());
++                  break;
++                default:
++                  NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
++                  delete result;
++                  return PR_FALSE;
++              }
++              *resultTail = item;
++              resultTail = &item->mNext;
++            }
++            aComputedValue.SetCSSValueListValue(result, eUnit_Dasharray,
++                                                PR_TRUE);
++          } else {
++            aComputedValue.SetNoneValue();
++          }
++          break;
++        }
++
+         default:
+           NS_ABORT_IF_FALSE(PR_FALSE, "missing property implementation");
+           return PR_FALSE;
+       };
+       return PR_TRUE;
+     case eStyleAnimType_Coord:
+       return StyleCoordToValue(*static_cast<const nsStyleCoord*>(
+         StyleDataAtOffset(styleStruct, ssOffset)), aComputedValue);
+@@ -903,16 +963,17 @@ nsStyleAnimation::Value::operator=(const
+       break;
+     case eUnit_Percent:
+     case eUnit_Float:
+       mValue.mFloat = aOther.mValue.mFloat;
+       break;
+     case eUnit_Color:
+       mValue.mColor = aOther.mValue.mColor;
+       break;
++    case eUnit_Dasharray:
+     case eUnit_Shadow:
+       mValue.mCSSValueList = aOther.mValue.mCSSValueList
+                                ? aOther.mValue.mCSSValueList->Clone() : nsnull;
+   }
+ 
+   return *this;
+ }
+ 
+@@ -1007,16 +1068,17 @@ nsStyleAnimation::Value::operator==(cons
+       return PR_TRUE;
+     case eUnit_Coord:
+       return mValue.mCoord == aOther.mValue.mCoord;
+     case eUnit_Percent:
+     case eUnit_Float:
+       return mValue.mFloat == aOther.mValue.mFloat;
+     case eUnit_Color:
+       return mValue.mColor == aOther.mValue.mColor;
++    case eUnit_Dasharray:
+     case eUnit_Shadow:
+       return nsCSSValueList::Equal(mValue.mCSSValueList,
+                                    aOther.mValue.mCSSValueList);
+   }
+ 
+   NS_NOTREACHED("incomplete case");
+   return PR_FALSE;
+ }
+diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
+--- a/layout/style/nsStyleAnimation.h
++++ b/layout/style/nsStyleAnimation.h
+@@ -215,16 +215,17 @@ public:
+     eUnit_Null, // not initialized
+     eUnit_Normal,
+     eUnit_Auto,
+     eUnit_None,
+     eUnit_Coord,
+     eUnit_Percent,
+     eUnit_Float,
+     eUnit_Color,
++    eUnit_Dasharray, // nsCSSValueList*
+     eUnit_Shadow  // nsCSSValueList*
+   };
+ 
+   class Value {
+   private:
+     Unit mUnit;
+     union {
+       nscoord mCoord;
+@@ -297,14 +298,14 @@ public:
+     PRBool operator==(const Value& aOther) const;
+     PRBool operator!=(const Value& aOther) const
+       { return !(*this == aOther); }
+ 
+   private:
+     void FreeValue();
+ 
+     static PRBool IsCSSValueListUnit(Unit aUnit) {
+-      return aUnit == eUnit_Shadow;
++      return aUnit == eUnit_Dasharray || aUnit == eUnit_Shadow;
+     }
+   };
+ };
+ 
+ #endif
