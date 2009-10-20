@@ -29,7 +29,51 @@ diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
 diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
 --- a/layout/style/nsStyleAnimation.cpp
 +++ b/layout/style/nsStyleAnimation.cpp
-@@ -148,16 +148,21 @@ nsStyleAnimation::ComputeDistance(const 
+@@ -81,16 +81,43 @@ GetCommonUnit(nsStyleAnimation::Unit aFi
+   if (aFirstUnit != aSecondUnit) {
+     // NOTE: Some unit-pairings will need special handling,
+     // e.g. percent vs coord (bug 520234)
+     return nsStyleAnimation::eUnit_Null;
+   }
+   return aFirstUnit;
+ }
+ 
++// Greatest Common Divisor
++static PRUint32
++gcd(PRUint32 a, PRUint32 b)
++{
++  // Euclid's algorithm; O(N) in the worst case.  (There are better
++  // ways, but we don't need them for stroke-dasharray animation.)
++  NS_ABORT_IF_FALSE(a > 0 && b > 0, "positive numbers expected");
++
++  while (a != b) {
++    if (a > b) {
++      a = a - b;
++    } else {
++      b = b - a;
++    }
++  }
++
++  return a;
++}
++
++// Least Common Multiple
++static PRUint32
++lcm(PRUint32 a, PRUint32 b)
++{
++  // Divide first to reduce overflow risk.
++  return (a / gcd(a, b)) * b;
++}
++
+ // CLASS METHODS
+ // -------------
+ 
+ PRBool
+ nsStyleAnimation::ComputeDistance(const Value& aStartValue,
+                                   const Value& aEndValue,
+                                   double& aDistance)
+ {
+@@ -148,16 +175,57 @@ nsStyleAnimation::ComputeDistance(const 
        double diffA = startA - endA;
        double diffR = startR - endR;
        double diffG = startG - endG;
@@ -39,8 +83,44 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        break;
      }
 +    case eUnit_Dasharray: {
-+      // FIXME: WRITE ME
-+      success = PR_FALSE;
++      // Call AddWeighted to make us lists of the same length.
++      Value normValue1, normValue2;
++      if (!AddWeighted(1.0, aStartValue, 0.0, aEndValue, normValue1) ||
++          !AddWeighted(0.0, aStartValue, 1.0, aEndValue, normValue2)) {
++        success = PR_FALSE;
++        break;
++      }
++
++      double distance = 0.0;
++      const nsCSSValueList *list1 = normValue1.GetCSSValueListValue();
++      const nsCSSValueList *list2 = normValue2.GetCSSValueListValue();
++
++      while (list1 && list2) {
++        const nsCSSValue &val1 = list1->mValue;
++        const nsCSSValue &val2 = list2->mValue;
++
++        NS_ABORT_IF_FALSE(val1.GetUnit() == val2.GetUnit(),
++                          "unit match should be assured by AddWeighted");
++        double diff;
++        switch (val1.GetUnit()) {
++          case eCSSUnit_Percent:
++            diff = val1.GetPercentValue() - val2.GetPercentValue();
++            break;
++          case eCSSUnit_Number:
++            diff = val1.GetFloatValue() - val2.GetFloatValue();
++            break;
++          default:
++            NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
++            return PR_FALSE;
++        }
++        distance += diff * diff;
++
++        list1 = list1->mNext;
++        list2 = list2->mNext;
++      }
++      NS_ABORT_IF_FALSE(!list1 && !list2, "lists should be same length");
++
++      aDistance = sqrt(distance);
 +      break;
 +    }
      case eUnit_Shadow: {
@@ -51,7 +131,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
          success = PR_FALSE;
          break;
        }
-@@ -361,16 +366,21 @@ nsStyleAnimation::AddWeighted(double aCo
+@@ -361,16 +429,74 @@ nsStyleAnimation::AddWeighted(double aCo
          PRUint8 Rres = ClampColor((R1 * aCoeff1 + R2 * aCoeff2) * factor);
          PRUint8 Gres = ClampColor((G1 * aCoeff1 + G2 * aCoeff2) * factor);
          PRUint8 Bres = ClampColor((B1 * aCoeff1 + B2 * aCoeff2) * factor);
@@ -61,8 +141,61 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        break;
      }
 +    case eUnit_Dasharray: {
-+      // FIXME: WRITE ME
-+      success = PR_FALSE;
++      const nsCSSValueList *list1 = aValue1.GetCSSValueListValue();
++      const nsCSSValueList *list2 = aValue2.GetCSSValueListValue();
++
++      PRUint32 len1 = 0, len2 = 0;
++      for (const nsCSSValueList *v = list1; v; v = v->mNext) {
++        ++len1;
++      }
++      for (const nsCSSValueList *v = list2; v; v = v->mNext) {
++        ++len2;
++      }
++      NS_ABORT_IF_FALSE(len1 > 0 && len2 > 0, "unexpected length");
++
++      nsCSSValueList *result = nsnull;
++      nsCSSValueList **resultTail = &result;
++      for (PRUint32 i = 0, i_end = lcm(len1, len2); i != i_end; ++i) {
++        const nsCSSValue& v1 = list1->mValue;
++        const nsCSSValue& v2 = list2->mValue;
++        NS_ABORT_IF_FALSE(v1.GetUnit() == eCSSUnit_Number ||
++                          v1.GetUnit() == eCSSUnit_Percent, "unexpected");
++        NS_ABORT_IF_FALSE(v2.GetUnit() == eCSSUnit_Number ||
++                          v2.GetUnit() == eCSSUnit_Percent, "unexpected");
++        if (v1.GetUnit() != v2.GetUnit()) {
++          // Can't animate between lengths and percentages (until calc()).
++          delete result;
++          return PR_FALSE;
++        }
++
++        nsCSSValueList *item = new nsCSSValueList;
++        if (!item) {
++          delete result;
++          return PR_FALSE;
++        }
++        *resultTail = item;
++        resultTail = &item->mNext;
++
++        if (v1.GetUnit() == eCSSUnit_Number) {
++          item->mValue.SetFloatValue(aCoeff1 * v1.GetFloatValue() +
++                                     aCoeff2 * v2.GetFloatValue(),
++                                     eCSSUnit_Number);
++        } else {
++          NS_ABORT_IF_FALSE(v1.GetUnit() == eCSSUnit_Percent, "unexpected");
++          item->mValue.SetPercentValue(aCoeff1 * v1.GetPercentValue() +
++                                       aCoeff2 * v2.GetPercentValue());
++        }
++
++        list1 = list1->mNext;
++        if (!list1) {
++          list1 = aValue1.GetCSSValueListValue();
++        }
++        list2 = list2->mNext;
++        if (!list2) {
++          list2 = aValue1.GetCSSValueListValue();
++        }
++      }
++
 +      break;
 +    }
      case eUnit_Shadow: {
@@ -73,7 +206,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        const nsCSSValueList *shadow1 = aValue1.GetCSSValueListValue();
        const nsCSSValueList *shadow2 = aValue2.GetCSSValueListValue();
        nsCSSValueList *result = nsnull;
-@@ -569,16 +579,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+@@ -569,16 +695,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
            SetBothValuesTo(val);
        } else {
          NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] == eCSSType_Value,
@@ -91,7 +224,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        break;
      default:
        return PR_FALSE;
-@@ -745,16 +756,65 @@ nsStyleAnimation::ExtractComputedValue(n
+@@ -745,16 +872,65 @@ nsStyleAnimation::ExtractComputedValue(n
          #else
            if (!styleOutline->GetOutlineColor(color))
              color = aStyleContext->GetStyleColor()->mColor;
@@ -157,7 +290,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
      case eStyleAnimType_Coord:
        return StyleCoordToValue(*static_cast<const nsStyleCoord*>(
          StyleDataAtOffset(styleStruct, ssOffset)), aComputedValue);
-@@ -903,16 +963,17 @@ nsStyleAnimation::Value::operator=(const
+@@ -903,16 +1079,17 @@ nsStyleAnimation::Value::operator=(const
        break;
      case eUnit_Percent:
      case eUnit_Float:
@@ -175,7 +308,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
    return *this;
  }
  
-@@ -1007,16 +1068,17 @@ nsStyleAnimation::Value::operator==(cons
+@@ -1007,16 +1184,17 @@ nsStyleAnimation::Value::operator==(cons
        return PR_TRUE;
      case eUnit_Coord:
        return mValue.mCoord == aOther.mValue.mCoord;
