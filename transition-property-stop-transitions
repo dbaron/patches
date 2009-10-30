@@ -1,0 +1,145 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Stop transitions when -moz-transition-property changes to a value that no longer includes the transitioning property.  (Bug 525530)
+
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1917,25 +1917,26 @@ nsChangeHint nsStyleDisplay::CalcDiffere
+     
+     for (PRUint8 index = 0; index < 2; ++index)
+       if (mTransformOrigin[index] != aOther.mTransformOrigin[index]) {
+         NS_UpdateHint(hint, NS_CombineHint(nsChangeHint_ReflowFrame,
+                                            nsChangeHint_RepaintFrame));
+         break;
+       }
+   }
+-  
+-  // Note:  Our current behavior for handling changes to transition
++
++  // Note:  Our current behavior for handling changes to the
++  // transition-duration, transition-delay, and transition-timing-function
+   // properties is to do nothing.  In other words, the transition
+   // property that matters is what it is when the transition begins, and
+   // we don't stop a transition later because the transition property
+   // changed.
+-  // FIXME (Bug 522599):  Need to test for this and write it in the
+-  // spec, if it's compatible with other browsers.  Test for behavior at
+-  // http://dbaron.org/css/test/2009/transitions/dynamic-transition-change
++  // We do handle changes to transition-property, but we don't need to
++  // bother with anything here, since the transition manager is notified
++  // of any style context change anyway.
+   
+   return hint;
+ }
+ 
+ #ifdef DEBUG
+ /* static */
+ nsChangeHint nsStyleDisplay::MaxDifference()
+ {
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -367,19 +367,23 @@ nsTransitionManager::StyleContextChanged
+   // it's worth thinking about some more.
+   NS_PRECONDITION(aOldStyleContext->HasPseudoElementData() ==
+                       aNewStyleContext->HasPseudoElementData(),
+                   "pseudo type mismatch");
+ 
+   // Return sooner (before the startedAny check below) for the most
+   // common case: no transitions specified.
+   const nsStyleDisplay *disp = aNewStyleContext->GetStyleDisplay();
++  const nsStyleDisplay *oldDisp = aOldStyleContext->GetStyleDisplay();
+   if (disp->mTransitionPropertyCount == 1 &&
++      oldDisp->mTransitionPropertyCount == 1 &&
+       disp->mTransitions[0].GetDelay() == 0.0f &&
+-      disp->mTransitions[0].GetDuration() == 0.0f) {
++      disp->mTransitions[0].GetDuration() == 0.0f &&
++      oldDisp->mTransitions[0].GetProperty() ==
++        disp->mTransitions[0].GetProperty()) {
+     return nsnull;
+   }      
+ 
+ 
+   if (aNewStyleContext->PresContext()->IsProcessingAnimationStyleChange()) {
+     return nsnull;
+   }
+   
+@@ -397,16 +401,17 @@ nsTransitionManager::StyleContextChanged
+   }
+ 
+   // Per http://lists.w3.org/Archives/Public/www-style/2009Aug/0109.html
+   // I'll consider only the transitions from the number of items in
+   // 'transition-property' on down, and later ones will override earlier
+   // ones (tracked using |whichStarted|).
+   PRBool startedAny = PR_FALSE;
+   nsCSSPropertySet whichStarted;
++  nsCSSPropertySet allTransitionProperties;
+   ElementTransitions *et = nsnull;
+   for (PRUint32 i = disp->mTransitionPropertyCount; i-- != 0; ) {
+     const nsTransition& t = disp->mTransitions[i];
+     // Check delay and duration first, since they default to zero, and
+     // when they're both zero, we can ignore the transition.
+     if (t.GetDelay() != 0.0f || t.GetDuration() != 0.0f) {
+       et = GetElementTransitions(aElement,
+                                  aNewStyleContext->GetPseudo(),
+@@ -417,34 +422,59 @@ nsTransitionManager::StyleContextChanged
+       nsCSSProperty property = t.GetProperty();
+       if (property == eCSSPropertyExtra_no_properties ||
+           property == eCSSProperty_UNKNOWN) {
+         // Nothing to do, but need to exclude this from cases below.
+       } else if (property == eCSSPropertyExtra_all_properties) {
+         for (nsCSSProperty p = nsCSSProperty(0); 
+              p < eCSSProperty_COUNT_no_shorthands;
+              p = nsCSSProperty(p + 1)) {
++          allTransitionProperties.AddProperty(p);
+           ConsiderStartingTransition(p, t, aElement, et,
+                                      aOldStyleContext, aNewStyleContext,
+                                      &startedAny, &whichStarted);
+         }
+       } else if (nsCSSProps::IsShorthand(property)) {
+         CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(subprop, property) {
++          allTransitionProperties.AddProperty(*subprop);
+           ConsiderStartingTransition(*subprop, t, aElement, et,
+                                      aOldStyleContext, aNewStyleContext,
+                                      &startedAny, &whichStarted);
+         }
+       } else {
++        allTransitionProperties.AddProperty(property);
+         ConsiderStartingTransition(property, t, aElement, et,
+                                    aOldStyleContext, aNewStyleContext,
+                                    &startedAny, &whichStarted);
+       }
+     }
+   }
+ 
++  // Stop any transitions for properties that are no longer in
++  // 'transition-property'.
++  PRBool didStop = PR_FALSE;
++  if (et) {
++    nsTArray<ElementPropertyTransition> &pts = et->mPropertyTransitions;
++    PRUint32 i = pts.Length();
++    NS_ABORT_IF_FALSE(i != 0, "empty transitions list?");
++    do {
++      --i;
++      ElementPropertyTransition &pt = pts[i];
++      if (!allTransitionProperties.HasProperty(pt.mProperty)) {
++        pts.RemoveElementAt(i);
++        didStop = PR_TRUE;
++      }
++    } while (i != 0);
++
++    if (pts.IsEmpty()) {
++      et->Destroy();
++      et = nsnull;
++    }
++  }
++
+   if (!startedAny) {
+     return nsnull;
+   }
+ 
+   NS_ABORT_IF_FALSE(et, "must have element transitions if we started "
+                         "any transitions");
+ 
+   // In the CSS working group discussion (2009 Jul 15 telecon,
