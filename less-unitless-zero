@@ -1,0 +1,210 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Stop accepting unitless 0 for angles, times, and frequencies.  (Bug 526402)
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -1800,22 +1800,22 @@ CSSParserImpl::ParseMediaQueryExpression
+         rv = ParseVariant(a->Item(0), VARIANT_INTEGER, nsnull) &&
+              a->Item(0).GetIntValue() > 0 &&
+              ExpectSymbol('/', PR_TRUE) &&
+              ParseVariant(a->Item(1), VARIANT_INTEGER, nsnull) &&
+              a->Item(1).GetIntValue() > 0;
+       }
+       break;
+     case nsMediaFeature::eResolution:
+-      rv = GetToken(PR_TRUE) && mToken.IsDimension() &&
++      rv = GetToken(PR_TRUE) && mToken.mType == eCSSToken_Dimension &&
+            mToken.mIntegerValid && mToken.mNumber > 0.0f;
+       if (rv) {
+         // No worries about whether unitless zero is allowed, since the
+         // value must be positive (and we checked that above).
+-        NS_ASSERTION(!mToken.mIdent.IsEmpty(), "IsDimension lied");
++        NS_ASSERTION(!mToken.mIdent.IsEmpty(), "unit lied");
+         if (mToken.mIdent.LowerCaseEqualsLiteral("dpi")) {
+           expr->mValue.SetFloatValue(mToken.mNumber, eCSSUnit_Inch);
+         } else if (mToken.mIdent.LowerCaseEqualsLiteral("dpcm")) {
+           expr->mValue.SetFloatValue(mToken.mNumber, eCSSUnit_Centimeter);
+         } else {
+           rv = PR_FALSE;
+         }
+       }
+@@ -4289,28 +4289,16 @@ CSSParserImpl::TranslateDimension(nsCSSV
+     }
+   } else {
+     // Must be a zero number...
+     NS_ASSERTION(0 == aNumber, "numbers without units must be 0");
+     if ((VARIANT_LENGTH & aVariantMask) != 0) {
+       units = eCSSUnit_Point;
+       type = VARIANT_LENGTH;
+     }
+-    else if ((VARIANT_ANGLE & aVariantMask) != 0) {
+-      units = eCSSUnit_Degree;
+-      type = VARIANT_ANGLE;
+-    }
+-    else if ((VARIANT_FREQUENCY & aVariantMask) != 0) {
+-      units = eCSSUnit_Hertz;
+-      type = VARIANT_FREQUENCY;
+-    }
+-    else if ((VARIANT_TIME & aVariantMask) != 0) {
+-      units = eCSSUnit_Seconds;
+-      type = VARIANT_TIME;
+-    }
+     else {
+       NS_ERROR("Variant mask does not include dimension; why were we called?");
+       return PR_FALSE;
+     }
+   }
+   if ((type & aVariantMask) != 0) {
+     aValue.SetFloatValue(aNumber, units);
+     return PR_TRUE;
+@@ -4462,18 +4450,22 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+         PRInt32 value;
+         if (nsCSSProps::FindKeyword(keyword, aKeywordTable, value)) {
+           aValue.SetIntValue(value, eCSSUnit_Enumerated);
+           return PR_TRUE;
+         }
+       }
+     }
+   }
+-  if (((aVariantMask & (VARIANT_LENGTH | VARIANT_ANGLE | VARIANT_FREQUENCY | VARIANT_TIME)) != 0) &&
+-      tk->IsDimension()) {
++  if (((aVariantMask & (VARIANT_LENGTH | VARIANT_ANGLE |
++                        VARIANT_FREQUENCY | VARIANT_TIME)) != 0 &&
++       eCSSToken_Dimension == tk->mType) ||
++      ((aVariantMask & VARIANT_LENGTH) != 0 &&
++       eCSSToken_Number == tk->mType &&
++       tk->mNumber == 0.0f)) {
+     if (TranslateDimension(aValue, aVariantMask, tk->mNumber, tk->mIdent)) {
+       return PR_TRUE;
+     }
+     // Put the token back; we didn't parse it, so we shouldn't consume it
+     UngetToken();
+     return PR_FALSE;
+   }
+   if (((aVariantMask & VARIANT_PERCENT) != 0) &&
+@@ -6465,17 +6457,18 @@ CSSParserImpl::ParseBackgroundItem(CSSPa
+                 mToken.mIdent.LowerCaseEqualsLiteral("-moz-image-rect"))) {
+       if (haveImage)
+         return PR_FALSE;
+       haveImage = PR_TRUE;
+       if (!ParseSingleValueProperty(aItem.mImage,
+                                     eCSSProperty_background_image)) {
+         return PR_FALSE;
+       }
+-    } else if (mToken.IsDimension() || tt == eCSSToken_Percentage) {
++    } else if (tt == eCSSToken_Dimension || tt == eCSSToken_Number ||
++               tt == eCSSToken_Percentage) {
+       if (havePosition)
+         return PR_FALSE;
+       havePosition = PR_TRUE;
+       if (!ParseBoxPositionValues(aItem.mPosition, PR_FALSE)) {
+         return PR_FALSE;
+       }
+     } else {
+       if (haveColor)
+diff --git a/layout/style/nsCSSScanner.h b/layout/style/nsCSSScanner.h
+--- a/layout/style/nsCSSScanner.h
++++ b/layout/style/nsCSSScanner.h
+@@ -115,21 +115,16 @@ struct nsCSSToken {
+   PRInt32         mInteger2;
+   nsCSSTokenType  mType;
+   PRUnichar       mSymbol;
+   PRPackedBool    mIntegerValid; // for number, dimension, urange
+   PRPackedBool    mHasSign; // for number, percentage, and dimension
+ 
+   nsCSSToken();
+ 
+-  PRBool IsDimension() {
+-    return PRBool((eCSSToken_Dimension == mType) ||
+-                  ((eCSSToken_Number == mType) && (mNumber == 0.0f)));
+-  }
+-
+   PRBool IsSymbol(PRUnichar aSymbol) {
+     return PRBool((eCSSToken_Symbol == mType) && (mSymbol == aSymbol));
+   }
+ 
+   void AppendToString(nsString& aBuffer);
+ };
+ 
+ // CSS Scanner API. Used to tokenize an input stream using the CSS
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -1531,37 +1531,37 @@ var gCSSProperties = {
+ 		invalid_values: []
+ 	},
+ 	"pause": {
+ 		domProp: "pause",
+ 		inherited: false,
+ 		backend_only: true,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "pause-before", "pause-after" ],
+-		initial_values: [ "0", "0s", "0ms", "0 0", "0s 0ms", "0ms 0" ],
++		initial_values: [ "0s", "0ms", "0 0", "0s 0ms", "0ms 0" ],
+ 		other_values: [ "1s", "200ms", "-2s", "50%", "-10%", "10% 200ms", "-3s -5%" ],
+-		invalid_values: [ "0px" ]
++		invalid_values: [ "0", "0px" ]
+ 	},
+ 	"pause-after": {
+ 		domProp: "pauseAfter",
+ 		inherited: false,
+ 		backend_only: true,
+ 		type: CSS_TYPE_LONGHAND,
+-		initial_values: [ "0", "0s", "0ms" ],
++		initial_values: [ "0s", "0ms" ],
+ 		other_values: [ "1s", "200ms", "-2s", "50%", "-10%" ],
+-		invalid_values: [ "0px" ]
++		invalid_values: [ "0", "0px" ]
+ 	},
+ 	"pause-before": {
+ 		domProp: "pauseBefore",
+ 		inherited: false,
+ 		backend_only: true,
+ 		type: CSS_TYPE_LONGHAND,
+-		initial_values: [ "0", "0s", "0ms" ],
++		initial_values: [ "0s", "0ms" ],
+ 		other_values: [ "1s", "200ms", "-2s", "50%", "-10%" ],
+-		invalid_values: [ "0px" ]
++		invalid_values: [ "0", "0px" ]
+ 	},
+ 	"pitch": {
+ 		domProp: "pitch",
+ 		inherited: true,
+ 		backend_only: true,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "medium" ],
+ 		other_values: [ "x-low", "low", "high", "x-high" ],
+@@ -1758,27 +1758,27 @@ var gCSSProperties = {
+ 		initial_values: [ "all 0s ease 0s" ],
+ 		other_values: [ "width 1s linear 2s", "width 1s 2s linear", "width linear 1s 2s", "linear width 1s 2s", "linear 1s width 2s", "linear 1s 2s width", "1s width linear 2s", "1s width 2s linear", "1s 2s width linear", "1s linear width 2s", "1s linear 2s width", "1s 2s linear width", "width linear 1s", "width 1s linear", "linear width 1s", "linear 1s width", "1s width linear", "1s linear width", "1s 2s width", "1s width 2s", "width 1s 2s", "1s 2s linear", "1s linear 2s", "linear 1s 2s", "width 1s", "1s width", "linear 1s", "1s linear", "1s 2s", "2s 1s", "width", "linear", "1s", "height", "2s", "ease-in-out", "2s ease-in", "opacity linear", "ease-out 2s", "2s color, 1s width, 500ms height linear, 1s opacity 4s cubic-bezier(0.0, 0.1, 1.0, 1.0)" ],
+ 		invalid_values: [ "2s, 1s width", "1s width, 2s", "2s all, 1s width", "1s width, 2s all", "1s width, 2s none", "2s none, 1s width", "2s inherit", "inherit 2s", "2s width, 1s inherit", "2s inherit, 1s width", "2s initial", "2s all, 1s width", "2s width, 1s all" ]
+ 	},
+ 	"-moz-transition-delay": {
+ 		domProp: "MozTransitionDelay",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+-		initial_values: [ "0", "0s", "0ms" ],
++		initial_values: [ "0s", "0ms" ],
+ 		other_values: [ "1s", "250ms", "-100ms", "-1s", "1s, 250ms, 2.3s"],
+-		invalid_values: []
++		invalid_values: [ "0", "0px" ]
+ 	},
+ 	"-moz-transition-duration": {
+ 		domProp: "MozTransitionDuration",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+-		initial_values: [ "0", "0s", "0ms" ],
++		initial_values: [ "0s", "0ms" ],
+ 		other_values: [ "1s", "250ms", "-1ms", "-2s", "1s, 250ms, 2.3s"],
+-		invalid_values: []
++		invalid_values: [ "0", "0px" ]
+ 	},
+ 	"-moz-transition-property": {
+ 		domProp: "MozTransitionProperty",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "all" ],
+ 		other_values: [ "none", "left", "top", "color", "width, height, opacity", "foobar", "auto" ],
+ 		invalid_values: [ "none, none", "all, all", "color, none", "none, color", "all, color", "color, all", "inherit, color", "color, inherit", "initial, color", "color, initial", "none, color", "color, none", "all, color", "color, all" ]
