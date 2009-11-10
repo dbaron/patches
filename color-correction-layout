@@ -201,3 +201,123 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
                         PRBool                  aClipBorderBackground,
                         PRBool                  aClipAll)
  {
+@@ -1156,27 +1177,49 @@ nsIFrame::Clip(nsDisplayListBuilder*   a
+                const nsDisplayListSet& aToSet,
+                const nsRect&           aClipRect)
+ {
+   nsAbsPosClipWrapper wrapper(this, aClipRect);
+   return wrapper.WrapLists(aBuilder, this, aFromSet, aToSet);
+ }
+ 
+ static nsresult
+-BuildDisplayListWithOverflowClip(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
++BuildDisplayListWithWrappers(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+     const nsRect& aDirtyRect, const nsDisplayListSet& aSet,
+-    const nsRect& aClipRect)
+-{
++    const nsRect& aClipRect, PRBool aApplyOverflowClip,
++    PRBool aChangeColorCorrection)
++{
++  NS_PRECONDITION(aApplyOverflowClip || aChangeColorCorrection,
++                  "shouldn't have been called");
+   nsDisplayListCollection set;
+   nsresult rv = aFrame->BuildDisplayList(aBuilder, aDirtyRect, set);
+   NS_ENSURE_SUCCESS(rv, rv);
+   rv = aBuilder->DisplayCaret(aFrame, aDirtyRect, aSet);
+   NS_ENSURE_SUCCESS(rv, rv);
+-  
+-  return aFrame->OverflowClip(aBuilder, set, aSet, aClipRect);
++
++  // REVIEW: Are there any other callers (e.g., other callers of
++  // nsIFrame::OverflowClip()) that need to do this wrapping for
++  // color-correction?
++  if (aApplyOverflowClip && aChangeColorCorrection) {
++    nsDisplayListCollection set2;
++    rv = aFrame->OverflowClip(aBuilder, set, set2, aClipRect);
++    NS_ENSURE_SUCCESS(rv, rv);
++    nsChangeColorCorrectionWrapper
++      ccWrap(aFrame->GetStyleVisibility()->mColorCorrection);
++    rv = ccWrap.WrapLists(aBuilder, aFrame, set2, aSet);
++  } else if (aApplyOverflowClip) {
++    rv = aFrame->OverflowClip(aBuilder, set, aSet, aClipRect);
++  } else {
++    NS_ASSERTION(aChangeColorCorrection, "unexpected");
++    nsChangeColorCorrectionWrapper
++      ccWrap(aFrame->GetStyleVisibility()->mColorCorrection);
++    rv = ccWrap.WrapLists(aBuilder, aFrame, set, aSet);
++  }
++  
++  return rv;
+ }
+ 
+ #ifdef NS_DEBUG
+ static void PaintDebugBorder(nsIFrame* aFrame, nsIRenderingContext* aCtx,
+      const nsRect& aDirtyRect, nsPoint aPt) {
+   nsRect r(aPt, aFrame->GetSize());
+   if (aFrame->HasView()) {
+     aCtx->SetColor(NS_RGB(0,0,255));
+@@ -1483,32 +1526,36 @@ nsIFrame::BuildDisplayListForChild(nsDis
+       (aFlags & DISPLAY_CHILD_FORCE_STACKING_CONTEXT)) {
+     // If you change this, also change IsPseudoStackingContextFromStyle()
+     pseudoStackingContext = PR_TRUE;
+   }
+   
+   nsRect overflowClip;
+   PRBool applyOverflowClip =
+     ApplyOverflowClipping(aBuilder, aChild, disp, &overflowClip);
++  PRBool changeColorCorrection =
++    aChild->GetStyleVisibility()->mColorCorrection != 
++    GetStyleVisibility()->mColorCorrection;
+   // Don't use overflowClip to restrict the dirty rect, since some of the
+   // descendants may not be clipped by it. Even if we end up with unnecessary
+   // display items, they'll be pruned during ComputeVisibility. Note that
+   // this overflow-clipping here only applies to overflow:-moz-hidden-unscrollable;
+   // overflow:hidden etc creates an nsHTML/XULScrollFrame which does its own
+   // clipping.
+ 
+   nsDisplayListBuilder::AutoIsRootSetter rootSetter(aBuilder, pseudoStackingContext);
+   nsresult rv;
+   if (!pseudoStackingContext) {
+     // THIS IS THE COMMON CASE.
+     // Not a pseudo or real stacking context. Do the simple thing and
+     // return early.
+-    if (applyOverflowClip) {
+-      rv = BuildDisplayListWithOverflowClip(aBuilder, aChild, dirty, aLists,
+-                                            overflowClip);
++    if (applyOverflowClip || changeColorCorrection) {
++      rv = BuildDisplayListWithWrappers(aBuilder, aChild, dirty, aLists,
++                                        overflowClip, applyOverflowClip,
++                                        changeColorCorrection);
+     } else {
+       rv = aChild->BuildDisplayList(aBuilder, dirty, aLists);
+       if (NS_SUCCEEDED(rv)) {
+         rv = aBuilder->DisplayCaret(aChild, dirty, aLists);
+       }
+     }
+ #ifdef NS_DEBUG
+     DisplayDebugBorders(aBuilder, aChild, aLists);
+@@ -1538,19 +1585,21 @@ nsIFrame::BuildDisplayListForChild(nsDis
+     nsRect clippedDirtyRect = dirty;
+     if (applyAbsPosClipping) {
+       // clipRect is in builder-reference-frame coordinates,
+       // dirty/clippedDirtyRect are in aChild coordinates
+       clippedDirtyRect.IntersectRect(clippedDirtyRect,
+                                      clipRect - aBuilder->ToReferenceFrame(aChild));
+     }
+     
+-    if (applyOverflowClip) {
+-      rv = BuildDisplayListWithOverflowClip(aBuilder, aChild, clippedDirtyRect,
+-                                            pseudoStack, overflowClip);
++    if (applyOverflowClip || changeColorCorrection) {
++      rv = BuildDisplayListWithWrappers(aBuilder, aChild, clippedDirtyRect,
++                                        pseudoStack, overflowClip,
++                                        applyOverflowClip,
++                                        changeColorCorrection);
+     } else {
+       rv = aChild->BuildDisplayList(aBuilder, clippedDirtyRect, pseudoStack);
+       if (NS_SUCCEEDED(rv)) {
+         rv = aBuilder->DisplayCaret(aChild, dirty, aLists);
+       }
+     }
+     
+     if (NS_SUCCEEDED(rv)) {
