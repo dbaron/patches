@@ -5,7 +5,65 @@ Use nsWeakFrame from accessibility.  (Bug 525579)
 diff --git a/accessible/src/base/nsAccessibleTreeWalker.cpp b/accessible/src/base/nsAccessibleTreeWalker.cpp
 --- a/accessible/src/base/nsAccessibleTreeWalker.cpp
 +++ b/accessible/src/base/nsAccessibleTreeWalker.cpp
-@@ -162,16 +162,17 @@ NS_IMETHODIMP nsAccessibleTreeWalker::Pu
+@@ -41,30 +41,28 @@
+ #include "nsAccessibilityAtoms.h"
+ #include "nsAccessNode.h"
+ 
+ #include "nsIAnonymousContentCreator.h"
+ #include "nsIServiceManager.h"
+ #include "nsIContent.h"
+ #include "nsIDOMXULElement.h"
+ #include "nsIPresShell.h"
+-#include "nsIFrame.h"
+ #include "nsWeakReference.h"
+ 
+ nsAccessibleTreeWalker::nsAccessibleTreeWalker(nsIWeakReference* aPresShell, nsIDOMNode* aNode, PRBool aWalkAnonContent): 
+   mWeakShell(aPresShell), 
+   mAccService(do_GetService("@mozilla.org/accessibilityService;1")),
+   mWalkAnonContent(aWalkAnonContent)
+ {
+   mState.domNode = aNode;
+   mState.prevState = nsnull;
+   mState.siblingIndex = eSiblingsUninitialized;
+   mState.siblingList = nsnull;
+   mState.isHidden = false;
+-  mState.frame = nsnull;
+ 
+   MOZ_COUNT_CTOR(nsAccessibleTreeWalker);
+ }
+ 
+ nsAccessibleTreeWalker::~nsAccessibleTreeWalker()
+ {
+   // Clear state stack from memory
+   while (NS_SUCCEEDED(PopState()))
+@@ -116,22 +114,23 @@ void nsAccessibleTreeWalker::GetKids(nsI
+     }
+   }
+ 
+   mState.siblingList->Item(0 /* 0 == mState.siblingIndex */, getter_AddRefs(mState.domNode));
+ }
+ 
+ NS_IMETHODIMP nsAccessibleTreeWalker::PopState()
+ {
+-  nsIFrame *frameParent = mState.frame? mState.frame->GetParent(): nsnull;
++  nsIFrame *frameParent =
++    mState.frame.GetFrame() ? mState.frame.GetFrame()->GetParent() : nsnull;
+   if (mState.prevState) {
+     WalkState *toBeDeleted = mState.prevState;
+     mState = *mState.prevState; // deep copy
+     mState.isHidden = PR_FALSE; // If we were in a child, the parent wasn't hidden
+-    if (!mState.frame) {
++    if (!mState.frame.GetFrame()) {
+       mState.frame = frameParent;
+     }
+     delete toBeDeleted;
+     return NS_OK;
+   }
+   ClearState();
+   mState.frame = frameParent;
+   mState.isHidden = PR_FALSE;
+@@ -161,18 +160,18 @@ NS_IMETHODIMP nsAccessibleTreeWalker::Pu
+ 
  void nsAccessibleTreeWalker::GetNextDOMNode()
  {
    // Get next DOM node
@@ -13,9 +71,10 @@ diff --git a/accessible/src/base/nsAccessibleTreeWalker.cpp b/accessible/src/bas
      mState.domNode = do_QueryInterface(mState.parentContent->GetChildAt(++mState.siblingIndex));
    }
    else if (mState.siblingIndex == eSiblingsWalkFrames) {
-     if (mState.frame) {
-+      nsWeakFrame(mState.frame);
-       mState.domNode = do_QueryInterface(mState.frame->GetContent());
+-    if (mState.frame) {
+-      mState.domNode = do_QueryInterface(mState.frame->GetContent());
++    if (mState.frame.GetFrame()) {
++      mState.domNode = do_QueryInterface(mState.frame.GetFrame()->GetContent());
      } else {
        mState.domNode = nsnull;
      }
@@ -23,10 +82,116 @@ diff --git a/accessible/src/base/nsAccessibleTreeWalker.cpp b/accessible/src/bas
    else { 
      mState.siblingList->Item(++mState.siblingIndex, getter_AddRefs(mState.domNode));
    }
+ }
+@@ -225,28 +224,30 @@ NS_IMETHODIMP nsAccessibleTreeWalker::Ge
+   }
+ 
+   PopState();  // Return to previous state
+   return NS_ERROR_FAILURE;
+ }
+ 
+ void nsAccessibleTreeWalker::UpdateFrame(PRBool aTryFirstChild)
+ {
+-  if (!mState.frame) {
++  nsIFrame *curFrame = mState.frame.GetFrame();
++  if (!curFrame) {
+     return;
+   }
+ 
+   if (aTryFirstChild) {
+     // If the frame implements nsIAnonymousContentCreator interface then go down
+     // through the frames and obtain anonymous nodes for them.
+-    nsIAnonymousContentCreator* creator = do_QueryFrame(mState.frame);
+-    mState.frame = mState.frame->GetFirstChild(nsnull);
++    nsIAnonymousContentCreator* creator = do_QueryFrame(curFrame);
++    nsIFrame *child = curFrame->GetFirstChild(nsnull);
++    mState.frame = child;
+ 
+-    if (creator && mState.frame && mState.siblingIndex < 0) {
+-      mState.domNode = do_QueryInterface(mState.frame->GetContent());
++    if (creator && child && mState.siblingIndex < 0) {
++      mState.domNode = do_QueryInterface(child->GetContent());
+       mState.siblingIndex = eSiblingsWalkFrames;
+     }
+ // temporary workaround for Bug 359210. We never want to walk frames.
+ // Aaron Leventhal will refix :before and :after content later without walking frames.
+ #if 0
+     if (mState.frame && mState.siblingIndex < 0) {
+       // Container frames can contain generated content frames from
+       // :before and :after style rules, so we walk their frame trees
+@@ -263,31 +264,33 @@ void nsAccessibleTreeWalker::UpdateFrame
+       //   pseudoContext = presContext->StyleSet()->
+       //     ProbePseudoStyleFor(content, nsAccessibilityAtoms::after, aStyleContext);
+       mState.domNode = do_QueryInterface(mState.frame->GetContent());
+       mState.siblingIndex = eSiblingsWalkFrames;
+     }
+ #endif
+   }
+   else {
+-    mState.frame = mState.frame->GetNextSibling();
++    mState.frame = curFrame->GetNextSibling();
+   }
+ }
+ 
+ /**
+  * If the DOM node's frame has an accessible or the DOMNode
+  * itself implements nsIAccessible return it.
+  */
+ PRBool nsAccessibleTreeWalker::GetAccessible()
+ {
+   if (!mAccService) {
+     return PR_FALSE;
+   }
+ 
+   mState.accessible = nsnull;
+   nsCOMPtr<nsIPresShell> presShell(do_QueryReferent(mWeakShell));
+ 
++  nsIFrame *frame;
+   mAccService->GetAccessible(mState.domNode, presShell, mWeakShell,
+-                             &mState.frame, &mState.isHidden,
++                             &frame, &mState.isHidden,
+                              getter_AddRefs(mState.accessible));
++  mState.frame = frame;
+   return mState.accessible ? PR_TRUE : PR_FALSE;
+ }
+ 
+diff --git a/accessible/src/base/nsAccessibleTreeWalker.h b/accessible/src/base/nsAccessibleTreeWalker.h
+--- a/accessible/src/base/nsAccessibleTreeWalker.h
++++ b/accessible/src/base/nsAccessibleTreeWalker.h
+@@ -44,26 +44,27 @@
+ 
+ #include "nsCOMPtr.h"
+ #include "nsIDocument.h"
+ #include "nsIAccessible.h"
+ #include "nsIDOMNode.h"
+ #include "nsIDOMNodeList.h"
+ #include "nsIAccessibilityService.h"
+ #include "nsIWeakReference.h"
++#include "nsIFrame.h"
+ 
+ enum { eSiblingsUninitialized = -1, eSiblingsWalkFrames = -2 };
+ 
+ struct WalkState {
+   nsCOMPtr<nsIAccessible> accessible;
+   nsCOMPtr<nsIDOMNode> domNode;
+   nsCOMPtr<nsIDOMNodeList> siblingList;
+   nsIContent *parentContent; // For walking normal DOM
+   WalkState *prevState;
+-  nsIFrame *frame;     // Helps avoid GetPrimaryFrameFor() calls
++  nsWeakFrame frame;       // Helps avoid GetPrimaryFrameFor() calls
+   PRInt32 siblingIndex;    // Holds a state flag or an index into the siblingList
+   PRBool isHidden;         // Don't enter subtree if hidden
+ };
+  
+ /** This class is used to walk the DOM tree. It skips
+   * everything but nodes that either implement nsIAccessibleProvider
+   * or have primary frames that implement "GetAccessible"
+   */
 diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
 --- a/layout/base/nsIPresShell.h
 +++ b/layout/base/nsIPresShell.h
-@@ -824,17 +824,28 @@ public:
+@@ -823,18 +823,39 @@ public:
+    * such that the mouse is over the same point in the scaled image as in
     * the original. When scaling does not occur, the mouse point isn't used
     * as the position can be determined from the displayed frames.
     */
@@ -34,8 +199,19 @@ diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
                                                          nsIntPoint& aPoint,
                                                          nsIntRect* aScreenRect) = 0;
  
-   void AddWeakFrame(nsWeakFrame* aWeakFrame);
+-  void AddWeakFrame(nsWeakFrame* aWeakFrame);
 -  void RemoveWeakFrame(nsWeakFrame* aWeakFrame);
++  void AddWeakFrameInternal(nsWeakFrame* aWeakFrame);
++  virtual void AddWeakFrameExternal(nsWeakFrame* aWeakFrame);
++
++  void AddWeakFrame(nsWeakFrame* aWeakFrame)
++  {
++#ifdef _IMPL_NS_LAYOUT
++    AddWeakFrameInternal(aWeakFrame);
++#else
++    AddWeakFrameExternal(aWeakFrame);
++#endif
++  }
 +
 +  void RemoveWeakFrameInternal(nsWeakFrame* aWeakFrame);
 +  virtual void RemoveWeakFrameExternal(nsWeakFrame* aWeakFrame);
@@ -59,7 +235,26 @@ diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
 diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
 --- a/layout/base/nsPresShell.cpp
 +++ b/layout/base/nsPresShell.cpp
-@@ -1556,17 +1556,23 @@ nsIPresShell::AddWeakFrame(nsWeakFrame* 
+@@ -1545,28 +1545,40 @@ nsIPresShell::GetVerifyReflowFlags()
+ {
+ #ifdef NS_DEBUG
+   return gVerifyReflowFlags;
+ #else
+   return 0;
+ #endif
+ }
+ 
+-void
+-nsIPresShell::AddWeakFrame(nsWeakFrame* aWeakFrame)
++/* virtual */ void
++nsIPresShell::AddWeakFrameExternal(nsWeakFrame* aWeakFrame)
++{
++  AddWeakFrameInternal(aWeakFrame);
++}
++
++void
++nsIPresShell::AddWeakFrameInternal(nsWeakFrame* aWeakFrame)
+ {
    if (aWeakFrame->GetFrame()) {
      aWeakFrame->GetFrame()->AddStateBits(NS_FRAME_EXTERNAL_REFERENCE);
    }
@@ -67,8 +262,9 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
    mWeakFrames = aWeakFrame;
  }
  
- void
+-void
 -nsIPresShell::RemoveWeakFrame(nsWeakFrame* aWeakFrame)
++/* virtual */ void
 +nsIPresShell::RemoveWeakFrameExternal(nsWeakFrame* aWeakFrame)
 +{
 +  RemoveWeakFrameInternal(aWeakFrame);
