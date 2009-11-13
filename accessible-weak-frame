@@ -1,0 +1,152 @@
+From: David Bolter <bolterbugz@gmail.com>, L. David Baron <dbaron@dbaron.org>
+
+Use nsWeakFrame from accessibility.  (Bug 525579)
+
+diff --git a/accessible/src/base/nsAccessibleTreeWalker.cpp b/accessible/src/base/nsAccessibleTreeWalker.cpp
+--- a/accessible/src/base/nsAccessibleTreeWalker.cpp
++++ b/accessible/src/base/nsAccessibleTreeWalker.cpp
+@@ -162,16 +162,17 @@ NS_IMETHODIMP nsAccessibleTreeWalker::Pu
+ void nsAccessibleTreeWalker::GetNextDOMNode()
+ {
+   // Get next DOM node
+   if (mState.parentContent) {
+     mState.domNode = do_QueryInterface(mState.parentContent->GetChildAt(++mState.siblingIndex));
+   }
+   else if (mState.siblingIndex == eSiblingsWalkFrames) {
+     if (mState.frame) {
++      nsWeakFrame(mState.frame);
+       mState.domNode = do_QueryInterface(mState.frame->GetContent());
+     } else {
+       mState.domNode = nsnull;
+     }
+   }
+   else { 
+     mState.siblingList->Item(++mState.siblingIndex, getter_AddRefs(mState.domNode));
+   }
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -824,17 +824,28 @@ public:
+    * the original. When scaling does not occur, the mouse point isn't used
+    * as the position can be determined from the displayed frames.
+    */
+   virtual already_AddRefed<gfxASurface> RenderSelection(nsISelection* aSelection,
+                                                         nsIntPoint& aPoint,
+                                                         nsIntRect* aScreenRect) = 0;
+ 
+   void AddWeakFrame(nsWeakFrame* aWeakFrame);
+-  void RemoveWeakFrame(nsWeakFrame* aWeakFrame);
++
++  void RemoveWeakFrameInternal(nsWeakFrame* aWeakFrame);
++  virtual void RemoveWeakFrameExternal(nsWeakFrame* aWeakFrame);
++
++  void RemoveWeakFrame(nsWeakFrame* aWeakFrame)
++  {
++#ifdef _IMPL_NS_LAYOUT
++    RemoveWeakFrameInternal(aWeakFrame);
++#else
++    RemoveWeakFrameExternal(aWeakFrame);
++#endif
++  }
+ 
+ #ifdef NS_DEBUG
+   nsIFrame* GetDrawEventTargetFrame() { return mDrawEventTargetFrame; }
+ #endif
+ 
+   /**
+    * Stop or restart non synthetic test mouse event handling on *all*
+    * presShells.
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -1556,17 +1556,23 @@ nsIPresShell::AddWeakFrame(nsWeakFrame* 
+   if (aWeakFrame->GetFrame()) {
+     aWeakFrame->GetFrame()->AddStateBits(NS_FRAME_EXTERNAL_REFERENCE);
+   }
+   aWeakFrame->SetPreviousWeakFrame(mWeakFrames);
+   mWeakFrames = aWeakFrame;
+ }
+ 
+ void
+-nsIPresShell::RemoveWeakFrame(nsWeakFrame* aWeakFrame)
++nsIPresShell::RemoveWeakFrameExternal(nsWeakFrame* aWeakFrame)
++{
++  RemoveWeakFrameInternal(aWeakFrame);
++}
++
++void
++nsIPresShell::RemoveWeakFrameInternal(nsWeakFrame* aWeakFrame)
+ {
+   if (mWeakFrames == aWeakFrame) {
+     mWeakFrames = aWeakFrame->GetPreviousWeakFrame();
+     return;
+   }
+   nsWeakFrame* nextWeak = mWeakFrames;
+   while (nextWeak && nextWeak->GetPreviousWeakFrame() != aWeakFrame) {
+     nextWeak = nextWeak->GetPreviousWeakFrame();
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -263,17 +263,17 @@ NS_MergeReflowStatusInto(nsReflowStatus*
+     (NS_FRAME_NOT_COMPLETE | NS_FRAME_OVERFLOW_INCOMPLETE |
+      NS_FRAME_TRUNCATED | NS_FRAME_REFLOW_NEXTINFLOW);
+   if (*aPrimary & NS_FRAME_NOT_COMPLETE) {
+     *aPrimary &= ~NS_FRAME_OVERFLOW_INCOMPLETE;
+   }
+ }
+ 
+ void
+-nsWeakFrame::Init(nsIFrame* aFrame)
++nsWeakFrame::InitInternal(nsIFrame* aFrame)
+ {
+   Clear(mFrame ? mFrame->PresContext()->GetPresShell() : nsnull);
+   mFrame = aFrame;
+   if (mFrame) {
+     nsIPresShell* shell = mFrame->PresContext()->GetPresShell();
+     NS_WARN_IF_FALSE(shell, "Null PresShell in nsWeakFrame!");
+     if (shell) {
+       shell->AddWeakFrame(this);
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -2527,17 +2527,39 @@ public:
+ 
+   void SetPreviousWeakFrame(nsWeakFrame* aPrev) { mPrev = aPrev; }
+ 
+   ~nsWeakFrame()
+   {
+     Clear(mFrame ? mFrame->PresContext()->GetPresShell() : nsnull);
+   }
+ private:
+-  void Init(nsIFrame* aFrame);
++  void InitInternal(nsIFrame* aFrame);
++
++  void InitExternal(nsIFrame* aFrame) {
++    Clear(mFrame ? mFrame->PresContext()->GetPresShell() : nsnull);
++    mFrame = aFrame;
++    if (mFrame) {
++      nsIPresShell* shell = mFrame->PresContext()->GetPresShell();
++      NS_WARN_IF_FALSE(shell, "Null PresShell in nsWeakFrame!");
++      if (shell) {
++        shell->AddWeakFrame(this);
++      } else {
++        mFrame = nsnull;
++      }
++    }
++  }
++
++  void Init(nsIFrame* aFrame) {
++#ifdef _IMPL_NS_LAYOUT
++    InitInternal(aFrame);
++#else
++    InitExternal(aFrame);
++#endif
++  }
+ 
+   nsWeakFrame*  mPrev;
+   nsIFrame*     mFrame;
+ };
+ 
+ inline void
+ nsFrameList::Enumerator::Next()
+ {
