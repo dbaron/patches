@@ -5,43 +5,188 @@ Reference-count CSS data blocks and make them immutable when their reference cou
 diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
 --- a/layout/style/nsCSSDataBlock.cpp
 +++ b/layout/style/nsCSSDataBlock.cpp
-@@ -584,16 +584,32 @@ nsCSSExpandedDataBlock::kOffsetTable[eCS
+@@ -539,23 +539,25 @@ nsCSSCompressedDataBlock::Destroy()
+                 cursor += CDBPointerStorage_advance;
+             } break;
+         }
+     }
+     NS_ASSERTION(cursor == cursor_end, "inconsistent data");
+     delete this;
+ }
+ 
+-/* static */ nsCSSCompressedDataBlock*
++/* static */ already_AddRefed<nsCSSCompressedDataBlock>
+ nsCSSCompressedDataBlock::CreateEmptyBlock()
+ {
+     nsCSSCompressedDataBlock *result = new(0) nsCSSCompressedDataBlock();
+     if (!result)
+         return nsnull;
+     result->mBlockEnd = result->Block();
++
++    result->AddRef();
+     return result;
+ }
+ 
+ /*****************************************************************************/
+ 
+ nsCSSExpandedDataBlock::nsCSSExpandedDataBlock()
+ {
+     AssertInitialState();
+@@ -579,29 +581,41 @@ nsCSSExpandedDataBlock::kOffsetTable[eCS
+           offsetof(nsRuleData, m##datastruct_##Data),                          \
+           offsetof(nsRuleData##datastruct_, member_) },
+     #include "nsCSSPropList.h"
+     #undef CSS_PROP
+     #undef CSS_PROP_BACKENDONLY
  };
  
  void
- nsCSSExpandedDataBlock::DoExpand(nsCSSCompressedDataBlock *aBlock,
+-nsCSSExpandedDataBlock::DoExpand(nsCSSCompressedDataBlock *aBlock,
++nsCSSExpandedDataBlock::DoExpand(nsRefPtr<nsCSSCompressedDataBlock> *aBlock,
                                   PRBool aImportant)
  {
-     NS_PRECONDITION(aBlock, "unexpected null block");
- 
-+    if (!aBlock->IsMutable()) {
+-    NS_PRECONDITION(aBlock, "unexpected null block");
++    NS_PRECONDITION(*aBlock, "unexpected null block");
++
++    if (!(*aBlock)->IsMutable()) {
 +        // FIXME (maybe): We really don't need to clone the block
 +        // itself, just all the data inside it.
-+        nsCSSCompressedDataBlock *newBlock = aBlock->Clone();
-+        aBlock->Release();
-+
-+        aBlock = newBlock;
++        *aBlock = (*aBlock)->Clone();
 +        if (!aBlock) {
 +            // Not much we can do; just lose the properties.
 +            NS_WARNING("out of memory");
 +            return;
 +        }
-+        aBlock->AddRef();
-+        NS_ABORT_IF_FALSE(aBlock->IsMutable(), "we just cloned it");
++        NS_ABORT_IF_FALSE((*aBlock)->IsMutable(), "we just cloned it");
 +    }
-+
+ 
      /*
       * Save needless copying and allocation by copying the memory
       * corresponding to the stored data in the compressed block, and
       * then, to avoid destructors, deleting the compressed block by
       * calling |delete| instead of using its |Destroy| method.
       */
-     const char* cursor = aBlock->Block();
-     const char* cursor_end = aBlock->BlockEnd();
+-    const char* cursor = aBlock->Block();
+-    const char* cursor_end = aBlock->BlockEnd();
++    const char* cursor = (*aBlock)->Block();
++    const char* cursor_end = (*aBlock)->BlockEnd();
+     while (cursor < cursor_end) {
+         nsCSSProperty iProp = PropertyAtCursor(cursor);
+         NS_ASSERTION(0 <= iProp && iProp < eCSSProperty_COUNT_no_shorthands,
+                      "out of range");
+         NS_ASSERTION(!HasPropertyBit(iProp),
+                      "compressed block has property multiple times");
+         SetPropertyBit(iProp);
+         if (aImportant)
+@@ -658,31 +672,31 @@ nsCSSExpandedDataBlock::DoExpand(nsCSSCo
+                 NS_ASSERTION(!*dest, "expanding into non-empty block");
+                 *dest = val;
+                 cursor += CDBPointerStorage_advance;
+             } break;
+         }
+     }
+     NS_ASSERTION(cursor == cursor_end, "inconsistent data");
+ 
+-    delete aBlock;
++    NS_ASSERTION((*aBlock)->mRefCnt == 1, "unexpected reference count");
++    delete aBlock->forget();
+ }
+ 
+ void
+-nsCSSExpandedDataBlock::Expand(nsCSSCompressedDataBlock **aNormalBlock,
+-                               nsCSSCompressedDataBlock **aImportantBlock)
++nsCSSExpandedDataBlock::Expand(
++                          nsRefPtr<nsCSSCompressedDataBlock> *aNormalBlock,
++                          nsRefPtr<nsCSSCompressedDataBlock> *aImportantBlock)
+ {
+     NS_PRECONDITION(*aNormalBlock, "unexpected null block");
+     AssertInitialState();
+ 
+     DoExpand(*aNormalBlock, PR_FALSE);
+-    *aNormalBlock = nsnull;
+     if (*aImportantBlock) {
+         DoExpand(*aImportantBlock, PR_TRUE);
+-        *aImportantBlock = nsnull;
+     }
+ }
+ 
+ nsCSSExpandedDataBlock::ComputeSizeResult
+ nsCSSExpandedDataBlock::ComputeSize()
+ {
+     ComputeSizeResult result = {0, 0};
+     for (PRUint32 iHigh = 0; iHigh < nsCSSPropertySet::kChunkCount; ++iHigh) {
+@@ -744,33 +758,32 @@ nsCSSExpandedDataBlock::ComputeSize()
+     }
+     return result;
+ }
+ 
+ void
+ nsCSSExpandedDataBlock::Compress(nsCSSCompressedDataBlock **aNormalBlock,
+                                  nsCSSCompressedDataBlock **aImportantBlock)
+ {
+-    nsCSSCompressedDataBlock *result_normal, *result_important;
++    nsRefPtr<nsCSSCompressedDataBlock> result_normal, result_important;
+     char *cursor_normal, *cursor_important;
+ 
+     ComputeSizeResult size = ComputeSize();
+     
+     result_normal = new(size.normal) nsCSSCompressedDataBlock();
+     if (!result_normal) {
+         *aNormalBlock = nsnull;
+         *aImportantBlock = nsnull;
+         return;
+     }
+     cursor_normal = result_normal->Block();
+ 
+     if (size.important != 0) {
+         result_important = new(size.important) nsCSSCompressedDataBlock();
+         if (!result_important) {
+-            delete result_normal;
+             *aNormalBlock = nsnull;
+             *aImportantBlock = nsnull;
+             return;
+         }
+         cursor_important = result_important->Block();
+     } else {
+         result_important = nsnull;
+     }
+@@ -856,18 +869,18 @@ nsCSSExpandedDataBlock::Compress(nsCSSCo
+     if (result_important) {
+         result_important->mBlockEnd = cursor_important;
+         NS_ASSERTION(result_important->DataSize() == ptrdiff_t(size.important),
+                      "size miscalculation");
+     }
+ 
+     ClearSets();
+     AssertInitialState();
+-    *aNormalBlock = result_normal;
+-    *aImportantBlock = result_important;
++    result_normal.forget(aNormalBlock);
++    result_important.forget(aImportantBlock);
+ }
+ 
+ void
+ nsCSSExpandedDataBlock::Clear()
+ {
+     for (PRUint32 iHigh = 0; iHigh < nsCSSPropertySet::kChunkCount; ++iHigh) {
+         if (!mPropertiesSet.HasPropertyInChunk(iHigh))
+             continue;
 diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
 --- a/layout/style/nsCSSDataBlock.h
 +++ b/layout/style/nsCSSDataBlock.h
-@@ -51,16 +51,21 @@ struct nsRuleData;
+@@ -40,27 +40,33 @@
+  */
+ 
+ #ifndef nsCSSDataBlock_h__
+ #define nsCSSDataBlock_h__
+ 
+ #include "nsCSSStruct.h"
+ #include "nsCSSProps.h"
+ #include "nsCSSPropertySet.h"
++#include "nsAutoPtr.h"
+ 
+ struct nsRuleData;
+ 
  class nsCSSExpandedDataBlock;
  class nsCSSDeclaration;
  
@@ -63,7 +208,7 @@ diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
  
      /**
       * Do what |nsIStyleRule::MapRuleInfoInto| needs to do for a style
-@@ -117,56 +122,77 @@ public:
+@@ -117,56 +123,77 @@ public:
      }
  
      /**
@@ -79,8 +224,9 @@ diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
 -    /**
       * Create a new nsCSSCompressedDataBlock holding no declarations.
       */
-     static nsCSSCompressedDataBlock* CreateEmptyBlock();
- 
+-    static nsCSSCompressedDataBlock* CreateEmptyBlock();
++    static already_AddRefed<nsCSSCompressedDataBlock> CreateEmptyBlock();
++
 +    void AddRef() {
 +        NS_ASSERTION(mRefCnt == 0 || mRefCnt == 1,
 +                     "unexpected reference count");
@@ -99,7 +245,7 @@ diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
 +                     "unexpected reference count");
 +        return mRefCnt < 2;
 +    }
-+
+ 
  private:
      PRInt32 mStyleBits; // the structs for which we have data, according to
                          // |nsCachedStyleData::GetBitForSID|.
@@ -146,7 +292,7 @@ diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
  public:
      nsCSSExpandedDataBlock();
      ~nsCSSExpandedDataBlock();
-@@ -194,20 +220,20 @@ public:
+@@ -194,23 +221,23 @@ public:
  #endif
      nsCSSColumn mColumn;
  
@@ -162,10 +308,181 @@ diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
 -     * block.)
 +     * block in many cases.)
       */
-     void Expand(nsCSSCompressedDataBlock **aNormalBlock,
-                 nsCSSCompressedDataBlock **aImportantBlock);
+-    void Expand(nsCSSCompressedDataBlock **aNormalBlock,
+-                nsCSSCompressedDataBlock **aImportantBlock);
++    void Expand(nsRefPtr<nsCSSCompressedDataBlock> *aNormalBlock,
++                nsRefPtr<nsCSSCompressedDataBlock> *aImportantBlock);
  
      /**
       * Allocate a new compressed block and transfer all of the state
       * from this expanded block to the new compressed block, clearing
       * the state of this expanded block.
+      */
+     void Compress(nsCSSCompressedDataBlock **aNormalBlock,
+                   nsCSSCompressedDataBlock **aImportantBlock);
+@@ -237,17 +264,18 @@ private:
+      * Compute the size that will be occupied by the result of
+      * |Compress|.
+      */
+     struct ComputeSizeResult {
+         PRUint32 normal, important;
+     };
+     ComputeSizeResult ComputeSize();
+ 
+-    void DoExpand(nsCSSCompressedDataBlock *aBlock, PRBool aImportant);
++    void DoExpand(nsRefPtr<nsCSSCompressedDataBlock> *aBlock,
++                  PRBool aImportant);
+ 
+ #ifdef DEBUG
+     void DoAssertInitialState();
+ #endif
+ 
+     struct PropertyOffsetInfo {
+         // XXX These could probably be pointer-to-member, if the casting can
+         // be done correctly.
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -57,18 +57,16 @@
+ #include "nsReadableUtils.h"
+ #include "nsStyleUtil.h"
+ 
+ #include "nsStyleConsts.h"
+ 
+ #include "nsCOMPtr.h"
+ 
+ nsCSSDeclaration::nsCSSDeclaration() 
+-  : mData(nsnull),
+-    mImportantData(nsnull)
+ {
+   // check that we can fit all the CSS properties into a PRUint8
+   // for the mOrder array - if not, might need to use PRUint16!
+   PR_STATIC_ASSERT(eCSSProperty_COUNT_no_shorthands - 1 <= PR_UINT8_MAX);
+ 
+   MOZ_COUNT_CTOR(nsCSSDeclaration);
+ }
+ 
+@@ -78,23 +76,16 @@ nsCSSDeclaration::nsCSSDeclaration(const
+     mImportantData(aCopy.mImportantData ? aCopy.mImportantData->Clone()
+                                          : nsnull)
+ {
+   MOZ_COUNT_CTOR(nsCSSDeclaration);
+ }
+ 
+ nsCSSDeclaration::~nsCSSDeclaration(void)
+ {
+-  if (mData) {
+-    mData->Destroy();
+-  }
+-  if (mImportantData) {
+-    mImportantData->Destroy();
+-  }
+-
+   MOZ_COUNT_DTOR(nsCSSDeclaration);
+ }
+ 
+ nsresult
+ nsCSSDeclaration::ValueAppended(nsCSSProperty aProperty)
+ {
+   NS_ABORT_IF_FALSE(!nsCSSProps::IsShorthand(aProperty),
+                     "shorthands forbidden");
+@@ -103,30 +94,30 @@ nsCSSDeclaration::ValueAppended(nsCSSPro
+   mOrder.AppendElement(aProperty);
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsCSSDeclaration::RemoveProperty(nsCSSProperty aProperty)
+ {
+   nsCSSExpandedDataBlock data;
+-  data.Expand(&mData, &mImportantData);
++  ExpandTo(&data);
+   NS_ASSERTION(!mData && !mImportantData, "Expand didn't null things out");
+ 
+   if (nsCSSProps::IsShorthand(aProperty)) {
+     CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(p, aProperty) {
+       data.ClearProperty(*p);
+       mOrder.RemoveElement(*p);
+     }
+   } else {
+     data.ClearProperty(aProperty);
+     mOrder.RemoveElement(aProperty);
+   }
+ 
+-  data.Compress(&mData, &mImportantData);
++  CompressFrom(&data);
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsCSSDeclaration::AppendComment(const nsAString& aComment)
+ {
+   return /* NS_ERROR_NOT_IMPLEMENTED, or not any longer that is */ NS_OK;
+ }
+diff --git a/layout/style/nsCSSDeclaration.h b/layout/style/nsCSSDeclaration.h
+--- a/layout/style/nsCSSDeclaration.h
++++ b/layout/style/nsCSSDeclaration.h
+@@ -107,17 +107,18 @@ public:
+ 
+   /**
+    * Transfer all of the state from |aExpandedData| into this declaration.
+    * After calling, |aExpandedData| should be in its initial state.
+    */
+   void CompressFrom(nsCSSExpandedDataBlock *aExpandedData) {
+     NS_ASSERTION(!mData, "oops");
+     NS_ASSERTION(!mImportantData, "oops");
+-    aExpandedData->Compress(&mData, &mImportantData);
++    aExpandedData->Compress(getter_AddRefs(mData),
++                            getter_AddRefs(mImportantData));
+     aExpandedData->AssertInitialState();
+   }
+ 
+   /**
+    * Transfer all of the state from this declaration into
+    * |aExpandedData| and put this declaration temporarily into an
+    * invalid state (ended by |CompressFrom| or |InitializeEmpty|) that
+    * should last only during parsing.  During this time only
+@@ -152,22 +153,18 @@ public:
+     return slot;
+   }
+ 
+   /**
+    * Clear the data, in preparation for its replacement with entirely
+    * new data by a call to |CompressFrom|.
+    */
+   void ClearData() {
+-    mData->Destroy();
+     mData = nsnull;
+-    if (mImportantData) {
+-      mImportantData->Destroy();
+-      mImportantData = nsnull;
+-    }
++    mImportantData = nsnull;
+     mOrder.Clear();
+   }
+ 
+ #ifdef DEBUG
+   void List(FILE* out = stdout, PRInt32 aIndent = 0) const;
+ #endif
+   
+   // return whether there was a value in |aValue| (i.e., it had a non-null unit)
+@@ -232,13 +229,17 @@ private:
+     
+   nsCSSProperty OrderValueAt(PRUint32 aValue) const {
+     return nsCSSProperty(mOrder.ElementAt(aValue));
+   }
+ 
+ private:
+     nsAutoTArray<PRUint8, 8> mOrder;
+     nsAutoRefCnt mRefCnt;
+-    nsCSSCompressedDataBlock *mData; // never null, except while expanded
+-    nsCSSCompressedDataBlock *mImportantData; // may be null
++
++    // never null, except while expanded
++    nsRefPtr<nsCSSCompressedDataBlock> mData;
++
++    // may be null
++    nsRefPtr<nsCSSCompressedDataBlock> mImportantData;
+ };
+ 
+ #endif /* nsCSSDeclaration_h___ */
