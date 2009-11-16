@@ -1,0 +1,171 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Reference-count CSS data blocks and make them immutable when their reference count is above 1.  (Bug 522595)
+
+diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
+--- a/layout/style/nsCSSDataBlock.cpp
++++ b/layout/style/nsCSSDataBlock.cpp
+@@ -584,16 +584,32 @@ nsCSSExpandedDataBlock::kOffsetTable[eCS
+ };
+ 
+ void
+ nsCSSExpandedDataBlock::DoExpand(nsCSSCompressedDataBlock *aBlock,
+                                  PRBool aImportant)
+ {
+     NS_PRECONDITION(aBlock, "unexpected null block");
+ 
++    if (!aBlock->IsMutable()) {
++        // FIXME (maybe): We really don't need to clone the block
++        // itself, just all the data inside it.
++        nsCSSCompressedDataBlock *newBlock = aBlock->Clone();
++        aBlock->Release();
++
++        aBlock = newBlock;
++        if (!aBlock) {
++            // Not much we can do; just lose the properties.
++            NS_WARNING("out of memory");
++            return;
++        }
++        aBlock->AddRef();
++        NS_ABORT_IF_FALSE(aBlock->IsMutable(), "we just cloned it");
++    }
++
+     /*
+      * Save needless copying and allocation by copying the memory
+      * corresponding to the stored data in the compressed block, and
+      * then, to avoid destructors, deleting the compressed block by
+      * calling |delete| instead of using its |Destroy| method.
+      */
+     const char* cursor = aBlock->Block();
+     const char* cursor_end = aBlock->BlockEnd();
+diff --git a/layout/style/nsCSSDataBlock.h b/layout/style/nsCSSDataBlock.h
+--- a/layout/style/nsCSSDataBlock.h
++++ b/layout/style/nsCSSDataBlock.h
+@@ -51,16 +51,21 @@ struct nsRuleData;
+ class nsCSSExpandedDataBlock;
+ class nsCSSDeclaration;
+ 
+ /**
+  * An |nsCSSCompressedDataBlock| holds a usually-immutable chunk of
+  * property-value data for a CSS declaration block (which we misname a
+  * |nsCSSDeclaration|).  Mutation is accomplished through
+  * |nsCSSExpandedDataBlock| or in some cases via direct slot access.
++ *
++ * Mutation is forbidden when the reference count is greater than one,
++ * since once a style rule has used a compressed data block, mutation of
++ * that block is forbidden, and any declarations that want to mutate it
++ * need to clone it first.
+  */
+ class nsCSSCompressedDataBlock {
+ public:
+     friend class nsCSSExpandedDataBlock;
+     friend class nsCSSDeclaration;
+ 
+     /**
+      * Do what |nsIStyleRule::MapRuleInfoInto| needs to do for a style
+@@ -117,56 +122,77 @@ public:
+     }
+ 
+     /**
+      * Clone this block, or return null on out-of-memory.
+      */
+     nsCSSCompressedDataBlock* Clone() const;
+ 
+     /**
+-     * Delete all the data stored in this block, and the block itself.
+-     */
+-    void Destroy();
+-
+-    /**
+      * Create a new nsCSSCompressedDataBlock holding no declarations.
+      */
+     static nsCSSCompressedDataBlock* CreateEmptyBlock();
+ 
++    void AddRef() {
++        NS_ASSERTION(mRefCnt == 0 || mRefCnt == 1,
++                     "unexpected reference count");
++        ++mRefCnt;
++    }
++    void Release() {
++        NS_ASSERTION(mRefCnt == 1 || mRefCnt == 2,
++                     "unexpected reference count");
++        if (--mRefCnt == 0) {
++            Destroy();
++        }
++    }
++
++    PRBool IsMutable() const {
++        NS_ASSERTION(mRefCnt == 1 || mRefCnt == 2,
++                     "unexpected reference count");
++        return mRefCnt < 2;
++    }
++
+ private:
+     PRInt32 mStyleBits; // the structs for which we have data, according to
+                         // |nsCachedStyleData::GetBitForSID|.
++    nsAutoRefCnt mRefCnt;
+ 
+     enum { block_chars = 4 }; // put 4 chars in the definition of the class
+                               // to ensure size not inflated by alignment
+ 
+     void* operator new(size_t aBaseSize, size_t aDataSize) {
+         // subtract off the extra size to store |mBlock_|
+         return ::operator new(aBaseSize + aDataSize -
+                               sizeof(char) * block_chars);
+     }
+ 
+     nsCSSCompressedDataBlock() : mStyleBits(0) {}
+ 
+     // Only this class (through |Destroy|) or nsCSSExpandedDataBlock (in
+     // |Expand|) can delete compressed data blocks.
+     ~nsCSSCompressedDataBlock() { }
+ 
++    /**
++     * Delete all the data stored in this block, and the block itself.
++     */
++    void Destroy();
++
+     char* mBlockEnd; // the byte after the last valid byte
+     char mBlock_[block_chars]; // must be the last member!
+ 
+     char* Block() { return mBlock_; }
+     char* BlockEnd() { return mBlockEnd; }
+     const char* Block() const { return mBlock_; }
+     const char* BlockEnd() const { return mBlockEnd; }
+     ptrdiff_t DataSize() const { return BlockEnd() - Block(); }
+ 
+     // Direct slot access to our values.  See StorageFor above.  Can
+     // return null.  Must not be called for shorthand properties.
+     void* SlotForValue(nsCSSProperty aProperty) {
++      NS_ABORT_IF_FALSE(IsMutable(), "must be mutable");
+       return const_cast<void*>(StorageFor(aProperty));
+     }
+ };
+ 
+ class nsCSSExpandedDataBlock {
+ public:
+     nsCSSExpandedDataBlock();
+     ~nsCSSExpandedDataBlock();
+@@ -194,20 +220,20 @@ public:
+ #endif
+     nsCSSColumn mColumn;
+ 
+     /**
+      * Transfer all of the state from the compressed block to this
+      * expanded block.  The state of this expanded block must be clear
+      * beforehand.
+      *
+-     * The compressed block passed in IS DESTROYED by this method and
++     * The compressed block passed in IS RELEASED by this method and
+      * set to null, and thus cannot be used again.  (This is necessary
+      * because ownership of sub-objects is transferred to the expanded
+-     * block.)
++     * block in many cases.)
+      */
+     void Expand(nsCSSCompressedDataBlock **aNormalBlock,
+                 nsCSSCompressedDataBlock **aImportantBlock);
+ 
+     /**
+      * Allocate a new compressed block and transfer all of the state
+      * from this expanded block to the new compressed block, clearing
+      * the state of this expanded block.
