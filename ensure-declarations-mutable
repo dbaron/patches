@@ -1,0 +1,106 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Ensure that declarations are mutable where needed.  (Bug 522595)
+
+diff --git a/layout/style/nsCSSDeclaration.cpp b/layout/style/nsCSSDeclaration.cpp
+--- a/layout/style/nsCSSDeclaration.cpp
++++ b/layout/style/nsCSSDeclaration.cpp
+@@ -1312,8 +1312,28 @@ nsCSSDeclaration::Clone() const
+ 
+ PRBool
+ nsCSSDeclaration::InitializeEmpty()
+ {
+   NS_ASSERTION(!mData && !mImportantData, "already initialized");
+   mData = nsCSSCompressedDataBlock::CreateEmptyBlock();
+   return mData != nsnull;
+ }
++
++PRBool
++nsCSSDeclaration::EnsureMutable()
++{
++  if (!mData->IsMutable()) {
++    nsRefPtr<nsCSSCompressedDataBlock> newBlock = mData->Clone();
++    if (!newBlock) {
++      return PR_FALSE;
++    }
++    newBlock.swap(mData);
++  }
++  if (mImportantData && !mImportantData->IsMutable()) {
++    nsRefPtr<nsCSSCompressedDataBlock> newBlock = mImportantData->Clone();
++    if (!newBlock) {
++      return PR_FALSE;
++    }
++    newBlock.swap(mImportantData);
++  }
++  return PR_TRUE;
++}
+diff --git a/layout/style/nsCSSDeclaration.h b/layout/style/nsCSSDeclaration.h
+--- a/layout/style/nsCSSDeclaration.h
++++ b/layout/style/nsCSSDeclaration.h
+@@ -133,16 +133,18 @@ public:
+                  "Expand didn't null things out");
+   }
+ 
+   /**
+    * Return a pointer to our current value for this property.  This only
+    * returns non-null if the property is set and it not !important.  This
+    * should only be called when not expanded.  Always returns null for
+    * shorthand properties.
++   *
++   * The caller must call EnsureMutable first.
+    */
+   void* SlotForValue(nsCSSProperty aProperty) {
+     NS_PRECONDITION(mData, "How did that happen?");
+     if (nsCSSProps::IsShorthand(aProperty)) {
+       return nsnull;
+     }
+ 
+     void* slot = mData->SlotForValue(aProperty);
+@@ -154,16 +156,23 @@ public:
+   }
+ 
+   PRBool HasNonImportantValueFor(nsCSSProperty aProperty) const {
+     NS_ABORT_IF_FALSE(nsCSSProps::IsShorthand(aProperty), "must be longhand");
+     return !!mData->StorageFor(aProperty);
+   }
+ 
+   /**
++   * Ensures that IsMutable on both data blocks will return true by
++   * cloning data blocks if needed.  Returns false on out-of-memory
++   * (which means IsMutable won't return true).
++   */
++  PRBool EnsureMutable();
++
++  /**
+    * Clear the data, in preparation for its replacement with entirely
+    * new data by a call to |CompressFrom|.
+    */
+   void ClearData() {
+     mData = nsnull;
+     mImportantData = nsnull;
+     mOrder.Clear();
+   }
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -1115,16 +1115,20 @@ CSSParserImpl::ParseProperty(const nsCSS
+   mTempData.AssertInitialState();
+ 
+   // We know that our new value is not !important, and that we don't need to
+   // force a ValueAppended call for it.  So if there's already a value for this
+   // property in the declaration, and it's not !important, and our prop is not
+   // a shorthand, we parse successfully, then we can just directly copy our
+   // parsed value into the declaration without going through the whole
+   // expand/compress thing.
++  if (!aDeclaration->EnsureMutable()) {
++    NS_WARNING("out of memory");
++    return NS_ERROR_OUT_OF_MEMORY;
++  }
+   void* valueSlot = aDeclaration->SlotForValue(aPropID);
+   if (!valueSlot) {
+     // Do it the slow way
+     aDeclaration->ExpandTo(&mData);
+   }
+   nsresult result = NS_OK;
+   PRBool parsedOK = ParseProperty(aPropID);
+   if (parsedOK && !GetToken(PR_TRUE)) {
