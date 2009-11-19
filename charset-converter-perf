@@ -5,7 +5,7 @@ Make GetUnicodeEncoder/GetUnicodeDecoder use a hash table.  (Bug 213197)
 diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCharsetConverterManager.cpp
 --- a/intl/uconv/src/nsCharsetConverterManager.cpp
 +++ b/intl/uconv/src/nsCharsetConverterManager.cpp
-@@ -60,42 +60,101 @@
+@@ -59,44 +59,104 @@
  // just for CONTRACTIDs
  #include "nsCharsetConverterManager.h"
  
@@ -67,7 +67,11 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 +                   nsICharsetConverterManager)
  
  nsCharsetConverterManager::nsCharsetConverterManager() 
-   :mDataBundle(NULL), mTitleBundle(NULL)
+   : mDataBundle(NULL)
+   , mTitleBundle(NULL)
+-  , mDecoderHashMutex("nsCharsetConverterManager mDecoderHashMutex")
++  , mEncoderTableMutex("nsCharsetConverterManager mEncoderTableMutex")
++  , mDecoderTableMutex("nsCharsetConverterManager mDecoderTableMutex")
  {
  #ifdef MOZ_USE_NATIVE_UCONV
    mNativeUC = do_GetService(NS_NATIVE_UCONV_SERVICE_CONTRACT_ID);
@@ -112,7 +116,7 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
    nsresult rv;
    nsCOMPtr<nsICategoryManager> catman = do_GetService(NS_CATEGORYMANAGER_CONTRACTID, &rv);
    if (NS_FAILED(rv))
-@@ -158,137 +217,156 @@ nsresult nsCharsetConverterManager::GetB
+@@ -159,138 +219,162 @@ nsresult nsCharsetConverterManager::GetB
    if (NS_FAILED(rv))
      return rv;
  
@@ -164,28 +168,31 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 +
 +  *aResult = nsnull;
 +
-+  EncoderDecoderEntry *entry = GetEncoderEntry(aDest, PL_DHASH_ADD);
-+  NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
-+  if (!entry->mCharset) {
-+    nsCAutoString charset;
-+    // fully qualify to possibly avoid vtable call
-+    nsCharsetConverterManager::GetCharsetAlias(aDest, charset);
++  {
++    mozilla::MutexAutoLock autoLock(mEncoderTableMutex);
++    EncoderDecoderEntry *entry = GetEncoderEntry(aDest, PL_DHASH_ADD);
++    NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
++    if (!entry->mCharset) {
++      nsCAutoString charset;
++      // fully qualify to possibly avoid vtable call
++      nsCharsetConverterManager::GetCharsetAlias(aDest, charset);
 +
-+    nsCAutoString
-+      contractid(NS_LITERAL_CSTRING(NS_UNICODEENCODER_CONTRACTID_BASE) +
-+                 charset);
++      nsCAutoString
++        contractid(NS_LITERAL_CSTRING(NS_UNICODEENCODER_CONTRACTID_BASE) +
++                   charset);
 +
-+    nsCOMPtr<nsIComponentManager> cm;
-+    NS_GetComponentManager(getter_AddRefs(cm));
-+    nsresult rv =
-+      cm->GetClassObjectByContractID(contractid.get(), NS_GET_IID(nsIFactory),
-+                                     (void**) &entry->mFactory);
-+    if (NS_FAILED(rv)) {
-+      PL_DHashTableRawRemove(&mEncoderTable, entry);
-+      return rv;
++      nsCOMPtr<nsIComponentManager> cm;
++      NS_GetComponentManager(getter_AddRefs(cm));
++      nsresult rv =
++        cm->GetClassObjectByContractID(contractid.get(), NS_GET_IID(nsIFactory),
++                                       (void**) &entry->mFactory);
++      if (NS_FAILED(rv)) {
++        PL_DHashTableRawRemove(&mEncoderTable, entry);
++        return rv;
++      }
++
++      entry->mCharset = nsCRT::strdup(aDest);
 +    }
-+
-+    entry->mCharset = nsCRT::strdup(aDest);
 +  }
 +
 +  // Always create an instance since encoders hold state.
@@ -268,32 +275,35 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 +  *aResult = nsnull;
 +
 +  PRBool stateless = IsDecoderStateless(aSrc);
-+  EncoderDecoderEntry *entry = GetDecoderEntry(aSrc, PL_DHASH_ADD);
-+  NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
-+  if (!entry->mCharset) {
-+    nsCAutoString charset;
-+    // fully qualify to possibly avoid vtable call
-+    nsCharsetConverterManager::GetCharsetAlias(aSrc, charset);
++  {
++    mozilla::MutexAutoLock autoLock(mDecoderTableMutex);
++    EncoderDecoderEntry *entry = GetDecoderEntry(aSrc, PL_DHASH_ADD);
++    NS_ENSURE_TRUE(entry, NS_ERROR_OUT_OF_MEMORY);
++    if (!entry->mCharset) {
++      nsCAutoString charset;
++      // fully qualify to possibly avoid vtable call
++      nsCharsetConverterManager::GetCharsetAlias(aSrc, charset);
 +
-+    NS_NAMED_LITERAL_CSTRING(kUnicodeDecoderContractIDBase,
-+                             NS_UNICODEDECODER_CONTRACTID_BASE);
-+    nsCAutoString contractid(kUnicodeDecoderContractIDBase + charset);
++      NS_NAMED_LITERAL_CSTRING(kUnicodeDecoderContractIDBase,
++                               NS_UNICODEDECODER_CONTRACTID_BASE);
++      nsCAutoString contractid(kUnicodeDecoderContractIDBase + charset);
 +
-+    nsresult rv;
-+    if (stateless) {
-+      rv = CallGetService(contractid.get(), &entry->mService);
-+    } else {
-+      nsCOMPtr<nsIComponentManager> cm;
-+      NS_GetComponentManager(getter_AddRefs(cm));
-+      rv = cm->GetClassObjectByContractID(contractid.get(),
-+                                          NS_GET_IID(nsIFactory),
-+                                          (void**) &entry->mFactory);
++      nsresult rv;
++      if (stateless) {
++        rv = CallGetService(contractid.get(), &entry->mService);
++      } else {
++        nsCOMPtr<nsIComponentManager> cm;
++        NS_GetComponentManager(getter_AddRefs(cm));
++        rv = cm->GetClassObjectByContractID(contractid.get(),
++                                            NS_GET_IID(nsIFactory),
++                                            (void**) &entry->mFactory);
++      }
++      if (NS_FAILED(rv)) {
++        PL_DHashTableRawRemove(&mEncoderTable, entry);
++        return rv;
++      }
++      entry->mCharset = nsCRT::strdup(aSrc);
 +    }
-+    if (NS_FAILED(rv)) {
-+      PL_DHashTableRawRemove(&mEncoderTable, entry);
-+      return rv;
-+    }
-+    entry->mCharset = nsCRT::strdup(aSrc);
 +  }
 +
 +  if (stateless) {
@@ -334,6 +344,7 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
 -  
 -  if (!strncmp(aSrc, NS_1BYTE_CODER_PATTERN, NS_1BYTE_CODER_PATTERN_LEN))
 -  {
+-    mozilla::MutexAutoLock autoLock(mDecoderHashMutex);
 -    // Single byte decoders don't hold state. Optimize by using a service, and
 -    // cache it in our hash to avoid repeated trips through the service manager.
 -    if (!mDecoderHash.Get(aSrc, getter_AddRefs(decoder))) {
@@ -362,11 +373,11 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.cpp b/intl/uconv/src/nsCha
                                     nsIUTF8StringEnumerator** aResult)
  {
    if (aResult == NULL) 
-@@ -381,21 +459,19 @@ nsCharsetConverterManager::GetCharsetAli
-                          getter_AddRefs(self));
-     NS_ENSURE_SUCCESS(rv, rv);
-     return self->GetCharsetAlias(aCharset, aResult);
-   }
+@@ -371,21 +455,19 @@ nsCharsetConverterManager::GetCharsetAli
+ {
+   NS_PRECONDITION(aCharset, "null param");
+   if (!aCharset)
+     return NS_ERROR_NULL_POINTER;
  
    // We try to obtain the preferred name for this charset from the charset 
    // aliases. If we don't get it from there, we just use the original string
@@ -400,6 +411,7 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
  #include "nsIStringBundle.h"
 -#include "nsInterfaceHashtable.h"
 +#include "pldhash.h"
+ #include "mozilla/Mutex.h"
  
  #ifdef MOZ_USE_NATIVE_UCONV
  #include "nsINativeUConvService.h"
@@ -407,8 +419,7 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
  
  class nsCharsetConverterManager : public nsICharsetConverterManager
  {
-   NS_DECL_ISUPPORTS
-@@ -58,22 +58,62 @@ public:
+@@ -59,22 +59,64 @@ public:
  
    nsresult Init();
  
@@ -419,6 +430,8 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
  
 +  PLDHashTable mEncoderTable;
 +  PLDHashTable mDecoderTable;
++  mozilla::Mutex mEncoderTableMutex;
++  mozilla::Mutex mDecoderTableMutex;
 +
 +  nsCOMPtr<nsICharsetAlias> mCSAlias;
 +
@@ -464,7 +477,8 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
  #endif
  
 -  nsInterfaceHashtable<nsCharPtrHashKey, nsIUnicodeDecoder> mDecoderHash;
--
+-  mozilla::Mutex                                            mDecoderHashMutex;
+ 
    nsresult LoadExtensibleBundle(const char * aRegistryKey, 
        nsIStringBundle ** aResult);
  
@@ -472,4 +486,3 @@ diff --git a/intl/uconv/src/nsCharsetConverterManager.h b/intl/uconv/src/nsChars
                                              const char* aCategory,
                                              const char* aURL);
  
-   nsresult GetBundleValue(nsIStringBundle * aBundle,
