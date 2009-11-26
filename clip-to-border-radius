@@ -1,0 +1,243 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Clip replaced elements (for now, images, canvases, videos, and windowless plugins) to the border radius.  (Bug 485501)
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -3691,8 +3691,57 @@ nsContextBoxBlur::DoPaint()
+ }
+ 
+ gfxContext*
+ nsContextBoxBlur::GetContext()
+ {
+   return mContext;
+ }
+ 
++nsAutoClipToBorderRadius::nsAutoClipToBorderRadius(
++                            nsIRenderingContext &aRenderingContext,
++                            nsIFrame *aFrame, nsPoint aOffsetToFrame)
++{
++  // This has some code in common with SetupBackgroundClip and
++  // PaintBackgroundWithSC, but it looks hard to refactor, and this
++  // isn't too bad.
++  const nsStyleBorder *border = aFrame->GetStyleBorder();
++  nscoord radii[8];
++  PRBool haveRoundedCorners =
++    nsCSSRendering::GetBorderRadiusTwips(border->mBorderRadius,
++                                         aFrame->GetSize().width,
++                                         radii);
++  if (haveRoundedCorners) {
++    PRInt32 appUnitsPerPixel = aFrame->PresContext()->AppUnitsPerDevPixel();
++
++    gfxCornerSizes pixelRadii;
++    ComputePixelRadii(radii, aFrame->GetRect(), aFrame->GetSkipSides(),
++                      appUnitsPerPixel, &pixelRadii);
++
++    nsMargin bp = aFrame->GetUsedBorderAndPadding();
++    aFrame->ApplySkipSides(bp);
++    gfxFloat bpSizes[4] = {
++      gfxFloat(bp.top / appUnitsPerPixel),
++      gfxFloat(bp.right / appUnitsPerPixel),
++      gfxFloat(bp.bottom / appUnitsPerPixel),
++      gfxFloat(bp.left / appUnitsPerPixel)
++    };
++    nsCSSBorderRenderer::ComputeInnerRadii(pixelRadii, bpSizes, &pixelRadii);
++
++    gfxRect contentArea(RectToGfxRect(aFrame->GetContentRect() -
++                                        aFrame->GetPosition() +
++                                        aOffsetToFrame,
++                                      appUnitsPerPixel));
++    contentArea.Round();
++    contentArea.Condition();
++
++    if (contentArea.IsEmpty()) {
++      // Our caller shouldn't be drawing anything anyway.
++      return;
++    }
++
++    gfxContext *ctx = aRenderingContext.ThebesContext();
++    gfxContextAutoSaveRestore::SetContext(ctx);
++    ctx->NewPath();
++    ctx->RoundedRectangle(contentArea, pixelRadii);
++    ctx->Clip();
++  }
++}
+diff --git a/layout/base/nsCSSRendering.h b/layout/base/nsCSSRendering.h
+--- a/layout/base/nsCSSRendering.h
++++ b/layout/base/nsCSSRendering.h
+@@ -446,9 +446,28 @@ public:
+ 
+ protected:
+   gfxAlphaBoxBlur blur;
+   nsRefPtr<gfxContext> mContext;
+   gfxContext* mDestinationCtx;
+   
+ };
+ 
++/**
++ * If the frame has a border radius, save the context state and clip to
++ * the border radius in the constructor, and restore the context state
++ * in the destructor.
++ *
++ * If the frame does NOT have a border-radius, do nothing (no save +
++ * restore).
++ */
++// FIXME: Add NS_NONTEMPORARY_CLASS if that lands first!
++// (And (or maybe only) to the gfxContext* classes too!)
++class NS_STACK_CLASS nsAutoClipToBorderRadius
++                         : public gfxContextAutoSaveRestore
++{
++public:
++  // FIXME: Add MOZILLA_GUARD_OBJECT_* if that lands first!
++  nsAutoClipToBorderRadius(nsIRenderingContext &aRenderingContext,
++                           nsIFrame *aFrame, nsPoint aOffsetToFrame);
++};
++
+ #endif /* nsCSSRendering_h___ */
+diff --git a/layout/generic/nsHTMLCanvasFrame.cpp b/layout/generic/nsHTMLCanvasFrame.cpp
+--- a/layout/generic/nsHTMLCanvasFrame.cpp
++++ b/layout/generic/nsHTMLCanvasFrame.cpp
+@@ -42,16 +42,17 @@
+ #include "nsCOMPtr.h"
+ #include "nsIServiceManager.h"
+ #include "nsGkAtoms.h"
+ 
+ #include "nsHTMLCanvasFrame.h"
+ #include "nsICanvasElement.h"
+ #include "nsDisplayList.h"
+ #include "nsLayoutUtils.h"
++#include "nsCSSRendering.h"
+ 
+ #include "nsTransform2D.h"
+ 
+ #include "gfxContext.h"
+ 
+ class nsDisplayItemCanvas : public nsDisplayItem {
+ public:
+   nsDisplayItemCanvas(nsIFrame* aFrame)
+@@ -234,16 +235,19 @@ nsHTMLCanvasFrame::PaintCanvas(nsIRender
+   nsCOMPtr<nsICanvasElement> canvas(do_QueryInterface(GetContent()));
+   if (!canvas)
+     return;
+ 
+   // anything to do?
+   if (inner.width == 0 || inner.height == 0)
+     return;
+ 
++  // This duplicates the save/restore in the rare border-radius case.
++  nsAutoClipToBorderRadius brClip(aRenderingContext, this, aPt);
++
+   gfxRect devInner(presContext->AppUnitsToGfxUnits(inner));
+ 
+   nsIntSize sizeCSSPixels = GetCanvasSize();
+   gfxFloat sx = devInner.size.width / (gfxFloat) sizeCSSPixels.width;
+   gfxFloat sy = devInner.size.height / (gfxFloat) sizeCSSPixels.height;
+ 
+   gfxContext *ctx = aRenderingContext.ThebesContext();
+ 
+diff --git a/layout/generic/nsImageFrame.cpp b/layout/generic/nsImageFrame.cpp
+--- a/layout/generic/nsImageFrame.cpp
++++ b/layout/generic/nsImageFrame.cpp
+@@ -1091,16 +1091,17 @@ nsImageFrame::DisplayAltFeedback(nsIRend
+ 
+   aRenderingContext.PopState();
+ }
+ 
+ static void PaintAltFeedback(nsIFrame* aFrame, nsIRenderingContext* aCtx,
+      const nsRect& aDirtyRect, nsPoint aPt)
+ {
+   nsImageFrame* f = static_cast<nsImageFrame*>(aFrame);
++  // FIXME: Should we use an nsAutoClipToBorderRadius here?
+   f->DisplayAltFeedback(*aCtx,
+                         aDirtyRect,
+                         IMAGE_OK(f->GetContent()->IntrinsicState(), PR_TRUE)
+                            ? nsImageFrame::gIconLoad->mLoadingImage
+                            : nsImageFrame::gIconLoad->mBrokenImage,
+                         aPt);
+ }
+ 
+@@ -1151,16 +1152,18 @@ nsDisplayImage::Paint(nsDisplayListBuild
+                  : (PRUint32) imgIContainer::FLAG_NONE);
+ }
+ 
+ void
+ nsImageFrame::PaintImage(nsIRenderingContext& aRenderingContext, nsPoint aPt,
+                          const nsRect& aDirtyRect, imgIContainer* aImage,
+                          PRUint32 aFlags)
+ {
++  nsAutoClipToBorderRadius brClip(aRenderingContext, this, aPt);
++
+   // Render the image into our content area (the area inside
+   // the borders and padding)
+   NS_ASSERTION(GetInnerArea().width == mComputedSize.width, "bad width");
+   nsRect inner = GetInnerArea() + aPt;
+   nsRect dest(inner.TopLeft(), mComputedSize);
+   dest.y -= GetContinuationOffset();
+ 
+   nsLayoutUtils::DrawSingleImage(&aRenderingContext, aImage,
+diff --git a/layout/generic/nsObjectFrame.cpp b/layout/generic/nsObjectFrame.cpp
+--- a/layout/generic/nsObjectFrame.cpp
++++ b/layout/generic/nsObjectFrame.cpp
+@@ -1129,16 +1129,18 @@ nsObjectFrame::DidReflow(nsPresContext* 
+ 
+   return rv;
+ }
+ 
+ /* static */ void
+ nsObjectFrame::PaintPrintPlugin(nsIFrame* aFrame, nsIRenderingContext* aCtx,
+                                 const nsRect& aDirtyRect, nsPoint aPt)
+ {
++  nsAutoClipToBorderRadius brClip(aRenderingContext, this, aPt);
++
+   nsPoint pt = aPt + aFrame->GetUsedBorderAndPadding().TopLeft();
+   nsIRenderingContext::AutoPushTranslation translate(aCtx, pt.x, pt.y);
+   // FIXME - Bug 385435: Doesn't aDirtyRect need translating too?
+   static_cast<nsObjectFrame*>(aFrame)->PrintPlugin(*aCtx, aDirtyRect);
+ }
+ 
+ nsRect
+ nsDisplayPlugin::GetBounds(nsDisplayListBuilder* aBuilder)
+@@ -1538,16 +1540,18 @@ nsObjectFrame::PrintPlugin(nsIRenderingC
+   frame->DidReflow(presContext,
+                    nsnull, status);  // DidReflow will take care of it
+ }
+ 
+ void
+ nsObjectFrame::PaintPlugin(nsIRenderingContext& aRenderingContext,
+                            const nsRect& aDirtyRect, const nsRect& aPluginRect)
+ {
++  nsAutoClipToBorderRadius brClip(aRenderingContext, this, aPt);
++
+   // Screen painting code
+ #if defined(XP_MACOSX)
+   // delegate all painting to the plugin instance.
+   if (mInstanceOwner) {
+     if (mInstanceOwner->GetDrawingModel() == NPDrawingModelCoreGraphics) {
+       PRInt32 appUnitsPerDevPixel = PresContext()->AppUnitsPerDevPixel();
+       // Clip to the content area where the plugin should be drawn. If
+       // we don't do this, the plugin can draw outside its bounds.
+diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
+--- a/layout/generic/nsVideoFrame.cpp
++++ b/layout/generic/nsVideoFrame.cpp
+@@ -170,17 +170,19 @@ nsVideoFrame::PaintVideo(nsIRenderingCon
+                          const nsRect& aDirtyRect, nsPoint aPt)
+ {
+   nsRect area = GetContentRect() - GetPosition() + aPt;
+   nsHTMLVideoElement* element = static_cast<nsHTMLVideoElement*>(GetContent());
+   nsIntSize videoSize = element->GetVideoSize(nsIntSize(0, 0));
+   if (videoSize.width <= 0 || videoSize.height <= 0 || area.IsEmpty())
+     return;
+ 
+-  gfxContext* ctx = static_cast<gfxContext*>(aRenderingContext.GetNativeGraphicData(nsIRenderingContext::NATIVE_THEBES_CONTEXT));
++  nsAutoClipToBorderRadius brClip(aRenderingContext, this, aPt);
++
++  gfxContext* ctx = aRenderingContext.ThebesContext();
+   nsPresContext* presContext = PresContext();
+   gfxRect r = gfxRect(presContext->AppUnitsToGfxUnits(area.x),
+                       presContext->AppUnitsToGfxUnits(area.y),
+                       presContext->AppUnitsToGfxUnits(area.width),
+                       presContext->AppUnitsToGfxUnits(area.height));
+ 
+   r = CorrectForAspectRatio(r, videoSize);
+   element->Paint(ctx, nsLayoutUtils::GetGraphicsFilterForFrame(this), r);
