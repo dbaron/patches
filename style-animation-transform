@@ -1,0 +1,249 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement animation of -moz-transform property.
+
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -2341,18 +2341,18 @@ CSS_PROP_DISPLAY(
+     -moz-transform,
+     _moz_transform,
+     MozTransform,
+     0,
+     Display,
+     mTransform,
+     eCSSType_ValueList,
+     kDisplayKTable,
+-    CSS_PROP_NO_OFFSET,
+-    eStyleAnimType_None)
++    offsetof(nsStyleDisplay, mSpecifiedTransform),
++    eStyleAnimType_Custom)
+ CSS_PROP_DISPLAY(
+     -moz-transform-origin,
+     _moz_transform_origin,
+     MozTransformOrigin,
+     0,
+     Display,
+     mTransformOrigin,
+     eCSSType_ValuePair,
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -396,16 +396,20 @@ nsStyleAnimation::ComputeDistance(nsCSSP
+ 
+         shadow1 = shadow1->mNext;
+         shadow2 = shadow2->mNext;
+         NS_ABORT_IF_FALSE(!shadow1 == !shadow2, "lists should be same length");
+       }
+       aDistance = sqrt(squareDistance);
+       break;
+     }
++    case eUnit_Transform: {
++      // FIXME: WRITE ME (or not?)
++      return PR_FALSE;
++    }
+     case eUnit_CSSValuePairList: {
+       const nsCSSValuePairList *list1 = aStartValue.GetCSSValuePairListValue();
+       const nsCSSValuePairList *list2 = aEndValue.GetCSSValuePairListValue();
+       double squareDistance = 0.0f;
+       do {
+         static nsCSSValue nsCSSValuePairList::* const pairListValues[] = {
+           &nsCSSValuePairList::mXValue,
+           &nsCSSValuePairList::mYValue,
+@@ -830,16 +834,20 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+           }
+ 
+           longShadow = longShadow->mNext;
+         }
+       }
+       aResultValue.SetAndAdoptCSSValueListValue(result.forget(), eUnit_Shadow);
+       break;
+     }
++    case eUnit_Transform: {
++      // FIXME: WRITE ME
++      break;
++    }
+     case eUnit_CSSValuePairList: {
+       const nsCSSValuePairList *list1 = aValue1.GetCSSValuePairListValue();
+       const nsCSSValuePairList *list2 = aValue2.GetCSSValuePairListValue();
+       nsAutoPtr<nsCSSValuePairList> result;
+       nsCSSValuePairList **resultTail = getter_Transfers(result);
+       do {
+         nsCSSValuePairList *item = new nsCSSValuePairList;
+         if (!item) {
+@@ -1070,16 +1078,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+     case eUnit_CSSRect:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                           eCSSType_Rect, "type mismatch");
+       *static_cast<nsCSSRect*>(aSpecifiedValue) =
+         *aComputedValue.GetCSSRectValue();
+       break;
+     case eUnit_Dasharray:
+     case eUnit_Shadow:
++    case eUnit_Transform:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                           eCSSType_ValueList, "type mismatch");
+       *static_cast<nsCSSValueList**>(aSpecifiedValue) =
+         aComputedValue.GetCSSValueListValue();
+       break;
+     case eUnit_CSSValuePairList:
+       NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
+                           eCSSType_ValuePairList, "type mismatch");
+@@ -1534,16 +1543,38 @@ nsStyleAnimation::ExtractComputedValue(n
+                 break;
+             }
+           }
+ 
+           aComputedValue.SetAndAdoptCSSValuePairListValue(result);
+           break;
+         }
+ 
++        case eCSSProperty__moz_transform: {
++          const nsStyleDisplay *display =
++            static_cast<const nsStyleDisplay*>(styleStruct);
++          nsAutoPtr<nsCSSValueList> result;
++          if (display->mSpecifiedTransform) {
++            result = display->mSpecifiedTransform->Clone();
++          } else {
++            result = new nsCSSValueList();
++            if (result) {
++              result->mValue.SetNoneValue();
++            }
++          }
++          if (!result) {
++            NS_WARNING("out of memory");
++            return PR_FALSE;
++          }
++
++          aComputedValue.SetAndAdoptCSSValueListValue(result.forget(),
++                                                      eUnit_Transform);
++          break;
++        }
++
+         default:
+           NS_ABORT_IF_FALSE(PR_FALSE, "missing property implementation");
+           return PR_FALSE;
+       };
+       return PR_TRUE;
+     case eStyleAnimType_Coord:
+       return StyleCoordToValue(*static_cast<const nsStyleCoord*>(
+         StyleDataAtOffset(styleStruct, ssOffset)), aComputedValue);
+@@ -1747,18 +1778,19 @@ nsStyleAnimation::Value::operator=(const
+       NS_ABORT_IF_FALSE(aOther.mValue.mCSSRect, "rects may not be null");
+       mValue.mCSSRect = new nsCSSRect(*aOther.mValue.mCSSRect);
+       if (!mValue.mCSSRect) {
+         mUnit = eUnit_Null;
+       }
+       break;
+     case eUnit_Dasharray:
+     case eUnit_Shadow:
+-      NS_ABORT_IF_FALSE(mUnit != eUnit_Dasharray || aOther.mValue.mCSSValueList,
+-                        "dasharrays may not be null");
++    case eUnit_Transform:
++      NS_ABORT_IF_FALSE(mUnit == eUnit_Shadow || aOther.mValue.mCSSValueList,
++                        "value lists other than shadows may not be null");
+       if (aOther.mValue.mCSSValueList) {
+         mValue.mCSSValueList = aOther.mValue.mCSSValueList->Clone();
+         if (!mValue.mCSSValueList) {
+           mUnit = eUnit_Null;
+         }
+       } else {
+         mValue.mCSSValueList = nsnull;
+       }
+@@ -1919,16 +1951,17 @@ nsStyleAnimation::Value::operator==(cons
+     case eUnit_Color:
+       return mValue.mColor == aOther.mValue.mColor;
+     case eUnit_CSSValuePair:
+       return *mValue.mCSSValuePair == *aOther.mValue.mCSSValuePair;
+     case eUnit_CSSRect:
+       return *mValue.mCSSRect == *aOther.mValue.mCSSRect;
+     case eUnit_Dasharray:
+     case eUnit_Shadow:
++    case eUnit_Transform:
+       return nsCSSValueList::Equal(mValue.mCSSValueList,
+                                    aOther.mValue.mCSSValueList);
+     case eUnit_CSSValuePairList:
+       return nsCSSValuePairList::Equal(mValue.mCSSValuePairList,
+                                        aOther.mValue.mCSSValuePairList);
+       break;
+   }
+ 
+diff --git a/layout/style/nsStyleAnimation.h b/layout/style/nsStyleAnimation.h
+--- a/layout/style/nsStyleAnimation.h
++++ b/layout/style/nsStyleAnimation.h
+@@ -232,16 +232,17 @@ public:
+     eUnit_Coord,
+     eUnit_Percent,
+     eUnit_Float,
+     eUnit_Color,
+     eUnit_CSSValuePair, // nsCSSValuePair* (never null)
+     eUnit_CSSRect, // nsCSSRect* (never null)
+     eUnit_Dasharray, // nsCSSValueList* (never null)
+     eUnit_Shadow, // nsCSSValueList* (may be null)
++    eUnit_Transform, // nsCSSValueList* (never null)
+     eUnit_CSSValuePairList // nsCSSValuePairList* (never null)
+   };
+ 
+   class Value {
+   private:
+     Unit mUnit;
+     union {
+       PRInt32 mInt;
+@@ -350,17 +351,18 @@ public:
+     }
+     static PRBool IsCSSValuePairUnit(Unit aUnit) {
+       return aUnit == eUnit_CSSValuePair;
+     }
+     static PRBool IsCSSRectUnit(Unit aUnit) {
+       return aUnit == eUnit_CSSRect;
+     }
+     static PRBool IsCSSValueListUnit(Unit aUnit) {
+-      return aUnit == eUnit_Dasharray || aUnit == eUnit_Shadow;
++      return aUnit == eUnit_Dasharray || aUnit == eUnit_Shadow ||
++             aUnit == eUnit_Transform;
+     }
+     static PRBool IsCSSValuePairListUnit(Unit aUnit) {
+       return aUnit == eUnit_CSSValuePairList;
+     }
+   };
+ };
+ 
+ #endif
+diff --git a/layout/style/test/test_transitions_per_property.html b/layout/style/test/test_transitions_per_property.html
+--- a/layout/style/test/test_transitions_per_property.html
++++ b/layout/style/test/test_transitions_per_property.html
+@@ -59,16 +59,17 @@ var supported_properties = {
+     "-moz-column-rule-color": [ test_color_transition ],
+     "-moz-column-rule-width": [ test_length_transition ],
+     "-moz-column-width": [ test_length_transition ],
+     "-moz-image-region": [ test_rect_transition ],
+     "-moz-outline-radius-bottomleft": [ test_radius_transition ],
+     "-moz-outline-radius-bottomright": [ test_radius_transition ],
+     "-moz-outline-radius-topleft": [ test_radius_transition ],
+     "-moz-outline-radius-topright": [ test_radius_transition ],
++    "-moz-transform": [ test_transform_transition ],
+     "-moz-transform-origin": [ test_length_pair_transition,
+                                test_length_percent_pair_transition ],
+     "background-color": [ test_color_transition ],
+     "border-bottom-color": [ test_color_transition ],
+     "border-bottom-width": [ test_length_transition ],
+     "border-left-color": [ test_color_transition ],
+     "border-left-width": [ test_length_transition ],
+     "border-right-color": [ test_color_transition ],
+@@ -555,12 +556,16 @@ function test_visibility_transition(prop
+   is(cs.getPropertyValue(prop), "hidden",
+      "visibility property " + prop + ": computed value before transition");
+   div.style.setProperty("-moz-transition-property", prop, "");
+   div.style.setProperty(prop, "visible", "");
+   is(cs.getPropertyValue(prop), "hidden",
+      "visibility property " + prop + ": interpolation of visibility");
+ }
+ 
++function test_transform_transition(prop) {
++  ok(false, "FIXME: WRITE ME");
++}
++
+ </script>
+ </pre>
+ </body>
+ </html>
