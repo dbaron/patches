@@ -5,7 +5,7 @@ Don't use ComputeDistance in nsTransitionManager when shortening reversals of pa
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -69,18 +69,44 @@ struct ElementPropertyTransition
+@@ -69,18 +69,54 @@ struct ElementPropertyTransition
    // object's owning style rule needs to keep alive (after calling
    // UncomputeValue on it in MapRuleInfoInto).
    nsStyleAnimation::Value mStartValue, mEndValue, mCurrentValue;
@@ -14,6 +14,16 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
    // data from the relevant nsTransition
    TimeDuration mDuration;
    nsSMILKeySpline mTimingFunction;
++
++  // This is the start value to be used for a check for whether a
++  // transition is being reversed.  Normally the same as mStartValue,
++  // except when this transition started as the reversal of another
++  // in-progress transition.  Needed so we can handle two reverses in a
++  // row.
++  nsStyleAnimation::Value mStartForReversingTest;
++  // Likewise, the portion of the "full" reversed transition that we're
++  // actually covering.
++  double mReversePortion;
 +
 +  double ValuePortionFor(TimeStamp aRefreshTime) const;
  };
@@ -50,7 +60,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
   * any new changes; if necessary we restyle immediately afterwards with
   * animation.
   */
-@@ -217,36 +243,17 @@ ElementTransitionsStyleRule::MapRuleInfo
+@@ -217,36 +253,17 @@ ElementTransitionsStyleRule::MapRuleInfo
    NS_ENSURE_TRUE(et, NS_OK); // FIXME (Bug 522597): Why can this be null?
    for (PRUint32 i = 0, i_end = et->mPropertyTransitions.Length();
         i < i_end; ++i)
@@ -88,7 +98,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
                                        valuePortion, pt.mCurrentValue);
        NS_ABORT_IF_FALSE(ok, "could not interpolate values");
  
-@@ -602,79 +609,64 @@ nsTransitionManager::ConsiderStartingTra
+@@ -602,79 +619,67 @@ nsTransitionManager::ConsiderStartingTra
          // |aElementTransitions| is now a dangling pointer!
          aElementTransitions = nsnull;
        }
@@ -112,6 +122,8 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 +    // The spec says a negative duration is treated as zero.
 +    duration = 0.0;
 +  }
++  pt.mStartForReversingTest = pt.mStartValue;
++  pt.mReversePortion = 1.0;
  
    // We need to check two things if we have a currently running
 -  // transition for this property:  see durationFraction comment above
@@ -142,18 +154,12 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 -    NS_ABORT_IF_FALSE(fullDistance >= 0.0, "distance must be positive");
 +    // If the new transition reverses the old one, we'll need to handle
 +    // the timing differently.
-+    if (oldPT.mStartValue == pt.mEndValue) {
++    if (oldPT.mStartForReversingTest == pt.mEndValue) {
 +      // Compute the appropriate negative transition-delay such that right
 +      // now we'd end up at the current position.
-+      double valuePortionComplete =
-+        1.0 - oldPT.ValuePortionFor(mostRecentRefresh);
-+      nsSMILKeySpline inverseFunction(tf.mY1, tf.mX1, tf.mY2, tf.mX2);
-+      double timePortionComplete =
-+        inverseFunction.GetSplineValue(valuePortionComplete);
-+      double reversingDelay = - timePortionComplete * duration;
-+      // And use the lesser of that and the real transition delay (in case
-+      // we were never intended to use this part of the timing function).
-+      delay = PR_MIN(delay, reversingDelay);
++      double valuePortion =
++        oldPT.ValuePortionFor(mostRecentRefresh) * oldPT.mReversePortion +
++        (1.0 - oldPT.mReversePortion); 
  
 -    if (nsStyleAnimation::ComputeDistance(aProperty, endVal, pt.mEndValue,
 -                                          remainingDistance)) {
@@ -162,8 +168,15 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 -      if (durationFraction > 1.0) {
 -        durationFraction = 1.0;
 -      }
-+      // And use the end of the old transition as the start of this one.
-+      pt.mStartValue = oldPT.mEndValue;
++      // Negative delays are essentially part of the transition
++      // function, so reduce them along with the duration, but don't
++      // reduce positive delays.
++      if (delay < 0.0f)
++        delay *= valuePortion;
++      duration *= valuePortion;
++
++      pt.mStartForReversingTest = oldPT.mEndValue;
++      pt.mReversePortion = valuePortion;
      }
    }
  
