@@ -5,8 +5,126 @@ Don't use ComputeDistance in nsTransitionManager when shortening reversals of pa
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -623,29 +623,26 @@ nsTransitionManager::ConsiderStartingTra
-     if (endVal == pt.mEndValue) {
+@@ -69,18 +69,44 @@ struct ElementPropertyTransition
+   // object's owning style rule needs to keep alive (after calling
+   // UncomputeValue on it in MapRuleInfoInto).
+   nsStyleAnimation::Value mStartValue, mEndValue, mCurrentValue;
+   TimeStamp mStartTime; // actual start plus transition delay
+ 
+   // data from the relevant nsTransition
+   TimeDuration mDuration;
+   nsSMILKeySpline mTimingFunction;
++
++  double ValuePortionFor(TimeStamp aRefreshTime) const;
+ };
+ 
++double
++ElementPropertyTransition::ValuePortionFor(TimeStamp aRefreshTime) const
++{
++  double duration = mDuration.ToSeconds();
++  NS_ABORT_IF_FALSE(duration >= 0.0, "negative duration forbidden");
++  double timePortion;
++  if (duration == 0.0) {
++    if (aRefreshTime >= mStartTime) {
++      timePortion = 0.0;
++    } else {
++      timePortion = 1.0;
++    }
++  } else {
++    timePortion = (aRefreshTime - mStartTime).ToSeconds() /
++                  mDuration.ToSeconds();
++    if (timePortion < 0.0)
++      timePortion = 0.0; // use start value during transition-delay
++    if (timePortion > 1.0)
++      timePortion = 1.0; // we might be behind on flushing
++  }
++
++  return mTimingFunction.GetSplineValue(timePortion);
++}
++
+ /**
+  * An ElementTransitionsStyleRule overrides style data with the
+  * currently-transitioning value for an element that is executing a
+  * transition.  It only matches when styling with animation.  When we
+  * style without animation, we need to not use it so that we can detect
+  * any new changes; if necessary we restyle immediately afterwards with
+  * animation.
+  */
+@@ -217,36 +243,17 @@ ElementTransitionsStyleRule::MapRuleInfo
+   NS_ENSURE_TRUE(et, NS_OK); // FIXME (Bug 522597): Why can this be null?
+   for (PRUint32 i = 0, i_end = et->mPropertyTransitions.Length();
+        i < i_end; ++i)
+   {
+     ElementPropertyTransition &pt = et->mPropertyTransitions[i];
+     if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+                              nsCSSProps::kSIDTable[pt.mProperty]))
+     {
+-      double duration = pt.mDuration.ToSeconds();
+-      NS_ABORT_IF_FALSE(duration >= 0.0, "negative duration forbidden");
+-      double timePortion;
+-      if (duration == 0.0) {
+-        if (RefreshTime() >= pt.mStartTime) {
+-          timePortion = 0.0;
+-        } else {
+-          timePortion = 1.0;
+-        }
+-      } else {
+-        timePortion = (RefreshTime() - pt.mStartTime).ToSeconds() /
+-                      pt.mDuration.ToSeconds();
+-        if (timePortion < 0.0)
+-          timePortion = 0.0; // use start value during transition-delay
+-        if (timePortion > 1.0)
+-          timePortion = 1.0; // we might be behind on flushing
+-      }
+-
+-      double valuePortion =
+-        pt.mTimingFunction.GetSplineValue(timePortion);
++      double valuePortion = pt.ValuePortionFor(RefreshTime());
+ #ifdef DEBUG
+       PRBool ok =
+ #endif
+         nsStyleAnimation::Interpolate(pt.mProperty,
+                                       pt.mStartValue, pt.mEndValue,
+                                       valuePortion, pt.mCurrentValue);
+       NS_ABORT_IF_FALSE(ok, "could not interpolate values");
+ 
+@@ -602,79 +609,64 @@ nsTransitionManager::ConsiderStartingTra
+         // |aElementTransitions| is now a dangling pointer!
+         aElementTransitions = nsnull;
+       }
+       // WalkTransitionRule already called RestyleForAnimation.
+     }
+     return;
+   }
+ 
+-  // When we interrupt a running transition, we want to reduce the
+-  // duration of the new transition *if* the new transition would have
+-  // been longer had it started from the endpoint of the currently
+-  // running transition.
+-  double durationFraction = 1.0;
++  TimeStamp mostRecentRefresh =
++    presContext->RefreshDriver()->MostRecentRefresh();
++
++  const nsTimingFunction &tf = aTransition.GetTimingFunction();
++  float delay = aTransition.GetDelay();
++  float duration = aTransition.GetDuration();
++  if (duration < 0.0) {
++    // The spec says a negative duration is treated as zero.
++    duration = 0.0;
++  }
+ 
+   // We need to check two things if we have a currently running
+-  // transition for this property:  see durationFraction comment above
+-  // and the endpoint check below.
++  // transition for this property.
+   if (currentIndex != nsTArray<ElementPropertyTransition>::NoIndex) {
+-    const nsStyleAnimation::Value &endVal =
+-      aElementTransitions->mPropertyTransitions[currentIndex].mEndValue;
++    const ElementPropertyTransition &oldPT =
++      aElementTransitions->mPropertyTransitions[currentIndex];
+ 
+-    if (endVal == pt.mEndValue) {
++    if (oldPT.mEndValue == pt.mEndValue) {
        // If we got a style change that changed the value to the endpoint
        // of the currently running transition, we don't want to interrupt
        // its timing function.
@@ -22,26 +140,62 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 -                                        pt.mEndValue, fullDistance);
 -    NS_ABORT_IF_FALSE(ok, "could not compute distance");
 -    NS_ABORT_IF_FALSE(fullDistance >= 0.0, "distance must be positive");
--
++    // If the new transition reverses the old one, we'll need to handle
++    // the timing differently.
++    if (oldPT.mStartValue == pt.mEndValue) {
++      // Compute the appropriate negative transition-delay such that right
++      // now we'd end up at the current position.
++      double valuePortionComplete =
++        1.0 - oldPT.ValuePortionFor(mostRecentRefresh);
++      nsSMILKeySpline inverseFunction(tf.mY1, tf.mX1, tf.mY2, tf.mX2);
++      double timePortionComplete =
++        inverseFunction.GetSplineValue(valuePortionComplete);
++      double reversingDelay = - timePortionComplete * duration;
++      // And use the lesser of that and the real transition delay (in case
++      // we were never intended to use this part of the timing function).
++      delay = PR_MIN(delay, reversingDelay);
+ 
 -    if (nsStyleAnimation::ComputeDistance(aProperty, endVal, pt.mEndValue,
 -                                          remainingDistance)) {
 -      NS_ABORT_IF_FALSE(remainingDistance >= 0.0, "distance must be positive");
 -      durationFraction = fullDistance / remainingDistance;
-+    // Reversing transitions with different timing functions or that
-+    // involve discrete steps should make them all still end at the same
-+    // point, assuming they have the same duration and delay.
-+    // So rather than using ComputeDistance, shorten only for
-+    // transitions that are going back to the start of the currently
-+    // running transition.
-+    if (endVal == pt.mStartValue) {
-+      durationFraction = (presContext->RefreshDriver()->MostRecentRefresh() -
-+                            pt.mStartTime).ToSeconds() /
-+                         pt.mDuration.ToSeconds();
-       if (durationFraction > 1.0) {
-         durationFraction = 1.0;
-       }
+-      if (durationFraction > 1.0) {
+-        durationFraction = 1.0;
+-      }
++      // And use the end of the old transition as the start of this one.
++      pt.mStartValue = oldPT.mEndValue;
      }
    }
  
+-
+-  nsRefreshDriver *rd = presContext->RefreshDriver();
+-
+   pt.mProperty = aProperty;
+-  float delay = aTransition.GetDelay();
+-  float duration = aTransition.GetDuration();
+-  if (duration < 0.0) {
+-    // The spec says a negative duration is treated as zero.
+-    duration = 0.0;
+-  }
+-  if (durationFraction != 1.0) {
+-    // Negative delays are essentially part of the transition
+-    // function, so reduce them along with the duration, but don't
+-    // reduce positive delays.  (See comment above about
+-    // durationFraction.)
+-    if (delay < 0.0f)
+-        delay *= durationFraction;
+-    duration *= durationFraction;
+-  }
+-  pt.mStartTime = rd->MostRecentRefresh() +
+-                  TimeDuration::FromMilliseconds(delay);
++  pt.mStartTime = mostRecentRefresh + TimeDuration::FromMilliseconds(delay);
+   pt.mDuration = TimeDuration::FromMilliseconds(duration);
+-  const nsTimingFunction &tf = aTransition.GetTimingFunction();
+   pt.mTimingFunction.Init(tf.mX1, tf.mY1, tf.mX2, tf.mY2);
  
-   nsRefreshDriver *rd = presContext->RefreshDriver();
+   if (!aElementTransitions) {
+     aElementTransitions =
+       GetElementTransitions(aElement, aNewStyleContext->GetPseudo(),
+                             PR_TRUE);
+     if (!aElementTransitions) {
+       NS_WARNING("allocating ElementTransitions failed");
