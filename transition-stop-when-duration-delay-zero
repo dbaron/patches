@@ -2,6 +2,209 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Make setting property after setting transition-duration and transition-delay to 0 stop running transitions on that property.  (Bug 522643)
 
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -366,16 +366,34 @@ nsTransitionManager::~nsTransitionManage
+   // Content nodes might outlive the transition manager.
+   while (!PR_CLIST_IS_EMPTY(&mElementTransitions)) {
+     ElementTransitions *head = static_cast<ElementTransitions*>(
+                                  PR_LIST_HEAD(&mElementTransitions));
+     head->Destroy();
+   }
+ }
+ 
++static PRBool
++TransExtractComputedValue(nsCSSProperty aProperty,
++                          nsStyleContext* aStyleContext,
++                          nsStyleAnimation::Value& aComputedValue)
++{
++  PRBool result =
++    nsStyleAnimation::ExtractComputedValue(aProperty, aStyleContext,
++                                           aComputedValue);
++  if (aProperty == eCSSProperty_visibility) {
++    NS_ABORT_IF_FALSE(aComputedValue.GetUnit() ==
++                        nsStyleAnimation::eUnit_Enumerated,
++                      "unexpected unit");
++    aComputedValue.SetIntValue(aComputedValue.GetIntValue(),
++                               nsStyleAnimation::eUnit_Visibility);
++  }
++  return result;
++}
++
+ already_AddRefed<nsIStyleRule>
+ nsTransitionManager::StyleContextChanged(nsIContent *aElement,
+                                          nsStyleContext *aOldStyleContext,
+                                          nsStyleContext *aNewStyleContext)
+ {
+   NS_PRECONDITION(aOldStyleContext->GetPseudo() ==
+                       aNewStyleContext->GetPseudo(),
+                   "pseudo type mismatch");
+@@ -387,25 +405,24 @@ nsTransitionManager::StyleContextChanged
+                       aNewStyleContext->HasPseudoElementData(),
+                   "pseudo type mismatch");
+ 
+   // NOTE: Things in this function (and ConsiderStartingTransition)
+   // should never call PeekStyleData because we don't preserve gotten
+   // structs across reframes.
+ 
+   // Return sooner (before the startedAny check below) for the most
+-  // common case: no transitions specified.
++  // common case: no transitions specified or running.
+   const nsStyleDisplay *disp = aNewStyleContext->GetStyleDisplay();
+-  const nsStyleDisplay *oldDisp = aOldStyleContext->GetStyleDisplay();
+-  if (disp->mTransitionPropertyCount == 1 &&
+-      oldDisp->mTransitionPropertyCount == 1 &&
++  ElementTransitions *et =
++      GetElementTransitions(aElement, aNewStyleContext->GetPseudo(), PR_FALSE);
++  if (!et &&
++      disp->mTransitionPropertyCount == 1 &&
+       disp->mTransitions[0].GetDelay() == 0.0f &&
+-      disp->mTransitions[0].GetDuration() == 0.0f &&
+-      oldDisp->mTransitions[0].GetProperty() ==
+-        disp->mTransitions[0].GetProperty()) {
++      disp->mTransitions[0].GetDuration() == 0.0f) {
+     return nsnull;
+   }      
+ 
+ 
+   if (aNewStyleContext->PresContext()->IsProcessingAnimationStyleChange()) {
+     return nsnull;
+   }
+   
+@@ -423,18 +440,16 @@ nsTransitionManager::StyleContextChanged
+   }
+ 
+   // Per http://lists.w3.org/Archives/Public/www-style/2009Aug/0109.html
+   // I'll consider only the transitions from the number of items in
+   // 'transition-property' on down, and later ones will override earlier
+   // ones (tracked using |whichStarted|).
+   PRBool startedAny = PR_FALSE;
+   nsCSSPropertySet whichStarted;
+-  ElementTransitions *et =
+-      GetElementTransitions(aElement, aNewStyleContext->GetPseudo(), PR_FALSE);
+   for (PRUint32 i = disp->mTransitionPropertyCount; i-- != 0; ) {
+     const nsTransition& t = disp->mTransitions[i];
+     // Check delay and duration first, since they default to zero, and
+     // when they're both zero, we can ignore the transition.
+     if (t.GetDelay() != 0.0f || t.GetDuration() != 0.0f) {
+       // We might have something to transition.  See if any of the
+       // properties in question changed and are animatable.
+       // FIXME: Would be good to find a way to share code between this
+@@ -505,16 +520,41 @@ nsTransitionManager::StyleContextChanged
+     } while (i != 0);
+ 
+     if (pts.IsEmpty()) {
+       et->Destroy();
+       et = nsnull;
+     }
+   }
+ 
++  // Stop any transitions for properties that just changed (and are
++  // still in the set of properties to transition), but we didn't just
++  // start the transition because delay and duration are both zero.
++  if (et) {
++    nsTArray<ElementPropertyTransition> &pts = et->mPropertyTransitions;
++    PRUint32 i = pts.Length();
++    NS_ABORT_IF_FALSE(i != 0, "empty transitions list?");
++    do {
++      --i;
++      ElementPropertyTransition &pt = pts[i];
++
++      nsStyleAnimation::Value currentValue;
++      if (!TransExtractComputedValue(pt.mProperty, aNewStyleContext,
++                                     currentValue) ||
++          currentValue != pt.mEndValue) {
++        pts.RemoveElementAt(i);
++      }
++    } while (i != 0);
++
++    if (pts.IsEmpty()) {
++      et->Destroy();
++      et = nsnull;
++    }
++  }
++
+   if (!startedAny) {
+     return nsnull;
+   }
+ 
+   NS_ABORT_IF_FALSE(et, "must have element transitions if we started "
+                         "any transitions");
+ 
+   // In the CSS working group discussion (2009 Jul 15 telecon,
+@@ -546,34 +586,16 @@ nsTransitionManager::StyleContextChanged
+       coverRule->CoverValue(pt.mProperty, pt.mStartValue);
+     }
+   }
+ 
+   return already_AddRefed<nsIStyleRule>(
+            static_cast<nsIStyleRule*>(coverRule.forget().get()));
+ }
+ 
+-static PRBool
+-TransExtractComputedValue(nsCSSProperty aProperty,
+-                          nsStyleContext* aStyleContext,
+-                          nsStyleAnimation::Value& aComputedValue)
+-{
+-  PRBool result =
+-    nsStyleAnimation::ExtractComputedValue(aProperty, aStyleContext,
+-                                           aComputedValue);
+-  if (aProperty == eCSSProperty_visibility) {
+-    NS_ABORT_IF_FALSE(aComputedValue.GetUnit() ==
+-                        nsStyleAnimation::eUnit_Enumerated,
+-                      "unexpected unit");
+-    aComputedValue.SetIntValue(aComputedValue.GetIntValue(),
+-                               nsStyleAnimation::eUnit_Visibility);
+-  }
+-  return result;
+-}
+-
+ void
+ nsTransitionManager::ConsiderStartingTransition(nsCSSProperty aProperty,
+                        const nsTransition& aTransition,
+                        nsIContent *aElement,
+                        ElementTransitions *&aElementTransitions,
+                        nsStyleContext *aOldStyleContext,
+                        nsStyleContext *aNewStyleContext,
+                        PRBool *aStartedAny,
+@@ -727,26 +749,33 @@ nsTransitionManager::ConsiderStartingTra
+   aWhichStarted->AddProperty(aProperty);
+ }
+ 
+ ElementTransitions*
+ nsTransitionManager::GetElementTransitions(nsIContent *aElement,
+                                            nsIAtom *aPseudo,
+                                            PRBool aCreateIfNeeded)
+ {
++  if (!aCreateIfNeeded && PR_CLIST_IS_EMPTY(&mElementTransitions)) {
++    // Early return for the most common case.
++    return nsnull;
++  }
++
+   nsIAtom *propName;
+-  if (aPseudo == nsCSSPseudoElements::before) {
++  if (!aPseudo) {
++    propName = nsGkAtoms::transitionsProperty;
++  } else if (aPseudo == nsCSSPseudoElements::before) {
+     propName = nsGkAtoms::transitionsOfBeforeProperty;
+   } else if (aPseudo == nsCSSPseudoElements::after) {
+     propName = nsGkAtoms::transitionsOfAfterProperty;
+   } else {
+-    NS_ASSERTION(!aPseudo || !aCreateIfNeeded,
++    NS_ASSERTION(!aCreateIfNeeded,
+                  "should never try to create transitions for pseudo "
+                  "other than :before or :after");
+-    propName = nsGkAtoms::transitionsProperty;
++    return nsnull;
+   }
+   ElementTransitions *et = static_cast<ElementTransitions*>(
+                              aElement->GetProperty(propName));
+   if (!et && aCreateIfNeeded) {
+     // FIXME: Consider arena-allocating?
+     et = new ElementTransitions(aElement, propName, this);
+     if (!et) {
+       NS_WARNING("out of memory");
 diff --git a/layout/style/test/test_transitions_dynamic_changes.html b/layout/style/test/test_transitions_dynamic_changes.html
 --- a/layout/style/test/test_transitions_dynamic_changes.html
 +++ b/layout/style/test/test_transitions_dynamic_changes.html
