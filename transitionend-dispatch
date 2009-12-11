@@ -1,0 +1,112 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Dispatch transitionend events.  (Bug 531585)
+
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -47,16 +47,18 @@
+ #include "nsIStyleRule.h"
+ #include "nsRuleWalker.h"
+ #include "nsRuleData.h"
+ #include "nsSMILKeySpline.h"
+ #include "gfxColor.h"
+ #include "nsCSSPropertySet.h"
+ #include "nsStyleAnimation.h"
+ #include "nsCSSDataBlock.h"
++#include "nsEventDispatcher.h"
++#include "nsGUIEvent.h"
+ 
+ using mozilla::TimeStamp;
+ using mozilla::TimeDuration;
+ 
+ /*****************************************************************************
+  * Per-Element data                                                          *
+  *****************************************************************************/
+ 
+@@ -893,23 +895,39 @@ nsTransitionManager::HasAttributeDepende
+ NS_IMETHODIMP
+ nsTransitionManager::MediumFeaturesChanged(nsPresContext* aPresContext,
+                                            PRBool* aRulesChanged)
+ {
+   *aRulesChanged = PR_FALSE;
+   return NS_OK;
+ }
+ 
++struct TransitionEventInfo {
++  nsCOMPtr<nsIContent> mElement;
++  nsTransitionEvent mEvent;
++
++  TransitionEventInfo(nsIContent *aElement, nsCSSProperty aProperty,
++                      TimeDuration aDuration)
++    : mElement(aElement),
++      mEvent(PR_TRUE, NS_TRANSITION_END,
++             NS_ConvertUTF8toUTF16(nsCSSProps::GetStringValue(aProperty)),
++             aDuration.ToSeconds())
++  {
++  }
++};
++
+ /* virtual */ void
+ nsTransitionManager::WillRefresh(mozilla::TimeStamp aTime)
+ {
+   NS_ABORT_IF_FALSE(mPresContext,
+                     "refresh driver should not notify additional observers "
+                     "after pres context has been destroyed");
+ 
++  nsTArray<TransitionEventInfo> events;
++
+   // Trim transitions that have completed, and post restyle events for
+   // frames that are still transitioning.
+   {
+     PRCList *next = PR_LIST_HEAD(&mElementTransitions);
+     while (next != &mElementTransitions) {
+       ElementTransitions *et = static_cast<ElementTransitions*>(next);
+       next = PR_NEXT_LINK(next);
+ 
+@@ -921,16 +939,19 @@ nsTransitionManager::WillRefresh(mozilla
+       PRUint32 i = et->mPropertyTransitions.Length();
+       NS_ABORT_IF_FALSE(i != 0, "empty transitions list?");
+       do {
+         --i;
+         ElementPropertyTransition &pt = et->mPropertyTransitions[i];
+         if (pt.mStartTime + pt.mDuration <= aTime) {
+           // This transition has completed.
+           et->mPropertyTransitions.RemoveElementAt(i);
++
++          events.AppendElement(
++            TransitionEventInfo(et->mElement, pt.mProperty, pt.mDuration));
+         }
+       } while (i != 0);
+ 
+       // We need to restyle even if the transition rule no longer
+       // applies (in which case we just made it not apply).
+       mPresContext->PresShell()->RestyleForAnimation(et->mElement);
+ 
+       if (et->mPropertyTransitions.IsEmpty()) {
+@@ -938,16 +959,25 @@ nsTransitionManager::WillRefresh(mozilla
+         // |et| is now a dangling pointer!
+         et = nsnull;
+       }
+     }
+   }
+ 
+   // We might have removed transitions above.
+   TransitionsRemoved();
++
++  for (PRUint32 i = 0, i_end = events.Length(); i < i_end; ++i) {
++    TransitionEventInfo &info = events[i];
++    nsEventDispatcher::Dispatch(info.mElement, mPresContext, &info.mEvent);
++
++    if (!mPresContext) {
++      break;
++    }
++  }
+ }
+ 
+ void
+ nsTransitionManager::TransitionsRemoved()
+ {
+   // If we have no transitions left, remove ourselves from the refresh
+   // driver.
+   if (PR_CLIST_IS_EMPTY(&mElementTransitions)) {
