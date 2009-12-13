@@ -1,0 +1,137 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Change GCC half to use inline assembly rather than __get_cpuid for calling CPUID.  (Bug 513422)
+
+diff --git a/xpcom/glue/SSE.cpp b/xpcom/glue/SSE.cpp
+--- a/xpcom/glue/SSE.cpp
++++ b/xpcom/glue/SSE.cpp
+@@ -38,16 +38,41 @@
+ /* compile-time and runtime tests for whether to use SSE instructions */
+ 
+ #include "SSE.h"
+ 
+ namespace mozilla {
+ 
+ namespace sse_private {
+ 
++#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
++
++void cpuid(unsigned int level, unsigned int *eax, unsigned int *ebx,
++                               unsigned int *ecx, unsigned int *edx)
++{
++  __asm__ (
++    /* assembly */
++    "cpuid"
++    /* output operands */
++    : "=a" (eax) /* %0; constrained to eax */
++    , "=b" (ebx) /* %1; constrained to ebx */
++    , "=c" (ecx) /* %2; constrained to ecx */
++    , "=d" (edx) /* %3; constrained to edx */
++    /* input operands */
++    : "a" (level) /* %4; constrained to eax */
++    /* clobbered registers */
++    : "%eax"
++    , "%ebx"
++    , "%ecx"
++    , "%edx"
++  );
++}
++
++#endif
++
+ #if defined(MOZILLA_SSE_HAVE_CPUID_DETECTION)
+ 
+ #if !defined(MOZILLA_PRESUME_MMX)
+   bool mmx_enabled
+     = sse_private::has_cpuid_bit(1u, sse_private::edx, (1u<<23));
+ #endif
+ 
+ #if !defined(MOZILLA_PRESUME_SSE)
+diff --git a/xpcom/glue/SSE.h b/xpcom/glue/SSE.h
+--- a/xpcom/glue/SSE.h
++++ b/xpcom/glue/SSE.h
+@@ -86,21 +86,22 @@
+  * intrinsics for many of these features won't compile unless we define
+  * a particular macro first (to pretend that we gave gcc an appropriate
+  * -march option).  Therefore, code using this header should NOT include
+  * the headers for intrinsics directly, but should instead request the
+  * header by defining the header macro given below *before* including
+  * this file (which, in practice, means before including *any* header
+  * files).
+  *
+- * The dynamic detection depends on cpuid intrinsics only available in
+- * gcc 4.3 or later and MSVC 8.0 (Visual C++ 2005) or later, so the
+- * dynamic detection returns false in older compilers.  However, it
+- * could be extended to avoid this restriction; see the code in
+- * mozilla/jpeg/jdapimin.c for some hints.
++ * On Windows, the dynamic detection depends on cpuid intrinsics only
++ * available in MSVC 8.0 (Visual C++ 2005) or later, so the dynamic
++ * detection returns false in older compilers.  However, it could be
++ * extended to avoid this restriction; see the code in
++ * mozilla/jpeg/jdapimin.c, or the assembly in the gcc case, for some
++ * hints.
+  *
+  * Macro: MOZILLA_COMPILE_WITH_MMX
+  * Function: mozilla::use_mmx
+  * Header Macro: MOZILLA_SSE_INCLUDE_HEADER_FOR_MMX
+  * Header: <mmintrin.h>
+  *
+  * Macro: MOZILLA_COMPILE_WITH_SSE
+  * Function: mozilla::use_sse
+@@ -232,42 +233,48 @@
+   // It's ok to use SSE4.1 instructions based on the -march option.
+   #define MOZILLA_PRESUME_SSE4_1 1
+ #endif
+ #ifdef __SSE4_2__
+   // It's ok to use SSE4.2 instructions based on the -march option.
+   #define MOZILLA_PRESUME_SSE4_2 1
+ #endif
+ 
+-#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3)
+-
+-// cpuid.h is available on gcc 4.3 and higher on i386 and x86_64
+-#include <cpuid.h>
+ #define MOZILLA_SSE_HAVE_CPUID_DETECTION
+ 
+ namespace mozilla {
+ 
+   namespace sse_private {
+ 
++    /*
++     * Get the CPUID information for a given level, or return false
++     * if that level is not available.
++     */
++    NS_COM_GLUE void
++    cpuid(unsigned int level, unsigned int *eax, unsigned int *ebx,
++                              unsigned int *ecx, unsigned int *edx);
++
+     enum CPUIDRegister { eax = 0, ebx = 1, ecx = 2, edx = 3 };
+ 
+     inline bool
+     has_cpuid_bit(unsigned int level, CPUIDRegister reg, unsigned int bit)
+     {
+       unsigned int regs[4];
+-      return __get_cpuid(level, &regs[0], &regs[1], &regs[2], &regs[3]) &&
+-             (regs[reg] & bit);
++      cpuid(level & 0x80000000u, &regs[0], &regs[1], &regs[2], &regs[3]);
++      if (unsigned(regs[0]) < level)
++        return false;
++
++      cpuid(level, &regs[0], &regs[1], &regs[2], &regs[3]);
++      return !!(unsigned(regs[reg]) & bit);
+     }
+ 
+   }
+ 
+ }
+ 
+-#endif
+-
+ // We need to #include headers quite carefully for CPUID-tested
+ // compilation.  GCC's headers for SSE intrinsics both:
+ //  * have #error in them when the appropriate macro is not defined, and
+ //  * depend on intrinsics that depend on -msse, etc.
+ // We could fix the first of these options with #define.  However, we
+ // can fix the second only with #pragma directives introduced in GCC
+ // 4.4 (but not yet working quite well enough on any gcc version), whose
+ // availability influenced (above) whether MOZILLA_COMPILE_WITH_* is
