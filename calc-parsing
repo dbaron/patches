@@ -1,0 +1,131 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement parsing of calc().
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -109,16 +109,17 @@
+ #define VARIANT_NORMAL          0x080000  // M
+ #define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
+ #define VARIANT_GRADIENT        0x200000  // eCSSUnit_Gradient
+ #define VARIANT_CUBIC_BEZIER    0x400000  // CSS transition timing function
+ #define VARIANT_ALL             0x800000  //
+ #define VARIANT_IMAGE_RECT    0x01000000  // eCSSUnit_Function
+ // This is an extra bit that says that a VARIANT_ANGLE allows unitless zero:
+ #define VARIANT_ZERO_ANGLE    0x02000000  // unitless zero for angles
++#define VARIANT_CALC          0x04000000  // eCSSUnit_Calc
+ 
+ // Common combinations of variants
+ #define VARIANT_AL   (VARIANT_AUTO | VARIANT_LENGTH)
+ #define VARIANT_LP   (VARIANT_LENGTH | VARIANT_PERCENT)
+ #define VARIANT_AH   (VARIANT_AUTO | VARIANT_INHERIT)
+ #define VARIANT_AHLP (VARIANT_AH | VARIANT_LP)
+ #define VARIANT_AHI  (VARIANT_AH | VARIANT_INTEGER)
+ #define VARIANT_AHK  (VARIANT_AH | VARIANT_KEYWORD)
+@@ -458,16 +459,17 @@ protected:
+   PRBool ParseBorderImage();
+   PRBool ParseBorderSpacing();
+   PRBool ParseBorderSide(const nsCSSProperty aPropIDs[],
+                          PRBool aSetAllSides);
+   PRBool ParseDirectionalBorderSide(const nsCSSProperty aPropIDs[],
+                                     PRInt32 aSourceType);
+   PRBool ParseBorderStyle();
+   PRBool ParseBorderWidth();
++  PRBool ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask);
+   // for 'clip' and '-moz-image-region'
+   PRBool ParseRect(nsCSSRect& aRect,
+                    nsCSSProperty aPropID);
+   PRBool DoParseRect(nsCSSRect& aRect);
+   PRBool ParseContent();
+   PRBool ParseCounterData(nsCSSValuePairList** aResult,
+                           nsCSSProperty aPropID);
+   PRBool ParseCue();
+@@ -4349,16 +4351,19 @@ CSSParserImpl::TranslateDimension(nsCSSV
+   }
+   if ((type & aVariantMask) != 0) {
+     aValue.SetFloatValue(aNumber, units);
+     return PR_TRUE;
+   }
+   return PR_FALSE;
+ }
+ 
++// This explicitly does not include VARIANT_CALC, which we do consider
++// numeric.  If we support calc() on properties requiring nonnegative or
++// positive values, we need to figure out what the requirements are.
+ #define VARIANT_ALL_NONNUMERIC \
+   VARIANT_KEYWORD | \
+   VARIANT_COLOR | \
+   VARIANT_URL | \
+   VARIANT_STRING | \
+   VARIANT_COUNTER | \
+   VARIANT_ATTR | \
+   VARIANT_IDENTIFIER | \
+@@ -4624,16 +4629,25 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+     return ParseAttr(aValue);
+   }
+   if (((aVariantMask & VARIANT_CUBIC_BEZIER) != 0) &&
+       (eCSSToken_Function == tk->mType)) {
+      if (tk->mIdent.LowerCaseEqualsLiteral("cubic-bezier")) {
+       return ParseTransitionTimingFunctionValues(aValue);
+     }
+   }
++  if ((aVariantMask & VARIANT_CALC) &&
++      (eCSSToken_Function == tk->mType) &&
++      tk->mIdent.LowerCaseEqualsLiteral("calc")) {
++    NS_ASSERTION((aVariantMask & VARIANT_LP) == VARIANT_LP,
++                 "does not (currently) make sense to support calc unless "
++                 "property supports both lengths and percents");
++    // calc() currently allows only lengths and percents inside it.
++    return ParseCalc(aValue, aVariantMask & VARIANT_LP);
++  }
+ 
+   UngetToken();
+   return PR_FALSE;
+ }
+ 
+ 
+ PRBool
+ CSSParserImpl::ParseCounter(nsCSSValue& aValue)
+@@ -7115,16 +7129,41 @@ CSSParserImpl::ParseBorderColors(nsCSSVa
+     }
+   }
+   // Have failure case at the end so we can |break| to get to it.
+   delete list;
+   return PR_FALSE;
+ }
+ 
+ PRBool
++CSSParserImpl::ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask)
++{
++  PRBool res = ExpectSymbol('(', PR_FALSE);
++  NS_ABORT_IF_FALSE(res, "function token without open paren");
++
++  // One-iteration loop so we can break to the error-handling case.
++  do {
++    // The toplevel of a calc() is always an nsCSSValue::Array of length 1.
++    nsRefPtr<nsCSSValue::Array> val = nsCSSValue::Array::Create(1);
++    if (!val)
++      break;
++
++    if (!ParseCalcLengthAdditiveExpression(val->Item(0)))
++      break;
++
++    aValue.SetArrayValue(val, eCSSUnit_Calc);
++    return PR_TRUE;
++  } while (PR_FALSE);
++
++  mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
++  SkipUntil(')');
++  return PR_FALSE;
++}
++
++PRBool
+ CSSParserImpl::ParseRect(nsCSSRect& aRect, nsCSSProperty aPropID)
+ {
+   nsCSSRect rect;
+   PRBool result;
+   if ((result = DoParseRect(rect)) &&
+       rect != aRect) {
+     aRect = rect;
+     mTempData.SetPropertyBit(aPropID);
