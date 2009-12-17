@@ -52,12 +52,12 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    PRBool ParseBorderWidth();
 +
 +  PRBool ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask);
-+  PRBool ParseCalcValueAdditiveExpression(nsCSSValue& aValue,
-+                                          PRInt32 aVariantMask);
-+  PRBool ParseCalcValueMultiplicativeExpression(nsCSSValue& aValue,
-+                                                PRInt32 aVariantMask,
-+                                                PRBool *aHadFinalWS);
-+  PRBool ParseCalcValueTerm(nsCSSValue& aValue, PRInt32 aVariantMask);
++  PRBool ParseCalcAdditiveExpression(nsCSSValue& aValue,
++                                     PRInt32& aVariantMask);
++  PRBool ParseCalcMultiplicativeExpression(nsCSSValue& aValue,
++                                           PRInt32& aVariantMask,
++                                           PRBool *aHadFinalWS);
++  PRBool ParseCalcTerm(nsCSSValue& aValue, PRInt32& aVariantMask);
 +  PRBool ParseCalcMinMax(nsCSSValue& aValue, nsCSSUnit aUnit,
 +                         PRInt32 aVariantMask);
 +  PRBool RequireWhitespace();
@@ -161,7 +161,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
  
  PRBool
  CSSParserImpl::ParseCounter(nsCSSValue& aValue)
-@@ -7114,16 +7149,315 @@ CSSParserImpl::ParseBorderColors(nsCSSVa
+@@ -7114,16 +7149,357 @@ CSSParserImpl::ParseBorderColors(nsCSSVa
        break;
      }
    }
@@ -175,6 +175,10 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +PRBool
 +CSSParserImpl::ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask)
 +{
++  // Parsing calc expressions requires, in a number of cases, looking
++  // for a token that is *either* a value of the property or a number.
++  // This can be done without lookahead when we assume that the property
++  // values cannot themselves be numbers.
 +  NS_ASSERTION(!(aVariantMask & VARIANT_NUMBER), "unexpected variant mask");
 +
 +  nsCSSUnit unit;
@@ -204,7 +208,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +      break;
 +    }
 +
-+    if (!ParseCalcValueAdditiveExpression(arr->Item(0), aVariantMask))
++    if (!ParseCalcAdditiveExpression(arr->Item(0), aVariantMask))
 +      break;
 +
 +    if (!ExpectSymbol(')', PR_TRUE))
@@ -221,19 +225,24 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +// We optimize away the <value-expression> production given that
 +// ParseVariant consumes initial whitespace and we call
 +// ExpectSymbol(')') with PR_TRUE for aSkipWS.
-+// This function parses the <value-additive-expression> production, or,
-+// when aVariantMask is VARIANT_NUMBER, the <number-additive-expression>
-+// production.  It does so iteratively, but builds the correct recursive
++//  * If aVariantMask is VARIANT_NUMBER, this function parses the
++//    <number-additive-expression> production.
++//  * If aVariantMask does not contain VARIANT_NUMBER, this function
++//    parses the <value-additive-expression> production.
++//  * Otherwise (VARIANT_NUMBER and other bits) this function parses
++//    whichever one of the productions matches ***and modifies
++//    aVariantMask*** to reflect which one it has parsed by either
++//    removing VARIANT_NUMBER or removing all other bits.
++// It does so iteratively, but builds the correct recursive
 +// data structure.
 +PRBool
-+CSSParserImpl::ParseCalcValueAdditiveExpression(nsCSSValue& aValue,
-+                                                PRInt32 aVariantMask)
++CSSParserImpl::ParseCalcAdditiveExpression(nsCSSValue& aValue,
++                                           PRInt32& aVariantMask)
 +{
 +  nsCSSValue *storage = &aValue;
 +  for (;;) {
 +    PRBool haveWS;
-+    if (!ParseCalcValueMultiplicativeExpression(*storage, aVariantMask,
-+                                                &haveWS))
++    if (!ParseCalcMultiplicativeExpression(*storage, aVariantMask, &haveWS))
 +      return PR_FALSE;
 +
 +    if (!haveWS || !GetToken(PR_FALSE))
@@ -279,58 +288,59 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +  }
 +};
 +
-+// This function parses the <value-multiplicative-expression> production
-+// AND its interleaving with <number-multiplicative-expression>, or,
-+// when aVariantMask is VARIANT_NUMBER, the
-+// <number-multiplicative-expression> production.  It does so
-+// iteratively, but builds the correct recursive data structure.
++//  * If aVariantMask is VARIANT_NUMBER, this function parses the
++//    <number-multiplicative-expression> production.
++//  * If aVariantMask does not contain VARIANT_NUMBER, this function
++//    parses the <value-multiplicative-expression> production.
++//  * Otherwise (VARIANT_NUMBER and other bits) this function parses
++//    whichever one of the productions matches ***and modifies
++//    aVariantMask*** to reflect which one it has parsed by either
++//    removing VARIANT_NUMBER or removing all other bits.
++// It does so iteratively, but builds the correct recursive data
++// structure.
 +// This function always consumes *trailing* whitespace when it returns
 +// true; whether there was any such whitespace is returned in the
 +// aHadFinalWS parameter.
 +PRBool
-+CSSParserImpl::ParseCalcValueMultiplicativeExpression(nsCSSValue& aValue,
-+                                                      PRInt32 aVariantMask,
-+                                                      PRBool *aHadFinalWS)
++CSSParserImpl::ParseCalcMultiplicativeExpression(nsCSSValue& aValue,
++                                                 PRInt32& aVariantMask,
++                                                 PRBool *aHadFinalWS)
 +{
-+  // Whether we already got the one with the unit.
-+  // If we're parsing <number-multiplicative-expression>, then
-+  // initialize it to true.
-+  PRBool gotValue = aVariantMask == VARIANT_NUMBER;
++  PRBool gotValue = PR_FALSE; // already got the part with the unit
 +  PRBool afterDivision = PR_FALSE;
 +
 +  nsCSSValue *storage = &aValue;
 +  for (;;) {
-+    if (!GetToken(PR_TRUE))
++    PRInt32 variantMask;
++    if (afterDivision || gotValue) {
++      variantMask = VARIANT_NUMBER;
++    } else {
++      variantMask = aVariantMask | VARIANT_NUMBER;
++    }
++    if (!ParseCalcTerm(*storage, variantMask))
 +      return PR_FALSE;
-+    // FIXME:  This isn't correct, since if we have an opening
-+    // parenthesis, it's still ambiguous whether the next part is
-+    // numeric or not, and we really need to propagate the ambiguity
-+    // down but then be consistent once we resolve it!
-+    PRBool isNumber = mToken.mType == eCSSToken_Number;
-+    UngetToken();
++    NS_ABORT_IF_FALSE(aVariantMask != 0,
++                      "ParseCalcTerm did not set variantMask appropriately");
++    NS_ABORT_IF_FALSE(!(variantMask & VARIANT_NUMBER) ||
++                      !(variantMask & ~PRInt32(VARIANT_NUMBER)),
++                      "ParseCalcTerm did not set variantMask appropriately");
 +
-+    if (isNumber) {
-+      nsCSSValue termAsValue;
-+      if (!ParseCalcValueTerm(termAsValue, VARIANT_NUMBER))
-+        return PR_FALSE;
++    if (variantMask & VARIANT_NUMBER) {
 +      // Simplify the value immediately so we can check for division by
 +      // zero.
 +      float number = mozilla::css::ComputeCalc<ReduceNumberCalcOps>(
-+                       termAsValue, ReduceNumberCalcOps::ComputeData());
-+      if (number == 0.0)
++                       *storage, ReduceNumberCalcOps::ComputeData());
++      if (number == 0.0 && afterDivision)
 +        return PR_FALSE;
 +      storage->SetFloatValue(number, eCSSUnit_Number);
 +    } else {
-+      if (afterDivision || gotValue ||
-+          !ParseCalcValueTerm(*storage, aVariantMask))
-+        return PR_FALSE;
 +      gotValue = PR_TRUE;
 +    }
 +
 +    PRBool hadWS = RequireWhitespace();
 +    if (!GetToken(PR_FALSE)) {
 +      *aHadFinalWS = hadWS;
-+      return gotValue;
++      break;
 +    }
 +    nsCSSUnit unit;
 +    if (mToken.IsSymbol('*')) {
@@ -348,7 +358,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +    } else {
 +      UngetToken();
 +      *aHadFinalWS = hadWS;
-+      return gotValue;
++      break;
 +    }
 +
 +    nsRefPtr<nsCSSValue::Array> arr = nsCSSValue::Array::Create(2);
@@ -360,18 +370,36 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +    storage = &arr->Item(1);
 +    aValue.SetArrayValue(arr, unit);
 +  }
++
++  // Adjust aVariantMask (see comments above function) to reflect which
++  // option we took.
++  if (aVariantMask & VARIANT_NUMBER) {
++    if (gotValue) {
++      aVariantMask &= ~PRInt32(VARIANT_NUMBER);
++    } else {
++      aVariantMask = VARIANT_NUMBER;
++    }
++  }
++
++  return PR_TRUE;
 +}
 +
-+// Parse the <length-term> production, or, if aVariantMask is
-+// VARIANT_NUMBER, the <number-term> production.
++//  * If aVariantMask is VARIANT_NUMBER, this function parses the
++//    <number-term> production.
++//  * If aVariantMask does not contain VARIANT_NUMBER, this function
++//    parses the <value-term> production.
++//  * Otherwise (VARIANT_NUMBER and other bits) this function parses
++//    whichever one of the productions matches ***and modifies
++//    aVariantMask*** to reflect which one it has parsed by either
++//    removing VARIANT_NUMBER or removing all other bits.
 +PRBool
-+CSSParserImpl::ParseCalcValueTerm(nsCSSValue& aValue, PRInt32 aVariantMask)
++CSSParserImpl::ParseCalcTerm(nsCSSValue& aValue, PRInt32& aVariantMask)
 +{
 +  if (!GetToken(PR_TRUE))
 +    return PR_FALSE;
 +  // Either an additive expression in parentheses...
 +  if (mToken.IsSymbol('(')) {
-+    if (!ParseCalcValueAdditiveExpression(aValue, aVariantMask) ||
++    if (!ParseCalcAdditiveExpression(aValue, aVariantMask) ||
 +        !ExpectSymbol(')', PR_TRUE)) {
 +      SkipUntil(')');
 +      return PR_FALSE;
@@ -379,17 +407,31 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +    return PR_TRUE;
 +  }
 +  // ... or a min() or max() expression
-+  if (aVariantMask != VARIANT_NUMBER &&
++  PRInt32 mmMask = aVariantMask & ~PRInt32(VARIANT_NUMBER);
++  if (mmMask != 0 &&
 +      mToken.mType == eCSSToken_Function &&
 +      (mToken.mIdent.LowerCaseEqualsLiteral("min") ||
 +       mToken.mIdent.LowerCaseEqualsLiteral("max"))) {
 +    nsCSSUnit unit = mToken.mIdent.LowerCaseEqualsLiteral("min")
 +                       ? eCSSUnit_Calc_Minimum : eCSSUnit_Calc_Maximum;
-+    return ParseCalcMinMax(aValue, unit, aVariantMask);
++    aVariantMask = mmMask;
++    return ParseCalcMinMax(aValue, unit, mmMask);
 +  }
 +  // ... or just a value
 +  UngetToken();
-+  return ParseVariant(aValue, aVariantMask, nsnull);
++  if (!ParseVariant(aValue, aVariantMask, nsnull)) {
++    return PR_FALSE;
++  }
++  // If we did the value parsing, we need to adjust aVariantMask to
++  // reflect which option we took (see above).
++  if (aVariantMask & VARIANT_NUMBER) {
++    if (aValue.GetUnit() == eCSSUnit_Number) {
++      aVariantMask = VARIANT_NUMBER;
++    } else {
++      aVariantMask &= ~PRInt32(VARIANT_NUMBER);
++    }
++  }
++  return PR_TRUE;
 +}
 +
 +PRBool
@@ -421,7 +463,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +      return PR_FALSE;
 +    }
 +
-+    if (!ParseCalcValueAdditiveExpression(*v, aVariantMask))
++    if (!ParseCalcAdditiveExpression(*v, aVariantMask))
 +      return PR_FALSE;
 +
 +    if (ExpectSymbol(',', PR_TRUE))
