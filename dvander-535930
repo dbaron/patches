@@ -1,0 +1,77 @@
+
+# HG changeset patch
+# User David Anderson <danderson@mozilla.com>
+# Date 1261527685 28800
+# Node ID 167467b7b43980475254beb71c588b5c8a0e1eb6
+# Parent a73a47b3bb8309460da7a5489e4d87d6277abbcd
+Fixed lazy import regression in upvar resolution, take two (bug 535930, r=dmandelin).
+
+--- a/js/src/jstracer.cpp	Tue Dec 22 15:53:28 2009 -0800
++++ b/js/src/jstracer.cpp	Tue Dec 22 16:21:25 2009 -0800
+@@ -3778,6 +3778,22 @@ TraceRecorder::set(jsval* p, LIns* i, bo
+ }
+ 
+ JS_REQUIRES_STACK LIns*
++TraceRecorder::attemptImport(jsval* p)
++{
++    if (LIns* i = tracker.get(p))
++        return i;
++
++    /* If the variable was not known, it could require a lazy import. */
++    CountSlotsVisitor countVisitor(p);
++    VisitStackSlots(countVisitor, cx, callDepth);
++
++    if (countVisitor.stopped() || size_t(p - cx->fp->slots) < cx->fp->script->nslots)
++        return get(p);
++
++    return NULL;
++}
++
++JS_REQUIRES_STACK LIns*
+ TraceRecorder::get(jsval* p)
+ {
+     checkForGlobalObjectReallocation();
+@@ -12123,8 +12139,8 @@ TraceRecorder::upvar(JSScript* script, J
+     jsval& vr = js_GetUpvar(cx, script->staticLevel, cookie);
+     v = vr;
+ 
+-    if (known(&vr))
+-        return get(&vr);
++    if (LIns* ins = attemptImport(&vr))
++        return ins;
+ 
+     /*
+      * The upvar is not in the current trace, so get the upvar value exactly as
+--- a/js/src/jstracer.h	Tue Dec 22 15:53:28 2009 -0800
++++ b/js/src/jstracer.h	Tue Dec 22 16:21:25 2009 -0800
+@@ -1103,6 +1103,7 @@ class TraceRecorder
+     JS_REQUIRES_STACK void set(jsval* p, nanojit::LIns* l, bool initializing = false,
+                                bool demote = true);
+     JS_REQUIRES_STACK nanojit::LIns* get(jsval* p);
++    JS_REQUIRES_STACK nanojit::LIns* attemptImport(jsval* p);
+     JS_REQUIRES_STACK nanojit::LIns* addr(jsval* p);
+ 
+     JS_REQUIRES_STACK bool known(jsval* p);
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/js/src/trace-test/tests/basic/bug535930.js	Tue Dec 22 16:21:25 2009 -0800
+@@ -0,0 +1,19 @@
++(function () {
++    p = function () {
++        Set()
++    };
++    var Set = function () {};
++    for (var x = 0; x < 5; x++) {
++        Set = function (z) {
++            return function () {
++                [z]
++            }
++        } (x)
++    }
++})()
++
++/*
++ * bug 535930, mistakenly generated code to GetUpvar and crashed inside the call.
++ * so don't crash.
++ */
++
+
