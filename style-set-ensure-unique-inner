@@ -2,10 +2,66 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Add method to nsStyleSet to call EnsureUniqueInner on all CSS sheets.  (Bug 536379)
 
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -1479,16 +1479,28 @@ nsCSSStyleSheet::EnsureUniqueInner()
+   if (!clone) {
+     return eUniqueInner_CloneFailed;
+   }
+   mInner->RemoveSheet(this);
+   mInner = clone;
+   return eUniqueInner_ClonedInner;
+ }
+ 
++PRBool
++nsCSSStyleSheet::AppendAllChildSheets(nsTArray<nsCSSStyleSheet*> aArray)
++{
++  for (nsCSSStyleSheet* child = mInner->mFirstChild; child;
++       child = child->mNext) {
++    if (!aArray.AppendElement(child)) {
++      return PR_FALSE;
++    }
++  }
++  return PR_TRUE;
++}
++
+ NS_IMETHODIMP
+ nsCSSStyleSheet::Clone(nsICSSStyleSheet* aCloneParent,
+                        nsICSSImportRule* aCloneOwnerRule,
+                        nsIDocument* aCloneDocument,
+                        nsIDOMNode* aCloneOwningNode,
+                        nsICSSStyleSheet** aClone) const
+ {
+   NS_PRECONDITION(aClone, "Null out param!");
+diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
+--- a/layout/style/nsCSSStyleSheet.h
++++ b/layout/style/nsCSSStyleSheet.h
+@@ -182,16 +182,20 @@ public:
+     // A clone was done to ensure a unique inner (which means the style
+     // rules in this sheet have changed).
+     eUniqueInner_ClonedInner,
+     // A clone was attempted, but it failed.
+     eUniqueInner_CloneFailed
+   };
+   EnsureUniqueInnerResult EnsureUniqueInner();
+ 
++  // Append all of this sheet's child sheets to aArray.  Return PR_TRUE
++  // on success and PR_FALSE on allocation failure.
++  PRBool AppendAllChildSheets(nsTArray<nsCSSStyleSheet*> aArray);
++
+   PRBool UseForPresentation(nsPresContext* aPresContext,
+                             nsMediaQueryResultCacheKey& aKey) const;
+ 
+   // nsIDOMStyleSheet interface
+   NS_DECL_NSIDOMSTYLESHEET
+ 
+   // nsIDOMCSSStyleSheet interface
+   NS_DECL_NSIDOMCSSSTYLESHEET
 diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 --- a/layout/style/nsStyleSet.cpp
 +++ b/layout/style/nsStyleSet.cpp
-@@ -1156,8 +1156,30 @@ nsStyleSet::MediumFeaturesChanged(nsPres
+@@ -1156,8 +1156,46 @@ nsStyleSet::MediumFeaturesChanged(nsPres
    if (mBindingManager) {
      PRBool thisChanged = PR_FALSE;
      mBindingManager->MediumFeaturesChanged(aPresContext, &thisChanged);
@@ -18,20 +74,36 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 +nsCSSStyleSheet::EnsureUniqueInnerResult
 +nsStyleSet::EnsureUniqueInnerOnCSSSheets()
 +{
-+  nsCSSStyleSheet::EnsureUniqueInnerResult res =
-+    nsCSSStyleSheet::eUniqueInner_AlreadyUnique;
++  nsAutoTArray<nsCSSStyleSheet*, 32> queue;
 +  for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(gCSSSheetTypes); ++i) {
 +    nsCOMArray<nsIStyleSheet> &sheets = mSheets[gCSSSheetTypes[i]];
 +    for (PRUint32 j = 0, j_end = sheets.Count(); j < j_end; ++j) {
 +      nsCSSStyleSheet *sheet = static_cast<nsCSSStyleSheet*>(sheets[j]);
-+      nsCSSStyleSheet::EnsureUniqueInnerResult sheetRes =
-+        sheet->EnsureUniqueInner();
-+      if (sheetRes == nsCSSStyleSheet::eUniqueInner_CloneFailed) {
-+        return sheetRes;
++      if (!queue.AppendElement(sheet)) {
++        return nsCSSStyleSheet::eUniqueInner_CloneFailed;
 +      }
-+      if (sheetRes == nsCSSStyleSheet::eUniqueInner_ClonedInner) {
-+        res = sheetRes;
-+      }
++    }
++  }
++
++  nsCSSStyleSheet::EnsureUniqueInnerResult res =
++    nsCSSStyleSheet::eUniqueInner_AlreadyUnique;
++  while (!queue.IsEmpty()) {
++    PRUint32 idx = queue.Length() - 1;
++    nsCSSStyleSheet *sheet = queue[idx];
++    queue.RemoveElementAt(idx);
++
++    nsCSSStyleSheet::EnsureUniqueInnerResult sheetRes =
++      sheet->EnsureUniqueInner();
++    if (sheetRes == nsCSSStyleSheet::eUniqueInner_CloneFailed) {
++      return sheetRes;
++    }
++    if (sheetRes == nsCSSStyleSheet::eUniqueInner_ClonedInner) {
++      res = sheetRes;
++    }
++
++    // Enqueue all the sheet's children.
++    if (!sheet->AppendAllChildSheets(queue)) {
++      return nsCSSStyleSheet::eUniqueInner_CloneFailed;
 +    }
 +  }
 +  return res;
