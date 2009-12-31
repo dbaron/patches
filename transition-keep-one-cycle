@@ -1,0 +1,123 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Store transitions for one refresh cycle after they complete so that merging with a non-animation style change doesn't make us start a second transition to transition the last step.  (Bug 537151)
+
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -82,16 +82,27 @@ struct ElementPropertyTransition
+   // in-progress transition.  Needed so we can handle two reverses in a
+   // row.
+   nsStyleAnimation::Value mStartForReversingTest;
+   // Likewise, the portion of the "full" reversed transition that we're
+   // actually covering.
+   double mReversePortion;
+ 
+   double ValuePortionFor(TimeStamp aRefreshTime) const;
++
++  PRBool IsRemovedSentinel() const
++  {
++    return mStartTime.IsNull();
++  }
++
++  void SetRemovedSentinel()
++  {
++    // assign the null time stamp
++    mStartTime = TimeStamp();
++  }
+ };
+ 
+ double
+ ElementPropertyTransition::ValuePortionFor(TimeStamp aRefreshTime) const
+ {
+   double duration = mDuration.ToSeconds();
+   NS_ABORT_IF_FALSE(duration >= 0.0, "negative duration forbidden");
+   double timePortion;
+@@ -251,16 +262,20 @@ ElementTransitionsStyleRule::MapRuleInfo
+   }
+ 
+   ElementTransitions *et = ElementData();
+   NS_ENSURE_TRUE(et, NS_OK); // FIXME (Bug 522597): Why can this be null?
+   for (PRUint32 i = 0, i_end = et->mPropertyTransitions.Length();
+        i < i_end; ++i)
+   {
+     ElementPropertyTransition &pt = et->mPropertyTransitions[i];
++    if (pt.IsRemovedSentinel()) {
++      continue;
++    }
++
+     if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
+                              nsCSSProps::kSIDTable[pt.mProperty]))
+     {
+       double valuePortion = pt.ValuePortionFor(RefreshTime());
+ #ifdef DEBUG
+       PRBool ok =
+ #endif
+         nsStyleAnimation::Interpolate(pt.mProperty,
+@@ -686,17 +701,18 @@ nsTransitionManager::ConsiderStartingTra
+       // of the currently running transition, we don't want to interrupt
+       // its timing function.
+       // WalkTransitionRule already called RestyleForAnimation.
+       return;
+     }
+ 
+     // If the new transition reverses the old one, we'll need to handle
+     // the timing differently.
+-    if (oldPT.mStartForReversingTest == pt.mEndValue) {
++    if (!oldPT.IsRemovedSentinel() &&
++        oldPT.mStartForReversingTest == pt.mEndValue) {
+       // Compute the appropriate negative transition-delay such that right
+       // now we'd end up at the current position.
+       double valuePortion =
+         oldPT.ValuePortionFor(mostRecentRefresh) * oldPT.mReversePortion +
+         (1.0 - oldPT.mReversePortion); 
+ 
+       // Negative delays are essentially part of the transition
+       // function, so reduce them along with the duration, but don't
+@@ -955,33 +971,44 @@ nsTransitionManager::WillRefresh(mozilla
+                         "nsGenericElement::UnbindFromTree should have "
+                         "destroyed the element transitions object");
+ 
+       PRUint32 i = et->mPropertyTransitions.Length();
+       NS_ABORT_IF_FALSE(i != 0, "empty transitions list?");
+       do {
+         --i;
+         ElementPropertyTransition &pt = et->mPropertyTransitions[i];
+-        if (pt.mStartTime + pt.mDuration <= aTime) {
++        if (pt.IsRemovedSentinel()) {
++          // Actually remove transitions one cycle after their
++          // completion.  See comment below.
++          et->mPropertyTransitions.RemoveElementAt(i);
++        } else if (pt.mStartTime + pt.mDuration <= aTime) {
+           // This transition has completed.
+ 
+           // Fire transitionend events only for transitions on elements
+           // and not those on pseudo-elements, since we can't target an
+           // event at pseudo-elements.
+           if (et->mElementProperty == nsGkAtoms::transitionsProperty) {
+             nsCSSProperty prop = pt.mProperty;
+             if (nsCSSProps::PropHasFlags(prop, CSS_PROPERTY_REPORT_OTHER_NAME))
+             {
+               prop = nsCSSProps::OtherNameFor(prop);
+             }
+             events.AppendElement(
+               TransitionEventInfo(et->mElement, prop, pt.mDuration));
+           }
+ 
+-          et->mPropertyTransitions.RemoveElementAt(i);
++          // Leave this transition in the list for one more refresh
++          // cycle, since we haven't yet processed its style change, and
++          // if we also have (already, or will have from processing
++          // transitionend events or other refresh driver notifications)
++          // a non-animation style change that would affect it, we need
++          // to know not to start a new transition for the transition
++          // from the almost-completed value to the final value.
++          pt.SetRemovedSentinel();
+         }
+       } while (i != 0);
+ 
+       // We need to restyle even if the transition rule no longer
+       // applies (in which case we just made it not apply).
+       mPresContext->PresShell()->RestyleForAnimation(et->mElement);
+ 
+       if (et->mPropertyTransitions.IsEmpty()) {
