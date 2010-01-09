@@ -5,15 +5,15 @@ Store transitions for one refresh cycle after they complete so that merging with
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -82,16 +82,27 @@ struct ElementPropertyTransition
-   // in-progress transition.  Needed so we can handle two reverses in a
-   // row.
-   nsStyleAnimation::Value mStartForReversingTest;
-   // Likewise, the portion of the "full" reversed transition that we're
-   // actually covering.
-   double mReversePortion;
+@@ -70,16 +70,27 @@ struct ElementPropertyTransition
+   // object's owning style rule needs to keep alive (after calling
+   // UncomputeValue on it in MapRuleInfoInto).
+   nsStyleAnimation::Value mStartValue, mEndValue, mCurrentValue;
+   TimeStamp mStartTime; // actual start plus transition delay
  
-   double ValuePortionFor(TimeStamp aRefreshTime) const;
+   // data from the relevant nsTransition
+   TimeDuration mDuration;
+   nsSMILKeySpline mTimingFunction;
 +
 +  PRBool IsRemovedSentinel() const
 +  {
@@ -27,13 +27,13 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 +  }
  };
  
- double
- ElementPropertyTransition::ValuePortionFor(TimeStamp aRefreshTime) const
- {
-   double duration = mDuration.ToSeconds();
-   NS_ABORT_IF_FALSE(duration >= 0.0, "negative duration forbidden");
-   double timePortion;
-@@ -251,16 +262,20 @@ ElementTransitionsStyleRule::MapRuleInfo
+ /**
+  * An ElementTransitionsStyleRule overrides style data with the
+  * currently-transitioning value for an element that is executing a
+  * transition.  It only matches when styling with animation.  When we
+  * style without animation, we need to not use it so that we can detect
+  * any new changes; if necessary we restyle immediately afterwards with
+@@ -215,16 +226,20 @@ ElementTransitionsStyleRule::MapRuleInfo
    }
  
    ElementTransitions *et = ElementData();
@@ -49,32 +49,36 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
      if (aRuleData->mSIDs & nsCachedStyleData::GetBitForSID(
                               nsCSSProps::kSIDTable[pt.mProperty]))
      {
-       double valuePortion = pt.ValuePortionFor(RefreshTime());
- #ifdef DEBUG
-       PRBool ok =
- #endif
-         nsStyleAnimation::Interpolate(pt.mProperty,
-@@ -686,17 +701,18 @@ nsTransitionManager::ConsiderStartingTra
+       double timePortion =
+         (RefreshTime() - pt.mStartTime).ToSeconds() / pt.mDuration.ToSeconds();
+       if (timePortion < 0.0)
+         timePortion = 0.0; // use start value during transition-delay
+       if (timePortion > 1.0)
+@@ -639,20 +654,20 @@ nsTransitionManager::ConsiderStartingTra
+   // been longer had it started from the endpoint of the currently
+   // running transition.
+   double durationFraction = 1.0;
+ 
+   // We need to check two things if we have a currently running
+   // transition for this property:  see durationFraction comment above
+   // and the endpoint check below.
+   if (currentIndex != nsTArray<ElementPropertyTransition>::NoIndex) {
+-    const nsStyleAnimation::Value &endVal =
+-      aElementTransitions->mPropertyTransitions[currentIndex].mEndValue;
++    const ElementPropertyTransition &oldPT =
++      aElementTransitions->mPropertyTransitions[currentIndex];
+ 
+-    if (endVal == pt.mEndValue) {
++    if (oldPT.mEndValue == pt.mEndValue) {
+       // If we got a style change that changed the value to the endpoint
        // of the currently running transition, we don't want to interrupt
        // its timing function.
        // WalkTransitionRule already called RestyleForAnimation.
        return;
      }
  
-     // If the new transition reverses the old one, we'll need to handle
-     // the timing differently.
--    if (oldPT.mStartForReversingTest == pt.mEndValue) {
-+    if (!oldPT.IsRemovedSentinel() &&
-+        oldPT.mStartForReversingTest == pt.mEndValue) {
-       // Compute the appropriate negative transition-delay such that right
-       // now we'd end up at the current position.
-       double valuePortion =
-         oldPT.ValuePortionFor(mostRecentRefresh) * oldPT.mReversePortion +
-         (1.0 - oldPT.mReversePortion); 
- 
-       // Negative delays are essentially part of the transition
-       // function, so reduce them along with the duration, but don't
-@@ -955,33 +971,44 @@ nsTransitionManager::WillRefresh(mozilla
+     double fullDistance, remainingDistance;
+@@ -935,26 +950,37 @@ nsTransitionManager::WillRefresh(mozilla
                          "nsGenericElement::UnbindFromTree should have "
                          "destroyed the element transitions object");
  
@@ -90,19 +94,12 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 +          et->mPropertyTransitions.RemoveElementAt(i);
 +        } else if (pt.mStartTime + pt.mDuration <= aTime) {
            // This transition has completed.
- 
-           // Fire transitionend events only for transitions on elements
-           // and not those on pseudo-elements, since we can't target an
-           // event at pseudo-elements.
-           if (et->mElementProperty == nsGkAtoms::transitionsProperty) {
-             nsCSSProperty prop = pt.mProperty;
-             if (nsCSSProps::PropHasFlags(prop, CSS_PROPERTY_REPORT_OTHER_NAME))
-             {
-               prop = nsCSSProps::OtherNameFor(prop);
-             }
-             events.AppendElement(
-               TransitionEventInfo(et->mElement, prop, pt.mDuration));
+           nsCSSProperty prop = pt.mProperty;
+           if (nsCSSProps::PropHasFlags(prop, CSS_PROPERTY_REPORT_OTHER_NAME)) {
+             prop = nsCSSProps::OtherNameFor(prop);
            }
+           events.AppendElement(
+             TransitionEventInfo(et->mElement, prop, pt.mDuration));
  
 -          et->mPropertyTransitions.RemoveElementAt(i);
 +          // Leave this transition in the list for one more refresh
@@ -124,7 +121,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
 diff --git a/layout/style/test/Makefile.in b/layout/style/test/Makefile.in
 --- a/layout/style/test/Makefile.in
 +++ b/layout/style/test/Makefile.in
-@@ -139,16 +139,17 @@ _TEST_FILES =	test_acid3_test46.html \
+@@ -138,16 +138,17 @@ _TEST_FILES =	test_acid3_test46.html \
  		test_style_struct_copy_constructors.html \
  		test_system_font_serialization.html \
  		test_transitions_computed_values.html \
