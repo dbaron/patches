@@ -2,38 +2,62 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Add function to nsStyleUtil for choosing the appropriate color from style data based on link visitedness.  (Bug 147777)
 
-diff --git a/layout/style/nsStyleUtil.cpp b/layout/style/nsStyleUtil.cpp
---- a/layout/style/nsStyleUtil.cpp
-+++ b/layout/style/nsStyleUtil.cpp
-@@ -47,16 +47,18 @@
- #include "nsINameSpaceManager.h"
- #include "nsIURI.h"
- #include "nsNetUtil.h"
- #include "nsReadableUtils.h"
- #include "nsContentUtils.h"
- #include "nsTextFormatter.h"
- #include "nsIScriptError.h"
- #include "nsCSSProps.h"
-+#include "nsStyleAnimation.h"
-+#include "nsStyleContext.h"
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -716,16 +716,22 @@ public:
+     const nsStyle##name_ * GetStyle##name_ () const {                         \
+       return static_cast<const nsStyle##name_*>(                              \
+                             GetStyleDataExternal(eStyleStruct_##name_));      \
+     }
+ #endif
+   #include "nsStyleStructList.h"
+   #undef STYLE_STRUCT
  
- // XXX This is here because nsCachedStyleData is accessed outside of
- // the content module; e.g., by nsCSSFrameConstructor.
- #include "nsRuleNode.h"
- 
- nsCachedStyleData::StyleStructInfo
- nsCachedStyleData::gInfo[] = {
- 
-@@ -616,8 +618,52 @@ nsStyleUtil::IsSignificantChild(nsIConte
- nsStyleUtil::ReportUseOfDeprecatedMethod(nsIURI* aURI, const char* aWarning)
- {
-   nsContentUtils::ReportToConsole(nsContentUtils::eCSS_PROPERTIES,
-                                   aWarning, nsnull, 0, aURI,
-                                   EmptyString(), 0, 0,
-                                   nsIScriptError::warningFlag,
-                                   "CSS Object Model");
- }
++#ifdef _IMPL_NS_LAYOUT
++  /** Also forward GetVisitedDependentColor to the style context */
++  nscolor GetVisitedDependentColor(nsCSSProperty aProperty)
++    { return mStyleContext->GetVisitedDependentColor(aProperty); }
++#endif
 +
+   /**
+    * These methods are to access any additional style contexts that
+    * the frame may be holding. These are contexts that are children
+    * of the frame's primary context and are NOT used as style contexts
+    * for any child frames. These contexts also MUST NOT have any child 
+    * contexts whatsoever. If you need to insert style contexts into the
+    * style tree, then you should create pseudo element frames to own them
+    * The indicies must be consecutive and implementations MUST return an 
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -46,16 +46,17 @@
+ 
+ #include "nsCOMPtr.h"
+ #include "nsStyleSet.h"
+ #include "nsIPresShell.h"
+ 
+ #include "nsRuleNode.h"
+ #include "nsStyleContext.h"
+ #include "prlog.h"
++#include "nsStyleAnimation.h"
+ 
+ #ifdef DEBUG
+ // #define NOISY_DEBUG
+ #endif
+ 
+ //----------------------------------------------------------------------
+ 
+ 
+@@ -648,8 +649,50 @@ NS_NewStyleContext(nsStyleContext* aPare
+   nsStyleContext* context =
+     new (aPresContext) nsStyleContext(aParentContext, aPseudoTag, aPseudoType,
+                                       aRuleNode, aPresContext);
+   if (context)
+     context->AddRef();
+   return context;
+ }
+ 
 +static nscolor ExtractColor(nsCSSProperty aProperty,
 +                            nsStyleContext *aStyleContext)
 +{
@@ -53,14 +77,13 @@ diff --git a/layout/style/nsStyleUtil.cpp b/layout/style/nsStyleUtil.cpp
 +
 +static const ColorIndexSet gVisitedIndices[2] = { { 0, 0 }, { 1, 0 } };
 +
-+/* static */ nscolor
-+nsStyleUtil::GetVisitedDependentColor(nsStyleContext *aStyleContext,
-+                                      nsCSSProperty aProperty)
++nscolor
++nsStyleContext::GetVisitedDependentColor(nsCSSProperty aProperty)
 +{
 +  nscolor colors[2];
-+  colors[0] = ExtractColor(aProperty, aStyleContext);
++  colors[0] = ExtractColor(aProperty, this);
 +
-+  nsStyleContext *visitedStyle = aStyleContext->StyleIfVisited();
++  nsStyleContext *visitedStyle = this->StyleIfVisited();
 +  if (!visitedStyle) {
 +    return colors[0];
 +  }
@@ -68,38 +91,41 @@ diff --git a/layout/style/nsStyleUtil.cpp b/layout/style/nsStyleUtil.cpp
 +  colors[1] = ExtractColor(aProperty, visitedStyle);
 +
 +  // NOTE: We want this code to have as little timing dependence as
-+  // possible on whether aStyleContext->RelevantLinkVisited() is true.
++  // possible on whether this->RelevantLinkVisited() is true.
 +  const ColorIndexSet &set =
-+    gVisitedIndices[aStyleContext->RelevantLinkVisited() ? 1 : 0];
++    gVisitedIndices[this->RelevantLinkVisited() ? 1 : 0];
 +
 +  nscolor colorColor = colors[set.colorIndex];
 +  nscolor alphaColor = colors[set.alphaIndex];
 +  return NS_RGBA(NS_GET_R(colorColor), NS_GET_G(colorColor),
 +                 NS_GET_B(colorColor), NS_GET_A(alphaColor));
 +}
-diff --git a/layout/style/nsStyleUtil.h b/layout/style/nsStyleUtil.h
---- a/layout/style/nsStyleUtil.h
-+++ b/layout/style/nsStyleUtil.h
-@@ -112,12 +112,21 @@ public:
-   /*
-    * Does this child count as significant for selector matching?
-    */
-   static PRBool IsSignificantChild(nsIContent* aChild,
-                                    PRBool aTextIsSignificant,
-                                    PRBool aWhitespaceIsSignificant);
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -185,16 +185,25 @@ public:
  
-   static void ReportUseOfDeprecatedMethod(nsIURI* aURI, const char* aWarning);
-+
+ 
+   NS_HIDDEN_(const void*) PeekStyleData(nsStyleStructID aSID);
+ 
+   NS_HIDDEN_(void*) GetUniqueStyleData(const nsStyleStructID& aSID);
+ 
+   NS_HIDDEN_(nsChangeHint) CalcStyleDifference(nsStyleContext* aOther);
+ 
 +  /**
-+   * Get a color that depends on link-visitedness using aStyleContext
-+   * and aStyleContext->StyleIfVisited().
++   * Get a color that depends on link-visitedness using this and
++   * this->StyleIfVisited().
 +   *
 +   * aProperty must be a color-valued property that nsStyleAnimation
 +   * knows how to extract.
 +   */
-+  static nscolor GetVisitedDependentColor(nsStyleContext *aStyleContext,
-+                                          nsCSSProperty aProperty);
- };
++  NS_HIDDEN_(nscolor) GetVisitedDependentColor(nsCSSProperty aProperty);
++
+ #ifdef DEBUG
+   NS_HIDDEN_(void) List(FILE* out, PRInt32 aIndent);
+ #endif
  
--
- #endif /* nsStyleUtil_h___ */
+ protected:
+   NS_HIDDEN_(void) AddChild(nsStyleContext* aChild);
+   NS_HIDDEN_(void) RemoveChild(nsStyleContext* aChild);
+ 
