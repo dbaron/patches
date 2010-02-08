@@ -1,0 +1,1118 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement :-moz-any() selector to allow simplification of user-agent style sheets.
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -369,28 +369,32 @@ protected:
+   nsSelectorParsingStatus ParsePseudoClassWithIdentArg(nsCSSSelector& aSelector,
+                                                        nsIAtom*       aPseudo,
+                                                        nsCSSPseudoClasses::Type aType);
+ 
+   nsSelectorParsingStatus ParsePseudoClassWithNthPairArg(nsCSSSelector& aSelector,
+                                                          nsIAtom*       aPseudo,
+                                                          nsCSSPseudoClasses::Type aType);
+ 
++  nsSelectorParsingStatus ParsePseudoClassWithSelectorListArg(nsCSSSelector& aSelector,
++                                                              nsIAtom*       aPseudo,
++                                                              nsCSSPseudoClasses::Type aType);
++
+   nsSelectorParsingStatus ParseNegatedSimpleSelector(PRInt32&       aDataMask,
+                                                      nsCSSSelector& aSelector);
+ 
+   nsSelectorParsingStatus ParseSelector(nsCSSSelector& aSelectorResult,
+                                         nsIAtom** aPseudoElement,
+                                         nsPseudoClassList** aPseudoElementArgs,
+                                         nsCSSPseudoElements::Type* aPseudoElementType);
+ 
+-  // If aTerminateAtBrace is true, the selector list is done when we
+-  // hit a '{'.  Otherwise, it's done when we hit EOF.
++  // If aStopChar is non-zero, the selector list is done when we hit
++  // aStopChar.  Otherwise, it's done when we hit EOF.
+   PRBool ParseSelectorList(nsCSSSelectorList*& aListHead,
+-                           PRBool aTerminateAtBrace);
++                           PRUnichar aStopChar);
+   PRBool ParseSelectorGroup(nsCSSSelectorList*& aListHead);
+   nsCSSDeclaration* ParseDeclarationBlock(PRBool aCheckForBraces);
+   PRBool ParseDeclaration(nsCSSDeclaration* aDeclaration,
+                           PRBool aCheckForBraces,
+                           PRBool aMustCallValueAppended,
+                           PRBool* aChanged);
+   // After a parse error parsing |aPropID|, clear the data in
+   // |mTempData|.
+@@ -1283,17 +1287,17 @@ CSSParserImpl::ParseSelectorString(const
+                                    nsCSSSelectorList **aSelectorList)
+ {
+   InitScanner(aSelectorString, aURL, aLineNumber, aURL, nsnull);
+ 
+   AssertInitialState();
+ 
+   mUnresolvablePrefixException = PR_TRUE;
+ 
+-  PRBool success = ParseSelectorList(*aSelectorList, PR_FALSE);
++  PRBool success = ParseSelectorList(*aSelectorList, PRUnichar(0));
+   nsresult rv = mScanner.GetLowLevelError();
+   OUTPUT_ERROR();
+   ReleaseScanner();
+ 
+   mUnresolvablePrefixException = PR_FALSE;
+ 
+   if (success) {
+     NS_ASSERTION(*aSelectorList, "Should have list!");
+@@ -2421,17 +2425,17 @@ CSSParserImpl::AppendRule(nsICSSRule* aR
+ 
+ PRBool
+ CSSParserImpl::ParseRuleSet(RuleAppendFunc aAppendFunc, void* aData,
+                             PRBool aInsideBraces)
+ {
+   // First get the list of selectors for the rule
+   nsCSSSelectorList* slist = nsnull;
+   PRUint32 linenum = mScanner.GetLineNumber();
+-  if (! ParseSelectorList(slist, PR_TRUE)) {
++  if (! ParseSelectorList(slist, PRUnichar('{'))) {
+     REPORT_UNEXPECTED(PEBadSelectorRSIgnored);
+     OUTPUT_ERROR();
+     SkipRuleSet(aInsideBraces);
+     return PR_FALSE;
+   }
+   NS_ASSERTION(nsnull != slist, "null selector list");
+   CLEAR_ERROR();
+ 
+@@ -2462,33 +2466,33 @@ CSSParserImpl::ParseRuleSet(RuleAppendFu
+   rule->SetLineNumber(linenum);
+   (*aAppendFunc)(rule, aData);
+ 
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseSelectorList(nsCSSSelectorList*& aListHead,
+-                                 PRBool aTerminateAtBrace)
++                                 PRUnichar aStopChar)
+ {
+   nsCSSSelectorList* list = nsnull;
+   if (! ParseSelectorGroup(list)) {
+     // must have at least one selector group
+     aListHead = nsnull;
+     return PR_FALSE;
+   }
+   NS_ASSERTION(nsnull != list, "no selector list");
+   aListHead = list;
+ 
+   // After that there must either be a "," or a "{" (the latter if
+-  // aTerminateAtBrace is true)
++  // StopChar is nonzero)
+   nsCSSToken* tk = &mToken;
+   for (;;) {
+     if (! GetToken(PR_TRUE)) {
+-      if (!aTerminateAtBrace) {
++      if (aStopChar == PRUnichar(0)) {
+         return PR_TRUE;
+       }
+ 
+       REPORT_UNEXPECTED_EOF(PESelectorListExtraEOF);
+       break;
+     }
+ 
+     if (eCSSToken_Symbol == tk->mType) {
+@@ -2497,17 +2501,17 @@ CSSParserImpl::ParseSelectorList(nsCSSSe
+         // Another selector group must follow
+         if (! ParseSelectorGroup(newList)) {
+           break;
+         }
+         // add new list to the end of the selector list
+         list->mNext = newList;
+         list = newList;
+         continue;
+-      } else if ('{' == tk->mSymbol && aTerminateAtBrace) {
++      } else if (aStopChar == tk->mSymbol && aStopChar != PRUnichar(0)) {
+         UngetToken();
+         return PR_TRUE;
+       }
+     }
+     REPORT_UNEXPECTED_TOKEN(PESelectorListExtra);
+     UngetToken();
+     break;
+   }
+@@ -3135,17 +3139,18 @@ CSSParserImpl::ParsePseudoSelector(PRInt
+   // is that of a function pseudo it better be a function token
+   if ((eCSSToken_Function == mToken.mType) !=
+       (
+ #ifdef MOZ_XUL
+        isTree ||
+ #endif
+        nsCSSPseudoClasses::notPseudo == pseudo ||
+        nsCSSPseudoClasses::HasStringArg(pseudo) ||
+-       nsCSSPseudoClasses::HasNthPairArg(pseudo))) {
++       nsCSSPseudoClasses::HasNthPairArg(pseudo) ||
++       nsCSSPseudoClasses::HasSelectorListArg(pseudo))) {
+     // There are no other function pseudos
+     REPORT_UNEXPECTED_TOKEN(PEPseudoSelNonFunc);
+     UngetToken();
+     return eSelectorParsingStatus_Error;
+   }
+ 
+   // If it starts with "::", it better be a pseudo-element
+   if (parsingPseudoElement &&
+@@ -3166,27 +3171,34 @@ CSSParserImpl::ParsePseudoSelector(PRInt
+     nsSelectorParsingStatus parsingStatus =
+       ParseNegatedSimpleSelector(aDataMask, aSelector);
+     if (eSelectorParsingStatus_Continue != parsingStatus) {
+       return parsingStatus;
+     }
+   }
+   else if (!parsingPseudoElement && isPseudoClass) {
+     aDataMask |= SEL_MASK_PCLASS;
+-    if (nsCSSPseudoClasses::HasStringArg(pseudo)) {
+-      nsSelectorParsingStatus parsingStatus =
+-        ParsePseudoClassWithIdentArg(aSelector, pseudo, pseudoClassType);
++    if (eCSSToken_Function == mToken.mType) {
++      nsSelectorParsingStatus parsingStatus;
++      if (nsCSSPseudoClasses::HasStringArg(pseudo)) {
++        parsingStatus =
++          ParsePseudoClassWithIdentArg(aSelector, pseudo, pseudoClassType);
++      }
++      else if (nsCSSPseudoClasses::HasNthPairArg(pseudo)) {
++        parsingStatus =
++          ParsePseudoClassWithNthPairArg(aSelector, pseudo, pseudoClassType);
++      }
++      else if (nsCSSPseudoClasses::HasSelectorListArg(pseudo)) {
++        parsingStatus = ParsePseudoClassWithSelectorListArg(aSelector, pseudo,
++                                                            pseudoClassType);
++      }
+       if (eSelectorParsingStatus_Continue != parsingStatus) {
+-        return parsingStatus;
+-      }
+-    }
+-    else if (nsCSSPseudoClasses::HasNthPairArg(pseudo)) {
+-      nsSelectorParsingStatus parsingStatus =
+-        ParsePseudoClassWithNthPairArg(aSelector, pseudo, pseudoClassType);
+-      if (eSelectorParsingStatus_Continue != parsingStatus) {
++        if (eSelectorParsingStatus_Error == parsingStatus) {
++          SkipUntil(')');
++        }
+         return parsingStatus;
+       }
+     }
+     else {
+       aSelector.AddPseudoClass(pseudo, pseudoClassType);
+     }
+   }
+   else if (isPseudoElement || isAnonBox) {
+@@ -3339,36 +3351,34 @@ CSSParserImpl::ParsePseudoClassWithIdent
+   if (! GetToken(PR_TRUE)) { // premature eof
+     REPORT_UNEXPECTED_EOF(PEPseudoClassArgEOF);
+     return eSelectorParsingStatus_Error;
+   }
+   // We expect an identifier with a language abbreviation
+   if (eCSSToken_Ident != mToken.mType) {
+     REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotIdent);
+     UngetToken();
+-    // XXX Call SkipUntil to the next ")"?
+-    return eSelectorParsingStatus_Error;
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+   }
+ 
+   // -moz-locale-dir can only have values of 'ltr' or 'rtl'.
+   if (aPseudo == nsCSSPseudoClasses::mozLocaleDir) {
+     if (!mToken.mIdent.EqualsLiteral("ltr") &&
+         !mToken.mIdent.EqualsLiteral("rtl")) {
+-      return eSelectorParsingStatus_Error;
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+     }
+   }
+ 
+   // Add the pseudo with the language parameter
+   aSelector.AddPseudoClass(aPseudo, aType, mToken.mIdent.get());
+ 
+   // close the parenthesis
+   if (!ExpectSymbol(')', PR_TRUE)) {
+     REPORT_UNEXPECTED_TOKEN(PEPseudoClassNoClose);
+-    // XXX Call SkipUntil to the next ")"?
+-    return eSelectorParsingStatus_Error;
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+   }
+ 
+   return eSelectorParsingStatus_Continue;
+ }
+ 
+ CSSParserImpl::nsSelectorParsingStatus
+ CSSParserImpl::ParsePseudoClassWithNthPairArg(nsCSSSelector& aSelector,
+                                               nsIAtom*       aPseudo,
+@@ -3419,42 +3429,39 @@ CSSParserImpl::ParsePseudoClassWithNthPa
+     else if (mToken.mIdent.EqualsIgnoreCase("n")) {
+       numbers[0] = 1;
+     }
+     else if (mToken.mIdent.EqualsIgnoreCase("-n")) {
+       numbers[0] = -1;
+     }
+     else {
+       REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotNth);
+-      // XXX Call SkipUntil to the next ")"?
+-      return eSelectorParsingStatus_Error;
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+     }
+   }
+   else if (eCSSToken_Number == mToken.mType) {
+     if (!mToken.mIntegerValid) {
+       REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotNth);
+-      // XXX Call SkipUntil to the next ")"?
+-      return eSelectorParsingStatus_Error;
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+     }
+     numbers[1] = mToken.mInteger;
+     lookForB = PR_FALSE;
+   }
+   else if (eCSSToken_Dimension == mToken.mType) {
+     if (!mToken.mIntegerValid || !mToken.mIdent.EqualsIgnoreCase("n")) {
+       REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotNth);
+-      // XXX Call SkipUntil to the next ")"?
+-      return eSelectorParsingStatus_Error;
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+     }
+     numbers[0] = mToken.mInteger;
+   }
+   // XXX If it's a ')', is that valid?  (as 0n+0)
+   else {
+     REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotNth);
+-    // XXX Call SkipUntil to the next ")" (unless this is one already)?
+-    return eSelectorParsingStatus_Error;
++    UngetToken();
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+   }
+ 
+   if (! GetToken(PR_TRUE)) {
+     REPORT_UNEXPECTED_EOF(PEPseudoClassArgEOF);
+     return eSelectorParsingStatus_Error;
+   }
+   if (lookForB && !mToken.IsSymbol(')')) {
+     // The '+' or '-' sign can optionally be separated by whitespace.
+@@ -3470,34 +3477,68 @@ CSSParserImpl::ParsePseudoClassWithNthPa
+       if (! GetToken(PR_TRUE)) {
+         REPORT_UNEXPECTED_EOF(PEPseudoClassArgEOF);
+         return eSelectorParsingStatus_Error;
+       }
+     }
+     if (eCSSToken_Number != mToken.mType ||
+         !mToken.mIntegerValid || mToken.mHasSign == haveSign) {
+       REPORT_UNEXPECTED_TOKEN(PEPseudoClassArgNotNth);
+-      // XXX Call SkipUntil to the next ")"?
+-      return eSelectorParsingStatus_Error;
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+     }
+     numbers[1] = mToken.mInteger * sign;
+     if (! GetToken(PR_TRUE)) {
+       REPORT_UNEXPECTED_EOF(PEPseudoClassArgEOF);
+       return eSelectorParsingStatus_Error;
+     }
+   }
+   if (!mToken.IsSymbol(')')) {
+     REPORT_UNEXPECTED_TOKEN(PEPseudoClassNoClose);
+-    // XXX Call SkipUntil to the next ")"?
+-    return eSelectorParsingStatus_Error;
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
+   }
+   aSelector.AddPseudoClass(aPseudo, aType, numbers);
+   return eSelectorParsingStatus_Continue;
+ }
+ 
++//
++// Parse the argument of a pseudo-class that has a selector list argument.
++// Such selector lists cannot contain combinators, but can contain
++// anything that goes between a pair of combinators.
++//
++CSSParserImpl::nsSelectorParsingStatus
++CSSParserImpl::ParsePseudoClassWithSelectorListArg(nsCSSSelector& aSelector,
++                                                   nsIAtom*       aPseudo,
++                                                   nsCSSPseudoClasses::Type aType)
++{
++  nsAutoPtr<nsCSSSelectorList> slist;
++  if (! ParseSelectorList(*getter_Transfers(slist), PRUnichar(')'))) {
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
++  }
++
++  // Check that none of the selectors in the list have combinators or
++  // pseudo-elements.
++  for (nsCSSSelectorList *l = slist; l; l = l->mNext) {
++    nsCSSSelector *s = l->mSelectors;
++    if (s->mNext || s->IsPseudoElement()) {
++      return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
++    }
++  }
++
++  // Add the pseudo with the selector list parameter
++  aSelector.AddPseudoClass(aPseudo, aType, slist.forget());
++
++  // close the parenthesis
++  if (!ExpectSymbol(')', PR_TRUE)) {
++    REPORT_UNEXPECTED_TOKEN(PEPseudoClassNoClose);
++    return eSelectorParsingStatus_Error; // our caller calls SkipUntil(')')
++  }
++
++  return eSelectorParsingStatus_Continue;
++}
++
+ 
+ /**
+  * This is the format for selectors:
+  * operator? [[namespace |]? element_name]? [ ID | class | attrib | pseudo ]*
+  */
+ CSSParserImpl::nsSelectorParsingStatus
+ CSSParserImpl::ParseSelector(nsCSSSelector& aSelector,
+                              nsIAtom** aPseudoElement,
+diff --git a/layout/style/nsCSSPseudoClassList.h b/layout/style/nsCSSPseudoClassList.h
+--- a/layout/style/nsCSSPseudoClassList.h
++++ b/layout/style/nsCSSPseudoClassList.h
+@@ -67,16 +67,17 @@
+ 
+ CSS_PSEUDO_CLASS(empty, ":empty")
+ CSS_PSEUDO_CLASS(mozOnlyWhitespace, ":-moz-only-whitespace")
+ CSS_PSEUDO_CLASS(mozEmptyExceptChildrenWithLocalname, ":-moz-empty-except-children-with-localname")
+ CSS_PSEUDO_CLASS(lang, ":lang")
+ CSS_PSEUDO_CLASS(notPseudo, ":not")
+ CSS_PSEUDO_CLASS(mozBoundElement, ":-moz-bound-element")
+ CSS_PSEUDO_CLASS(root, ":root")
++CSS_PSEUDO_CLASS(any, ":-moz-any")
+ 
+ CSS_PSEUDO_CLASS(link, ":link")
+ CSS_PSEUDO_CLASS(mozAnyLink, ":-moz-any-link") // what matches :link or :visited
+ CSS_PSEUDO_CLASS(visited, ":visited")
+ 
+ CSS_STATE_PSEUDO_CLASS(active, ":active", NS_EVENT_STATE_ACTIVE)
+ CSS_STATE_PSEUDO_CLASS(checked, ":checked", NS_EVENT_STATE_CHECKED)
+ CSS_STATE_PSEUDO_CLASS(disabled, ":disabled", NS_EVENT_STATE_DISABLED)
+diff --git a/layout/style/nsCSSPseudoClasses.cpp b/layout/style/nsCSSPseudoClasses.cpp
+--- a/layout/style/nsCSSPseudoClasses.cpp
++++ b/layout/style/nsCSSPseudoClasses.cpp
+@@ -81,16 +81,22 @@ PRBool
+ nsCSSPseudoClasses::HasNthPairArg(nsIAtom* aAtom)
+ {
+   return aAtom == nsCSSPseudoClasses::nthChild ||
+          aAtom == nsCSSPseudoClasses::nthLastChild ||
+          aAtom == nsCSSPseudoClasses::nthOfType ||
+          aAtom == nsCSSPseudoClasses::nthLastOfType;
+ }
+ 
++PRBool
++nsCSSPseudoClasses::HasSelectorListArg(nsIAtom* aAtom)
++{
++  return aAtom == nsCSSPseudoClasses::any;
++}
++
+ nsCSSPseudoClasses::Type
+ nsCSSPseudoClasses::GetPseudoType(nsIAtom* aAtom)
+ {
+   for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(CSSPseudoClasses_info); ++i) {
+     if (*CSSPseudoClasses_info[i].mAtom == aAtom) {
+       return Type(i);
+     }
+   }
+diff --git a/layout/style/nsCSSPseudoClasses.h b/layout/style/nsCSSPseudoClasses.h
+--- a/layout/style/nsCSSPseudoClasses.h
++++ b/layout/style/nsCSSPseudoClasses.h
+@@ -50,16 +50,17 @@ class nsICSSPseudoClass : public nsIAtom
+ class nsCSSPseudoClasses {
+ public:
+ 
+   static void AddRefAtoms();
+ 
+   static PRBool IsPseudoClass(nsIAtom *aAtom);
+   static PRBool HasStringArg(nsIAtom* aAtom);
+   static PRBool HasNthPairArg(nsIAtom* aAtom);
++  static PRBool HasSelectorListArg(nsIAtom* aAtom);
+ 
+ #define CSS_PSEUDO_CLASS(_name, _value) static nsICSSPseudoClass* _name;
+ #include "nsCSSPseudoClassList.h"
+ #undef CSS_PSEUDO_CLASS
+ 
+   enum Type {
+ #define CSS_PSEUDO_CLASS(_name, _value) \
+     ePseudoClass_##_name,
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -1246,19 +1246,41 @@ static PRBool AttrMatchesValue(const nsA
+     case NS_ATTR_FUNC_CONTAINSMATCH:
+       return FindInReadable(aAttrSelector->mValue, aValue, comparator);
+     default:
+       NS_NOTREACHED("Shouldn't be ending up here");
+       return PR_FALSE;
+   }
+ }
+ 
++static PRBool SelectorMatches(RuleProcessorData &data,
++                              nsCSSSelector* aSelector,
++                              PRInt32 aStateMask,
++                              PRBool aForStyling,
++                              PRBool* const aDependence = nsnull);
++
++static PRBool NS_FASTCALL
++anyMatches(RuleProcessorData& data, PRBool setNodeFlags,
++           PRBool aStateMask, nsPseudoClassList* pseudoClass)
++{
++  NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::any,
++                  "Unexpected atom");
++  for (nsCSSSelectorList *l = pseudoClass->u.mSelectors; l; l = l->mNext) {
++    nsCSSSelector *s = l->mSelectors;
++    NS_ABORT_IF_FALSE(!s->mNext && !s->IsPseudoElement(), "parser failed");
++    if (SelectorMatches(data, s, aStateMask, setNodeFlags)) {
++      return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
+ static PRBool NS_FASTCALL
+ firstNodeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstNode,
+                   "Unexpected atom");
+   nsIContent *firstNode = nsnull;
+   nsIContent *parent = data.mParentContent;
+   if (parent) {
+     if (setNodeFlags)
+       parent->SetFlags(NODE_HAS_EDGE_CHILD_SELECTOR);
+@@ -1270,17 +1292,17 @@ firstNodeMatches(RuleProcessorData& data
+     } while (firstNode &&
+              !IsSignificantChild(firstNode, PR_TRUE, PR_FALSE));
+   }
+   return (data.mContent == firstNode);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastNodeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                nsPseudoClassList* pseudoClass)
++                PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastNode,
+                   "Unexpected atom");
+   nsIContent *lastNode = nsnull;
+   nsIContent *parent = data.mParentContent;
+   if (parent) {
+     if (setNodeFlags)
+       parent->SetFlags(NODE_HAS_EDGE_CHILD_SELECTOR);
+@@ -1310,35 +1332,35 @@ edgeChildMatches(RuleProcessorData& data
+   return (!checkFirst ||
+           data.GetNthIndex(PR_FALSE, PR_FALSE, PR_TRUE) == 1) &&
+          (!checkLast ||
+           data.GetNthIndex(PR_FALSE, PR_TRUE, PR_TRUE) == 1);
+ }
+ 
+ static PRBool NS_FASTCALL
+ firstChildMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                  nsPseudoClassList* pseudoClass)
++                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, setNodeFlags, PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastChildMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, setNodeFlags, PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ onlyChildMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::onlyChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, setNodeFlags, PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+ nthChildGenericMatches(RuleProcessorData& data, PRBool setNodeFlags,
+@@ -1375,47 +1397,47 @@ nthChildGenericMatches(RuleProcessorData
+   // check that the result is nonnegative, and that there was no
+   // truncation.
+   const PRInt32 n = (index - b) / a;
+   return n >= 0 && (a * n == index - b);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthChildMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                nsPseudoClassList* pseudoClass)
++                PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthChild,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, setNodeFlags, pseudoClass,
+                                 PR_FALSE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthLastChildMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                    nsPseudoClassList* pseudoClass)
++                    PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthLastChild,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, setNodeFlags, pseudoClass,
+                                 PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthOfTypeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthOfType,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, setNodeFlags, pseudoClass,
+                                 PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthLastOfTypeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                     nsPseudoClassList* pseudoClass)
++                     PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthLastOfType,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, setNodeFlags, pseudoClass,
+                                 PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+@@ -1437,35 +1459,35 @@ edgeOfTypeMatches(RuleProcessorData& dat
+   return (!checkFirst ||
+           data.GetNthIndex(PR_TRUE, PR_FALSE, PR_TRUE) == 1) &&
+          (!checkLast ||
+           data.GetNthIndex(PR_TRUE, PR_TRUE, PR_TRUE) == 1);
+ }
+ 
+ static PRBool NS_FASTCALL
+ firstOfTypeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                   nsPseudoClassList* pseudoClass)
++                   PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ { 
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, setNodeFlags, PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastOfTypeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                  nsPseudoClassList* pseudoClass)
++                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, setNodeFlags, PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ onlyOfTypeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                  nsPseudoClassList* pseudoClass)
++                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::onlyOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, setNodeFlags, PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+ checkGenericEmptyMatches(RuleProcessorData& data, PRBool setNodeFlags,
+@@ -1483,35 +1505,36 @@ checkGenericEmptyMatches(RuleProcessorDa
+     // stop at first non-comment (and non-whitespace for
+     // :-moz-only-whitespace) node        
+   } while (child && !IsSignificantChild(child, PR_TRUE, isWhitespaceSignificant));
+   return (child == nsnull);
+ }
+ 
+ static PRBool NS_FASTCALL
+ emptyMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-             nsPseudoClassList* pseudoClass)
++             PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::empty,
+                   "Unexpected atom");
+   return checkGenericEmptyMatches(data, setNodeFlags, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozOnlyWhitespaceMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                         nsPseudoClassList* pseudoClass)
++                         PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozOnlyWhitespace,
+                   "Unexpected atom");
+   return checkGenericEmptyMatches(data, setNodeFlags, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozEmptyExceptChildrenWithLocalnameMatches(RuleProcessorData& data,
+                                            PRBool setNodeFlags,
++                                           PRBool aStateMask,
+                                            nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozEmptyExceptChildrenWithLocalname,
+                   "Unexpected atom");
+   NS_ASSERTION(pseudoClass->u.mString, "Must have string!");
+   nsIContent *child = nsnull;
+   nsIContent *element = data.mContent;
+@@ -1531,28 +1554,28 @@ mozEmptyExceptChildrenWithLocalnameMatch
+            (!IsSignificantChild(child, PR_TRUE, PR_FALSE) ||
+             (child->GetNameSpaceID() == element->GetNameSpaceID() &&
+              child->Tag()->Equals(nsDependentString(pseudoClass->u.mString)))));
+   return (child == nsnull);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozSystemMetricMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                       nsPseudoClassList* pseudoClass)
++                       PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozSystemMetric,
+                   "Unexpected atom");
+   NS_ASSERTION(pseudoClass->u.mString, "Must have string!");
+   nsCOMPtr<nsIAtom> metric = do_GetAtom(pseudoClass->u.mString);
+   return nsCSSRuleProcessor::HasSystemMetric(metric);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozHasHandlerRefMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                        nsPseudoClassList* pseudoClass)
++                        PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozHasHandlerRef,
+                   "Unexpected atom");
+   nsIContent *child = nsnull;
+   nsIContent *element = data.mContent;
+   PRInt32 index = -1;
+ 
+   do {
+@@ -1564,39 +1587,39 @@ mozHasHandlerRefMatches(RuleProcessorDat
+       return PR_TRUE;
+     }
+   } while (child);
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ rootMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-            nsPseudoClassList* pseudoClass)
++            PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::root,
+                   "Unexpected atom");
+   return (data.mParentContent == nsnull &&
+           data.mContent == data.mContent->GetOwnerDoc()->GetRootContent());
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozBoundElementMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                       nsPseudoClassList* pseudoClass)
++                       PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozBoundElement,
+                   "Unexpected atom");
+   // XXXldb How do we know where the selector came from?  And what
+   // if there are multiple bindings, and we should be matching the
+   // outer one?
+   return (data.mScopedRoot == data.mContent);
+ }
+ 
+ static PRBool NS_FASTCALL
+ langMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-            nsPseudoClassList* pseudoClass)
++            PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lang,
+                   "Unexpected atom");
+   NS_ASSERTION(nsnull != pseudoClass->u.mString, "null lang parameter");
+   if (!pseudoClass->u.mString || !*pseudoClass->u.mString) {
+     return PR_FALSE;
+   }
+ 
+@@ -1639,51 +1662,51 @@ langMatches(RuleProcessorData& data, PRB
+     }
+   }
+ 
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozAnyLinkMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                  nsPseudoClassList* pseudoClass)
++                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozAnyLink,
+                   "Unexpected atom");
+   return data.IsLink();
+ }
+ 
+ static PRBool NS_FASTCALL
+ linkMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-            nsPseudoClassList* pseudoClass)
++            PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_NOTREACHED("Shouldn't be called");
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ visitedMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-               nsPseudoClassList* pseudoClass)
++               PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_NOTREACHED("Shouldn't be called");
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozIsHTMLMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozIsHTML,
+                   "Unexpected atom");
+   return data.mIsHTML;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLocaleDirMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                    nsPseudoClassList* pseudoClass)
++                    PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozLocaleDir,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetDocument();
+ 
+   if (!doc) {
+     return PR_FALSE;
+   }
+@@ -1694,56 +1717,57 @@ mozLocaleDirMatches(RuleProcessorData& d
+   NS_ASSERTION(dirString.EqualsLiteral("ltr") || dirString.EqualsLiteral("rtl"),
+                "invalid value for -moz-locale-dir");
+ 
+   return dirString.EqualsLiteral("rtl") == docIsRTL;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                  nsPseudoClassList* pseudoClass)
++                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozLWTheme,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() > nsIDocument::Doc_Theme_None;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeBrightTextMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                            nsPseudoClassList* pseudoClass)
++                            PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozLWThemeBrightText,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Bright;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeDarkTextMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                          nsPseudoClassList* pseudoClass)
++                          PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozLWThemeDarkText,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Dark;
+ }
+ 
+ static PRBool NS_FASTCALL
+ notPseudoMatches(RuleProcessorData& data, PRBool setNodeFlags,
+-                 nsPseudoClassList* pseudoClass)
++                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
+ {
+   NS_NOTREACHED("Why did this get called?");
+   return PR_FALSE;
+ }
+ 
+ typedef PRBool
+   (NS_FASTCALL * PseudoClassMatcher)(RuleProcessorData&, PRBool setNodeFlags,
++                                     PRBool aStateMask,
+                                      nsPseudoClassList* pseudoClass);
+ // Only one of mFunc or mBit will be set; the other will be null or 0
+ // respectively.  We could use a union, but then we'd still need to
+ // differentiate somehow, eiher with another member in the struct or
+ // with a boolean coming from _sowewhere_.
+ struct PseudoClassInfo {
+   PseudoClassMatcher mFunc;
+   PRInt32 mBit;
+@@ -1778,17 +1802,17 @@ PR_STATIC_ASSERT(NS_ARRAY_LENGTH(sPseudo
+ //  * when non-null, it indicates that we're processing a negation,
+ //    which is done only when SelectorMatches calls itself recursively
+ //  * what it points to should be set to true whenever a test is skipped
+ //    because of aStateMask
+ static PRBool SelectorMatches(RuleProcessorData &data,
+                               nsCSSSelector* aSelector,
+                               PRInt32 aStateMask, // states NOT to test
+                               PRBool aForStyling,
+-                              PRBool* const aDependence = nsnull) 
++                              PRBool* const aDependence /* = nsnull */)
+ 
+ {
+   NS_PRECONDITION(!aSelector->IsPseudoElement(),
+                   "Pseudo-element snuck into SelectorMatches?");
+   // namespace/tag match
+   // optimization : bail out early if we can
+   if ((kNameSpaceID_Unknown != aSelector->mNameSpace &&
+        data.mNameSpaceID != aSelector->mNameSpace))
+@@ -1885,17 +1909,17 @@ static PRBool SelectorMatches(RuleProces
+                  (nsCSSPseudoClasses::link == pseudoClass->mAtom)) {
+         // Visited but :link or unvisited but :visited
+         return PR_FALSE;
+       }
+       continue;
+     }
+     const PseudoClassInfo& info = sPseudoClassInfo[pseudoClass->mType];
+     if (info.mFunc) {
+-      if (!(*info.mFunc)(data, setNodeFlags, pseudoClass)) {
++      if (!(*info.mFunc)(data, setNodeFlags, aStateMask, pseudoClass)) {
+         return PR_FALSE;
+       }
+     } else {
+       PRInt32 stateToCheck = info.mBit;
+       NS_ABORT_IF_FALSE(stateToCheck != 0, "How did that happen?");
+       if ((stateToCheck & (NS_EVENT_STATE_HOVER | NS_EVENT_STATE_ACTIVE)) &&
+           data.mCompatMode == eCompatibility_NavQuirks &&
+           // global selector (but don't check .class):
+diff --git a/layout/style/nsCSSStyleRule.cpp b/layout/style/nsCSSStyleRule.cpp
+--- a/layout/style/nsCSSStyleRule.cpp
++++ b/layout/style/nsCSSStyleRule.cpp
+@@ -173,42 +173,61 @@ nsPseudoClassList::nsPseudoClassList(nsI
+   NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(aAtom),
+                "unexpected pseudo-class");
+   NS_ASSERTION(aIntPair, "integer pair expected");
+   MOZ_COUNT_CTOR(nsPseudoClassList);
+   u.mNumbers =
+     static_cast<PRInt32*>(nsMemory::Clone(aIntPair, sizeof(PRInt32) * 2));
+ }
+ 
++nsPseudoClassList::nsPseudoClassList(nsIAtom* aAtom,
++                                     nsCSSPseudoClasses::Type aType,
++                                     const nsCSSSelectorList* aSelectorList)
++  : mAtom(aAtom),
++    mType(aType),
++    mNext(nsnull)
++{
++  NS_ASSERTION(nsCSSPseudoClasses::HasSelectorListArg(aAtom),
++               "unexpected pseudo-class");
++  NS_ASSERTION(aSelectorList, "integer pair expected");
++  MOZ_COUNT_CTOR(nsPseudoClassList);
++  u.mSelectors = aSelectorList->Clone();
++}
++
+ nsPseudoClassList*
+ nsPseudoClassList::Clone(PRBool aDeep) const
+ {
+   nsPseudoClassList *result;
+   if (!u.mMemory) {
+     result = new nsPseudoClassList(mAtom, mType);
+   } else if (nsCSSPseudoClasses::HasStringArg(mAtom)) {
+     result = new nsPseudoClassList(mAtom, mType, u.mString);
++  } else if (nsCSSPseudoClasses::HasNthPairArg(mAtom)) {
++    result = new nsPseudoClassList(mAtom, mType, u.mNumbers);
+   } else {
+-    NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(mAtom),
++    NS_ASSERTION(nsCSSPseudoClasses::HasSelectorListArg(mAtom),
+                  "unexpected pseudo-class");
+-    result = new nsPseudoClassList(mAtom, mType, u.mNumbers);
++    result = new nsPseudoClassList(mAtom, mType, u.mSelectors);
+   }
+ 
+   if (aDeep)
+     NS_CSS_CLONE_LIST_MEMBER(nsPseudoClassList, this, mNext, result,
+                              (PR_FALSE));
+ 
+   return result;
+ }
+ 
+ nsPseudoClassList::~nsPseudoClassList(void)
+ {
+   MOZ_COUNT_DTOR(nsPseudoClassList);
+-  if (u.mMemory)
++  if (nsCSSPseudoClasses::HasSelectorListArg(mAtom)) {
++    delete u.mSelectors;
++  } else if (u.mMemory) {
+     NS_Free(u.mMemory);
++  }
+   NS_CSS_DELETE_LIST_MEMBER(nsPseudoClassList, this, mNext);
+ }
+ 
+ nsAttrSelector::nsAttrSelector(PRInt32 aNameSpace, const nsString& aAttr)
+   : mValue(),
+     mNext(nsnull),
+     mLowercaseAttr(nsnull),
+     mCasedAttr(nsnull),
+@@ -415,16 +434,27 @@ void nsCSSSelector::AddPseudoClass(nsIAt
+ 
+ void nsCSSSelector::AddPseudoClass(nsIAtom* aPseudoClass,
+                                    nsCSSPseudoClasses::Type aType,
+                                    const PRInt32* aIntPair)
+ {
+   AddPseudoClassInternal(new nsPseudoClassList(aPseudoClass, aType, aIntPair));
+ }
+ 
++void nsCSSSelector:: AddPseudoClass(nsIAtom* aPseudoClass,
++                                    nsCSSPseudoClasses::Type aType,
++                                    nsCSSSelectorList* aSelectorList)
++{
++  // Take ownership of nsCSSSelectorList instead of copying.
++  nsPseudoClassList *pc = new nsPseudoClassList(aPseudoClass, aType,
++                                (const nsCSSSelectorList*)nsnull);
++  pc->u.mSelectors = aSelectorList;
++  AddPseudoClassInternal(pc);
++}
++
+ void nsCSSSelector::AddPseudoClassInternal(nsPseudoClassList *aPseudoClass)
+ {
+   nsPseudoClassList** list = &mPseudoClassList;
+   while (nsnull != *list) {
+     list = &((*list)->mNext);
+   }
+   *list = aPseudoClass;
+ }
+@@ -749,19 +779,17 @@ nsCSSSelector::AppendToStringWithoutComb
+       // this point are known, and therefore we know they don't need
+       // escaping.
+       aString.Append(temp);
+       if (list->u.mMemory) {
+         aString.Append(PRUnichar('('));
+         if (nsCSSPseudoClasses::HasStringArg(list->mAtom)) {
+           nsStyleUtil::AppendEscapedCSSIdent(
+             nsDependentString(list->u.mString), aString);
+-        } else {
+-          NS_ASSERTION(nsCSSPseudoClasses::HasNthPairArg(list->mAtom),
+-                       "unexpected pseudo-class");
++        } else if (nsCSSPseudoClasses::HasNthPairArg(list->mAtom)) {
+           PRInt32 a = list->u.mNumbers[0],
+                   b = list->u.mNumbers[1];
+           temp.Truncate();
+           if (a != 0) {
+             if (a == -1) {
+               temp.Append(PRUnichar('-'));
+             } else if (a != 1) {
+               temp.AppendInt(a);
+@@ -769,16 +797,22 @@ nsCSSSelector::AppendToStringWithoutComb
+             temp.Append(PRUnichar('n'));
+           }
+           if (b != 0 || a == 0) {
+             if (b >= 0 && a != 0) // check a != 0 for whether we printed above
+               temp.Append(PRUnichar('+'));
+             temp.AppendInt(b);
+           }
+           aString.Append(temp);
++        } else {
++          NS_ASSERTION(nsCSSPseudoClasses::HasSelectorListArg(list->mAtom),
++                       "unexpected pseudo-class");
++          nsString tmp;
++          list->u.mSelectors->ToString(tmp, aSheet);
++          aString.Append(tmp);
+         }
+         aString.Append(PRUnichar(')'));
+       }
+     }
+   }
+ }
+ 
+ PRBool
+diff --git a/layout/style/nsICSSStyleRule.h b/layout/style/nsICSSStyleRule.h
+--- a/layout/style/nsICSSStyleRule.h
++++ b/layout/style/nsICSSStyleRule.h
+@@ -53,16 +53,17 @@
+ #include "nsCSSValue.h"
+ #include "nsIAtom.h"
+ #include "nsCSSPseudoElements.h"
+ #include "nsCSSPseudoClasses.h"
+ 
+ class nsIAtom;
+ class nsCSSDeclaration;
+ class nsICSSStyleSheet;
++struct nsCSSSelectorList;
+ 
+ struct nsAtomList {
+ public:
+   nsAtomList(nsIAtom* aAtom);
+   nsAtomList(const nsString& aAtomValue);
+   ~nsAtomList(void);
+ 
+   /** Do a deep clone.  Should be used only on the first in the linked list. */
+@@ -80,33 +81,38 @@ private:
+ 
+ struct nsPseudoClassList {
+ public:
+   nsPseudoClassList(nsIAtom* aAtom, nsCSSPseudoClasses::Type aType);
+   nsPseudoClassList(nsIAtom* aAtom, nsCSSPseudoClasses::Type aType,
+                     const PRUnichar *aString);
+   nsPseudoClassList(nsIAtom* aAtom, nsCSSPseudoClasses::Type aType,
+                     const PRInt32 *aIntPair);
++  nsPseudoClassList(nsIAtom* aAtom, nsCSSPseudoClasses::Type aType,
++                    const nsCSSSelectorList *aSelectorList);
+   ~nsPseudoClassList(void);
+ 
+   /** Do a deep clone.  Should be used only on the first in the linked list. */
+   nsPseudoClassList* Clone() const { return Clone(PR_TRUE); }
+ 
+   nsCOMPtr<nsIAtom> mAtom;
+   union {
+     // For a given value of mAtom, we have either:
+     //   a. no value, which means mMemory is always null
+-    //      (if neither of the conditions for (b) or (c) is true)
++    //      (if none of the conditions for (b), (c), or (d) is true)
+     //   b. a string value, which means mString/mMemory is non-null
+     //      (if nsCSSPseudoClasses::HasStringArg(mAtom))
+     //   c. an integer pair value, which means mNumbers/mMemory is non-null
+     //      (if nsCSSPseudoClasses::HasNthPairArg(mAtom))
+-    void*           mMemory; // both pointer types use NS_Alloc/NS_Free
++    //   d. a selector list, which means mSelectors is non-null
++    //      (if nsCSSPseudoClasses::HasSelectorListArg(mAtom))
++    void*           mMemory; // mString and mNumbers use NS_Alloc/NS_Free
+     PRUnichar*      mString;
+     PRInt32*        mNumbers;
++    nsCSSSelectorList* mSelectors;
+   } u;
+   nsCSSPseudoClasses::Type mType;
+   nsPseudoClassList* mNext;
+ private: 
+   nsPseudoClassList* Clone(PRBool aDeep) const;
+ 
+   // These are not supported and are not implemented! 
+   nsPseudoClassList(const nsPseudoClassList& aCopy);
+@@ -163,16 +169,19 @@ public:
+   void SetTag(const nsString& aTag);
+   void AddID(const nsString& aID);
+   void AddClass(const nsString& aClass);
+   void AddPseudoClass(nsIAtom* aPseudoClass, nsCSSPseudoClasses::Type aType);
+   void AddPseudoClass(nsIAtom* aPseudoClass, nsCSSPseudoClasses::Type aType,
+                       const PRUnichar* aString);
+   void AddPseudoClass(nsIAtom* aPseudoClass, nsCSSPseudoClasses::Type aType,
+                       const PRInt32* aIntPair);
++  // takes ownership of aSelectorList
++  void AddPseudoClass(nsIAtom* aPseudoClass, nsCSSPseudoClasses::Type aType,
++                      nsCSSSelectorList* aSelectorList);
+   void AddAttribute(PRInt32 aNameSpace, const nsString& aAttr);
+   void AddAttribute(PRInt32 aNameSpace, const nsString& aAttr, PRUint8 aFunc, 
+                     const nsString& aValue, PRBool aCaseSensitive);
+   void SetOperator(PRUnichar aOperator);
+ 
+   inline PRBool HasTagSelector() const {
+     return !!mCasedTag;
+   }
