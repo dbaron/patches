@@ -1,0 +1,693 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Introduce NodeMatchContext for additional input into SelectorMatches.  (Bug 147777)
+
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -1203,33 +1203,59 @@ RuleProcessorData::GetNthIndex(PRBool aI
+   slot = result;
+   return result;
+ }
+ 
+ /**
+  * A |TreeMatchContext| has data about matching a selector (containing
+  * combinators) against a node and the tree that that node is in.  It
+  * contains both input to and output from the matching.
+- *
+- * (In contrast, a RuleProcessorData has information needed to match a
+- * selector (without combinators) against a single node; it only
+- * has input to the matching.)
+  */
+ struct TreeMatchContext {
+   // Is this matching operation for the creation of a style context?
+   // (If it is, we need to set slow selector bits on nodes indicating
+   // that certain restyling needs to happen.)
+   const PRBool mForStyling;
+ 
+   TreeMatchContext(PRBool aForStyling)
+     : mForStyling(aForStyling)
+   {
+   }
+ };
+ 
++/**
++ * A |NodeMatchContext| has data about matching a selector (without
++ * combinators) against a single node.  It contains only input to the
++ * matching.
++ *
++ * Unlike |RuleProcessorData|, which is similar, a |NodeMatchContext|
++ * can vary depending on the selector matching process.  In other words,
++ * a single node might have multiple value NodeMatchContext at one time,
++ * but only one possible RuleProcessorData.
++ */
++struct NodeMatchContext {
++  // In order to implement nsCSSRuleProcessor::HasStateDependentStyle,
++  // we need to be able to see if a node might match an
++  // event-state-dependent selector for any value of that event state.
++  // So mStateMask contains the states that should NOT be tested.
++  //
++  // NOTE: For |aStateMask| to work correctly, it's important that any
++  // change that changes multiple state bits include all those state
++  // bits in the notification.  Otherwise, if multiple states change but
++  // we do separate notifications then we might determine the style is
++  // not state-dependent when it really is (e.g., determining that a
++  // :hover:active rule no longer matches when both states are unset).
++  const PRInt32 mStateMask;
++
++  NodeMatchContext(PRInt32 aStateMask)
++    : mStateMask(aStateMask)
++  {
++  }
++};
++
+ static PRBool ValueIncludes(const nsSubstring& aValueList,
+                             const nsSubstring& aValue,
+                             const nsStringComparator& aComparator)
+ {
+   const PRUnichar *p = aValueList.BeginReading(),
+               *p_end = aValueList.EndReading();
+ 
+   while (p < p_end) {
+@@ -1318,39 +1344,39 @@ static PRBool AttrMatchesValue(const nsA
+     default:
+       NS_NOTREACHED("Shouldn't be ending up here");
+       return PR_FALSE;
+   }
+ }
+ 
+ static PRBool SelectorMatches(RuleProcessorData &data,
+                               nsCSSSelector* aSelector,
+-                              PRInt32 aStateMask,
++                              NodeMatchContext* aNodeMatchContext,
+                               TreeMatchContext* aTreeMatchContext,
+                               PRBool* const aDependence = nsnull);
+ 
+ static PRBool NS_FASTCALL
+ anyMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-           PRBool aStateMask, nsPseudoClassList* pseudoClass)
++           NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::any,
+                   "Unexpected atom");
+   for (nsCSSSelectorList *l = pseudoClass->u.mSelectors; l; l = l->mNext) {
+     nsCSSSelector *s = l->mSelectors;
+     NS_ABORT_IF_FALSE(!s->mNext && !s->IsPseudoElement(), "parser failed");
+-    if (SelectorMatches(data, s, aStateMask, aTreeMatchContext)) {
++    if (SelectorMatches(data, s, aNodeMatchContext, aTreeMatchContext)) {
+       return PR_TRUE;
+     }
+   }
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ firstNodeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstNode,
+                   "Unexpected atom");
+   nsIContent *firstNode = nsnull;
+   nsIContent *parent = data.mParentContent;
+   if (parent) {
+     if (aTreeMatchContext->mForStyling)
+       parent->SetFlags(NODE_HAS_EDGE_CHILD_SELECTOR);
+@@ -1362,17 +1388,17 @@ firstNodeMatches(RuleProcessorData& data
+     } while (firstNode &&
+              !IsSignificantChild(firstNode, PR_TRUE, PR_FALSE));
+   }
+   return (data.mContent == firstNode);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastNodeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastNode,
+                   "Unexpected atom");
+   nsIContent *lastNode = nsnull;
+   nsIContent *parent = data.mParentContent;
+   if (parent) {
+     if (aTreeMatchContext->mForStyling)
+       parent->SetFlags(NODE_HAS_EDGE_CHILD_SELECTOR);
+@@ -1402,35 +1428,35 @@ edgeChildMatches(RuleProcessorData& data
+   return (!checkFirst ||
+           data.GetNthIndex(PR_FALSE, PR_FALSE, PR_TRUE) == 1) &&
+          (!checkLast ||
+           data.GetNthIndex(PR_FALSE, PR_TRUE, PR_TRUE) == 1);
+ }
+ 
+ static PRBool NS_FASTCALL
+ firstChildMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                  NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, aTreeMatchContext, PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastChildMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, aTreeMatchContext, PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ onlyChildMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::onlyChild,
+                   "Unexpected atom");
+   return edgeChildMatches(data, aTreeMatchContext, PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+ nthChildGenericMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+@@ -1467,47 +1493,47 @@ nthChildGenericMatches(RuleProcessorData
+   // check that the result is nonnegative, and that there was no
+   // truncation.
+   const PRInt32 n = (index - b) / a;
+   return n >= 0 && (a * n == index - b);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthChildMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthChild,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, aTreeMatchContext, pseudoClass,
+                                 PR_FALSE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthLastChildMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                    PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                    NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthLastChild,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, aTreeMatchContext, pseudoClass,
+                                 PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthOfTypeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthOfType,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, aTreeMatchContext, pseudoClass,
+                                 PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ nthLastOfTypeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                     PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                     NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::nthLastOfType,
+                   "Unexpected atom");
+   return nthChildGenericMatches(data, aTreeMatchContext, pseudoClass,
+                                 PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+@@ -1529,35 +1555,35 @@ edgeOfTypeMatches(RuleProcessorData& dat
+   return (!checkFirst ||
+           data.GetNthIndex(PR_TRUE, PR_FALSE, PR_TRUE) == 1) &&
+          (!checkLast ||
+           data.GetNthIndex(PR_TRUE, PR_TRUE, PR_TRUE) == 1);
+ }
+ 
+ static PRBool NS_FASTCALL
+ firstOfTypeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                   PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                   NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ { 
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::firstOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, aTreeMatchContext, PR_TRUE, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ lastOfTypeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                  NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lastOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, aTreeMatchContext, PR_FALSE, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ onlyOfTypeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                  NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::onlyOfType,
+                   "Unexpected atom");
+   return edgeOfTypeMatches(data, aTreeMatchContext, PR_TRUE, PR_TRUE);
+ }
+ 
+ static inline PRBool
+ checkGenericEmptyMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+@@ -1575,36 +1601,36 @@ checkGenericEmptyMatches(RuleProcessorDa
+     // stop at first non-comment (and non-whitespace for
+     // :-moz-only-whitespace) node        
+   } while (child && !IsSignificantChild(child, PR_TRUE, isWhitespaceSignificant));
+   return (child == nsnull);
+ }
+ 
+ static PRBool NS_FASTCALL
+ emptyMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-             PRBool aStateMask, nsPseudoClassList* pseudoClass)
++             NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::empty,
+                   "Unexpected atom");
+   return checkGenericEmptyMatches(data, aTreeMatchContext, PR_TRUE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozOnlyWhitespaceMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                         PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                         NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozOnlyWhitespace,
+                   "Unexpected atom");
+   return checkGenericEmptyMatches(data, aTreeMatchContext, PR_FALSE);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozEmptyExceptChildrenWithLocalnameMatches(RuleProcessorData& data,
+                                            TreeMatchContext* aTreeMatchContext,
+-                                           PRBool aStateMask,
++                                           NodeMatchContext* aNodeMatchContext,
+                                            nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozEmptyExceptChildrenWithLocalname,
+                   "Unexpected atom");
+   NS_ASSERTION(pseudoClass->u.mString, "Must have string!");
+   nsIContent *child = nsnull;
+   nsIContent *element = data.mContent;
+@@ -1624,28 +1650,28 @@ mozEmptyExceptChildrenWithLocalnameMatch
+            (!IsSignificantChild(child, PR_TRUE, PR_FALSE) ||
+             (child->GetNameSpaceID() == element->GetNameSpaceID() &&
+              child->Tag()->Equals(nsDependentString(pseudoClass->u.mString)))));
+   return (child == nsnull);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozSystemMetricMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                       PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                       NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozSystemMetric,
+                   "Unexpected atom");
+   NS_ASSERTION(pseudoClass->u.mString, "Must have string!");
+   nsCOMPtr<nsIAtom> metric = do_GetAtom(pseudoClass->u.mString);
+   return nsCSSRuleProcessor::HasSystemMetric(metric);
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozHasHandlerRefMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                        PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                        NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozHasHandlerRef,
+                   "Unexpected atom");
+   nsIContent *child = nsnull;
+   nsIContent *element = data.mContent;
+   PRInt32 index = -1;
+ 
+   do {
+@@ -1657,39 +1683,39 @@ mozHasHandlerRefMatches(RuleProcessorDat
+       return PR_TRUE;
+     }
+   } while (child);
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ rootMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-            PRBool aStateMask, nsPseudoClassList* pseudoClass)
++            NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::root,
+                   "Unexpected atom");
+   return (data.mParentContent == nsnull &&
+           data.mContent == data.mContent->GetOwnerDoc()->GetRootContent());
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozBoundElementMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                       PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                       NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozBoundElement,
+                   "Unexpected atom");
+   // XXXldb How do we know where the selector came from?  And what
+   // if there are multiple bindings, and we should be matching the
+   // outer one?
+   return (data.mScopedRoot == data.mContent);
+ }
+ 
+ static PRBool NS_FASTCALL
+ langMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-            PRBool aStateMask, nsPseudoClassList* pseudoClass)
++            NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::lang,
+                   "Unexpected atom");
+   NS_ASSERTION(nsnull != pseudoClass->u.mString, "null lang parameter");
+   if (!pseudoClass->u.mString || !*pseudoClass->u.mString) {
+     return PR_FALSE;
+   }
+ 
+@@ -1732,26 +1758,26 @@ langMatches(RuleProcessorData& data, Tre
+     }
+   }
+ 
+   return PR_FALSE;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozIsHTMLMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozIsHTML,
+                   "Unexpected atom");
+   return data.mIsHTML;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLocaleDirMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                    PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                    NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozLocaleDir,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetDocument();
+ 
+   if (!doc) {
+     return PR_FALSE;
+   }
+@@ -1762,58 +1788,58 @@ mozLocaleDirMatches(RuleProcessorData& d
+   NS_ASSERTION(dirString.EqualsLiteral("ltr") || dirString.EqualsLiteral("rtl"),
+                "invalid value for -moz-locale-dir");
+ 
+   return dirString.EqualsLiteral("rtl") == docIsRTL;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                  PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                  NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom == nsCSSPseudoClasses::mozLWTheme,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() > nsIDocument::Doc_Theme_None;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeBrightTextMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                            PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                            NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozLWThemeBrightText,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Bright;
+ }
+ 
+ static PRBool NS_FASTCALL
+ mozLWThemeDarkTextMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                          PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                          NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_PRECONDITION(pseudoClass->mAtom ==
+                     nsCSSPseudoClasses::mozLWThemeDarkText,
+                   "Unexpected atom");
+   nsIDocument* doc = data.mContent->GetOwnerDoc();
+   return doc && doc->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Dark;
+ }
+ 
+ static PRBool NS_FASTCALL
+ notPseudoMatches(RuleProcessorData& data, TreeMatchContext* aTreeMatchContext,
+-                 PRBool aStateMask, nsPseudoClassList* pseudoClass)
++                 NodeMatchContext* aNodeMatchContext, nsPseudoClassList* pseudoClass)
+ {
+   NS_NOTREACHED("Why did this get called?");
+   return PR_FALSE;
+ }
+ 
+ typedef PRBool
+   (NS_FASTCALL * PseudoClassMatcher)(RuleProcessorData&,
+                                      TreeMatchContext* aTreeMatchContext,
+-                                     PRBool aStateMask,
++                                     NodeMatchContext* aNodeMatchContext,
+                                      nsPseudoClassList* pseudoClass);
+ // Only one of mFunc or mBits will be set; the other will be null or 0
+ // respectively.  We could use a union, but then we'd still need to
+ // differentiate somehow, eiher with another member in the struct or
+ // with a boolean coming from _sowewhere_.
+ struct PseudoClassInfo {
+   PseudoClassMatcher mFunc;
+   PRInt32 mBits;
+@@ -1830,31 +1856,24 @@ static const PseudoClassInfo sPseudoClas
+   // Add more entries for our fake values to make sure we can't
+   // index out of bounds into this array no matter what.
+   { nsnull, 0 },
+   { nsnull, 0 }
+ };
+ PR_STATIC_ASSERT(NS_ARRAY_LENGTH(sPseudoClassInfo) >
+                    nsCSSPseudoClasses::ePseudoClass_NotPseudoClass);
+ 
+-// NOTE: For |aStateMask| to work correctly, it's important that any change
+-// that changes multiple state bits include all those state bits in the
+-// notification.  Otherwise, if multiple states change but we do separate
+-// notifications then we might determine the style is not state-dependent when
+-// it really is (e.g., determining that a :hover:active rule no longer matches
+-// when both states are unset).
+-
+ // |aDependence| has two functions:
+ //  * when non-null, it indicates that we're processing a negation,
+ //    which is done only when SelectorMatches calls itself recursively
+ //  * what it points to should be set to true whenever a test is skipped
+ //    because of aStateMask
+ static PRBool SelectorMatches(RuleProcessorData &data,
+                               nsCSSSelector* aSelector,
+-                              PRInt32 aStateMask, // states NOT to test
++                              NodeMatchContext* aNodeMatchContext,
+                               TreeMatchContext* aTreeMatchContext,
+                               PRBool* const aDependence /* = nsnull */)
+ 
+ {
+   NS_PRECONDITION(!aSelector->IsPseudoElement(),
+                   "Pseudo-element snuck into SelectorMatches?");
+   // namespace/tag match
+   // optimization : bail out early if we can
+@@ -1925,26 +1944,28 @@ static PRBool SelectorMatches(RuleProces
+   }
+ 
+   const PRBool isNegated = (aDependence != nsnull);
+   // The selectors for which we set node bits are, unfortunately, early
+   // in this function (because they're pseudo-classes, which are
+   // generally quick to test, and thus earlier).  If they were later,
+   // we'd probably avoid setting those bits in more cases where setting
+   // them is unnecessary.
+-  NS_ASSERTION(aStateMask == 0 || !aTreeMatchContext->mForStyling,
++  NS_ASSERTION(aNodeMatchContext->mStateMask == 0 ||
++               !aTreeMatchContext->mForStyling,
+                "mForStyling must be false if we're just testing for "
+                "state-dependence");
+ 
+   // test for pseudo class match
+   for (nsPseudoClassList* pseudoClass = aSelector->mPseudoClassList;
+        pseudoClass; pseudoClass = pseudoClass->mNext) {
+     const PseudoClassInfo& info = sPseudoClassInfo[pseudoClass->mType];
+     if (info.mFunc) {
+-      if (!(*info.mFunc)(data, aTreeMatchContext, aStateMask, pseudoClass)) {
++      if (!(*info.mFunc)(data, aTreeMatchContext, aNodeMatchContext,
++                         pseudoClass)) {
+         return PR_FALSE;
+       }
+     } else {
+       PRInt32 statesToCheck = info.mBits;
+       NS_ABORT_IF_FALSE(statesToCheck != 0, "How did that happen?");
+       if ((statesToCheck & (NS_EVENT_STATE_HOVER | NS_EVENT_STATE_ACTIVE)) &&
+           data.mCompatMode == eCompatibility_NavQuirks &&
+           // global selector (but don't check .class):
+@@ -1957,17 +1978,17 @@ static PRBool SelectorMatches(RuleProces
+           !isNegated &&
+           // important for |IsQuirkEventSensitive|:
+           data.mIsHTMLContent && !data.IsLink() &&
+           !IsQuirkEventSensitive(data.mContentTag)) {
+         // In quirks mode, only make certain elements sensitive to
+         // selectors ":hover" and ":active".
+         return PR_FALSE;
+       } else {
+-        if (aStateMask & statesToCheck) {
++        if (aNodeMatchContext->mStateMask & statesToCheck) {
+           if (aDependence)
+             *aDependence = PR_TRUE;
+         } else {
+           if (!(data.ContentState() & statesToCheck)) {
+             return PR_FALSE;
+           }
+         }
+       }
+@@ -2052,17 +2073,17 @@ static PRBool SelectorMatches(RuleProces
+     }
+   }
+ 
+   // apply SelectorMatches to the negated selectors in the chain
+   if (!isNegated) {
+     for (nsCSSSelector *negation = aSelector->mNegations;
+          result && negation; negation = negation->mNegations) {
+       PRBool dependence = PR_FALSE;
+-      result = !SelectorMatches(data, negation, aStateMask,
++      result = !SelectorMatches(data, negation, aNodeMatchContext,
+                                 aTreeMatchContext, &dependence);
+       // If the selector does match due to the dependence on aStateMask,
+       // then we want to keep result true so that the final result of
+       // SelectorMatches is true.  Doing so tells StateEnumFunc that
+       // there is a dependence on the state.
+       result = result || dependence;
+     }
+   }
+@@ -2129,17 +2150,18 @@ static PRBool SelectorMatchesTree(RulePr
+                                            prevdata->mCompatMode);
+           prevdata->mParentData = data;
+         }
+       }
+     }
+     if (! data) {
+       return PR_FALSE;
+     }
+-    if (SelectorMatches(*data, selector, 0, aTreeMatchContext)) {
++    NodeMatchContext nodeContext(0);
++    if (SelectorMatches(*data, selector, &nodeContext, aTreeMatchContext)) {
+       // to avoid greedy matching, we need to recur if this is a
+       // descendant or general sibling combinator and the next
+       // combinator is different, but we can make an exception for
+       // sibling, then parent, since a sibling's parent is always the
+       // same.
+       if (NS_IS_GREEDY_OPERATOR(selector->mOperator) &&
+           selector->mNext &&
+           selector->mNext->mOperator != selector->mOperator &&
+@@ -2172,20 +2194,21 @@ static PRBool SelectorMatchesTree(RulePr
+   return PR_TRUE; // all the selectors matched.
+ }
+ 
+ static void ContentEnumFunc(nsICSSStyleRule* aRule, nsCSSSelector* aSelector,
+                             void* aData)
+ {
+   RuleProcessorData* data = (RuleProcessorData*)aData;
+ 
+-  TreeMatchContext context(PR_TRUE);
+-  if (SelectorMatches(*data, aSelector, 0, &context)) {
++  TreeMatchContext treeContext(PR_TRUE);
++  NodeMatchContext nodeContext(0);
++  if (SelectorMatches(*data, aSelector, &nodeContext, &treeContext)) {
+     nsCSSSelector *next = aSelector->mNext;
+-    if (!next || SelectorMatchesTree(*data, next, &context)) {
++    if (!next || SelectorMatchesTree(*data, next, &treeContext)) {
+       // for performance, require that every implementation of
+       // nsICSSStyleRule return the same pointer for nsIStyleRule (why
+       // would anything multiply inherit nsIStyleRule anyway?)
+ #ifdef DEBUG
+       nsCOMPtr<nsIStyleRule> iRule = do_QueryInterface(aRule);
+       NS_ASSERTION(static_cast<nsIStyleRule*>(aRule) == iRule.get(),
+                    "Please fix QI so this performance optimization is valid");
+ #endif
+@@ -2323,20 +2346,21 @@ nsCSSRuleProcessor::HasStateDependentSty
+       nsCSSSelector* selector = *iter;
+ 
+       nsReStyleHint possibleChange = IsSiblingOperator(selector->mOperator) ?
+         eReStyle_LaterSiblings : eReStyle_Self;
+ 
+       // If hint already includes all the bits of possibleChange,
+       // don't bother calling SelectorMatches, since even if it returns false
+       // hint won't change.
+-      TreeMatchContext context(PR_FALSE);
++      TreeMatchContext treeContext(PR_FALSE);
++      NodeMatchContext nodeContext(aData->mStateMask);
+       if ((possibleChange & ~hint) &&
+-          SelectorMatches(*aData, selector, aData->mStateMask, &context) &&
+-          SelectorMatchesTree(*aData, selector->mNext, &context)) {
++          SelectorMatches(*aData, selector, &nodeContext, &treeContext) &&
++          SelectorMatchesTree(*aData, selector->mNext, &treeContext)) {
+         hint = nsReStyleHint(hint | possibleChange);
+       }
+     }
+   }
+   return hint;
+ }
+ 
+ struct AttributeEnumData {
+@@ -2354,20 +2378,21 @@ AttributeEnumFunc(nsCSSSelector* aSelect
+   AttributeRuleProcessorData *data = aData->data;
+ 
+   nsReStyleHint possibleChange = IsSiblingOperator(aSelector->mOperator) ?
+     eReStyle_LaterSiblings : eReStyle_Self;
+ 
+   // If enumData->change already includes all the bits of possibleChange, don't
+   // bother calling SelectorMatches, since even if it returns false
+   // enumData->change won't change.
+-  TreeMatchContext context(PR_FALSE);
++  TreeMatchContext treeContext(PR_FALSE);
++  NodeMatchContext nodeContext(0);
+   if ((possibleChange & ~(aData->change)) &&
+-      SelectorMatches(*data, aSelector, 0, &context) &&
+-      SelectorMatchesTree(*data, aSelector->mNext, &context)) {
++      SelectorMatches(*data, aSelector, &nodeContext, &treeContext) &&
++      SelectorMatchesTree(*data, aSelector->mNext, &treeContext)) {
+     aData->change = nsReStyleHint(aData->change | possibleChange);
+   }
+ }
+ 
+ nsReStyleHint
+ nsCSSRuleProcessor::HasAttributeDependentStyle(AttributeRuleProcessorData* aData)
+ {
+   NS_PRECONDITION(aData->mContent->IsNodeOfType(nsINode::eELEMENT),
+@@ -2882,20 +2907,21 @@ nsCSSRuleProcessor::RefreshRuleCascade(n
+ /* static */ PRBool
+ nsCSSRuleProcessor::SelectorListMatches(RuleProcessorData& aData,
+                                         nsCSSSelectorList* aSelectorList)
+ {
+   while (aSelectorList) {
+     nsCSSSelector* sel = aSelectorList->mSelectors;
+     NS_ASSERTION(sel, "Should have *some* selectors");
+     NS_ASSERTION(!sel->IsPseudoElement(), "Shouldn't have been called");
+-    TreeMatchContext context(PR_FALSE);
+-    if (SelectorMatches(aData, sel, 0, &context)) {
++    TreeMatchContext treeContext(PR_FALSE);
++    NodeMatchContext nodeContext(0);
++    if (SelectorMatches(aData, sel, &nodeContext, &treeContext)) {
+       nsCSSSelector* next = sel->mNext;
+-      if (!next || SelectorMatchesTree(aData, next, &context)) {
++      if (!next || SelectorMatchesTree(aData, next, &treeContext)) {
+         return PR_TRUE;
+       }
+     }
+ 
+     aSelectorList = aSelectorList->mNext;
+   }
+ 
+   return PR_FALSE;
