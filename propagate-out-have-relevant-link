@@ -29,7 +29,7 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
   * A |NodeMatchContext| has data about matching a selector (without
   * combinators) against a single node.  It contains only input to the
   * matching.
-@@ -1240,18 +1245,26 @@ struct NodeMatchContext {
+@@ -1240,18 +1245,30 @@ struct NodeMatchContext {
    // NOTE: For |aStateMask| to work correctly, it's important that any
    // change that changes multiple state bits include all those state
    // bits in the notification.  Otherwise, if multiple states change but
@@ -38,16 +38,21 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
    // :hover:active rule no longer matches when both states are unset).
    const PRInt32 mStateMask;
  
-+  // FIXME: WRITE COMMENT HERE
-+  const PRBool mLookForRelevantLink;
-+
-+  // FIXME: WRITE COMMENT HERE
+-  NodeMatchContext(PRInt32 aStateMask)
++  // Is this link the unique link whose visitedness can affect the style
++  // of the node being matched?  (That link is the nearest link to the
++  // node being matched that is itself or an ancestor.)
++  //
++  // Always false when TreeMatchContext::mForStyling is false.  (We
++  // could figure it out for SelectorListMatches, but we're starting
++  // from the middle of the selector list when doing
++  // Has{Attribute,State}DependentStyle, so we can't tell.  So when
++  // mForStyling is false, we have to assume we don't know.)
 +  const PRBool mIsRelevantLink;
 +
-   NodeMatchContext(PRInt32 aStateMask)
++  NodeMatchContext(PRInt32 aStateMask, PRBool aIsRelevantLink)
      : mStateMask(aStateMask)
-+    , mLookForRelevantLink(PR_FALSE /* FIXME */)
-+    , mIsRelevantLink(PR_FALSE /* FIXME */)
++    , mIsRelevantLink(aIsRelevantLink)
    {
    }
  };
@@ -56,3 +61,175 @@ diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcess
                              const nsSubstring& aValue,
                              const nsStringComparator& aComparator)
  {
+@@ -2095,30 +2112,33 @@ static PRBool SelectorMatches(RuleProces
+ // Right now, there are four operators:
+ //   PRUnichar(0), the descendant combinator, is greedy
+ //   '~', the indirect adjacent sibling combinator, is greedy
+ //   '+' and '>', the direct adjacent sibling and child combinators, are not
+ #define NS_IS_GREEDY_OPERATOR(ch) (ch == PRUnichar(0) || ch == PRUnichar('~'))
+ 
+ static PRBool SelectorMatchesTree(RuleProcessorData& aPrevData,
+                                   nsCSSSelector* aSelector,
+-                                  TreeMatchContext* aTreeMatchContext)
++                                  TreeMatchContext* aTreeMatchContext,
++                                  PRBool aLookForRelevantLink)
+ {
+   nsCSSSelector* selector = aSelector;
+   RuleProcessorData* prevdata = &aPrevData;
+   while (selector) { // check compound selectors
+     // If we don't already have a RuleProcessorData for the next
+     // appropriate content (whether parent or previous sibling), create
+     // one.
+ 
+     // for adjacent sibling combinators, the content to test against the
+     // selector is the previous sibling *element*
+     RuleProcessorData* data;
+     if (PRUnichar('+') == selector->mOperator ||
+         PRUnichar('~') == selector->mOperator) {
++      // The relevant link must be an ancestor of the node being matched.
++      aLookForRelevantLink = PR_FALSE;
+       data = prevdata->mPreviousSiblingData;
+       if (!data) {
+         nsIContent* content = prevdata->mContent;
+         nsIContent* parent = prevdata->mParentContent;
+         if (parent) {
+           if (aTreeMatchContext->mForStyling)
+             parent->SetFlags(NODE_HAS_SLOW_SELECTOR_NOAPPEND);
+ 
+@@ -2150,17 +2170,21 @@ static PRBool SelectorMatchesTree(RulePr
+                                            prevdata->mCompatMode);
+           prevdata->mParentData = data;
+         }
+       }
+     }
+     if (! data) {
+       return PR_FALSE;
+     }
+-    NodeMatchContext nodeContext(0);
++    NodeMatchContext nodeContext(0, aLookForRelevantLink && data->IsLink());
++    if (nodeContext.mIsRelevantLink) {
++      // FIXME: Is this sufficient?
++      aLookForRelevantLink = PR_FALSE;
++    }
+     if (SelectorMatches(*data, selector, &nodeContext, aTreeMatchContext)) {
+       // to avoid greedy matching, we need to recur if this is a
+       // descendant or general sibling combinator and the next
+       // combinator is different, but we can make an exception for
+       // sibling, then parent, since a sibling's parent is always the
+       // same.
+       if (NS_IS_GREEDY_OPERATOR(selector->mOperator) &&
+           selector->mNext &&
+@@ -2171,17 +2195,18 @@ static PRBool SelectorMatchesTree(RulePr
+ 
+         // pretend the selector didn't match, and step through content
+         // while testing the same selector
+ 
+         // This approach is slightly strange in that when it recurs
+         // it tests from the top of the content tree, down.  This
+         // doesn't matter much for performance since most selectors
+         // don't match.  (If most did, it might be faster...)
+-        if (SelectorMatchesTree(*data, selector, aTreeMatchContext)) {
++        if (SelectorMatchesTree(*data, selector, aTreeMatchContext,
++                                aLookForRelevantLink)) {
+           return PR_TRUE;
+         }
+       }
+       selector = selector->mNext;
+     }
+     else {
+       // for adjacent sibling and child combinators, if we didn't find
+       // a match, we're done
+@@ -2195,20 +2220,21 @@ static PRBool SelectorMatchesTree(RulePr
+ }
+ 
+ static void ContentEnumFunc(nsICSSStyleRule* aRule, nsCSSSelector* aSelector,
+                             void* aData)
+ {
+   RuleProcessorData* data = (RuleProcessorData*)aData;
+ 
+   TreeMatchContext treeContext(PR_TRUE);
+-  NodeMatchContext nodeContext(0);
++  NodeMatchContext nodeContext(0, data->IsLink());
+   if (SelectorMatches(*data, aSelector, &nodeContext, &treeContext)) {
+     nsCSSSelector *next = aSelector->mNext;
+-    if (!next || SelectorMatchesTree(*data, next, &treeContext)) {
++    if (!next || SelectorMatchesTree(*data, next, &treeContext,
++                                     !nodeContext.mIsRelevantLink)) {
+       // for performance, require that every implementation of
+       // nsICSSStyleRule return the same pointer for nsIStyleRule (why
+       // would anything multiply inherit nsIStyleRule anyway?)
+ #ifdef DEBUG
+       nsCOMPtr<nsIStyleRule> iRule = do_QueryInterface(aRule);
+       NS_ASSERTION(static_cast<nsIStyleRule*>(aRule) == iRule.get(),
+                    "Please fix QI so this performance optimization is valid");
+ #endif
+@@ -2347,20 +2373,21 @@ nsCSSRuleProcessor::HasStateDependentSty
+ 
+       nsReStyleHint possibleChange = IsSiblingOperator(selector->mOperator) ?
+         eReStyle_LaterSiblings : eReStyle_Self;
+ 
+       // If hint already includes all the bits of possibleChange,
+       // don't bother calling SelectorMatches, since even if it returns false
+       // hint won't change.
+       TreeMatchContext treeContext(PR_FALSE);
+-      NodeMatchContext nodeContext(aData->mStateMask);
++      NodeMatchContext nodeContext(aData->mStateMask, PR_FALSE);
+       if ((possibleChange & ~hint) &&
+           SelectorMatches(*aData, selector, &nodeContext, &treeContext) &&
+-          SelectorMatchesTree(*aData, selector->mNext, &treeContext)) {
++          SelectorMatchesTree(*aData, selector->mNext, &treeContext, PR_FALSE))
++      {
+         hint = nsReStyleHint(hint | possibleChange);
+       }
+     }
+   }
+   return hint;
+ }
+ 
+ struct AttributeEnumData {
+@@ -2379,20 +2406,20 @@ AttributeEnumFunc(nsCSSSelector* aSelect
+ 
+   nsReStyleHint possibleChange = IsSiblingOperator(aSelector->mOperator) ?
+     eReStyle_LaterSiblings : eReStyle_Self;
+ 
+   // If enumData->change already includes all the bits of possibleChange, don't
+   // bother calling SelectorMatches, since even if it returns false
+   // enumData->change won't change.
+   TreeMatchContext treeContext(PR_FALSE);
+-  NodeMatchContext nodeContext(0);
++  NodeMatchContext nodeContext(0, PR_FALSE);
+   if ((possibleChange & ~(aData->change)) &&
+       SelectorMatches(*data, aSelector, &nodeContext, &treeContext) &&
+-      SelectorMatchesTree(*data, aSelector->mNext, &treeContext)) {
++      SelectorMatchesTree(*data, aSelector->mNext, &treeContext, PR_FALSE)) {
+     aData->change = nsReStyleHint(aData->change | possibleChange);
+   }
+ }
+ 
+ nsReStyleHint
+ nsCSSRuleProcessor::HasAttributeDependentStyle(AttributeRuleProcessorData* aData)
+ {
+   NS_PRECONDITION(aData->mContent->IsNodeOfType(nsINode::eELEMENT),
+@@ -2908,20 +2935,20 @@ nsCSSRuleProcessor::RefreshRuleCascade(n
+ nsCSSRuleProcessor::SelectorListMatches(RuleProcessorData& aData,
+                                         nsCSSSelectorList* aSelectorList)
+ {
+   while (aSelectorList) {
+     nsCSSSelector* sel = aSelectorList->mSelectors;
+     NS_ASSERTION(sel, "Should have *some* selectors");
+     NS_ASSERTION(!sel->IsPseudoElement(), "Shouldn't have been called");
+     TreeMatchContext treeContext(PR_FALSE);
+-    NodeMatchContext nodeContext(0);
++    NodeMatchContext nodeContext(0, PR_FALSE);
+     if (SelectorMatches(aData, sel, &nodeContext, &treeContext)) {
+       nsCSSSelector* next = sel->mNext;
+-      if (!next || SelectorMatchesTree(aData, next, &treeContext)) {
++      if (!next || SelectorMatchesTree(aData, next, &treeContext, PR_FALSE)) {
+         return PR_TRUE;
+       }
+     }
+ 
+     aSelectorList = aSelectorList->mNext;
+   }
+ 
+   return PR_FALSE;
