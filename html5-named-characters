@@ -5,12 +5,14 @@ Make nsHtml5NamedCharacters store data as data rather than as code.  (Bug 501082
 diff --git a/parser/html/nsHtml5NamedCharacters.cpp b/parser/html/nsHtml5NamedCharacters.cpp
 --- a/parser/html/nsHtml5NamedCharacters.cpp
 +++ b/parser/html/nsHtml5NamedCharacters.cpp
-@@ -1,12 +1,13 @@
+@@ -1,12 +1,15 @@
  #define nsHtml5NamedCharacters_cpp__
  #include "prtypes.h"
  #include "jArray.h"
  #include "nscore.h"
 +#include "nsDebug.h"
++#include "prlog.h"
++#include "nsMemory.h"
  
  #include "nsHtml5NamedCharacters.h"
  
@@ -19,7 +21,8 @@ diff --git a/parser/html/nsHtml5NamedCharacters.cpp b/parser/html/nsHtml5NamedCh
  PRUnichar** nsHtml5NamedCharacters::WINDOWS_1252;
  static PRUnichar const WINDOWS_1252_DATA[] = {
    0x20AC,
-@@ -39,56 +40,70 @@ static PRUnichar const WINDOWS_1252_DATA
+@@ -38,57 +41,112 @@ static PRUnichar const WINDOWS_1252_DATA
+   0x0161,
    0x203A,
    0x0153,
    0x009D,
@@ -27,28 +30,73 @@ diff --git a/parser/html/nsHtml5NamedCharacters.cpp b/parser/html/nsHtml5NamedCh
    0x0178
  };
  
- #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
+-#define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
 -static PRUnichar const NAME_##N[] = { CHARS };
-+static const PRUnichar NAME_##N[] = { CHARS };
- #include "nsHtml5NamedCharactersInclude.h"
- #undef NAMED_CHARACTER_REFERENCE
+-#include "nsHtml5NamedCharactersInclude.h"
+-#undef NAMED_CHARACTER_REFERENCE
++/**
++ * To avoid having lots of pointers in the |charData| array, below,
++ * store all the string data in two big arrays (one for the names and
++ * one for the values).  Then use tricks with enums to help us build an
++ * array that contains the positions of each within the big arrays.
++ */
  
- #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
+-#define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
 -static PRUnichar const VALUE_##N[] = { VALUE };
-+static const PRUnichar VALUE_##N[] = { VALUE };
- #include "nsHtml5NamedCharactersInclude.h"
- #undef NAMED_CHARACTER_REFERENCE
+-#include "nsHtml5NamedCharactersInclude.h"
+-#undef NAMED_CHARACTER_REFERENCE
++const PRUnichar ALL_NAMES[] = {
++  #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) CHARS ,
++  #include "nsHtml5NamedCharactersInclude.h"
++  #undef NAMED_CHARACTER_REFERENCE
++};
  
 -// XXX bug 501082: for some reason, msvc takes forever to optimize this function
 -#ifdef _MSC_VER
 -#pragma optimize("", off)
++enum NamePositions {
++  DUMMY_INITIAL_NAME_POSITION = 0,
++
++  /* enums don't take up space, so generate _START and _END */
++  #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
++    NAME_##N##_DUMMY, /* automatically one higher than previous */ \
++    NAME_##N##_START = NAME_##N##_DUMMY - 1, \
++    NAME_##N##_END = NAME_##N##_START + LEN,
++  #include "nsHtml5NamedCharactersInclude.h"
++  #undef NAMED_CHARACTER_REFERENCE
++
++  DUMMY_FINAL_NAME_VALUE
++};
++
++const PRUnichar ALL_VALUES[] = {
++  #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) VALUE ,
++  #include "nsHtml5NamedCharactersInclude.h"
++  #undef NAMED_CHARACTER_REFERENCE
++};
++
++enum ValuePositions {
++  DUMMY_INITIAL_VALUE_POSITION = 0,
++
++  /* enums don't take up space, so generate _START and _END */
++  #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
++    VALUE_##N##_DUMMY, /* automatically one higher than previous */ \
++    VALUE_##N##_START = VALUE_##N##_DUMMY - 1, \
++    VALUE_##N##_END = VALUE_##N##_START + SIZE,
++  #include "nsHtml5NamedCharactersInclude.h"
++  #undef NAMED_CHARACTER_REFERENCE
++
++  DUMMY_FINAL_VALUE_VALUE
++};
++
++
 +#define NAMED_CHARACTERS_COUNT 2138
 +
++/* check that the start positions will fit in 16 bits */
++PR_STATIC_ASSERT(NS_ARRAY_LENGTH(ALL_NAMES) < 0x10000);
++PR_STATIC_ASSERT(NS_ARRAY_LENGTH(ALL_VALUES) < 0x10000);
++
 +struct NamedCharacterData {
-+  const PRUnichar* name;
-+  const PRUnichar* value;
-+  PRUint32 nameLen;
-+  PRUint32 valueSize;
++  PRUint16 nameStart, nameLen, valueStart, valueSize;
 +#ifdef DEBUG
 +  PRUint32 n;
  #endif
@@ -57,10 +105,10 @@ diff --git a/parser/html/nsHtml5NamedCharacters.cpp b/parser/html/nsHtml5NamedCh
 +static const NamedCharacterData charData[NAMED_CHARACTERS_COUNT] = {
 +  #ifdef DEBUG
 +    #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
-+    { NAME_##N, VALUE_##N, LEN, SIZE, N },
++    { NAME_##N##_START, LEN, VALUE_##N##_START, SIZE, N },
 +  #else
 +    #define NAMED_CHARACTER_REFERENCE(N, CHARS, LEN, VALUE, SIZE) \
-+    { NAME_##N, VALUE_##N, LEN, SIZE },
++    { NAME_##N##_START, LEN, VALUE_##N##_START, SIZE },
 +  #endif
 +  #include "nsHtml5NamedCharactersInclude.h"
 +  #undef NAMED_CHARACTER_REFERENCE
@@ -84,13 +132,15 @@ diff --git a/parser/html/nsHtml5NamedCharacters.cpp b/parser/html/nsHtml5NamedCh
 -  VALUES[N] = jArray<PRUnichar,PRInt32>((PRUnichar*)VALUE_##N, SIZE);
 -#include "nsHtml5NamedCharactersInclude.h"
 -#undef NAMED_CHARACTER_REFERENCE
++  PRUnichar *allNames = const_cast<PRUnichar*>(ALL_NAMES);
++  PRUnichar *allValues = const_cast<PRUnichar*>(ALL_VALUES);
 +  for (PRUint32 i = 0; i < NAMED_CHARACTERS_COUNT; ++i) {
 +    const NamedCharacterData &data = charData[i];
 +    NS_ABORT_IF_FALSE(data.n == i,
 +                      "index error in nsHtml5NamedCharactersInclude.h");
-+    NAMES[i] = jArray<PRUnichar,PRInt32>(const_cast<PRUnichar*>(data.name),
++    NAMES[i] = jArray<PRUnichar,PRInt32>(allNames + data.nameStart,
 +                                         data.nameLen);
-+    VALUES[i] = jArray<PRUnichar,PRInt32>(const_cast<PRUnichar*>(data.value),
++    VALUES[i] = jArray<PRUnichar,PRInt32>(allValues + data.valueStart,
 +                                          data.valueSize);
 +  }
  
