@@ -1,0 +1,351 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Use the information in nsCCUncollectableMarker to optimize traversal of the JS graph too.  (Bug 549793)
+
+diff --git a/content/base/src/nsCCUncollectableMarker.h b/content/base/src/nsCCUncollectableMarker.h
+--- a/content/base/src/nsCCUncollectableMarker.h
++++ b/content/base/src/nsCCUncollectableMarker.h
+@@ -53,14 +53,23 @@ class nsCCUncollectableMarker : public n
+    */
+   static PRBool InGeneration(nsCycleCollectionTraversalCallback &cb,
+                              PRUint32 aGeneration) {
+     return !cb.WantAllTraces() &&
+            aGeneration &&
+            aGeneration == sGeneration;
+   }
+ 
++  /**
++   * Likewise, but for callers who already know they don't want all traces.
++   */
++  static PRBool ReallyInGeneration(PRUint32 aGeneration) {
++    return aGeneration &&
++           aGeneration == sGeneration;
++  }
++
++
+   static PRUint32 sGeneration;
+ 
+ private:
+   nsCCUncollectableMarker() {}
+ 
+ };
+diff --git a/content/xbl/src/nsXBLDocumentInfo.cpp b/content/xbl/src/nsXBLDocumentInfo.cpp
+--- a/content/xbl/src/nsXBLDocumentInfo.cpp
++++ b/content/xbl/src/nsXBLDocumentInfo.cpp
+@@ -71,16 +71,17 @@ public:
+   // nsIScriptGlobalObject methods
+   virtual nsresult EnsureScriptEnvironment(PRUint32 aLangID);
+   virtual nsresult SetScriptContext(PRUint32 lang_id, nsIScriptContext *aContext);
+ 
+   virtual nsIScriptContext *GetContext();
+   virtual JSObject *GetGlobalJSObject();
+   virtual void OnFinalize(PRUint32 aLangID, void *aScriptGlobal);
+   virtual void SetScriptsEnabled(PRBool aEnabled, PRBool aFireTimeouts);
++  virtual PRBool IsKnownUncollectable();
+ 
+   // nsIScriptObjectPrincipal methods
+   virtual nsIPrincipal* GetPrincipal();
+ 
+   static JSBool doCheckAccess(JSContext *cx, JSObject *obj, jsval id,
+                               PRUint32 accessType);
+ 
+   NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsXBLDocGlobalObject,
+@@ -387,16 +388,22 @@ nsXBLDocGlobalObject::OnFinalize(PRUint3
+ }
+ 
+ void
+ nsXBLDocGlobalObject::SetScriptsEnabled(PRBool aEnabled, PRBool aFireTimeouts)
+ {
+     // We don't care...
+ }
+ 
++PRBool
++nsXBLDocGlobalObject::IsKnownUncollectable()
++{
++  return PR_FALSE;
++}
++
+ //----------------------------------------------------------------------
+ //
+ // nsIScriptObjectPrincipal methods
+ //
+ 
+ nsIPrincipal*
+ nsXBLDocGlobalObject::GetPrincipal()
+ {
+diff --git a/content/xul/document/src/nsXULPrototypeDocument.cpp b/content/xul/document/src/nsXULPrototypeDocument.cpp
+--- a/content/xul/document/src/nsXULPrototypeDocument.cpp
++++ b/content/xul/document/src/nsXULPrototypeDocument.cpp
+@@ -76,16 +76,17 @@ public:
+     nsXULPDGlobalObject(nsXULPrototypeDocument* owner);
+ 
+     // nsISupports interface
+     NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+     // nsIScriptGlobalObject methods
+     virtual void OnFinalize(PRUint32 aLangID, void *aGlobal);
+     virtual void SetScriptsEnabled(PRBool aEnabled, PRBool aFireTimeouts);
++    virtual PRBool IsKnownUncollectable();
+ 
+     virtual void *GetScriptGlobal(PRUint32 lang);
+     virtual nsresult EnsureScriptEnvironment(PRUint32 aLangID);
+ 
+     virtual nsIScriptContext *GetScriptContext(PRUint32 lang);
+     virtual nsresult SetScriptContext(PRUint32 language, nsIScriptContext *ctx);
+ 
+     // nsIScriptObjectPrincipal methods
+@@ -803,16 +804,22 @@ nsXULPDGlobalObject::OnFinalize(PRUint32
+ }
+ 
+ void
+ nsXULPDGlobalObject::SetScriptsEnabled(PRBool aEnabled, PRBool aFireTimeouts)
+ {
+     // We don't care...
+ }
+ 
++PRBool
++nsXULPDGlobalObject::IsKnownUncollectable()
++{
++  return PR_FALSE;
++}
++
+ //----------------------------------------------------------------------
+ //
+ // nsIScriptObjectPrincipal methods
+ //
+ 
+ nsIPrincipal*
+ nsXULPDGlobalObject::GetPrincipal()
+ {
+diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
+--- a/dom/base/nsGlobalWindow.cpp
++++ b/dom/base/nsGlobalWindow.cpp
+@@ -2438,16 +2438,23 @@ nsGlobalWindow::SetScriptsEnabled(PRBool
+   if (aEnabled && aFireTimeouts) {
+     // Scripts are enabled (again?) on this context, run timeouts that
+     // fired on this context while scripts were disabled.
+ 
+     RunTimeout(nsnull);
+   }
+ }
+ 
++PRBool
++nsGlobalWindow::IsKnownUncollectable()
++{
++  return mDoc && nsCCUncollectableMarker::ReallyInGeneration(
++                                            mDoc->GetMarkedCCGeneration());
++}
++
+ nsresult
+ nsGlobalWindow::SetArguments(nsIArray *aArguments, nsIPrincipal *aOrigin)
+ {
+   FORWARD_TO_OUTER(SetArguments, (aArguments, aOrigin),
+                    NS_ERROR_NOT_INITIALIZED);
+ 
+   // Hold on to the arguments so that we can re-set them once the next
+   // document is loaded.
+diff --git a/dom/base/nsGlobalWindow.h b/dom/base/nsGlobalWindow.h
+--- a/dom/base/nsGlobalWindow.h
++++ b/dom/base/nsGlobalWindow.h
+@@ -255,16 +255,17 @@ public:
+   virtual void *GetScriptGlobal(PRUint32 lang);
+ 
+   // Set a new script language context for this global.  The native global
+   // for the context is created by the context's GetNativeGlobal() method.
+   virtual nsresult SetScriptContext(PRUint32 lang, nsIScriptContext *aContext);
+   
+   virtual void OnFinalize(PRUint32 aLangID, void *aScriptGlobal);
+   virtual void SetScriptsEnabled(PRBool aEnabled, PRBool aFireTimeouts);
++  virtual PRBool IsKnownUncollectable();
+ 
+   // nsIScriptObjectPrincipal
+   virtual nsIPrincipal* GetPrincipal();
+ 
+   // nsIDOMWindow
+   NS_DECL_NSIDOMWINDOW
+ 
+   // nsIDOMWindow2
+diff --git a/dom/base/nsIScriptGlobalObject.h b/dom/base/nsIScriptGlobalObject.h
+--- a/dom/base/nsIScriptGlobalObject.h
++++ b/dom/base/nsIScriptGlobalObject.h
+@@ -95,19 +95,20 @@ struct JSObject; // until we finally rem
+ // Returns PR_TRUE if HandleDOMEvent was actually called, in which case
+ // aStatus will be filled in with the status.
+ PRBool
+ NS_HandleScriptError(nsIScriptGlobalObject *aScriptGlobal,
+                      nsScriptErrorEvent *aErrorEvent,
+                      nsEventStatus *aStatus);
+ 
+ 
++// 8b6bf1cf-84ec-4f7c-8d6e-a2d56b0ec281
+ #define NS_ISCRIPTGLOBALOBJECT_IID \
+-{ 0xe9f3f2c1, 0x2d94, 0x4722, \
+-  { 0xbb, 0xd4, 0x2b, 0xf6, 0xfd, 0xf4, 0x2f, 0x48 } }
++{ 0x8b6bf1cf, 0x84ec, 0x4f7c, \
++  { 0x8d, 0x6e, 0xa2, 0xd5, 0x6b, 0x0e, 0xc2, 0x81 } }
+ 
+ /**
+   * The global object which keeps a script context for each supported script
+   * language. This often used to store per-window global state.
+  */
+ 
+ class nsIScriptGlobalObject : public nsISupports
+ {
+@@ -167,14 +168,20 @@ public:
+ 
+   /**
+    * Handle a script error.  Generally called by a script context.
+    */
+   virtual nsresult HandleScriptError(nsScriptErrorEvent *aErrorEvent,
+                                      nsEventStatus *aEventStatus) {
+     return NS_HandleScriptError(this, aErrorEvent, aEventStatus);
+   }
++
++  /**
++   * Is the object known (because it's for a currently displayed
++   * document) to be uncollectable by the GC?
++   */
++  virtual PRBool IsKnownUncollectable() = 0;
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsIScriptGlobalObject,
+                               NS_ISCRIPTGLOBALOBJECT_IID)
+ 
+ #endif
+diff --git a/js/src/xpconnect/src/nsXPConnect.cpp b/js/src/xpconnect/src/nsXPConnect.cpp
+--- a/js/src/xpconnect/src/nsXPConnect.cpp
++++ b/js/src/xpconnect/src/nsXPConnect.cpp
+@@ -373,17 +373,17 @@ static PRBool gCollected;
+ 
+ static JSBool
+ XPCCycleCollectGCCallback(JSContext *cx, JSGCStatus status)
+ {
+     // Launch the cycle collector.
+     switch(status)
+     {
+       case JSGC_BEGIN:
+-        nsXPConnect::GetRuntimeInstance()->UnrootContextGlobals();
++        nsXPConnect::GetRuntimeInstance()->UnrootContextGlobals(PR_FALSE);
+         break;
+ 
+       case JSGC_MARK_END:
+         // This is the hook between marking and sweeping in the JS GC. Do cycle
+         // collection.
+         if(!gDidCollection)
+         {
+             NS_ASSERTION(!gInCollection, "Recursing?");
+@@ -550,17 +550,17 @@ nsXPConnect::BeginCycleCollection(nsCycl
+         // collection identical for DEBUG_CC and non-DEBUG_CC builds.
+         if(!PL_DHashTableInit(&mJSRoots, PL_DHashGetStubOps(), nsnull,
+                               sizeof(PLDHashEntryStub), PL_DHASH_MIN_SIZE)) {
+             mJSRoots.ops = nsnull;
+ 
+             return NS_ERROR_OUT_OF_MEMORY;
+         }
+ 
+-        GetRuntime()->UnrootContextGlobals();
++        GetRuntime()->UnrootContextGlobals(cb.WantAllTraces());
+ 
+         PRBool alreadyCollecting = mCycleCollecting;
+         mCycleCollecting = PR_TRUE;
+         NoteJSRootTracer trc(&mJSRoots, cb);
+         JS_TRACER_INIT(&trc, mCycleCollectionContext->GetJSContext(),
+                        NoteJSRoot);
+         JS_TraceRuntime(&trc);
+         mCycleCollecting = alreadyCollecting;
+diff --git a/js/src/xpconnect/src/xpcjsruntime.cpp b/js/src/xpconnect/src/xpcjsruntime.cpp
+--- a/js/src/xpconnect/src/xpcjsruntime.cpp
++++ b/js/src/xpconnect/src/xpcjsruntime.cpp
+@@ -37,16 +37,18 @@
+  * the terms of any one of the MPL, the GPL or the LGPL.
+  *
+  * ***** END LICENSE BLOCK ***** */
+ 
+ /* Per JSRuntime object */
+ 
+ #include "xpcprivate.h"
+ #include "dom_quickstubs.h"
++#include "jsobj.h"
++#include "nsIScriptGlobalObject.h"
+ 
+ /***************************************************************************/
+ 
+ const char* XPCJSRuntime::mStrings[] = {
+     "constructor",          // IDX_CONSTRUCTOR
+     "toString",             // IDX_TO_STRING
+     "toSource",             // IDX_TO_SOURCE
+     "lastResult",           // IDX_LAST_RESULT
+@@ -431,32 +433,48 @@ void XPCJSRuntime::AddXPConnectRoots(JSC
+         nsIXPConnectWrappedJS *wrappedJS = static_cast<nsXPCWrappedJS*>(e);
+         cb.NoteXPCOMRoot(wrappedJS);
+     }
+ 
+     if(mJSHolders.ops)
+         JS_DHashTableEnumerate(&mJSHolders, NoteJSHolder, &cb);
+ }
+ 
+-void XPCJSRuntime::UnrootContextGlobals()
++void XPCJSRuntime::UnrootContextGlobals(PRBool aWantAllTraces)
+ {
+     mUnrootedGlobalCount = 0;
+     JSContext *iter = nsnull, *acx;
+     while((acx = JS_ContextIterator(GetJSRuntime(), &iter)))
+     {
+         NS_ASSERTION(!JS_HAS_OPTION(acx, JSOPTION_UNROOTED_GLOBAL),
+                      "unrooted global should be set only during CC");
+         if(XPCPerThreadData::IsMainThread(acx) &&
+            nsXPConnect::GetXPConnect()->GetRequestDepth(acx) == 0)
+         {
+             JS_ClearNewbornRoots(acx);
+             if(acx->globalObject)
+             {
+-                JS_ToggleOptions(acx, JSOPTION_UNROOTED_GLOBAL);
+-                ++mUnrootedGlobalCount;
++                JSBool knownUncollectable = PR_FALSE;
++
++                JSClass *clazz = OBJ_GET_CLASS(acx, acx->globalObject);
++                if(!aWantAllTraces &&
++                   clazz->flags & JSCLASS_HAS_PRIVATE &&
++                   clazz->flags & JSCLASS_PRIVATE_IS_NSISUPPORTS)
++                {
++                    nsISupports *s = static_cast<nsISupports*>(
++                                       xpc_GetJSPrivate(acx->globalObject));
++                    nsCOMPtr<nsIScriptGlobalObject> sgo(do_QueryInterface(s));
++                    knownUncollectable =
++                        sgo && sgo->IsKnownUncollectable();
++                }
++
++                if (!knownUncollectable) {
++                    JS_ToggleOptions(acx, JSOPTION_UNROOTED_GLOBAL);
++                    ++mUnrootedGlobalCount;
++                }
+             }
+         }
+     }
+ }
+ 
+ #ifdef DEBUG_CC
+ void XPCJSRuntime::RootContextGlobals()
+ {
+diff --git a/js/src/xpconnect/src/xpcprivate.h b/js/src/xpconnect/src/xpcprivate.h
+--- a/js/src/xpconnect/src/xpcprivate.h
++++ b/js/src/xpconnect/src/xpcprivate.h
+@@ -730,17 +730,17 @@ public:
+ 
+     inline void AddVariantRoot(XPCTraceableVariant* variant);
+     inline void AddWrappedJSRoot(nsXPCWrappedJS* wrappedJS);
+     inline void AddObjectHolderRoot(XPCJSObjectHolder* holder);
+ 
+     nsresult AddJSHolder(void* aHolder, nsScriptObjectTracer* aTracer);
+     nsresult RemoveJSHolder(void* aHolder);
+ 
+-    void UnrootContextGlobals();
++    void UnrootContextGlobals(PRBool aWantAllTraces);
+ #ifdef DEBUG_CC
+     void RootContextGlobals();
+ #endif
+ 
+     void DebugDump(PRInt16 depth);
+ 
+     void SystemIsBeingShutDown(JSContext* cx);
+ 
