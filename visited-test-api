@@ -5,7 +5,25 @@ Add nsIDOMWindowUtils::getVisitedDependentComputedStyle for use in tests.  (Bug 
 diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
 --- a/dom/base/nsDOMWindowUtils.cpp
 +++ b/dom/base/nsDOMWindowUtils.cpp
-@@ -1218,8 +1218,22 @@ nsDOMWindowUtils::GetClassName(char **aN
+@@ -61,16 +61,17 @@
+ 
+ #include "nsIViewManager.h"
+ 
+ #include "nsIDOMHTMLCanvasElement.h"
+ #include "nsICanvasElement.h"
+ #include "gfxContext.h"
+ #include "gfxImageSurface.h"
+ #include "nsLayoutUtils.h"
++#include "nsComputedDOMStyle.h"
+ 
+ #if defined(MOZ_X11) && defined(MOZ_WIDGET_GTK2)
+ #include <gdk/gdk.h>
+ #include <gdk/gdkx.h>
+ #endif
+ 
+ static PRBool IsUniversalXPConnectCapable()
+ {
+@@ -1218,8 +1219,31 @@ nsDOMWindowUtils::GetClassName(char **aN
  
    // Our argument must be a non-null object.
    if(JSVAL_IS_PRIMITIVE(argv[0]))
@@ -26,7 +44,16 @@ diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
 +    return NS_ERROR_DOM_SECURITY_ERR;
 +  }
 +
-+  return NS_OK;
++  nsCOMPtr<nsIDOMCSSStyleDeclaration> decl;
++  nsresult rv =
++    mWindow->GetComputedStyle(aElement, aPseudoElement, getter_AddRefs(decl));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  static_cast<nsComputedDOMStyle*>(decl.get())->SetExposeVisitedStyle(PR_TRUE);
++  rv = decl->GetPropertyValue(aPropertyName, aResult);
++  static_cast<nsComputedDOMStyle*>(decl.get())->SetExposeVisitedStyle(PR_FALSE);
++
++  return rv;
 +}
 diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsIDOMWindowUtils.idl
 --- a/dom/interfaces/base/nsIDOMWindowUtils.idl
@@ -50,7 +77,7 @@ diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsI
     * to the given value. That is, when set to kDontAnimMode, all images
     * will stop animating. The attribute's value must be one of the
     * animationMode values from imgIContainer.
-@@ -608,9 +608,26 @@ interface nsIDOMWindowUtils : nsISupport
+@@ -608,9 +608,27 @@ interface nsIDOMWindowUtils : nsISupport
     * @param aReverse If true, the selection set from |aOffset + aLength| to
     *                 |aOffset|.  Otherwise, set from |aOffset| to
     *                 |aOffset + aLength|.
@@ -67,13 +94,112 @@ diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsI
 +   * except that, when the link whose presence in history is allowed to
 +   * influence aElement's style is visited, get the value the property
 +   * would have if allowed all properties to change as a result of
-+   * :visited selectors.
++   * :visited selectors (except for cases where getComputedStyle uses
++   * data from the frame).
 +   *
 +   * This is easier to implement than adding our property restrictions
 +   * to this API, and is sufficient for the present testing
-+   * requirements.
++   * requirements (which are essentially testing 'color').
 +   */
 +  AString getVisitedDependentComputedStyle(in nsIDOMElement aElement,
 +                                           in AString aPseudoElement,
 +                                           in AString aPropertyName);
  };
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -127,17 +127,18 @@ GetContainingBlockFor(nsIFrame* aFrame) 
+   if (!aFrame) {
+     return nsnull;
+   }
+   return nsHTMLReflowState::GetContainingBlockFor(aFrame);
+ }
+ 
+ nsComputedDOMStyle::nsComputedDOMStyle()
+   : mDocumentWeak(nsnull), mOuterFrame(nsnull),
+-    mInnerFrame(nsnull), mPresShell(nsnull), mAppUnitsPerInch(0)
++    mInnerFrame(nsnull), mPresShell(nsnull), mAppUnitsPerInch(0),
++    mExposeVisitedStyle(PR_FALSE)
+ {
+ }
+ 
+ 
+ nsComputedDOMStyle::~nsComputedDOMStyle()
+ {
+ }
+ 
+@@ -495,16 +496,29 @@ nsComputedDOMStyle::GetPropertyCSSValue(
+       nsComputedDOMStyle::GetStyleContextForContent(mContent,
+                                                     mPseudo,
+                                                     mPresShell);
+     NS_ENSURE_TRUE(mStyleContextHolder, NS_ERROR_OUT_OF_MEMORY);
+     NS_ASSERTION(mPseudo || !mStyleContextHolder->HasPseudoElementData(),
+                  "should not have pseudo-element data");
+   }
+ 
++  // mExposeVisitedStyle is set to true only by testing APIs that
++  // require UniversalXPConnect.
++  NS_ABORT_IF_FALSE(!mExposeVisitedStyle ||
++                    nsContentUtils::IsCallerTrustedForCapability(
++                                      "UniversalXPConnect"),
++                    "mExposeVisitedStyle set incorrectly");
++  if (mExposeVisitedStyle && mStyleContextHolder->RelevantLinkVisited()) {
++    nsStyleContext *styleIfVisited = mStyleContextHolder->StyleIfVisited();
++    if (styleIfVisited) {
++      mStyleContextHolder = styleIfVisited;
++    }
++  }
++
+   // Call our pointer-to-member-function.
+   nsresult rv = (this->*(propEntry->mGetter))(aReturn);
+ 
+   if (NS_FAILED(rv)) {
+     *aReturn = nsnull;
+   }
+ 
+   mOuterFrame = nsnull;
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -87,16 +87,22 @@ public:
+ 
+   static already_AddRefed<nsStyleContext>
+   GetStyleContextForContentNoFlush(nsIContent* aContent, nsIAtom* aPseudo,
+                                    nsIPresShell* aPresShell);
+ 
+   static nsIPresShell*
+   GetPresShellForContent(nsIContent* aContent);
+ 
++  // Helper for nsDOMWindowUtils::GetVisitedDependentComputedStyle
++  void SetExposeVisitedStyle(PRBool aExpose) {
++    NS_ASSERTION(aExpose != mExposeVisitedStyle, "should always be changing");
++    mExposeVisitedStyle = aExpose;
++  }
++
+ private:
+   void AssertFlushedPendingReflows() {
+     NS_ASSERTION(mFlushedPendingReflows,
+                  "property getter should have been marked layout-dependent");
+   }
+   
+ #define STYLE_STRUCT(name_, checkdata_cb_, ctor_args_)                  \
+   const nsStyle##name_ * GetStyle##name_() {                            \
+@@ -467,16 +473,18 @@ private:
+   /*
+    * While computing style data, the presshell we're working with.  Null
+    * otherwise.
+    */
+   nsIPresShell* mPresShell;
+ 
+   PRInt32 mAppUnitsPerInch; /* For unit conversions */
+ 
++  PRPackedBool mExposeVisitedStyle;
++
+ #ifdef DEBUG
+   PRBool mFlushedPendingReflows;
+ #endif
+ };
+ 
+ nsresult 
+ NS_NewComputedDOMStyle(nsIDOMElement *aElement, const nsAString &aPseudoElt,
+                        nsIPresShell *aPresShell,
