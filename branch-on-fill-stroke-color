@@ -1,0 +1,159 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Use the appropriate color based on visitedness for the color or fallback color parts of 'fill' and 'stroke'.  (Bug 147777)
+
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -663,18 +663,25 @@ nsStyleContext::GetVisitedDependentColor
+ 
+   nsStyleContext *visitedStyle = this->StyleIfVisited();
+   if (!visitedStyle) {
+     return colors[0];
+   }
+ 
+   colors[1] = ExtractColor(aProperty, visitedStyle);
+ 
++  return nsStyleContext::CombineVisitedColors(colors,
++                                              this->RelevantLinkVisited());
++}
++
++/* static */ nscolor
++nsStyleContext::CombineVisitedColors(nscolor *aColors, PRBool aLinkIsVisited)
++{
+   // NOTE: We want this code to have as little timing dependence as
+   // possible on whether this->RelevantLinkVisited() is true.
+   const ColorIndexSet &set =
+-    gVisitedIndices[this->RelevantLinkVisited() ? 1 : 0];
++    gVisitedIndices[aLinkIsVisited ? 1 : 0];
+ 
+-  nscolor colorColor = colors[set.colorIndex];
+-  nscolor alphaColor = colors[set.alphaIndex];
++  nscolor colorColor = aColors[set.colorIndex];
++  nscolor alphaColor = aColors[set.alphaIndex];
+   return NS_RGBA(NS_GET_R(colorColor), NS_GET_G(colorColor),
+                  NS_GET_B(colorColor), NS_GET_A(alphaColor));
+ }
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -244,16 +244,26 @@ public:
+    * aProperty must be a color-valued property that nsStyleAnimation
+    * knows how to extract.
+    *
+    * Note that if aProperty is eCSSProperty_border_*_color, this
+    * function handles -moz-use-text-color.
+    */
+   NS_HIDDEN_(nscolor) GetVisitedDependentColor(nsCSSProperty aProperty);
+ 
++  /**
++   * aColors should be a two element array of nscolor in which the first
++   * color is the unvisited color and the second is the visited color.
++   *
++   * Combine the R, G, and B components of whichever of aColors should
++   * be used based on aLinkIsVisited with the A component of aColors[0].
++   */
++  static nscolor CombineVisitedColors(nscolor *aColors,
++                                      PRBool aLinkIsVisited);
++
+ #ifdef DEBUG
+   NS_HIDDEN_(void) List(FILE* out, PRInt32 aIndent);
+ #endif
+ 
+ protected:
+   NS_HIDDEN_(void) AddChild(nsStyleContext* aChild);
+   NS_HIDDEN_(void) RemoveChild(nsStyleContext* aChild);
+ 
+diff --git a/layout/svg/base/src/nsSVGGeometryFrame.cpp b/layout/svg/base/src/nsSVGGeometryFrame.cpp
+--- a/layout/svg/base/src/nsSVGGeometryFrame.cpp
++++ b/layout/svg/base/src/nsSVGGeometryFrame.cpp
+@@ -186,16 +186,40 @@ static void
+ SetupCairoColor(gfxContext *aContext, nscolor aRGB, float aOpacity)
+ {
+   aContext->SetColor(gfxRGBA(NS_GET_R(aRGB)/255.0,
+                              NS_GET_G(aRGB)/255.0,
+                              NS_GET_B(aRGB)/255.0,
+                              NS_GET_A(aRGB)/255.0 * aOpacity));
+ }
+ 
++static void
++SetupFallbackOrPaintColor(gfxContext *aContext, nsStyleContext *aStyleContext,
++                          nsStyleSVGPaint nsStyleSVG::*aFillOrStroke,
++                          float aOpacity)
++{
++  const nsStyleSVGPaint &paint = aStyleContext->GetStyleSVG()->*aFillOrStroke;
++  nsStyleContext *styleIfVisited = aStyleContext->StyleIfVisited();
++  PRBool isServer = paint.mType == eStyleSVGPaintType_Server;
++  nscolor color = isServer ? paint.mFallbackColor : paint.mPaint.mColor;
++  if (styleIfVisited) {
++    const nsStyleSVGPaint &paintIfVisited =
++      styleIfVisited->GetStyleSVG()->*aFillOrStroke;
++    if (paintIfVisited.mType == paint.mType) {
++      nscolor colorIfVisited = isServer ? paintIfVisited.mFallbackColor
++                                        : paintIfVisited.mPaint.mColor;
++      nscolor colors[2] = { color, colorIfVisited };
++      color = nsStyleContext::CombineVisitedColors(colors,
++                                         aStyleContext->RelevantLinkVisited());
++    }
++  }
++
++  SetupCairoColor(aContext, color, aOpacity);
++}
++
+ float
+ nsSVGGeometryFrame::MaybeOptimizeOpacity(float aFillOrStrokeOpacity)
+ {
+   float opacity = GetStyleDisplay()->mOpacity;
+   if (opacity < 1 && nsSVGUtils::CanOptimizeOpacity(this)) {
+     return aFillOrStrokeOpacity * opacity;
+   }
+   return aFillOrStrokeOpacity;
+@@ -218,24 +242,18 @@ nsSVGGeometryFrame::SetupCairoFill(gfxCo
+   nsSVGPaintServerFrame *ps =
+     GetPaintServer(&style->mFill, nsGkAtoms::fill);
+   if (ps && ps->SetupPaintServer(aContext, this, opacity))
+     return PR_TRUE;
+ 
+   // On failure, use the fallback colour in case we have an
+   // objectBoundingBox where the width or height of the object is zero.
+   // See http://www.w3.org/TR/SVG11/coords.html#ObjectBoundingBox
+-  if (style->mFill.mType == eStyleSVGPaintType_Server) {
+-    SetupCairoColor(aContext,
+-                    GetStyleSVG()->mFill.mFallbackColor,
+-                    opacity);
+-  } else
+-    SetupCairoColor(aContext,
+-                    GetStyleSVG()->mFill.mPaint.mColor,
+-                    opacity);
++  SetupFallbackOrPaintColor(aContext, GetStyleContext(),
++                            &nsStyleSVG::mFill, opacity);
+ 
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ nsSVGGeometryFrame::HasStroke()
+ {
+   const nsStyleSVG *style = GetStyleSVG();
+@@ -309,19 +327,13 @@ nsSVGGeometryFrame::SetupCairoStroke(gfx
+   nsSVGPaintServerFrame *ps =
+     GetPaintServer(&style->mStroke, nsGkAtoms::stroke);
+   if (ps && ps->SetupPaintServer(aContext, this, opacity))
+     return PR_TRUE;
+ 
+   // On failure, use the fallback colour in case we have an
+   // objectBoundingBox where the width or height of the object is zero.
+   // See http://www.w3.org/TR/SVG11/coords.html#ObjectBoundingBox
+-  if (style->mStroke.mType == eStyleSVGPaintType_Server) {
+-    SetupCairoColor(aContext,
+-                    GetStyleSVG()->mStroke.mFallbackColor,
+-                    opacity);
+-  } else
+-    SetupCairoColor(aContext,
+-                    GetStyleSVG()->mStroke.mPaint.mColor,
+-                    opacity);
++  SetupFallbackOrPaintColor(aContext, GetStyleContext(),
++                            &nsStyleSVG::mStroke, opacity);
+ 
+   return PR_TRUE;
+ }
