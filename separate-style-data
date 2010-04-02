@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add mechanism for separate style data for visited style.  (Bug 147777)
+Add mechanism for separate style data for visited style.  (Bug 147777)  r=bzbarsky
 
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
@@ -32,7 +32,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 --- a/layout/style/nsStyleContext.cpp
 +++ b/layout/style/nsStyleContext.cpp
-@@ -458,22 +458,78 @@ nsStyleContext::CalcStyleDifference(nsSt
+@@ -458,22 +458,75 @@ nsStyleContext::CalcStyleDifference(nsSt
  
    // The following structs cause (as their maximal difference) a
    // re-render to occur.  VISUAL Structs: Color, Background
@@ -43,54 +43,51 @@ diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
  
 +  nsStyleContext *thisVis = GetStyleIfVisited(),
 +                *otherVis = aOther->GetStyleIfVisited();
-+  if (thisVis) {
-+    if (otherVis) {
-+      PRBool change = PR_FALSE;
++  if (!thisVis != !otherVis) {
++    // One style context has a style-if-visited and the other doesn't.
++    // Presume a difference.
++    NS_UpdateHint(hint, NS_STYLE_HINT_VISUAL);
++  } else if (thisVis) {
++    // Both style contexts have a style-if-visited.
++    PRBool change = PR_FALSE;
 +
-+      // NB: Calling Peek on |this|, not |thisVis|.
-+      if (PeekStyleColor()) {
-+        if (thisVis->GetStyleColor()->mColor !=
-+            otherVis->GetStyleColor()->mColor) {
-+          change = PR_TRUE;
-+        }
++    // NB: Calling Peek on |this|, not |thisVis|, since callers may look
++    // at a struct on |this| without looking at the same struct on
++    // |thisVis| (including this function if we skip one of these checks
++    // due to change being true already), but not the other way around.
++    if (PeekStyleColor()) {
++      if (thisVis->GetStyleColor()->mColor !=
++          otherVis->GetStyleColor()->mColor) {
++        change = PR_TRUE;
 +      }
-+
-+      // NB: Calling Peek on |this|, not |thisVis|.
-+      if (PeekStyleBackground()) {
-+        if (thisVis->GetStyleBackground()->mBackgroundColor !=
-+            otherVis->GetStyleBackground()->mBackgroundColor) {
-+          change = PR_TRUE;
-+        }
-+      }
-+
-+      // NB: Calling Peek on |this|, not |thisVis|.
-+      if (PeekStyleBorder()) {
-+        const nsStyleBorder *thisVisBorder = thisVis->GetStyleBorder();
-+        const nsStyleBorder *otherVisBorder = otherVis->GetStyleBorder();
-+        NS_FOR_CSS_SIDES(side) {
-+          PRBool thisFG, otherFG;
-+          nscolor thisColor, otherColor;
-+          thisVisBorder->GetBorderColor(side, thisColor, thisFG);
-+          otherVisBorder->GetBorderColor(side, otherColor, otherFG);
-+          if (thisFG != otherFG || (!thisFG && thisColor != otherColor)) {
-+            change = PR_TRUE;
-+          }
-+        }
-+      }
-+
-+      if (change) {
-+        NS_UpdateHint(hint, NS_STYLE_HINT_VISUAL);
-+      }
-+
-+    } else {
-+      // Presume a difference.
-+      NS_UpdateHint(hint, NS_STYLE_HINT_VISUAL);
 +    }
-+  } else {
-+    if (otherVis) {
-+      // Presume a difference.
++
++    // NB: Calling Peek on |this|, not |thisVis| (see above).
++    if (!change && PeekStyleBackground()) {
++      if (thisVis->GetStyleBackground()->mBackgroundColor !=
++          otherVis->GetStyleBackground()->mBackgroundColor) {
++        change = PR_TRUE;
++      }
++    }
++
++    // NB: Calling Peek on |this|, not |thisVis| (see above).
++    if (!change && PeekStyleBorder()) {
++      const nsStyleBorder *thisVisBorder = thisVis->GetStyleBorder();
++      const nsStyleBorder *otherVisBorder = otherVis->GetStyleBorder();
++      NS_FOR_CSS_SIDES(side) {
++        PRBool thisFG, otherFG;
++        nscolor thisColor, otherColor;
++        thisVisBorder->GetBorderColor(side, thisColor, thisFG);
++        otherVisBorder->GetBorderColor(side, otherColor, otherFG);
++        if (thisFG != otherFG || (!thisFG && thisColor != otherColor)) {
++          change = PR_TRUE;
++          break;
++        }
++      }
++    }
++
++    if (change) {
 +      NS_UpdateHint(hint, NS_STYLE_HINT_VISUAL);
-+    } else {
 +    }
 +  }
 +
@@ -114,7 +111,7 @@ diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
 --- a/layout/style/nsStyleContext.h
 +++ b/layout/style/nsStyleContext.h
-@@ -125,16 +125,47 @@ public:
+@@ -125,16 +125,58 @@ public:
  
    // Does this style context represent the style for a pseudo-element or
    // inherit data from such a style context?  Whether this returns true
@@ -132,6 +129,17 @@ diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
 +  // Return the style context whose style data should be used for the R,
 +  // G, and B components of color, background-color, and border-*-color
 +  // if RelevantLinkIsVisited().
++  //
++  // GetPseudo() and GetPseudoType() on this style context return the
++  // same as on |this|, and its depth in the tree (number of GetParent()
++  // calls until null is returned) is the same as |this|, since its
++  // parent is either |this|'s parent or |this|'s parent's
++  // style-if-visited.
++  //
++  // Structs on this context should never be examined without also
++  // examining the corresponding struct on |this|.  Doing so will likely
++  // both (1) lead to a privacy leak and (2) lead to dynamic change bugs
++  // related to the Peek code in nsStyleContext::CalcStyleDifference.
 +  nsStyleContext* GetStyleIfVisited()
 +    { return mStyleIfVisited; }
 +
@@ -162,7 +170,7 @@ diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
      void SetStyle##name_ (nsStyle##name_ * aStruct) {                       \
        NS_ASSERTION(!mCachedInheritedData.m##name_##Data ||                  \
                     (mBits &                                                 \
-@@ -238,29 +269,34 @@ protected:
+@@ -238,29 +280,34 @@ protected:
          return cachedData;                                              \
        /* Have the rulenode deal */                                      \
        return mRuleNode->GetStyle##name_(this, aComputeData);            \
