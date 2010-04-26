@@ -1,0 +1,140 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add nsStyleContext::Alloc for allocations scoped to the lifetime of the style context.  (Bug 363249)
+
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -118,16 +118,18 @@ nsStyleContext::~nsStyleContext()
+     mParent->Release();
+   }
+ 
+   // Free up our data structs.
+   mCachedInheritedData.DestroyStructs(mBits, presContext);
+   if (mCachedResetData) {
+     mCachedResetData->Destroy(mBits, presContext);
+   }
++
++  FreeAllocations(presContext);
+ }
+ 
+ void nsStyleContext::AddChild(nsStyleContext* aChild)
+ {
+   NS_ASSERTION(aChild->mPrevSibling == aChild &&
+                aChild->mNextSibling == aChild,
+                "child already in a child list");
+ 
+@@ -766,8 +768,37 @@ nsStyleContext::CombineVisitedColors(nsc
+   const ColorIndexSet &set =
+     gVisitedIndices[aLinkIsVisited ? 1 : 0];
+ 
+   nscolor colorColor = aColors[set.colorIndex];
+   nscolor alphaColor = aColors[set.alphaIndex];
+   return NS_RGBA(NS_GET_R(colorColor), NS_GET_G(colorColor),
+                  NS_GET_B(colorColor), NS_GET_A(alphaColor));
+ }
++
++void*
++nsStyleContext::Alloc(size_t aSize)
++{
++  nsIPresShell *shell = PresContext()->PresShell();
++
++  aSize +=
++    sizeof(AllocationHeader) - offsetof(AllocationHeader, mStorageStart);
++  AllocationHeader *alloc =
++    static_cast<AllocationHeader*>(shell->AllocateMisc(aSize));
++
++  alloc->mSize = aSize; // NOTE: inflated by header
++
++  alloc->mNext = mAllocations;
++  mAllocations = alloc;
++
++  return static_cast<void*>(&alloc->mStorageStart);
++}
++
++void
++nsStyleContext::FreeAllocations(nsPresContext *aPresContext)
++{
++  nsIPresShell *shell = aPresContext->PresShell();
++
++  for (AllocationHeader *alloc = mAllocations, *next; alloc; alloc = next) {
++    next = alloc->mNext;
++    shell->FreeMisc(alloc->mSize, alloc);
++  }
++}
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -290,26 +290,46 @@ public:
+    * color is the unvisited color and the second is the visited color.
+    *
+    * Combine the R, G, and B components of whichever of aColors should
+    * be used based on aLinkIsVisited with the A component of aColors[0].
+    */
+   static nscolor CombineVisitedColors(nscolor *aColors,
+                                       PRBool aLinkIsVisited);
+ 
++  /**
++   * Allocate a chunk of memory that is scoped to the lifetime of this
++   * style context, i.e., memory that will automatically be freed when
++   * this style context is destroyed.  This is intended for allocations
++   * that are stored on this style context or its style structs.  (Use
++   * on style structs is fine since any style context to which this
++   * contexts style structs are shared will be a descendant of this
++   * style context and thus keep it alive.)
++   *
++   * This currently allocates the memory out of the pres shell arena.
++   *
++   * It would be relatively straightforward to write a Free method
++   * for the underlying implementation, but we don't need it (or the
++   * overhead of making a doubly-linked list or other structure to
++   * support it).
++   */
++  void* Alloc(size_t aSize);
++
+ #ifdef DEBUG
+   void List(FILE* out, PRInt32 aIndent);
+ #endif
+ 
+ protected:
+   void AddChild(nsStyleContext* aChild);
+   void RemoveChild(nsStyleContext* aChild);
+ 
+   void ApplyStyleFixups(nsPresContext* aPresContext);
+ 
++  void FreeAllocations(nsPresContext* aPresContext);
++
+   // Helper function that GetStyleData and GetUniqueStyleData use.  Only
+   // returns the structs we cache ourselves; never consults the ruletree.
+   inline const void* GetCachedStyleData(nsStyleStructID aSID);
+ 
+   // Helper functions for GetStyle* and PeekStyle*
+   #define STYLE_STRUCT_INHERITED(name_, checkdata_cb_, ctor_args_)      \
+     const nsStyle##name_ * DoGetStyle##name_(PRBool aComputeData) {     \
+       const nsStyle##name_ * cachedData =                               \
+@@ -357,16 +377,25 @@ protected:
+   // The rule node is the node in the lexicographic tree of rule nodes
+   // (the "rule tree") that indicates which style rules are used to
+   // compute the style data, and in what cascading order.  The least
+   // specific rule matched is the one whose rule node is a child of the
+   // root of the rule tree, and the most specific rule matched is the
+   // |mRule| member of |mRuleNode|.
+   nsRuleNode* const       mRuleNode;
+ 
++  // Private to nsStyleContext::Alloc and FreeAllocations.
++  struct AllocationHeader {
++    AllocationHeader* mNext;
++    size_t mSize;
++
++    void* mStorageStart; // ensure the storage is at least pointer-aligned
++  };
++  AllocationHeader*       mAllocations;
++
+   // mCachedInheritedData and mCachedResetData point to both structs that
+   // are owned by this style context and structs that are owned by one of
+   // this style context's ancestors (which are indirectly owned since this
+   // style context owns a reference to its parent).  If the bit in |mBits|
+   // is set for a struct, that means that the pointer for that struct is
+   // owned by an ancestor or by mRuleNode rather than by this style context.
+   // Since style contexts typically have some inherited data but only sometimes
+   // have reset data, we always allocate the mCachedInheritedData, but only
