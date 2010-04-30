@@ -1,0 +1,183 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add nsStyleCoord::Array type.  (Bug 363249)
+
+diff --git a/layout/style/nsStyleCoord.cpp b/layout/style/nsStyleCoord.cpp
+--- a/layout/style/nsStyleCoord.cpp
++++ b/layout/style/nsStyleCoord.cpp
+@@ -37,16 +37,17 @@
+ 
+ /* representation of length values in computed style data */
+ 
+ #include "nsStyleCoord.h"
+ #include "nsString.h"
+ #include "nsCRT.h"
+ #include "prlog.h"
+ #include "nsMathUtils.h"
++#include "nsStyleContext.h"
+ 
+ nsStyleCoord::nsStyleCoord(nsStyleUnit aUnit)
+   : mUnit(aUnit)
+ {
+   NS_ASSERTION(aUnit < eStyleUnit_Percent, "not a valueless unit");
+   if (aUnit >= eStyleUnit_Percent) {
+     mUnit = eStyleUnit_Null;
+   }
+@@ -188,16 +189,48 @@ nsStyleCoord::GetAngleValueInRadians() c
+   case eStyleUnit_Grad:   return angle * M_PI / 200.0;
+ 
+   default:
+     NS_NOTREACHED("unrecognized angular unit");
+     return 0.0;
+   }
+ }
+ 
++inline void*
++nsStyleCoord::Array::operator new(size_t aSelfSize,
++                                  nsStyleContext *aAllocationContext,
++                                  size_t aItemCount) CPP_THROW_NEW
++{
++  NS_ABORT_IF_FALSE(aItemCount > 0, "cannot have 0 item count");
++  return aAllocationContext->Alloc(
++           aSelfSize + sizeof(nsStyleCoord) * (aItemCount - 1));
++}
++
++/* static */ nsStyleCoord::Array*
++nsStyleCoord::Array::Create(nsStyleContext *aAllocationContext, size_t aCount)
++{
++  return new(aAllocationContext, aCount) Array(aCount);
++}
++
++bool
++nsStyleCoord::Array::operator==(const Array& aOther) const
++{
++  if (Count() != aOther.Count()) {
++    return false;
++  }
++
++  for (size_t i = 0; i < mCount; ++i) {
++    if ((*this)[i] != aOther[i]) {
++      return false;
++    }
++  }
++
++  return true;
++}
++
+ // used by nsStyleSides and nsStyleCorners
+ #define COMPARE_INDEXED_COORD(i)                                              \
+   PR_BEGIN_MACRO                                                              \
+   if (mUnits[i] != aOther.mUnits[i])                                          \
+     return PR_FALSE;                                                          \
+   if ((eStyleUnit_Percent <= mUnits[i]) &&                                    \
+       (mUnits[i] < eStyleUnit_Coord)) {                                       \
+     if (mValues[i].mFloat != aOther.mValues[i].mFloat)                        \
+diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
+--- a/layout/style/nsStyleCoord.h
++++ b/layout/style/nsStyleCoord.h
+@@ -40,16 +40,17 @@
+ #ifndef nsStyleCoord_h___
+ #define nsStyleCoord_h___
+ 
+ #include "nscore.h"
+ #include "nsCoord.h"
+ #include "nsCRT.h"
+ #include "nsStyleConsts.h"
+ class nsString;
++class nsStyleContext;
+ 
+ enum nsStyleUnit {
+   eStyleUnit_Null         = 0,      // (no value) value is not specified
+   eStyleUnit_Normal       = 1,      // (no value)
+   eStyleUnit_Auto         = 2,      // (no value)
+   eStyleUnit_None         = 3,      // (no value)
+   eStyleUnit_Percent      = 10,     // (float) 1.0 == 100%
+   eStyleUnit_Factor       = 11,     // (float) a multiplier
+@@ -71,16 +72,19 @@ typedef union {
+  * system.  The size specification consists of two parts -- a number
+  * and a unit.  The number is an integer, a floating point value, an
+  * nscoord, or undefined, and the unit is an nsStyleUnit.  Checking
+  * the unit is a must before asking for the value in any particular
+  * form.
+  */
+ class nsStyleCoord {
+ public:
++  struct Array;
++  friend struct Array;
++
+   nsStyleCoord(nsStyleUnit aUnit = eStyleUnit_Null);
+   enum CoordConstructorType { CoordConstructor };
+   inline nsStyleCoord(nscoord aValue, CoordConstructorType);
+   nsStyleCoord(PRInt32 aValue, nsStyleUnit aUnit);
+   nsStyleCoord(float aValue, nsStyleUnit aUnit);
+   inline nsStyleCoord(const nsStyleCoord& aCopy);
+   inline nsStyleCoord(const nsStyleUnion& aValue, nsStyleUnit aUnit);
+ 
+@@ -110,21 +114,66 @@ public:
+   void  SetIntValue(PRInt32 aValue, nsStyleUnit aUnit);
+   void  SetPercentValue(float aValue);
+   void  SetFactorValue(float aValue);
+   void  SetAngleValue(float aValue, nsStyleUnit aUnit);
+   void  SetNormalValue();
+   void  SetAutoValue();
+   void  SetNoneValue();
+ 
+-public:
++private:
+   nsStyleUnit   mUnit;
+   nsStyleUnion  mValue;
+ };
+ 
++// A fixed-size array, that, like everything else in nsStyleCoord,
++// doesn't require that its destructors be called.
++struct nsStyleCoord::Array {
++  static Array* Create(nsStyleContext *aAllocationContext, size_t aCount);
++
++  size_t Count() const { return mCount; }
++
++  nsStyleCoord& operator[](size_t aIndex) {
++    NS_ABORT_IF_FALSE(aIndex < mCount, "out of range");
++    return mArray[aIndex];
++  }
++
++  const nsStyleCoord& operator[](size_t aIndex) const {
++    NS_ABORT_IF_FALSE(aIndex < mCount, "out of range");
++    return mArray[aIndex];
++  }
++
++  bool operator==(const Array& aOther) const;
++
++  bool operator!=(const Array& aOther) const {
++    return !(*this == aOther);
++  }
++
++private:
++  inline void* operator new(size_t aSelfSize,
++                            nsStyleContext *aAllocationContext,
++                            size_t aItemCount) CPP_THROW_NEW;
++
++  Array(size_t aCount)
++    : mCount(aCount)
++  {
++    // Initialize all entries not in the class.
++    for (size_t i = 1; i < aCount; ++i) {
++      new (mArray + i) nsStyleCoord();
++    }
++  }
++
++  size_t mCount;
++  nsStyleCoord mArray[1]; // for alignment, have the first element in the class
++
++  // not to be implemented
++  Array(const Array& aOther);
++  Array& operator=(const Array& aOther);
++  ~Array();
++};
+ 
+ /**
+  * Class that represents a set of top/right/bottom/left nsStyleCoords.
+  * This is commonly used to hold the widths of the borders, margins,
+  * or paddings of a box.
+  */
+ class nsStyleSides {
+ public:
