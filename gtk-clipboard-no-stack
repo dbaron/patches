@@ -1,0 +1,168 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Don't use stack-allocated structures for things that might outlive the function.  (Bug 353547)
+
+diff --git a/widget/src/gtk2/nsClipboard.cpp b/widget/src/gtk2/nsClipboard.cpp
+--- a/widget/src/gtk2/nsClipboard.cpp
++++ b/widget/src/gtk2/nsClipboard.cpp
+@@ -97,23 +97,28 @@ wait_for_contents          (GtkClipboard
+ static gchar *
+ wait_for_text              (GtkClipboard *clipboard);
+ 
+ static Bool
+ checkEventProc(Display *display, XEvent *event, XPointer arg);
+ 
+ struct retrieval_context
+ {
+-    PRBool   completed;
++    PRPackedBool completed;
++    PRPackedBool timed_out;
+     void    *data;
+ 
+-    retrieval_context() : completed(PR_FALSE), data(nsnull) { }
++    retrieval_context()
++      : completed(PR_FALSE),
++        timed_out(PR_FALSE),
++        data(nsnull)
++    { }
+ };
+ 
+-static void
++static PRBool
+ wait_for_retrieval(GtkClipboard *clipboard, retrieval_context *transferData);
+ 
+ static void
+ clipboard_contents_received(GtkClipboard     *clipboard,
+                             GtkSelectionData *selection_data,
+                             gpointer          data);
+ 
+ static void
+@@ -887,21 +892,21 @@ checkEventProc(Display *display, XEvent 
+     }
+ 
+     return False;
+ }
+ 
+ // Idle timeout for receiving selection and property notify events (microsec)
+ static const int kClipboardTimeout = 500000;
+ 
+-static void
++static PRBool
+ wait_for_retrieval(GtkClipboard *clipboard, retrieval_context *r_context)
+ {
+     if (r_context->completed)  // the request completed synchronously
+-        return;
++        return PR_TRUE;
+ 
+     Display *xDisplay = GDK_DISPLAY();
+     checkEventContext context;
+     context.cbWidget = NULL;
+     context.selAtom = gdk_x11_atom_to_xatom(gdk_atom_intern("GDK_SELECTION",
+                                                             FALSE));
+ 
+     // Send X events which are relevant to the ongoing selection retrieval
+@@ -930,69 +935,95 @@ wait_for_retrieval(GtkClipboard *clipboa
+                              (XPointer) &context)) {
+ 
+             if (xevent.xany.type == SelectionNotify)
+                 DispatchSelectionNotifyEvent(context.cbWidget, &xevent);
+             else
+                 DispatchPropertyNotifyEvent(context.cbWidget, &xevent);
+ 
+             if (r_context->completed)
+-                return;
++                return PR_TRUE;
+         }
+ 
+ #ifdef POLL_WITH_XCONNECTIONNUMBER
+         select_result = poll(fds, 1, kClipboardTimeout / 1000);
+ #else
+         tv.tv_sec = 0;
+         tv.tv_usec = kClipboardTimeout;
+         select_result = select(cnumber, &select_set, NULL, NULL, &tv);
+ #endif
+     } while (select_result == 1);
+ 
+ #ifdef DEBUG_CLIPBOARD
+     printf("exceeded clipboard timeout\n");
+ #endif
++    r_context->timed_out = PR_TRUE;
++    return PR_FALSE;
+ }
+ 
+ static void
+ clipboard_contents_received(GtkClipboard     *clipboard,
+                             GtkSelectionData *selection_data,
+                             gpointer          data)
+ {
+     retrieval_context *context = static_cast<retrieval_context *>(data);
++    if (context->timed_out) {
++        delete context;
++        return;
++    }
++
+     context->completed = PR_TRUE;
+ 
+     if (selection_data->length >= 0)
+         context->data = gtk_selection_data_copy(selection_data);
+ }
+ 
+ 
+ static GtkSelectionData *
+ wait_for_contents(GtkClipboard *clipboard, GdkAtom target)
+ {
+-    retrieval_context context;
++    retrieval_context *context = new retrieval_context();
+     gtk_clipboard_request_contents(clipboard, target,
+                                    clipboard_contents_received,
+-                                   &context);
++                                   context);
+ 
+-    wait_for_retrieval(clipboard, &context);
+-    return static_cast<GtkSelectionData *>(context.data);
++    if (!wait_for_retrieval(clipboard, context)) {
++        // Don't delete |context|; the callback will when it eventually
++        // comes back.
++        return nsnull;
++    }
++
++    GtkSelectionData *result = static_cast<GtkSelectionData *>(context->data);
++    delete context;
++    return result;
+ }
+ 
+ static void
+ clipboard_text_received(GtkClipboard *clipboard,
+                         const gchar  *text,
+                         gpointer      data)
+ {
+     retrieval_context *context = static_cast<retrieval_context *>(data);
++    if (context->timed_out) {
++        delete context;
++        return;
++    }
++
+     context->completed = PR_TRUE;
+     context->data = g_strdup(text);
+ }
+ 
+ static gchar *
+ wait_for_text(GtkClipboard *clipboard)
+ {
+-    retrieval_context context;
+-    gtk_clipboard_request_text(clipboard, clipboard_text_received, &context);
++    retrieval_context *context = new retrieval_context();
++    gtk_clipboard_request_text(clipboard, clipboard_text_received, context);
+ 
+-    wait_for_retrieval(clipboard, &context);
+-    return static_cast<gchar *>(context.data);
++    if (!wait_for_retrieval(clipboard, context)) {
++        // Don't delete |context|; the callback will when it eventually
++        // comes back.
++        return nsnull;
++    }
++
++    gchar *result = static_cast<gchar *>(context->data);
++    delete context;
++    return result;
+ }
