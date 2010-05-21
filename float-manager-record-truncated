@@ -1,0 +1,158 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Allow the float manager to record that a float has been pushed past a break.  (Bug 563584)
+
+diff --git a/layout/generic/nsFloatManager.cpp b/layout/generic/nsFloatManager.cpp
+--- a/layout/generic/nsFloatManager.cpp
++++ b/layout/generic/nsFloatManager.cpp
+@@ -67,17 +67,18 @@ PSArenaFreeCB(size_t aSize, void* aPtr, 
+   static_cast<nsIPresShell*>(aClosure)->FreeMisc(aSize, aPtr);
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ // nsFloatManager
+ 
+ nsFloatManager::nsFloatManager(nsIPresShell* aPresShell)
+   : mX(0), mY(0),
+-    mFloatDamage(PSArenaAllocCB, PSArenaFreeCB, aPresShell)
++    mFloatDamage(PSArenaAllocCB, PSArenaFreeCB, aPresShell),
++    mPushedFloatPastBreak(PR_TRUE)
+ {
+   MOZ_COUNT_CTOR(nsFloatManager);
+ }
+ 
+ nsFloatManager::~nsFloatManager()
+ {
+   MOZ_COUNT_DTOR(nsFloatManager);
+ }
+@@ -410,35 +411,40 @@ nsFloatManager::PushState(SavedState* aS
+   // since that could lead to bugs where damage is missed/dropped when
+   // we move from position A to B (during the intermediate incremental
+   // reflow mentioned above) and then from B to C during the subsequent
+   // reflow. In the typical case A and C will be the same, but not always.
+   // Allowing mFloatDamage to accumulate the damage incurred during both
+   // reflows ensures that nothing gets missed.
+   aState->mX = mX;
+   aState->mY = mY;
++  aState->mPushedFloatPastBreak = mPushedFloatPastBreak;
+   aState->mFloatInfoCount = mFloats.Length();
+ }
+ 
+ void
+ nsFloatManager::PopState(SavedState* aState)
+ {
+   NS_PRECONDITION(aState, "No state to restore?");
+ 
+   mX = aState->mX;
+   mY = aState->mY;
++  mPushedFloatPastBreak = aState->mPushedFloatPastBreak;
+ 
+   NS_ASSERTION(aState->mFloatInfoCount <= mFloats.Length(),
+                "somebody misused PushState/PopState");
+   mFloats.TruncateLength(aState->mFloatInfoCount);
+ }
+ 
+ nscoord
+ nsFloatManager::GetLowestFloatTop() const
+ {
++  if (mPushedFloatPastBreak) {
++    return nscoord_MAX;
++  }
+   if (!HasAnyFloats()) {
+     return nscoord_MIN;
+   }
+   return mFloats[mFloats.Length() - 1].mRect.y - mY;
+ }
+ 
+ #ifdef DEBUG
+ void
+diff --git a/layout/generic/nsFloatManager.h b/layout/generic/nsFloatManager.h
+--- a/layout/generic/nsFloatManager.h
++++ b/layout/generic/nsFloatManager.h
+@@ -106,16 +106,17 @@ public:
+   // Structure that stores the current state of a frame manager for
+   // Save/Restore purposes.
+   struct SavedState;
+   friend struct SavedState;
+   struct SavedState {
+   private:
+     PRUint32 mFloatInfoCount;
+     nscoord mX, mY;
++    PRBool mPushedFloatPastBreak;
+     
+     friend class nsFloatManager;
+   };
+ 
+   /**
+    * Translate the current origin by the specified (dx, dy). This
+    * creates a new local coordinate space relative to the current
+    * coordinate space.
+@@ -177,16 +178,27 @@ public:
+    * must be even with or below the top of all previous floats.
+    *
+    * aMarginRect is relative to the current translation.  The caller
+    * must ensure aMarginRect.height >= 0 and aMarginRect.width >= 0.
+    */
+   nsresult AddFloat(nsIFrame* aFloatFrame, const nsRect& aMarginRect);
+ 
+   /**
++   * Notify that we tried to place a float that could not fit at all and
++   * had to be pushed to the next page/column?  (If so, we can't place
++   * any more floats in this page/column because of the rule that the
++   * top of a float cannot be above the top of an earlier float.)
++   */
++  void PushedFloatPastBreak()
++  {
++    mPushedFloatPastBreak = PR_TRUE;
++  }
++
++  /**
+    * Remove the regions associated with this floating frame and its
+    * next-sibling list.  Some of the frames may never have been added;
+    * we just skip those. This is not fully general; it only works as
+    * long as the N frames to be removed are the last N frames to have
+    * been added; if there's a frame in the middle of them that should
+    * not be removed, YOU LOSE.
+    */
+   nsresult RemoveTrailingRegions(nsIFrame* aFrameList);
+@@ -254,16 +266,17 @@ public:
+    * Checks if clear would pass into the floats' BFC's next-in-flow,
+    * i.e. whether floats affecting this clear have continuations.
+    */
+   PRBool ClearContinues(PRUint8 aBreakType) const;
+ 
+   void AssertStateMatches(SavedState *aState) const
+   {
+     NS_ASSERTION(aState->mX == mX && aState->mY == mY &&
++                 aState->mPushedFloatPastBreak == mPushedFloatPastBreak &&
+                  aState->mFloatInfoCount == mFloats.Length(),
+                  "float manager state should match saved state");
+   }
+ 
+ #ifdef DEBUG
+   /**
+    * Dump the state of the float manager out to a file.
+    */
+@@ -284,16 +297,22 @@ private:
+     ~FloatInfo();
+ #endif
+   };
+ 
+   nscoord         mX, mY;     // translation from local to global coordinate space
+   nsTArray<FloatInfo> mFloats;
+   nsIntervalSet   mFloatDamage;
+ 
++  // Did we try to place a float that could not fit at all and had to be
++  // pushed to the next page/column?  (If so, we can't place any more
++  // floats in this page/column because of the rule that the top of a
++  // float cannot be above the top of an earlier float.)
++  PRBool mPushedFloatPastBreak;
++
+   static PRInt32 sCachedFloatManagerCount;
+   static void* sCachedFloatManagers[NS_FLOAT_MANAGER_CACHE_SIZE];
+ 
+   nsFloatManager(const nsFloatManager&);  // no implementation
+   void operator=(const nsFloatManager&);  // no implementation
+ };
+ 
+ /**
