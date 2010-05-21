@@ -5,7 +5,48 @@ Replace force-fit with setting mIsTopOfPage correctly.  (Bug 563584)
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -5665,17 +5665,29 @@ nsBlockFrame::ReflowFloat(nsBlockReflowS
+@@ -5594,22 +5594,16 @@ nsBlockFrame::AdjustFloatAvailableSpace(
+     availWidth = aState.mContentArea.width;
+   }
+   else {
+     // This quirk matches the one in nsBlockReflowState::FlowAndPlaceFloat
+     // give tables only the available space
+     // if they can shrink we may not be constrained to place
+     // them in the next line
+     availWidth = aFloatAvailableSpace.width;
+-    // round down to twips per pixel so that we fit
+-    // needed when prev. float has procentage width
+-    // (maybe is a table flaw that makes table chose to round up
+-    // but I don't want to change that, too risky)
+-    nscoord twp = nsPresContext::CSSPixelsToAppUnits(1);
+-    availWidth -=  availWidth % twp;
+   }
+ 
+   // aState.mY is relative to the border-top, make it relative to the content-top
+   nscoord contentYOffset = aState.mY - aState.BorderPadding().top;
+   nscoord availHeight = NS_UNCONSTRAINEDSIZE == aState.mContentArea.height
+                         ? NS_UNCONSTRAINEDSIZE
+                         : NS_MAX(0, aState.mContentArea.height - contentYOffset);
+ 
+@@ -5646,16 +5640,17 @@ nsBlockFrame::ComputeFloatWidth(nsBlockR
+     floatRS.mComputedMargin.LeftRight();
+ }
+ 
+ nsresult
+ nsBlockFrame::ReflowFloat(nsBlockReflowState& aState,
+                           const nsRect&       aAdjustedAvailableSpace,
+                           nsIFrame*           aFloat,
+                           nsMargin&           aFloatMargin,
++                          PRBool              aFloatPushedDown,
+                           nsReflowStatus&     aReflowStatus)
+ {
+   NS_PRECONDITION(aFloat->GetStateBits() & NS_FRAME_OUT_OF_FLOW,
+                   "aFloat must be an out-of-flow frame");
+   // Reflow the float.
+   aReflowStatus = NS_FRAME_COMPLETE;
+ 
+ #ifdef NOISY_FLOAT
+@@ -5665,17 +5660,27 @@ nsBlockFrame::ReflowFloat(nsBlockReflowS
            aFloatAvailableSpace.width, aFloatAvailableSpace.height
    );
  #endif
@@ -17,14 +58,12 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 -  // Setup a block reflow state to reflow the float.
 +  // Normally the mIsTopOfPage state is copied from the parent reflow
 +  // state.  However, when reflowing a float, if we've placed other
-+  // floats that force this float *down*, we should unset the
-+  // mIsTopOfPage state.
-+  if (floatRS.mIsTopOfPage) {
-+    if ()
-+
-+    // AdjustFloatAvailableSpace adjusted the width, so we should not
-+    // consider the float top-of-page.
-+    availSpace.width != aState.mContentArea.width
++  // floats that force this float *down* or *narrower*, we should unset
++  // the mIsTopOfPage state.
++  if (floatRS.mIsTopOfPage &&
++      (aFloatPushedDown ||
++       aAdjustedAvailableSpace.width != aState.mContentArea.width)) {
++    aFloatRS.mIsTopOfPage = PR_FALSE;
 +  }
 +
 +  // Setup a block reflow context to reflow the float.
@@ -39,8 +78,27 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
 --- a/layout/generic/nsBlockReflowState.cpp
 +++ b/layout/generic/nsBlockReflowState.cpp
-@@ -787,16 +787,18 @@ nsBlockReflowState::FlowAndPlaceFloat(ns
-     // means the margin edge of the float can't be higher than the
+@@ -700,16 +700,19 @@ nsBlockReflowState::FlowAndPlaceFloat(ns
+       return PR_FALSE;
+     }
+ 
+     // Nope. try to advance to the next band.
+     if (NS_STYLE_DISPLAY_TABLE != floatDisplay->mDisplay ||
+           eCompatibility_NavQuirks != mPresContext->CompatibilityMode() ) {
+ 
+       mY += floatAvailableSpace.mRect.height;
++      if (adjustedAvailableSpace.height != NS_UNCONSTRAINEDSIZE) {
++        adjustedAvailableSpace.height -= floatAvailableSpace.mRect.height;
++      }
+       floatAvailableSpace = GetFloatAvailableSpace(mY);
+     } else {
+       // This quirk matches the one in nsBlockFrame::AdjustFloatAvailableSpace
+       // IE handles float tables in a very special way
+ 
+       // see if the previous float is also a table and has "align"
+       nsFloatCache* fc = mCurrentLineFloats.Head();
+       nsIFrame* prevFrame = nsnull;
+@@ -788,17 +791,17 @@ nsBlockReflowState::FlowAndPlaceFloat(ns
      // content edge of the block that contains it.)
      floatY = 0;
    }
@@ -48,16 +106,17 @@ diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflo
    // Reflow the float after computing its vertical position so it knows
    // where to break.
    nsMargin floatMargin; // computed margin
-+  // FIXME: Need to pass whether float has been pushed down to ReflowFloat
-+  // ... this means we need to ComputeSize in the loop below and reflow after!
    mBlock->ReflowFloat(*this, adjustedAvailableSpace, aFloat,
-                       floatMargin, aReflowStatus);
+-                      floatMargin, aReflowStatus);
++                      floatMargin, mY != saveY, aReflowStatus);
    if (aFloat->GetPrevInFlow())
      floatMargin.top = 0;
    if (NS_FRAME_IS_NOT_COMPLETE(aReflowStatus))
      floatMargin.bottom = 0;
  
    // Calculate the actual origin of the float frame's border rect
+   // relative to the parent block; floatX/Y must be converted from space-manager
+   // coordinates to parent coordinates, and the margin must be added in
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
