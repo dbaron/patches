@@ -1,0 +1,177 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement the HTML5 algorithm for backwards-compatible color parsing.  (Bug 121738, bug 227072)
+
+diff --git a/content/base/src/nsAttrValue.cpp b/content/base/src/nsAttrValue.cpp
+--- a/content/base/src/nsAttrValue.cpp
++++ b/content/base/src/nsAttrValue.cpp
+@@ -1131,36 +1131,40 @@ nsAttrValue::ParseColor(const nsAString&
+     return PR_FALSE;
+   }
+ 
+   nscolor color;
+   // No color names begin with a '#'; in standards mode, all acceptable
+   // numeric colors do.
+   if (colorStr.First() == '#') {
+     colorStr.Cut(0, 1);
++    // FIXME: According to HTML5 we should only accept #rgb values
++    // here in the cases where we're following the "rules for parsing a
++    // legacy color value".  (Does that match the quirks mode check
++    // below?)
+     if (NS_HexToRGB(colorStr, &color)) {
+       SetColorValue(color, aString);
+       return PR_TRUE;
+     }
+   } else {
+     if (NS_ColorNameToRGB(colorStr, &color)) {
+       SetColorValue(color, aString);
+       return PR_TRUE;
+     }
+   }
+ 
+-  if (aDocument->GetCompatibilityMode() != eCompatibility_NavQuirks) {
+-    return PR_FALSE;
++  // In compatibility mode, try LooseHexToRGB as a fallback for either
++  // of the above two possibilities.
++  if (aDocument->GetCompatibilityMode() == eCompatibility_NavQuirks &&
++      NS_LooseHexToRGB(colorStr, &color)) {
++    SetColorValue(color, aString);
++    return PR_TRUE;
+   }
+ 
+-  // In compatibility mode, try LooseHexToRGB as a fallback for either
+-  // of the above two possibilities.
+-  NS_LooseHexToRGB(colorStr, &color);
+-  SetColorValue(color, aString);
+-  return PR_TRUE;
++  return PR_FALSE;
+ }
+ 
+ PRBool nsAttrValue::ParseFloatValue(const nsAString& aString)
+ {
+   ResetIfSet();
+ 
+   PRInt32 ec;
+   float val = PromiseFlatString(aString).ToFloat(&ec);
+diff --git a/gfx/src/nsColor.cpp b/gfx/src/nsColor.cpp
+--- a/gfx/src/nsColor.cpp
++++ b/gfx/src/nsColor.cpp
+@@ -95,18 +95,34 @@ void nsColorNames::ReleaseTable(void)
+     gColorTable = nsnull;
+   }
+ }
+ 
+ static int ComponentValue(const PRUnichar* aColorSpec, int aLen, int color, int dpc)
+ {
+   int component = 0;
+   int index = (color * dpc);
+-  if (2 < dpc) {
+-    dpc = 2;
++  // Skip any initial characters that make the digits per component over 8.
++  if (dpc > 8) {
++    index += dpc - 8;
++    dpc = 8;
++  }
++  // Skip any initial non-hex characters, and then use the next two.
++  while (dpc > 2) {
++    NS_ABORT_IF_FALSE(index < aLen, "should never be past length outside of "
++                                    "the last 2 characters");
++    PRUnichar ch = aColorSpec[index];
++    if (('0' <= ch && ch <= '9') ||
++        ('A' <= ch && ch <= 'F') ||
++        ('a' <= ch && ch <= 'f')) {
++      dpc = 2;
++      break;
++    }
++    --dpc;
++    ++index;
+   }
+   while (--dpc >= 0) {
+     PRUnichar ch = ((index < aLen) ? aColorSpec[index++] : '0');
+     if (('0' <= ch) && (ch <= '9')) {
+       component = (component * 16) + (ch - '0');
+     } else if ((('a' <= ch) && (ch <= 'f')) || 
+                (('A' <= ch) && (ch <= 'F'))) {
+       // "ch&7" handles lower and uppercase hex alphabetics
+@@ -150,59 +166,55 @@ NS_GFX_(PRBool) NS_HexToRGB(const nsStri
+       // single digit to compute the new value.
+       r = (r << 4) | r;
+       g = (g << 4) | g;
+       b = (b << 4) | b;
+     }
+     NS_ASSERTION((r >= 0) && (r <= 255), "bad r");
+     NS_ASSERTION((g >= 0) && (g <= 255), "bad g");
+     NS_ASSERTION((b >= 0) && (b <= 255), "bad b");
+-    if (nsnull != aResult) {
+-      *aResult = NS_RGB(r, g, b);
+-    }
++    *aResult = NS_RGB(r, g, b);
+     return PR_TRUE;
+   }
+ 
+   // Improperly formatted color value
+   return PR_FALSE;
+ }
+ 
+-// compatible with legacy Nav behavior
++// This implements part of the algorithm for legacy behavior described in
++// http://www.whatwg.org/specs/web-apps/current-work/complete/common-microsyntaxes.html#rules-for-parsing-a-legacy-color-value
+ NS_GFX_(PRBool) NS_LooseHexToRGB(const nsString& aColorSpec, nscolor* aResult)
+ {
++  if (aColorSpec.EqualsLiteral("transparent")) {
++    return PR_FALSE;
++  }
++
+   int nameLen = aColorSpec.Length();
+   const PRUnichar* colorSpec = aColorSpec.get();
+   if ('#' == colorSpec[0]) {
+     ++colorSpec;
+     --nameLen;
+   }
+ 
+-  if (3 < nameLen) {
+-    // Convert the ascii to binary
+-    int dpc = (nameLen / 3) + (((nameLen % 3) != 0) ? 1 : 0);
+-    if (4 < dpc) {
+-      dpc = 4;
+-    }
++  if (nameLen > 128) {
++    nameLen = 128;
++  }
+ 
+-    // Translate components from hex to binary
+-    int r = ComponentValue(colorSpec, nameLen, 0, dpc);
+-    int g = ComponentValue(colorSpec, nameLen, 1, dpc);
+-    int b = ComponentValue(colorSpec, nameLen, 2, dpc);
+-    NS_ASSERTION((r >= 0) && (r <= 255), "bad r");
+-    NS_ASSERTION((g >= 0) && (g <= 255), "bad g");
+-    NS_ASSERTION((b >= 0) && (b <= 255), "bad b");
+-    if (nsnull != aResult) {
+-      *aResult = NS_RGB(r, g, b);
+-    }
+-  }
+-  else {
+-    if (nsnull != aResult) {
+-      *aResult = NS_RGB(0, 0, 0);
+-    }
+-  }
++  // Convert the ascii to binary
++  int dpc = (nameLen + 2) / 3;
++
++  // Translate components from hex to binary
++  int r = ComponentValue(colorSpec, nameLen, 0, dpc);
++  int g = ComponentValue(colorSpec, nameLen, 1, dpc);
++  int b = ComponentValue(colorSpec, nameLen, 2, dpc);
++  NS_ASSERTION((r >= 0) && (r <= 255), "bad r");
++  NS_ASSERTION((g >= 0) && (g <= 255), "bad g");
++  NS_ASSERTION((b >= 0) && (b <= 255), "bad b");
++
++  *aResult = NS_RGB(r, g, b);
+   return PR_TRUE;
+ }
+ 
+ NS_GFX_(PRBool) NS_ColorNameToRGB(const nsAString& aColorName, nscolor* aResult)
+ {
+   if (!gColorTable) return PR_FALSE;
+ 
+   PRInt32 id = gColorTable->Lookup(aColorName);
