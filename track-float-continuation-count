@@ -1,0 +1,165 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Track which frames were float continuations that need to be pulled to the next block rather than figuring it out again when it's time to pull them.  (This allows first-in-flows to be float continuations.)  (Bug 563584)
+
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1009,18 +1009,23 @@ nsBlockFrame::Reflow(nsPresContext*     
+   rv = ReflowDirtyLines(state);
+   NS_ASSERTION(NS_SUCCEEDED(rv), "reflow dirty lines failed");
+   if (NS_FAILED(rv)) return rv;
+ 
+   NS_MergeReflowStatusInto(&state.mReflowStatus, ocStatus);
+   NS_MergeReflowStatusInto(&state.mReflowStatus, fcStatus);
+ 
+   // Put continued floats at the end of mFloats
+-  if (state.mFloatContinuations.NotEmpty())
++  if (state.mFloatContinuations.NotEmpty()) {
++    PRInt32 len = state.mFloatContinuations.GetLength();
+     mFloats.AppendFrames(nsnull, state.mFloatContinuations);
++    aPresContext->PropertyTable()->
++      Set(this, nsBlockFrame::FloatContinuationCountProperty(),
++          NS_INT32_TO_PTR(len));
++  }
+ 
+   // If we end in a BR with clear and affected floats continue,
+   // we need to continue, too.
+   if (NS_UNCONSTRAINEDSIZE != aReflowState.availableHeight &&
+       NS_FRAME_IS_COMPLETE(state.mReflowStatus) &&
+       state.mFloatManager->ClearContinues(FindTrailingClear())) {
+     NS_FRAME_SET_INCOMPLETE(state.mReflowStatus);
+   }
+@@ -4491,63 +4496,58 @@ nsBlockFrame::DrainOverflowLines(nsBlock
+     }
+     delete ourOverflowLines;
+   }
+ 
+   return PR_TRUE;
+ }
+ 
+ // This function assumes our prev-in-flow has completed reflow and its
+-// mFloats contains at most two frames that belong to the same flow chain,
+-// the second one being a last-in-flow continuation intended for this block.
++// mFloats may, depending on its FloatContinuationCountProperty(), contain
++// frames at the end of its float list that should be pulled to this block.
+ void
+ nsBlockFrame::DrainFloatContinuations(nsBlockReflowState& aState)
+ {
+   // Cache any continuations of our own floats that we're still holding onto
+   // so they're out of the way. This should only happen if we're re-Reflow'd
+   // before our next-in-flow gets a chance to pull these continuations.
+-  nsFrameList floatContinuations;
+-  nsPresContext* presContext = PresContext();
+-  for (nsIFrame* f = mFloats.FirstChild(); f; f = f->GetNextSibling()) {
+-    nsIFrame* nif = f->GetNextInFlow();
+-    if (!nif) continue;
+-    if (nif->GetParent() == this) {
+-      NS_ASSERTION(!nif->GetNextInFlow(),
+-                   "Unexpected next-in-flow for float continuation");
+-      StealFrame(presContext, nif);
+-      floatContinuations.AppendFrame(nsnull, nif);
+-    }
+-  }
+-  if (floatContinuations.NotEmpty()) {
++  nsPresContext* presContext = aState.mPresContext;
++  PRInt32 len = NS_PTR_TO_INT32(presContext->PropertyTable()->Remove(
++    this, nsBlockFrame::FloatContinuationCountProperty()));
++  if (len > 0) {
++    nsIFrame *f = mFloats.LastChild();
++    while (len != 0) {
++      f = f->GetPrevSibling();
++      --len;
++    }
++    nsFrameList floatContinuations = mFloats.RemoveFramesAfter(f);
+     aState.SetupFloatContinuationList();
+     aState.mFloatContinuations.AppendFrames(nsnull, floatContinuations);
+   }
+ 
+   // Walk our prev-in-flow's floats and prepend their continuations to our
+   // floats list. This pulls any continuations we need to take from our
+   // prev-in-flow and makes sure our continuations of its floats are in the
+   // proper order.
+   nsBlockFrame* prevBlock = static_cast<nsBlockFrame*>(GetPrevInFlow());
+   if (!prevBlock)
+     return;
+-  for (nsIFrame* pf = prevBlock->mFloats.FirstChild(); pf; pf = pf->GetNextSibling()) {
+-    nsIFrame* nif = pf->GetNextInFlow();
+-    if (!nif)
+-      continue;
+-    nsContainerFrame* nifParent = static_cast<nsContainerFrame*>(nif->GetParent());
+-    nifParent->StealFrame(presContext, nif);
+-    if (nif->GetParent() != this) {
+-      NS_ASSERTION(!nif->GetNextInFlow(),
+-                   "Unexpected next-in-flow for float continuation");
+-      ReparentFrame(nif, nifParent, this);
+-    }
+-    floatContinuations.AppendFrame(this, nif);
+-  }
+-  if (floatContinuations.NotEmpty())
++  len = NS_PTR_TO_INT32(presContext->PropertyTable()->Remove(
++    prevBlock, nsBlockFrame::FloatContinuationCountProperty()));
++  if (len > 0) {
++    nsIFrame *f = prevBlock->mFloats.LastChild();
++    while (len != 0) {
++      ReparentFrame(f, prevBlock, this);
++      f = f->GetPrevSibling();
++      --len;
++    }
++
++    nsFrameList floatContinuations = prevBlock->mFloats.RemoveFramesAfter(f);
+     mFloats.InsertFrames(nsnull, nsnull, floatContinuations);
++  }
+ 
+ #ifdef DEBUG
+   for (nsIFrame* f = mFloats.FirstChild(); f ; f = f->GetNextSibling()) {
+     for (nsIFrame* c = f->GetFirstInFlow(); c ; c = c->GetNextInFlow()) {
+       NS_ASSERTION(c == f || c->GetParent() != this || !mFloats.ContainsFrame(c),
+                    "Two floats with same parent in same floats list, expect weird errors.");
+     }
+   }
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -92,17 +92,22 @@ class nsIntervalSet;
+  * flow frames whose placeholders are in the overflow list.
+  * -- A given piece of content has at most one placeholder
+  * frame in a block's normal child list.
+  * -- While a block is being reflowed, it may have a FloatContinuationProperty
+  * frame property that points to an nsFrameList in its
+  * nsBlockReflowState. This list contains continuations for
+  * floats whose prev-in-flow is in the block's regular float
+  * list. The list is always empty/non-existent after the
+- * block has been reflowed.
++ * block has been reflowed.  (However, after it has been
++ * reflowed and before the continuations are moved to the
++ * next block, it has a FloatContinuationCountProperty
++ * indicating how many of the elements at the end of its
++ * float list are continuations that should be pulled to
++ * the block's continuation.)
+  * -- In all these frame lists, if there are two frames for
+  * the same content appearing in the list, then the frames
+  * appear with the prev-in-flow before the next-in-flow.
+  * -- While reflowing a block, its overflow line list
+  * will usually be empty but in some cases will have lines
+  * (while we reflow the block at its shrink-wrap width).
+  * In this case any new overflowing content must be
+  * prepended to the overflow lines.
+@@ -152,16 +157,17 @@ public:
+   reverse_line_iterator rbegin_lines() { return mLines.rbegin(); }
+   reverse_line_iterator rend_lines() { return mLines.rend(); }
+   const_reverse_line_iterator rbegin_lines() const { return mLines.rbegin(); }
+   const_reverse_line_iterator rend_lines() const { return mLines.rend(); }
+ 
+   friend nsIFrame* NS_NewBlockFrame(nsIPresShell* aPresShell, nsStyleContext* aContext, PRUint32 aFlags);
+ 
+   NS_DECLARE_FRAME_PROPERTY(FloatContinuationProperty, nsnull)
++  NS_DECLARE_FRAME_PROPERTY(FloatContinuationCountProperty, nsnull)
+ 
+   // nsQueryFrame
+   NS_DECL_QUERYFRAME
+ 
+   // nsIFrame
+   NS_IMETHOD Init(nsIContent*      aContent,
+                   nsIFrame*        aParent,
+                   nsIFrame*        aPrevInFlow);
