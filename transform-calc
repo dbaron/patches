@@ -86,7 +86,115 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 diff --git a/layout/style/nsStyleTransformMatrix.cpp b/layout/style/nsStyleTransformMatrix.cpp
 --- a/layout/style/nsStyleTransformMatrix.cpp
 +++ b/layout/style/nsStyleTransformMatrix.cpp
-@@ -255,16 +255,18 @@ static void ProcessMatrix(float aMain[4]
+@@ -41,16 +41,19 @@
+ #include "nsStyleTransformMatrix.h"
+ #include "nsAutoPtr.h"
+ #include "nsCSSValue.h"
+ #include "nsStyleContext.h"
+ #include "nsPresContext.h"
+ #include "nsRuleNode.h"
+ #include "nsCSSKeywords.h"
+ #include "nsMathUtils.h"
++#include "CSSCalc.h"
++
++namespace css = mozilla::css;
+ 
+ /* Note on floating point precision: The transform matrix is an array
+  * of single precision 'float's, and so are most of the input values
+  * we get from the style system, but intermediate calculations
+  * involving angles need to be done in 'double'.
+  */
+ 
+ /* Force small values to zero.  We do this to avoid having sin(360deg)
+@@ -247,24 +250,110 @@ static void ProcessMatrix(float aMain[4]
+    */
+   if (aData->Item(6).GetUnit() == eCSSUnit_Percent)
+     aY[1] = aData->Item(6).GetPercentValue();
+   else
+     SetCoordToValue(aData->Item(6), aContext, aPresContext, aCanStoreInRuleTree,
+                     aDelta[1]);
+ }
+ 
++struct LengthPercentPairCalcOps : public css::NumbersAlreadyNormalizedOps
++{
++  struct result_type {
++    nscoord mLength;
++    float mPercent;
++
++    result_type(nscoord aLength, float aPercent)
++      : mLength(aLength), mPercent(aPercent) {}
++  };
++
++  LengthPercentPairCalcOps(nsStyleContext* aContext,
++                           nsPresContext* aPresContext,
++                           PRBool& aCanStoreInRuleTree)
++    : mContext(aContext),
++      mPresContext(aPresContext),
++      mCanStoreInRuleTree(aCanStoreInRuleTree) {}
++
++  nsStyleContext* mContext;
++  nsPresContext* mPresContext;
++  PRBool& mCanStoreInRuleTree;
++
++  result_type ComputeLeafValue(const nsCSSValue& aValue)
++  {
++    if (aValue.GetUnit() == eCSSUnit_Percent) {
++      return result_type(0, aValue.GetPercentValue());
++    } else {
++      return result_type(nsRuleNode::CalcLength(aValue, mContext, mPresContext,
++                                                mCanStoreInRuleTree),
++                         0.0f);
++    }
++  }
++
++  result_type
++  MergeAdditive(nsCSSUnit aCalcFunction,
++                result_type aValue1, result_type aValue2)
++  {
++    if (aCalcFunction == eCSSUnit_Calc_Plus) {
++      return result_type(aValue1.mLength + aValue2.mLength,
++                         aValue1.mPercent + aValue2.mPercent);
++    }
++    if (aCalcFunction == eCSSUnit_Calc_Minus) {
++      return result_type(aValue1.mLength - aValue2.mLength,
++                         aValue1.mPercent - aValue2.mPercent);
++    }
++    if (aCalcFunction == eCSSUnit_Calc_Minimum) {
++      return result_type(NS_MIN(aValue1.mLength, aValue2.mLength),
++                         NS_MIN(aValue1.mPercent, aValue2.mPercent));
++    }
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Maximum,
++                      "unexpected unit");
++    return result_type(NS_MAX(aValue1.mLength, aValue2.mLength),
++                       NS_MAX(aValue1.mPercent, aValue2.mPercent));
++  }
++
++  result_type
++  MergeMultiplicativeL(nsCSSUnit aCalcFunction,
++                       float aValue1, result_type aValue2)
++  {
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
++                      "unexpected unit");
++    return result_type(NSToCoordRound(aValue1 * aValue2.mLength),
++                       aValue1 * aValue2.mPercent);
++  }
++
++  result_type
++  MergeMultiplicativeR(nsCSSUnit aCalcFunction,
++                       result_type aValue1, float aValue2)
++  {
++    if (aCalcFunction == eCSSUnit_Calc_Times_R) {
++      return result_type(NSToCoordRound(aValue1.mLength * aValue2),
++                         aValue1.mPercent * aValue2);
++    }
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Divided,
++                      "unexpected unit");
++    return result_type(NSToCoordRound(aValue1.mLength / aValue2),
++                       aValue1.mPercent / aValue2);
++  }
++
++};
++
  static void ProcessTranslatePart(nscoord& aOffset, float& aPercent,
                                   const nsCSSValue& aValue,
                                   nsStyleContext* aContext,
@@ -96,7 +204,11 @@ diff --git a/layout/style/nsStyleTransformMatrix.cpp b/layout/style/nsStyleTrans
    if (aValue.GetUnit() == eCSSUnit_Percent) {
      aPercent = aValue.GetPercentValue();
 +  } else if (aValue.IsCalcUnit()) {
-+    // FIXME: WRITE ME
++    LengthPercentPairCalcOps ops(aContext, aPresContext, aCanStoreInRuleTree);
++    LengthPercentPairCalcOps::result_type result =
++      css::ComputeCalc(aValue, ops);
++    aPercent = result.mPercent;
++    aOffset = result.mLength;
    } else {
      SetCoordToValue(aValue, aContext, aPresContext, aCanStoreInRuleTree,
                      aOffset);
