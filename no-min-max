@@ -1,0 +1,149 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Allow CSS parser to forbid min()/max() within certain calc() expressions.
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -112,16 +112,17 @@
+ #define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
+ #define VARIANT_GRADIENT        0x200000  // eCSSUnit_Gradient
+ #define VARIANT_CUBIC_BEZIER    0x400000  // CSS transition timing function
+ #define VARIANT_ALL             0x800000  //
+ #define VARIANT_IMAGE_RECT    0x01000000  // eCSSUnit_Function
+ // This is an extra bit that says that a VARIANT_ANGLE allows unitless zero:
+ #define VARIANT_ZERO_ANGLE    0x02000000  // unitless zero for angles
+ #define VARIANT_CALC          0x04000000  // eCSSUnit_Calc
++#define VARIANT_CALC_NO_MIN_MAX 0x08000000 // no min() and max() for calc()
+ 
+ // Common combinations of variants
+ #define VARIANT_AL   (VARIANT_AUTO | VARIANT_LENGTH)
+ #define VARIANT_LP   (VARIANT_LENGTH | VARIANT_PERCENT)
+ #define VARIANT_AH   (VARIANT_AUTO | VARIANT_INHERIT)
+ #define VARIANT_AHLP (VARIANT_AH | VARIANT_LP)
+ #define VARIANT_AHI  (VARIANT_AH | VARIANT_INTEGER)
+ #define VARIANT_AHK  (VARIANT_AH | VARIANT_KEYWORD)
+@@ -4395,17 +4396,18 @@ CSSParserImpl::TranslateDimension(nsCSSV
+   VARIANT_AUTO | \
+   VARIANT_INHERIT | \
+   VARIANT_NONE | \
+   VARIANT_NORMAL | \
+   VARIANT_SYSFONT | \
+   VARIANT_GRADIENT | \
+   VARIANT_CUBIC_BEZIER | \
+   VARIANT_ALL | \
+-  VARIANT_CALC
++  VARIANT_CALC | \
++  VARIANT_CALC_NO_MIN_MAX
+ 
+ // Note that callers passing VARIANT_CALC in aVariantMask will get
+ // full-range parsing inside the calc() expression, and the code that
+ // computes the calc will be required to clamp the resulting value to an
+ // appropriate range.
+ PRBool
+ CSSParserImpl::ParseNonNegativeVariant(nsCSSValue& aValue,
+                                        PRInt32 aVariantMask,
+@@ -4669,17 +4671,18 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+     }
+   }
+   if ((aVariantMask & VARIANT_CALC) &&
+       (eCSSToken_Function == tk->mType) &&
+       (tk->mIdent.LowerCaseEqualsLiteral("-moz-calc") ||
+        tk->mIdent.LowerCaseEqualsLiteral("-moz-min") ||
+        tk->mIdent.LowerCaseEqualsLiteral("-moz-max"))) {
+     // calc() currently allows only lengths and percents inside it.
+-    return ParseCalc(aValue, aVariantMask & VARIANT_LP);
++    return ParseCalc(aValue,
++                     aVariantMask & (VARIANT_LP | VARIANT_CALC_NO_MIN_MAX));
+   }
+ 
+   UngetToken();
+   return PR_FALSE;
+ }
+ 
+ 
+ PRBool
+@@ -7151,40 +7154,62 @@ CSSParserImpl::ParseBorderColors(nsCSSVa
+       break;
+     }
+   }
+   // Have failure case at the end so we can |break| to get to it.
+   delete list;
+   return PR_FALSE;
+ }
+ 
++static PRBool
++HasMinMax(const nsCSSValue::Array *aArray)
++{
++  for (PRUint32 i = 0, i_end = aArray->Count(); i != i_end; ++i) {
++    const nsCSSValue &v = aArray->Item(i);
++    if (v.IsCalcUnit() &&
++        (v.GetUnit() == eCSSUnit_Calc_Minimum ||
++         v.GetUnit() == eCSSUnit_Calc_Maximum ||
++         HasMinMax(v.GetArrayValue()))) {
++      return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
+ // Parse the top level of a calc() expression, which can be calc(),
+ // min(), or max().
+ PRBool
+ CSSParserImpl::ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask)
+ {
+   // Parsing calc expressions requires, in a number of cases, looking
+   // for a token that is *either* a value of the property or a number.
+   // This can be done without lookahead when we assume that the property
+   // values cannot themselves be numbers.
+   NS_ASSERTION(!(aVariantMask & VARIANT_NUMBER), "unexpected variant mask");
+   NS_ABORT_IF_FALSE(aVariantMask != 0, "unexpected variant mask");
+ 
++  PRBool noMinMax = aVariantMask & VARIANT_CALC_NO_MIN_MAX;
++  aVariantMask &= ~VARIANT_CALC_NO_MIN_MAX;
++
+   nsCSSUnit unit;
+   if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-min")) {
+     unit = eCSSUnit_Calc_Minimum;
+   } else if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-max")) {
+     unit = eCSSUnit_Calc_Maximum;
+   } else {
+     NS_ASSERTION(mToken.mIdent.LowerCaseEqualsLiteral("-moz-calc"),
+                  "unexpected function");
+     unit = eCSSUnit_Calc;
+   }
+ 
+   if (unit != eCSSUnit_Calc) {
++    if (noMinMax) {
++      SkipUntil(')');
++      return PR_FALSE;
++    }
+     return ParseCalcMinMax(aValue, unit, aVariantMask);
+   }
+ 
+   // One-iteration loop so we can break to the error-handling case.
+   do {
+     // The toplevel of a calc() is always an nsCSSValue::Array of length 1.
+     nsRefPtr<nsCSSValue::Array> arr = nsCSSValue::Array::Create(1);
+     if (!arr) {
+@@ -7193,16 +7218,20 @@ CSSParserImpl::ParseCalc(nsCSSValue &aVa
+     }
+ 
+     if (!ParseCalcAdditiveExpression(arr->Item(0), aVariantMask))
+       break;
+ 
+     if (!ExpectSymbol(')', PR_TRUE))
+       break;
+ 
++    if (noMinMax && HasMinMax(arr)) {
++      return PR_FALSE;
++    }
++
+     aValue.SetArrayValue(arr, eCSSUnit_Calc);
+     return PR_TRUE;
+   } while (PR_FALSE);
+ 
+   SkipUntil(')');
+   return PR_FALSE;
+ }
+ 
