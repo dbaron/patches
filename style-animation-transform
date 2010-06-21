@@ -105,7 +105,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
    // X, Y, Radius, Spread, Color, Inset
    NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Array,
                      "wrong unit");
-@@ -569,16 +611,406 @@ AddShadowItems(double aCoeff1, const nsC
+@@ -569,16 +611,422 @@ AddShadowItems(double aCoeff1, const nsC
      return PR_FALSE;
    }
    resultItem->mValue.SetArrayValue(resultArray, eCSSUnit_Array);
@@ -158,128 +158,137 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +  aResult.SetFloatValue(result + 1.0f, eCSSUnit_Number);
 +}
 +
++/*
++ * The relevant section of the transitions specification:
++ * http://dev.w3.org/csswg/css3-transitions/#animation-of-property-types-
++ * defers all of the details to the 2-D and 3-D transforms specifications.
++ * For the 2-D transforms specification (all that's relevant for us, right
++ * now), the relevant section is:
++ * http://dev.w3.org/csswg/css3-2d-transforms/#animation
++ * This, in turn, refers to the unmatrix program in Graphics Gems,
++ * available from http://tog.acm.org/resources/GraphicsGems/ , and in
++ * particular as the file GraphicsGems/gemsii/unmatrix.c
++ * in http://tog.acm.org/resources/GraphicsGems/AllGems.tar.gz
++ *
++ * The unmatrix reference is for general 3-D transform matrices (any of the
++ * 16 components can have any value).
++ *
++ * For CSS 2-D transforms, we have a 2-D matrix with the bottom row constant:
++ *
++ * [ A C E ]
++ * [ B D F ]
++ * [ 0 0 1 ]
++ *
++ * For that case, I believe the algorithm in unmatrix reduces to:
++ *
++ *  (1) If A * D - B * C == 0, the matrix is singular.  Fail.
++ *
++ *  (2) Set translation components (Tx and Ty) to the translation parts of
++ *      the matrix (E and F) and then ignore them for the rest of the time.
++ *      (For us, E and F each actually consist of three constants:  a
++ *      length, a multiplier for the width, and a multiplier for the
++ *      height.  This actually requires its own decomposition, but I'll
++ *      keep that separate.)
++ *
++ *  (3) Let the X scale factor (Sx) be sqrt(A^2 + B^2).  Then divide both A
++ *      and B by it.
++ *
++ *  (4) Let the XY shear (K) be A * C + B * D.  From C, subtract A times
++ *      the XY shear.  From D, subtract B times the XY shear.
++ *
++ *  (5) Let the Y scale (Sy) be sqrt(C^2 + D^2).  Divide C, D, and the XY
++ *      shear (K) by it.
++ *
++ *  (6) At this point, A * D - B * C is either 1 or -1.  If it is -1,
++ *      negate all of A, B, C, D, the X scale (Sx), and the Y scale (Sy).
++ *
++ *  (7) Let the rotation be R = atan2(B, A).
++ *
++ * Then the resulting decomposed transformation is:
++ *
++ *   translate(Tx, Ty) rotate(R) skewX(atan(K)) scale(Sx, Sy)
++ *
++ * An interesting result of this is that all of the simple transform
++ * functions (i.e., all functions other than matrix()), in isolation,
++ * decompose back to themselves except for:
++ *   'skewY(φ)', which is 'matrix(1, tan(φ), 0, 1, 0, 0)', which decomposes
++ *   to 'rotate(φ) skewX(φ) scale(sec(φ), cos(φ))' since (ignoring the
++ *   alternate sign possibilities that would get fixed in step 6):
++ *     In step 3, the X scale factor is sqrt(1+tan²(φ)) = sqrt(sec²(φ)) = sec(φ).
++ *     Thus, after step 3, A = 1/sec(φ) = cos(φ) and B = tan(φ) / sec(φ) = sin(φ).
++ *     In step 4, the XY shear is sin(φ).
++ *     Thus, after step 4, C = -cos(φ)sin(φ) and D = 1 - sin²(φ) = cos²(φ).
++ *     Thus, in step 5, the Y scale is sqrt(cos²(φ)(sin²(φ) + cos²(φ)) = cos(φ).
++ *     Thus, after step 5, C = -sin(φ), D = cos(φ), and the XY shear is tan(φ).
++ *     Thus, in step 6, A * D - B * C = cos²(φ) + sin²(φ) = 1.
++ *     In step 7, the rotation is thus φ.
++ *
++ *   skew(θ, φ), which is matrix(1, tan(φ), tan(θ), 1, 0, 0), which decomposes
++ *   to 'rotate(φ) skewX(θ + φ) scale(sec(φ), cos(φ))' since (ignoring
++ *   the alternate sign possibilities that would get fixed in step 6):
++ *     In step 3, the X scale factor is sqrt(1+tan²(φ)) = sqrt(sec²(φ)) = sec(φ).
++ *     Thus, after step 3, A = 1/sec(φ) = cos(φ) and B = tan(φ) / sec(φ) = sin(φ).
++ *     In step 4, the XY shear is cos(φ)tan(θ) + sin(φ).
++ *     Thus, after step 4,
++ *     C = tan(θ) - cos(φ)(cos(φ)tan(θ) + sin(φ)) = tan(θ)sin²(φ) - cos(φ)sin(φ)
++ *     D = 1 - sin(φ)(cos(φ)tan(θ) + sin(φ)) = cos²(φ) - sin(φ)cos(φ)tan(θ)
++ *     Thus, in step 5, the Y scale is sqrt(C² + D²) =
++ *     sqrt(tan²(θ)(sin⁴(φ) + sin²(φ)cos²(φ)) -
++ *          2 tan(θ)(sin³(φ)cos(φ) + sin(φ)cos³(φ)) +
++ *          (sin²(φ)cos²(φ) + cos⁴(φ))) =
++ *     sqrt(tan²(θ)sin²(φ) - 2 tan(θ)sin(φ)cos(φ) + cos²(φ)) =
++ *     cos(φ) - tan(θ)sin(φ) (taking the negative of the obvious solution so
++ *     we avoid flipping in step 6).
++ *     After step 5, C = -sin(φ) and D = cos(φ), and the XY shear is
++ *     (cos(φ)tan(θ) + sin(φ)) / (cos(φ) - tan(θ)sin(φ)) =
++ *     (dividing both numerator and denominator by cos(φ))
++ *     (tan(θ) + tan(φ)) / (1 - tan(θ)tan(φ)) = tan(θ + φ).
++ *     (See http://en.wikipedia.org/wiki/List_of_trigonometric_identities .)
++ *     Thus, in step 6, A * D - B * C = cos²(φ) + sin²(φ) = 1.
++ *     In step 7, the rotation is thus φ.
++ *
++ *     To check this result, we can multiply things back together:
++ *
++ *     [ cos(φ) -sin(φ) ] [ 1 tan(θ + φ) ] [ sec(φ)    0   ]
++ *     [ sin(φ)  cos(φ) ] [ 0      1     ] [   0    cos(φ) ]
++ *
++ *     [ cos(φ)      cos(φ)tan(θ + φ) - sin(φ) ] [ sec(φ)    0   ]
++ *     [ sin(φ)      sin(φ)tan(θ + φ) + cos(φ) ] [   0    cos(φ) ]
++ *
++ *     but since tan(θ + φ) = (tan(θ) + tan(φ)) / (1 - tan(θ)tan(φ)),
++ *     cos(φ)tan(θ + φ) - sin(φ)
++ *      = cos(φ)(tan(θ) + tan(φ)) - sin(φ) + sin(φ)tan(θ)tan(φ)
++ *      = cos(φ)tan(θ) + sin(φ) - sin(φ) + sin(φ)tan(θ)tan(φ)
++ *      = cos(φ)tan(θ) + sin(φ)tan(θ)tan(φ)
++ *      = tan(θ) (cos(φ) + sin(φ)tan(φ))
++ *      = tan(θ) sec(φ) (cos²(φ) + sin²(φ))
++ *      = tan(θ) sec(φ)
++ *     and
++ *     sin(φ)tan(θ + φ) + cos(φ)
++ *      = sin(φ)(tan(θ) + tan(φ)) + cos(φ) - cos(φ)tan(θ)tan(φ)
++ *      = tan(θ) (sin(φ) - sin(φ)) + sin(φ)tan(φ) + cos(φ)
++ *      = sec(φ) (sin²(φ) + cos²(φ))
++ *      = sec(φ)
++ *     so the above is:
++ *     [ cos(φ)  tan(θ) sec(φ) ] [ sec(φ)    0   ]
++ *     [ sin(φ)     sec(φ)     ] [   0    cos(φ) ]
++ *
++ *     [    1   tan(θ) ]
++ *     [ tan(φ)    1   ]
++ */
++static void
++DecomposeMatrix(const nsStyleTransformMatrix &aMatrix,
++                float &aTranslateYPercentX, float &aTranslateXPercentY,
++                float &aTranslateXPercentX, float &aTranslateYPercentY,
++                float &aRotate, float &aSkewX, float &aScaleX, float &aScaleY)
++{
++  // FIXME: WRITE ME
++}
++
 +static nsCSSValueList*
 +AddTransformMatrix(const nsStyleTransformMatrix &aMatrix1, double aCoeff1,
 +                   const nsStyleTransformMatrix &aMatrix2, double aCoeff2)
 +{
-+  /*
-+   * The relevant section of the transitions specification:
-+   * http://dev.w3.org/csswg/css3-transitions/#animation-of-property-types-
-+   * defers all of the details to the 2-D and 3-D transforms specifications.
-+   * For the 2-D transforms specification (all that's relevant for us, right
-+   * now), the relevant section is:
-+   * http://dev.w3.org/csswg/css3-2d-transforms/#animation
-+   * This, in turn, refers to the unmatrix program in Graphics Gems,
-+   * available from http://tog.acm.org/resources/GraphicsGems/ , and in
-+   * particular as the file GraphicsGems/gemsii/unmatrix.c
-+   * in http://tog.acm.org/resources/GraphicsGems/AllGems.tar.gz
-+   *
-+   * The unmatrix reference is for general 3-D transform matrices (any of the
-+   * 16 components can have any value).
-+   *
-+   * For CSS 2-D transforms, we have a 2-D matrix with the bottom row constant:
-+   *
-+   * [ A C E ]
-+   * [ B D F ]
-+   * [ 0 0 1 ]
-+   *
-+   * For that case, I believe the algorithm in unmatrix reduces to:
-+   *
-+   *  (1) If A * D - B * C == 0, the matrix is singular.  Fail.
-+   *
-+   *  (2) Set translation components (Tx and Ty) to the translation parts of
-+   *      the matrix (E and F) and then ignore them for the rest of the time.
-+   *      (For us, E and F each actually consist of three constants:  a
-+   *      length, a multiplier for the width, and a multiplier for the
-+   *      height.  This actually requires its own decomposition, but I'll
-+   *      keep that separate.)
-+   *
-+   *  (3) Let the X scale factor (Sx) be sqrt(A^2 + B^2).  Then divide both A
-+   *      and B by it.
-+   *
-+   *  (4) Let the XY shear (K) be A * C + B * D.  From C, subtract A times
-+   *      the XY shear.  From D, subtract B times the XY shear.
-+   *
-+   *  (5) Let the Y scale (Sy) be sqrt(C^2 + D^2).  Divide C, D, and the XY
-+   *      shear (K) by it.
-+   *
-+   *  (6) At this point, A * D - B * C is either 1 or -1.  If it is -1,
-+   *      negate all of A, B, C, D, the X scale (Sx), and the Y scale (Sy).
-+   *
-+   *  (7) Let the rotation be R = atan2(B, A).
-+   *
-+   * Then the resulting decomposed transformation is:
-+   *
-+   *   translate(Tx, Ty) rotate(R) skewX(atan(K)) scale(Sx, Sy)
-+   *
-+   * An interesting result of this is that all of the simple transform
-+   * functions (i.e., all functions other than matrix()), in isolation,
-+   * decompose back to themselves except for:
-+   *   'skewY(φ)', which is 'matrix(1, tan(φ), 0, 1, 0, 0)', which decomposes
-+   *   to 'rotate(φ) skewX(φ) scale(sec(φ), cos(φ))' since (ignoring the
-+   *   alternate sign possibilities that would get fixed in step 6):
-+   *     In step 3, the X scale factor is sqrt(1+tan²(φ)) = sqrt(sec²(φ)) = sec(φ).
-+   *     Thus, after step 3, A = 1/sec(φ) = cos(φ) and B = tan(φ) / sec(φ) = sin(φ).
-+   *     In step 4, the XY shear is sin(φ).
-+   *     Thus, after step 4, C = -cos(φ)sin(φ) and D = 1 - sin²(φ) = cos²(φ).
-+   *     Thus, in step 5, the Y scale is sqrt(cos²(φ)(sin²(φ) + cos²(φ)) = cos(φ).
-+   *     Thus, after step 5, C = -sin(φ), D = cos(φ), and the XY shear is tan(φ).
-+   *     Thus, in step 6, A * D - B * C = cos²(φ) + sin²(φ) = 1.
-+   *     In step 7, the rotation is thus φ.
-+   *
-+   *   skew(θ, φ), which is matrix(1, tan(φ), tan(θ), 1, 0, 0), which decomposes
-+   *   to 'rotate(φ) skewX(θ + φ) scale(sec(φ), cos(φ))' since (ignoring
-+   *   the alternate sign possibilities that would get fixed in step 6):
-+   *     In step 3, the X scale factor is sqrt(1+tan²(φ)) = sqrt(sec²(φ)) = sec(φ).
-+   *     Thus, after step 3, A = 1/sec(φ) = cos(φ) and B = tan(φ) / sec(φ) = sin(φ).
-+   *     In step 4, the XY shear is cos(φ)tan(θ) + sin(φ).
-+   *     Thus, after step 4,
-+   *     C = tan(θ) - cos(φ)(cos(φ)tan(θ) + sin(φ)) = tan(θ)sin²(φ) - cos(φ)sin(φ)
-+   *     D = 1 - sin(φ)(cos(φ)tan(θ) + sin(φ)) = cos²(φ) - sin(φ)cos(φ)tan(θ)
-+   *     Thus, in step 5, the Y scale is sqrt(C² + D²) =
-+   *     sqrt(tan²(θ)(sin⁴(φ) + sin²(φ)cos²(φ)) -
-+   *          2 tan(θ)(sin³(φ)cos(φ) + sin(φ)cos³(φ)) +
-+   *          (sin²(φ)cos²(φ) + cos⁴(φ))) =
-+   *     sqrt(tan²(θ)sin²(φ) - 2 tan(θ)sin(φ)cos(φ) + cos²(φ)) =
-+   *     cos(φ) - tan(θ)sin(φ) (taking the negative of the obvious solution so
-+   *     we avoid flipping in step 6).
-+   *     After step 5, C = -sin(φ) and D = cos(φ), and the XY shear is
-+   *     (cos(φ)tan(θ) + sin(φ)) / (cos(φ) - tan(θ)sin(φ)) =
-+   *     (dividing both numerator and denominator by cos(φ))
-+   *     (tan(θ) + tan(φ)) / (1 - tan(θ)tan(φ)) = tan(θ + φ).
-+   *     (See http://en.wikipedia.org/wiki/List_of_trigonometric_identities .)
-+   *     Thus, in step 6, A * D - B * C = cos²(φ) + sin²(φ) = 1.
-+   *     In step 7, the rotation is thus φ.
-+   *
-+   *     To check this result, we can multiply things back together:
-+   *
-+   *     [ cos(φ) -sin(φ) ] [ 1 tan(θ + φ) ] [ sec(φ)    0   ]
-+   *     [ sin(φ)  cos(φ) ] [ 0      1     ] [   0    cos(φ) ]
-+   *
-+   *     [ cos(φ)      cos(φ)tan(θ + φ) - sin(φ) ] [ sec(φ)    0   ]
-+   *     [ sin(φ)      sin(φ)tan(θ + φ) + cos(φ) ] [   0    cos(φ) ]
-+   *
-+   *     but since tan(θ + φ) = (tan(θ) + tan(φ)) / (1 - tan(θ)tan(φ)),
-+   *     cos(φ)tan(θ + φ) - sin(φ)
-+   *      = cos(φ)(tan(θ) + tan(φ)) - sin(φ) + sin(φ)tan(θ)tan(φ)
-+   *      = cos(φ)tan(θ) + sin(φ) - sin(φ) + sin(φ)tan(θ)tan(φ)
-+   *      = cos(φ)tan(θ) + sin(φ)tan(θ)tan(φ)
-+   *      = tan(θ) (cos(φ) + sin(φ)tan(φ))
-+   *      = tan(θ) sec(φ) (cos²(φ) + sin²(φ))
-+   *      = tan(θ) sec(φ)
-+   *     and
-+   *     sin(φ)tan(θ + φ) + cos(φ)
-+   *      = sin(φ)(tan(θ) + tan(φ)) + cos(φ) - cos(φ)tan(θ)tan(φ)
-+   *      = tan(θ) (sin(φ) - sin(φ)) + sin(φ)tan(φ) + cos(φ)
-+   *      = sec(φ) (sin²(φ) + cos²(φ))
-+   *      = sec(φ)
-+   *     so the above is:
-+   *     [ cos(φ)  tan(θ) sec(φ) ] [ sec(φ)    0   ]
-+   *     [ sin(φ)     sec(φ)     ] [   0    cos(φ) ]
-+   *
-+   *     [    1   tan(θ) ]
-+   *     [ tan(φ)    1   ]
-+   */
 +
 +  nsAutoPtr<nsCSSValueList> result;
 +
@@ -293,6 +302,9 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +
 +  // Be very careful around the crossing-% components of the matrix!  It
 +  // will require multiple transform functions in the output!
++
++  // FIXME: Should skewx animate in tangent space instead of angle
++  // space?  That produces smoother animations.
 +
 +  // FIXME: WRITE ME
 +
@@ -435,6 +447,10 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +        NS_ABORT_IF_FALSE(a2->Count() == 2 || a2->Count() == 3,
 +                          "unexpected count");
 +
++        // FIXME: Should skew, skewx, and skewy animate in tangent
++        // space instead of angle space?  That produces smoother
++        // animations.
++
 +        // FIXME: SHARE THIS BETTER
 +        nsCSSValue &resulty = arr->Item(2);
 +        if (a1->Count() == 3) {
@@ -512,7 +528,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
  {
    Unit commonUnit = GetCommonUnit(aValue1.GetUnit(), aValue2.GetUnit());
    // Maybe need a followup method to convert the inputs into the common
-@@ -872,16 +1304,86 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+@@ -872,16 +1320,86 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
            }
  
            longShadow = longShadow->mNext;
@@ -599,7 +615,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        do {
          nsCSSValuePairList *item = new nsCSSValuePairList;
          if (!item) {
-@@ -1178,16 +1680,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
+@@ -1178,16 +1696,17 @@ nsStyleAnimation::UncomputeValue(nsCSSPr
      case eUnit_CSSRect:
        NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
                            eCSSType_Rect, "type mismatch");
@@ -617,7 +633,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
      case eUnit_CSSValuePairList:
        NS_ABORT_IF_FALSE(nsCSSProps::kTypeTable[aProperty] ==
                            eCSSType_ValuePairList, "type mismatch");
-@@ -1666,16 +2169,65 @@ nsStyleAnimation::ExtractComputedValue(n
+@@ -1666,16 +2185,65 @@ nsStyleAnimation::ExtractComputedValue(n
                  break;
              }
            }
@@ -683,7 +699,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
      case eStyleAnimType_Coord:
        return StyleCoordToValue(*static_cast<const nsStyleCoord*>(
          StyleDataAtOffset(styleStruct, ssOffset)), aComputedValue);
-@@ -1880,18 +2432,19 @@ nsStyleAnimation::Value::operator=(const
+@@ -1880,18 +2448,19 @@ nsStyleAnimation::Value::operator=(const
        NS_ABORT_IF_FALSE(aOther.mValue.mCSSRect, "rects may not be null");
        mValue.mCSSRect = new nsCSSRect(*aOther.mValue.mCSSRect);
        if (!mValue.mCSSRect) {
@@ -705,7 +721,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        } else {
          mValue.mCSSValueList = nsnull;
        }
-@@ -2074,16 +2627,17 @@ nsStyleAnimation::Value::operator==(cons
+@@ -2074,16 +2643,17 @@ nsStyleAnimation::Value::operator==(cons
      case eUnit_Color:
        return mValue.mColor == aOther.mValue.mColor;
      case eUnit_CSSValuePair:
