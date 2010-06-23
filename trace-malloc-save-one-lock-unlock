@@ -1,0 +1,93 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Avoid a lock/unlock pair for each call to |calltree|.
+
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
+--- a/tools/trace-malloc/lib/nsTraceMalloc.c
++++ b/tools/trace-malloc/lib/nsTraceMalloc.c
+@@ -608,16 +608,17 @@ static PLHashAllocOps lfdset_hashallocop
+ static PLHashTable *libraries = NULL;
+ 
+ /* Table of filename pathnames mapped to logged 'G' record serial numbers. */
+ static PLHashTable *filenames = NULL;
+ 
+ /* Table mapping method names to logged 'N' record serial numbers. */
+ static PLHashTable *methods = NULL;
+ 
++/* Presumes that its caller is holding tmlock */
+ static callsite *
+ calltree(void **stack, size_t num_stack_entries, tm_thread *t)
+ {
+     logfile *fp = logfp;
+     void *pc;
+     uint32 nkids;
+     callsite *parent, *site, **csp, *tmp;
+     int maxstack;
+@@ -626,23 +627,16 @@ calltree(void **stack, size_t num_stack_
+     char *slash;
+     PLHashNumber hash;
+     PLHashEntry **hep, *he;
+     lfdset_entry *le;
+     size_t stack_index;
+     nsCodeAddressDetails details;
+     nsresult rv;
+ 
+-    /*
+-     * FIXME bug 391749: We should really lock only the minimum amount
+-     * that we need to in this function, because it makes some calls
+-     * that could lock in the system's shared library loader.
+-     */
+-    TM_ENTER_LOCK(t);
+-
+     maxstack = (num_stack_entries > tmstats.calltree_maxstack);
+     if (maxstack) {
+         /* these two are the same, although that used to be less clear */
+         tmstats.calltree_maxstack = num_stack_entries;
+         tmstats.calltree_maxdepth = num_stack_entries;
+     }
+ 
+     /* Reverse the stack again, finding and building a path in the tree. */
+@@ -895,21 +889,19 @@ calltree(void **stack, size_t num_stack_
+ 
+       upward:
+         parent = site;
+     } while (stack_index > 0);
+ 
+     if (maxstack)
+         calltree_maxstack_top = site;
+ 
+-    TM_EXIT_LOCK(t);
+     return site;
+ 
+   fail:
+-    TM_EXIT_LOCK(t);
+     return NULL;
+ }
+ 
+ /*
+  * Buffer the stack from top at low index to bottom at high, so that we can
+  * reverse it in calltree.
+  */
+ static void
+@@ -979,19 +971,20 @@ backtrace(tm_thread *t, int skip, int *i
+ 
+         /* and call NS_StackWalk again */
+         info->entries = 0;
+         NS_StackWalk(stack_callback, skip, info);
+ 
+         PR_ASSERT(info->entries * 2 == new_stack_buffer_size); /* same stack */
+     }
+ 
++    TM_ENTER_LOCK(t);
++
+     site = calltree(info->buffer, info->entries, t);
+ 
+-    TM_ENTER_LOCK(t);
+     tmstats.backtrace_calls++;
+     if (!site) {
+         tmstats.backtrace_failures++;
+         PR_ASSERT(tmstats.backtrace_failures < 100);
+     }
+     TM_EXIT_LOCK(t);
+ 
+     t->suppress_tracing--;
