@@ -1,6 +1,6 @@
-From: Michael Ventnor <ventnor.bugzilla@gmail.com>
+From: Michael Ventnor <ventnor.bugzilla@gmail.com>, L. David Baron <dbaron@dbaron.org>
 
-Make dragging the menubar drag the window on GTK themes where that should work.  (Bug 566480)
+Make dragging the menubar drag the window on GTK themes where that should work (and also fix GTK resize drags to initialize drag better).  (Bug 566480)
 
 diff --git a/content/base/src/nsGkAtomList.h b/content/base/src/nsGkAtomList.h
 --- a/content/base/src/nsGkAtomList.h
@@ -34,7 +34,7 @@ diff --git a/content/base/src/nsGkAtomList.h b/content/base/src/nsGkAtomList.h
 diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 --- a/dom/base/nsGlobalWindow.cpp
 +++ b/dom/base/nsGlobalWindow.cpp
-@@ -9574,16 +9574,29 @@ nsGlobalChromeWindow::GetAttentionWithCy
+@@ -9574,16 +9574,34 @@ nsGlobalChromeWindow::GetAttentionWithCy
  
    if (widget) {
      rv = widget->GetAttention(aCycleCount);
@@ -47,13 +47,18 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +nsGlobalChromeWindow::BeginWindowMove(nsIDOMEvent *aMouseDownEvent)
 +{
 +  nsCOMPtr<nsIWidget> widget = GetMainWidget();
-+  nsresult rv = NS_OK;
-+
-+  if (widget) {
-+    rv = widget->BeginMoveDrag();
++  if (!widget) {
++    return NS_OK;
 +  }
 +
-+  return rv;
++  nsCOMPtr<nsIPrivateDOMEvent> privEvent = do_QueryInterface(aMouseDownEvent);
++  NS_ENSURE_TRUE(privEvent, NS_ERROR_FAILURE);
++  nsEvent *internalEvent = privEvent->GetInternalNSEvent();
++  NS_ENSURE_TRUE(internalEvent && internalEvent->type == NS_MOUSE_EVENT,
++                 NS_ERROR_FAILURE);
++  nsMouseEvent *mouseEvent = static_cast<nsMouseEvent*>(internalEvent);
++
++  return widget->BeginMoveDrag(mouseEvent);
 +}
 +
  //Note: This call will lock the cursor, it will not change as it moves.
@@ -268,9 +273,9 @@ diff --git a/widget/public/nsIWidget.h b/widget/public/nsIWidget.h
      NS_IMETHOD BeginResizeDrag(nsGUIEvent* aEvent, PRInt32 aHorizontal, PRInt32 aVertical) = 0;
  
 +    /**
-+     * Begin a window moving drag. We don't need an event.
++     * Begin a window moving drag, based on the event passed in.
 +     */
-+    NS_IMETHOD BeginMoveDrag() = 0;
++    NS_IMETHOD BeginMoveDrag(nsGUIEvent* aEvent) = 0;
 +
      enum Modifiers {
          CAPS_LOCK = 0x01, // when CapsLock is active
@@ -369,7 +374,8 @@ diff --git a/widget/src/gtk2/nsLookAndFeel.h b/widget/src/gtk2/nsLookAndFeel.h
 diff --git a/widget/src/gtk2/nsWindow.cpp b/widget/src/gtk2/nsWindow.cpp
 --- a/widget/src/gtk2/nsWindow.cpp
 +++ b/widget/src/gtk2/nsWindow.cpp
-@@ -6837,16 +6837,55 @@ nsWindow::GetThebesSurface()
+@@ -6836,31 +6836,88 @@ nsWindow::GetThebesSurface()
+         mThebesSurface = nsnull;
      } else {
          mThebesSurface->SetDeviceOffset(gfxPoint(-x_offset, -y_offset));
      }
@@ -377,54 +383,138 @@ diff --git a/widget/src/gtk2/nsWindow.cpp b/widget/src/gtk2/nsWindow.cpp
      return mThebesSurface;
  }
  
- NS_IMETHODIMP
-+nsWindow::BeginMoveDrag()
++// Code shared begin BeginMoveDrag and BeginResizeDrag
++PRBool
++nsWindow::GetDragInfo(nsMouseEvent* aMouseEvent,
++                      GdkWindow** aWindow, gint* aButton,
++                      gint* aRootX, gint* aRootY)
 +{
++    if (aMouseEvent->button != nsMouseEvent::eLeftButton) {
++        // we can only begin a move drag with the left mouse button
++        return PR_FALSE;
++    }
++    *aButton = 1;
++
 +    // get the gdk window for this widget
 +    GdkWindow* gdk_window = mGdkWindow;
 +    if (!GDK_IS_WINDOW(gdk_window)) {
-+      return NS_ERROR_FAILURE;
++        return PR_FALSE;
 +    }
 +
 +    // find the top-level window
 +    gdk_window = gdk_window_get_toplevel(gdk_window);
 +    if (!GDK_IS_WINDOW(gdk_window)) {
-+      return NS_ERROR_FAILURE;
++        return PR_FALSE;
++    }
++    *aWindow = gdk_window;
++
++    if (!event->widget) {
++        return PR_FALSE;
 +    }
 +
++    nsIntPoint offset = event->widget->WidgetToScreenOffset();
++    *aRootX = aEvent->refPoint.x + offset.x;
++    *aRootY = aEvent->refPoint.y + offset.y;
 +
-+    // get the current (default) display
-+    GdkDisplay* display = gdk_display_get_default();
-+    if (!GDK_IS_DISPLAY(display)) {
-+      return NS_ERROR_FAILURE;
-+    }
++    return PR_TRUE;
++}
 +
-+    // get the current pointer position and button state
-+    GdkScreen* screen = NULL;
-+    gint screenX, screenY;
-+    GdkModifierType mask;
-+    gdk_display_get_pointer(display, &screen, &screenX, &screenY, &mask);
++NS_IMETHODIMP
++nsWindow::BeginMoveDrag(nsMouseEvent* aEvent)
++{
++    NS_ABORT_IF_FALSE(aEvent, "must have event");
++    NS_ABORT_IF_FALSE(aEvent->eventStructType == NS_MOUSE_EVENT,
++                      "event must have correct struct type");
 +
-+    // we only support moving with button 1
-+    if (!(mask & GDK_BUTTON1_MASK)) {
++    GdkWindow *gdk_window;
++    gint button, screenX, screenY;
++    if (!GetDragInfo(aEvent, &gdk_window, &button, &screenX, &screenY)) {
 +        return NS_ERROR_FAILURE;
 +    }
 +
 +    // tell the window manager to start the move
-+    gdk_window_begin_move_drag(gdk_window, 1, screenX, screenY, GDK_CURRENT_TIME);
++    gdk_window_begin_move_drag(gdk_window, button, screenX, screenY,
++                               aEvent->time);
 +
 +    return NS_OK;
 +}
 +
-+NS_IMETHODIMP
+ NS_IMETHODIMP
  nsWindow::BeginResizeDrag(nsGUIEvent* aEvent, PRInt32 aHorizontal, PRInt32 aVertical)
  {
      NS_ENSURE_ARG_POINTER(aEvent);
  
      if (aEvent->eventStructType != NS_MOUSE_EVENT) {
-       // you can only begin a resize drag with a mouse event
-       return NS_ERROR_INVALID_ARG;
+-      // you can only begin a resize drag with a mouse event
+-      return NS_ERROR_INVALID_ARG;
++        // you can only begin a resize drag with a mouse event
++        return NS_ERROR_INVALID_ARG;
      }
+ 
+     nsMouseEvent* mouse_event = static_cast<nsMouseEvent*>(aEvent);
+ 
+-    if (mouse_event->button != nsMouseEvent::eLeftButton) {
+-      // you can only begin a resize drag with the left mouse button
+-      return NS_ERROR_INVALID_ARG;
++    GdkWindow *gdk_window;
++    gint button, screenX, screenY;
++    if (!GetDragInfo(mouse_event, &gdk_window, &button, &screenX, &screenY)) {
++        return NS_ERROR_FAILURE;
+     }
+ 
+     // work out what GdkWindowEdge we're talking about
+     GdkWindowEdge window_edge;
+     if (aVertical < 0) {
+         if (aHorizontal < 0) {
+             window_edge = GDK_WINDOW_EDGE_NORTH_WEST;
+         } else if (aHorizontal == 0) {
+@@ -6881,44 +6938,14 @@ nsWindow::BeginResizeDrag(nsGUIEvent* aE
+             window_edge = GDK_WINDOW_EDGE_SOUTH_WEST;
+         } else if (aHorizontal == 0) {
+             window_edge = GDK_WINDOW_EDGE_SOUTH;
+         } else {
+             window_edge = GDK_WINDOW_EDGE_SOUTH_EAST;
+         }
+     }
+ 
+-    // get the gdk window for this widget
+-    GdkWindow* gdk_window = mGdkWindow;
+-    if (!GDK_IS_WINDOW(gdk_window)) {
+-      return NS_ERROR_FAILURE;
+-    }
+-
+-    // find the top-level window
+-    gdk_window = gdk_window_get_toplevel(gdk_window);
+-    if (!GDK_IS_WINDOW(gdk_window)) {
+-      return NS_ERROR_FAILURE;
+-    }
+-
+-
+-    // get the current (default) display
+-    GdkDisplay* display = gdk_display_get_default();
+-    if (!GDK_IS_DISPLAY(display)) {
+-      return NS_ERROR_FAILURE;
+-    }
+-
+-    // get the current pointer position and button state
+-    GdkScreen* screen = NULL;
+-    gint screenX, screenY;
+-    GdkModifierType mask;
+-    gdk_display_get_pointer(display, &screen, &screenX, &screenY, &mask);
+-
+-    // we only support resizing with button 1
+-    if (!(mask & GDK_BUTTON1_MASK)) {
+-        return NS_ERROR_FAILURE;
+-    }
+-
+     // tell the window manager to start the resize
+-    gdk_window_begin_resize_drag(gdk_window, window_edge, 1,
+-            screenX, screenY, aEvent->time);
++    gdk_window_begin_resize_drag(gdk_window, window_edge, button,
++                                 screenX, screenY, aEvent->time);
+ 
+     return NS_OK;
+ }
 diff --git a/widget/src/gtk2/nsWindow.h b/widget/src/gtk2/nsWindow.h
 --- a/widget/src/gtk2/nsWindow.h
 +++ b/widget/src/gtk2/nsWindow.h
@@ -439,7 +529,7 @@ diff --git a/widget/src/gtk2/nsWindow.h b/widget/src/gtk2/nsWindow.h
  
 -    NS_IMETHOD         BeginResizeDrag   (nsGUIEvent* aEvent, PRInt32 aHorizontal, PRInt32 aVertical);
 +    NS_IMETHOD         BeginResizeDrag(nsGUIEvent* aEvent, PRInt32 aHorizontal, PRInt32 aVertical);
-+    NS_IMETHOD         BeginMoveDrag();
++    NS_IMETHOD         BeginMoveDrag(nsMouseEvent* aEvent);
  
      MozContainer*      GetMozContainer() { return mContainer; }
      GdkWindow*         GetGdkWindow() { return mGdkWindow; }
@@ -448,6 +538,26 @@ diff --git a/widget/src/gtk2/nsWindow.h b/widget/src/gtk2/nsWindow.h
      // If this dispatched the keydown event actually, this returns TRUE,
      // otherwise, FALSE.
      PRBool             DispatchKeyDownEvent(GdkEventKey *aEvent,
+@@ -371,16 +372,19 @@ private:
+     void               SetUrgencyHint(GtkWidget *top_window, PRBool state);
+     void              *SetupPluginPort(void);
+     nsresult           SetWindowIconList(const nsTArray<nsCString> &aIconList);
+     void               SetDefaultIcon(void);
+     void               InitButtonEvent(nsMouseEvent &aEvent, GdkEventButton *aGdkEvent);
+     PRBool             DispatchCommandEvent(nsIAtom* aCommand);
+     void               SetWindowClipRegion(const nsTArray<nsIntRect>& aRects,
+                                            PRBool aIntersectWithExisting);
++    PRBool             GetDragInfo(nsMouseEvent* aMouseEvent,
++                                   GdkWindow** aWindow, gint* aButton,
++                                   gint* aRootX, gint* aRootY);
+ 
+     GtkWidget          *mShell;
+     MozContainer       *mContainer;
+     GdkWindow          *mGdkWindow;
+ 
+     GtkWindowGroup     *mWindowGroup;
+ 
+     PRUint32            mHasMappedToplevel : 1,
 diff --git a/widget/src/xpwidgets/nsBaseWidget.cpp b/widget/src/xpwidgets/nsBaseWidget.cpp
 --- a/widget/src/xpwidgets/nsBaseWidget.cpp
 +++ b/widget/src/xpwidgets/nsBaseWidget.cpp
@@ -462,7 +572,7 @@ diff --git a/widget/src/xpwidgets/nsBaseWidget.cpp b/widget/src/xpwidgets/nsBase
  }
 +
 +NS_IMETHODIMP
-+nsBaseWidget::BeginMoveDrag()
++nsBaseWidget::BeginMoveDrag(nsMouseEvent* aEvent)
 +{
 +  return NS_ERROR_NOT_IMPLEMENTED;
 +}
@@ -486,7 +596,7 @@ diff --git a/widget/src/xpwidgets/nsBaseWidget.h b/widget/src/xpwidgets/nsBaseWi
    virtual PRBool          ShowsResizeIndicator(nsIntRect* aResizerRect);
    virtual void            FreeNativeData(void * data, PRUint32 aDataType) {}
    NS_IMETHOD              BeginResizeDrag(nsGUIEvent* aEvent, PRInt32 aHorizontal, PRInt32 aVertical);
-+  NS_IMETHOD              BeginMoveDrag();
++  NS_IMETHOD              BeginMoveDrag(nsMouseEvent* aEvent);
    virtual nsresult        ActivateNativeMenuItemAt(const nsAString& indexString) { return NS_ERROR_NOT_IMPLEMENTED; }
    virtual nsresult        ForceUpdateNativeMenuAt(const nsAString& indexString) { return NS_ERROR_NOT_IMPLEMENTED; }
    NS_IMETHOD              ResetInputState() { return NS_OK; }
