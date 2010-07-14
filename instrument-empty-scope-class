@@ -1,0 +1,109 @@
+From: Brendan Eich <brendan@mozilla.org>
+
+Empty scope class counting instrumentation support, to debug bug 570435.
+
+diff --git a/js/src/jscntxt.h b/js/src/jscntxt.h
+--- a/js/src/jscntxt.h
++++ b/js/src/jscntxt.h
+@@ -1428,16 +1428,25 @@ struct JSRuntime {
+ 
+     /* Literal table maintained by jsatom.c functions. */
+     JSAtomState         atomState;
+ 
+     JSEmptyScope          *emptyArgumentsScope;
+     JSEmptyScope          *emptyBlockScope;
+     JSEmptyScope          *emptyCallScope;
+ 
++#ifdef DEBUG
++    typedef js::HashMap<JSClass *,
++                        uint32,
++                        js::DefaultHasher<JSClass*>,
++                        js::SystemAllocPolicy> ClassToCountMap;
++
++    ClassToCountMap       emptyScopeClasses;
++#endif
++
+     /*
+      * Various metering fields are defined at the end of JSRuntime. In this
+      * way there is no need to recompile all the code that refers to other
+      * fields of JSRuntime after enabling the corresponding metering macro.
+      */
+ #ifdef JS_DUMP_ENUM_CACHE_STATS
+     int32               nativeEnumProbes;
+     int32               nativeEnumMisses;
+diff --git a/js/src/jspropertytree.cpp b/js/src/jspropertytree.cpp
+--- a/js/src/jspropertytree.cpp
++++ b/js/src/jspropertytree.cpp
+@@ -1006,10 +1006,30 @@ js::SweepScopeProperties(JSContext *cx)
+                     fprintf(dumpfp, "emptyShape %u ", rent->emptyShape);
+                     rent->firstProp->dumpSubtree(cx, 0, dumpfp);
+                 }
+                 rent++;
+             }
+             fclose(dumpfp);
+         }
+     }
++
++    if (const char *filename = getenv("JS_EMPTYCLASS_DUMPFILE")) {
++        typedef JSRuntime::ClassToCountMap HM;
++        HM &hm = cx->runtime->emptyScopeClasses;
++        HM::Range r = hm.all();
++        if (!r.empty()) {
++            char pathname[1024];
++            JS_snprintf(pathname, sizeof pathname, "%s.%lu",
++                        filename, (unsigned long)cx->runtime->gcNumber);
++            FILE *dumpfp = fopen(pathname, "w");
++            if (dumpfp) {
++                do {
++                    fprintf(dumpfp, "%10lu %s\n",
++                            (unsigned long) r.front().value, r.front().key->name);
++                    r.popFront();
++                } while (!r.empty());
++                fclose(dumpfp);
++            }
++        }
++    }
+ #endif /* DEBUG */
+ }
+diff --git a/js/src/jsscopeinlines.h b/js/src/jsscopeinlines.h
+--- a/js/src/jsscopeinlines.h
++++ b/js/src/jsscopeinlines.h
+@@ -182,25 +182,37 @@ JSScope::trace(JSTracer *trc)
+         if (!sprop || hasOwnShape()) {
+             newShape = js_RegenerateShapeForGC(cx);
+             JS_ASSERT_IF(sprop, newShape != sprop->shape);
+         }
+         shape = newShape;
+         flags ^= JSScope::SHAPE_REGEN;
+ 
+         /* Also regenerate the shapes of this scope's empty scope, if there is one. */
+-        JSScope *empty = emptyScope;
++        JSEmptyScope *empty = emptyScope;
+         if (empty) {
+             JS_ASSERT(!empty->emptyScope);
+             if (!empty->hasRegenFlag(regenFlag)) {
+                 uint32 newEmptyShape = js_RegenerateShapeForGC(cx);
+ 
+                 JS_PROPERTY_TREE(cx).emptyShapeChange(empty->shape, newEmptyShape);
+                 empty->shape = newEmptyShape;
+                 empty->flags ^= JSScope::SHAPE_REGEN;
++
++#ifdef DEBUG
++                typedef JSRuntime::ClassToCountMap HM;
++                HM &hm = cx->runtime->emptyScopeClasses;
++                HM::AddPtr p = hm.lookupForAdd(empty->clasp);
++                if (!p) {
++                    hm.add(p, empty->clasp, 1);
++                } else {
++                    JS_ASSERT(p->key == empty->clasp);
++                    ++p->value;
++                }
++#endif
+             }
+         }
+     }
+ 
+     if (sprop) {
+         JS_ASSERT(hasProperty(sprop));
+ 
+         /* Trace scope's property tree ancestor line. */
