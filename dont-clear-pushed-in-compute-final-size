@@ -1,0 +1,160 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Don't try to clear pushed floats when computing the final size of blocks.  Fixes scrollbar on layout/reftests/bugs/563584-6-columns.html .  (Bug 563584)
+
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1299,17 +1299,18 @@ nsBlockFrame::ComputeFinalSize(const nsH
+         NS_MIN(bottomEdgeOfChildren + aState.mPrevBottomMargin.get(),
+                aState.mReflowState.availableHeight);
+     }
+   }
+   if (aState.GetFlag(BRS_FLOAT_MGR)) {
+     // Include the float manager's state to properly account for the
+     // bottom margin of any floated elements; e.g., inside a table cell.
+     nscoord floatHeight =
+-      aState.ClearFloats(bottomEdgeOfChildren, NS_STYLE_CLEAR_LEFT_AND_RIGHT);
++      aState.ClearFloats(bottomEdgeOfChildren, NS_STYLE_CLEAR_LEFT_AND_RIGHT,
++                         nsnull, nsFloatManager::DONT_CLEAR_PUSHED_FLOATS);
+     bottomEdgeOfChildren = NS_MAX(bottomEdgeOfChildren, floatHeight);
+   }
+ 
+   // Compute final height
+   if (NS_UNCONSTRAINEDSIZE != aReflowState.ComputedHeight()) {
+     // Figure out how much of the computed height should be
+     // applied to this frame.
+     nscoord computedHeightLeftOver = aReflowState.ComputedHeight();
+diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
+--- a/layout/generic/nsBlockReflowState.cpp
++++ b/layout/generic/nsBlockReflowState.cpp
+@@ -960,17 +960,18 @@ nsBlockReflowState::PlaceBelowCurrentLin
+     }
+     fc = fc->Next();
+   }
+   return PR_TRUE;
+ }
+ 
+ nscoord
+ nsBlockReflowState::ClearFloats(nscoord aY, PRUint8 aBreakType,
+-                                nsIFrame *aReplacedBlock)
++                                nsIFrame *aReplacedBlock,
++                                PRUint32 aFlags)
+ {
+ #ifdef DEBUG
+   if (nsBlockFrame::gNoisyReflow) {
+     nsFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+     printf("clear floats: in: aY=%d(%d)\n",
+            aY, aY - BorderPadding().top);
+   }
+ #endif
+@@ -980,17 +981,18 @@ nsBlockReflowState::ClearFloats(nscoord 
+          aY, aBreakType);
+   mFloatManager->List(stdout);
+ #endif
+   
+   const nsMargin& bp = BorderPadding();
+   nscoord newY = aY;
+ 
+   if (aBreakType != NS_STYLE_CLEAR_NONE) {
+-    newY = bp.top + mFloatManager->ClearFloats(newY - bp.top, aBreakType);
++    newY = bp.top +
++           mFloatManager->ClearFloats(newY - bp.top, aBreakType, aFlags);
+   }
+ 
+   if (aReplacedBlock) {
+     for (;;) {
+       nsFlowAreaRect floatAvailableSpace = GetFloatAvailableSpace(newY);
+       nsBlockFrame::ReplacedElementWidthToClear replacedWidth =
+         nsBlockFrame::WidthToClearPastFloats(*this, floatAvailableSpace.mRect,
+                                              aReplacedBlock);
+diff --git a/layout/generic/nsBlockReflowState.h b/layout/generic/nsBlockReflowState.h
+--- a/layout/generic/nsBlockReflowState.h
++++ b/layout/generic/nsBlockReflowState.h
+@@ -113,17 +113,18 @@ public:
+   PRBool FlowAndPlaceFloat(nsIFrame*       aFloat,
+                            nsReflowStatus& aReflowStatus);
+   PRBool PlaceBelowCurrentLineFloats(nsFloatCacheFreeList& aFloats);
+ 
+   // Returns the first coordinate >= aY that clears the
+   // floats indicated by aBreakType and has enough width between floats
+   // (or no floats remaining) to accomodate aReplacedBlock.
+   nscoord ClearFloats(nscoord aY, PRUint8 aBreakType,
+-                      nsIFrame *aReplacedBlock = nsnull);
++                      nsIFrame *aReplacedBlock = nsnull,
++                      PRUint32 aFlags = 0);
+ 
+   PRBool IsAdjacentWithTop() const {
+     return mY ==
+       ((mFlags & BRS_ISFIRSTINFLOW) ? mReflowState.mComputedBorderPadding.top : 0);
+   }
+ 
+   /**
+    * Adjusts the border/padding to return 0 for the top if
+diff --git a/layout/generic/nsFloatManager.cpp b/layout/generic/nsFloatManager.cpp
+--- a/layout/generic/nsFloatManager.cpp
++++ b/layout/generic/nsFloatManager.cpp
+@@ -469,25 +469,28 @@ nsFloatManager::List(FILE* out) const
+            fi.mRect.x, fi.mRect.y, fi.mRect.width, fi.mRect.height,
+            fi.mLeftYMost, fi.mRightYMost);
+   }
+   return NS_OK;
+ }
+ #endif
+ 
+ nscoord
+-nsFloatManager::ClearFloats(nscoord aY, PRUint8 aBreakType) const
++nsFloatManager::ClearFloats(nscoord aY, PRUint8 aBreakType,
++                            PRUint32 aFlags) const
+ {
+-  if ((mPushedLeftFloatPastBreak &&
+-       (aBreakType == NS_STYLE_CLEAR_LEFT_AND_RIGHT ||
+-        aBreakType == NS_STYLE_CLEAR_LEFT)) ||
+-      (mPushedRightFloatPastBreak &&
+-       (aBreakType == NS_STYLE_CLEAR_LEFT_AND_RIGHT ||
+-        aBreakType == NS_STYLE_CLEAR_RIGHT))) {
+-    return nscoord_MAX;
++  if (!(aFlags & DONT_CLEAR_PUSHED_FLOATS)) {
++    if ((mPushedLeftFloatPastBreak &&
++         (aBreakType == NS_STYLE_CLEAR_LEFT_AND_RIGHT ||
++          aBreakType == NS_STYLE_CLEAR_LEFT)) ||
++        (mPushedRightFloatPastBreak &&
++         (aBreakType == NS_STYLE_CLEAR_LEFT_AND_RIGHT ||
++          aBreakType == NS_STYLE_CLEAR_RIGHT))) {
++      return nscoord_MAX;
++    }
+   }
+   if (!HasAnyFloats()) {
+     return aY;
+   }
+ 
+   nscoord bottom = aY + mY;
+ 
+   const FloatInfo &tail = mFloats[mFloats.Length() - 1];
+diff --git a/layout/generic/nsFloatManager.h b/layout/generic/nsFloatManager.h
+--- a/layout/generic/nsFloatManager.h
++++ b/layout/generic/nsFloatManager.h
+@@ -256,17 +256,22 @@ public:
+   nscoord GetLowestFloatTop() const;
+ 
+   /**
+    * Return the coordinate of the lowest float matching aBreakType in this
+    * float manager. Returns aY if there are no matching floats.
+    *
+    * Both aY and the result are relative to the current translation.
+    */
+-  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType) const;
++  enum {
++    // Tell ClearFloats not to push to nscoord_MAX when floats have been
++    // pushed to the next page/column.
++    DONT_CLEAR_PUSHED_FLOATS = (1<<0)
++  };
++  nscoord ClearFloats(nscoord aY, PRUint8 aBreakType, PRUint32 aFlags = 0) const;
+ 
+   /**
+    * Checks if clear would pass into the floats' BFC's next-in-flow,
+    * i.e. whether floats affecting this clear have continuations.
+    */
+   PRBool ClearContinues(PRUint8 aBreakType) const;
+ 
+   void AssertStateMatches(SavedState *aState) const
