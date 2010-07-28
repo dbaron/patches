@@ -5,7 +5,98 @@ Add support for calc() to the 'width' property.  (TODO:  Needs audit of users of
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
 +++ b/layout/base/nsLayoutUtils.cpp
-@@ -1969,16 +1969,17 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+@@ -90,28 +90,32 @@
+ #include "imgIRequest.h"
+ #include "imgIContainer.h"
+ #include "nsIImageLoadingContent.h"
+ #include "nsCOMPtr.h"
+ #include "nsListControlFrame.h"
+ #include "ImageLayers.h"
+ #include "mozilla/dom/Element.h"
+ #include "nsCanvasFrame.h"
++#include "CSSCalc.h"
+ 
+ #ifdef MOZ_SVG
+ #include "nsSVGUtils.h"
+ #include "nsSVGIntegrationUtils.h"
+ #include "nsSVGForeignObjectFrame.h"
+ #include "nsSVGOuterSVGFrame.h"
+ #endif
+ 
+ #ifdef MOZ_XUL
+ #include "nsXULPopupManager.h"
+ #endif
+ 
++// FIXME: TEMPORARY: UNCOMMENT THIS AFTER UPDATING TREE
++//namespace css = mozilla::css;
++
+ using namespace mozilla::layers;
+ using namespace mozilla::dom;
+ 
+ /**
+  * A namespace class for static layout utilities.
+  */
+ 
+ nsIFrame*
+@@ -1819,16 +1823,56 @@ GetIntrinsicCoord(const nsStyleCoord& aS
+ }
+ 
+ #undef  DEBUG_INTRINSIC_WIDTH
+ 
+ #ifdef DEBUG_INTRINSIC_WIDTH
+ static PRInt32 gNoiseIndent = 0;
+ #endif
+ 
++struct IntrinsicForWidthCalcOps : public css::StyleCoordInputCalcOps,
++                                  public css::BasicCoordCalcOps
++{
++  nsIRenderingContext *mRenderingContext;
++  nsIFrame *mFrame;
++  nsLayoutUtils::IntrinsicWidthType mType;
++  nscoord mInputResult, mCoordOutsideWidth;
++  float mPctOutsideWidth, mPctTotal;
++
++  IntrinsicForWidthCalcOps(nsIRenderingContext *aRenderingContext,
++                           nsIFrame *aFrame,
++                           nsLayoutUtils::IntrinsicWidthType aType,
++                           nscoord aInputResult, nscoord aCoordOutsideWidth,
++                           float aPctOutsideWidth, float aPctTotal)
++    : mRenderingContext(aRenderingContext), mFrame(aFrame), mType(aType),
++      mInputResult(aInputResult), mCoordOutsideWidth(aCoordOutsideWidth),
++      mPctOutsideWidth(aPctOutsideWidth), mPctTotal(aPctTotal) {}
++
++  result_type ComputeLeafValue(const nsStyleCoord& aValue)
++  {
++    nscoord w, result;
++    if (GetAbsoluteCoord(aValue, w) ||
++        GetIntrinsicCoord(aValue, mRenderingContext, mFrame,
++                          PROP_WIDTH, w)) {
++      result = AddPercents(mType, w + mCoordOutsideWidth, mPctOutsideWidth);
++    }
++    else if (mType == nsLayoutUtils::MIN_WIDTH &&
++             eStyleUnit_Percent == aValue.GetUnit() &&
++             mFrame->IsFrameOfType(nsIFrame::eReplaced)) {
++      // A percentage width on replaced elements means they can
++      // shrink to 0.
++      result = 0; // let |min| handle padding/border/margin
++    }
++    else {
++      result = AddPercents(mType, mInputResult, mPctTotal);
++    }
++    return result;
++  }
++};
++
+ /* static */ nscoord
+ nsLayoutUtils::IntrinsicForContainer(nsIRenderingContext *aRenderingContext,
+                                      nsIFrame *aFrame,
+                                      IntrinsicWidthType aType)
+ {
+   NS_PRECONDITION(aFrame, "null frame");
+   NS_PRECONDITION(aType == MIN_WIDTH || aType == PREF_WIDTH, "bad type");
+ 
+@@ -1968,29 +2012,21 @@ nsLayoutUtils::IntrinsicForContainer(nsI
+ 
    coordOutsideWidth += offsets.hMargin;
    pctOutsideWidth += offsets.hPctMargin;
  
@@ -13,17 +104,33 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    result = NSCoordSaturatingAdd(result, coordOutsideWidth);
    pctTotal += pctOutsideWidth;
  
-   nscoord w;
-+  // FIXME: handle calc()
-   if (GetAbsoluteCoord(styleWidth, w) ||
-       GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
-                         PROP_WIDTH, w)) {
-     result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
+-  nscoord w;
+-  if (GetAbsoluteCoord(styleWidth, w) ||
+-      GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
+-                        PROP_WIDTH, w)) {
+-    result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
+-  }
+-  else if (aType == MIN_WIDTH && eStyleUnit_Percent == styleWidth.GetUnit() &&
+-           aFrame->IsFrameOfType(nsIFrame::eReplaced)) {
+-    // A percentage width on replaced elements means they can shrink to 0.
+-    result = 0; // let |min| handle padding/border/margin
+-  }
+-  else {
+-    result = AddPercents(aType, result, pctTotal);
++  {
++    IntrinsicForWidthCalcOps ops(aRenderingContext, aFrame, aType,
++                                 result, coordOutsideWidth, pctOutsideWidth,
++                                 pctTotal);
++    result = css::ComputeCalc(styleWidth, ops);
    }
-   else if (aType == MIN_WIDTH && eStyleUnit_Percent == styleWidth.GetUnit() &&
-            aFrame->IsFrameOfType(nsIFrame::eReplaced)) {
-     // A percentage width on replaced elements means they can shrink to 0.
-@@ -2076,25 +2077,24 @@ nsLayoutUtils::ComputeWidthValue(
+ 
+   nscoord maxw;
+   if (GetAbsoluteCoord(styleMaxWidth, maxw) ||
+       GetIntrinsicCoord(styleMaxWidth, aRenderingContext, aFrame,
+                         PROP_MAX_WIDTH, maxw)) {
+     maxw = AddPercents(aType, maxw + coordOutsideWidth, pctOutsideWidth);
+     if (result > maxw)
+@@ -2076,25 +2112,24 @@ nsLayoutUtils::ComputeWidthValue(
    NS_WARN_IF_FALSE(aContainingBlockWidth != NS_UNCONSTRAINEDSIZE,
                     "have unconstrained width; this should only result from "
                     "very large sizes, not attempts at intrinsic width "
@@ -123,7 +230,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
-@@ -5531,18 +5531,18 @@ nsRuleNode::ComputePositionData(void* aS
+@@ -5524,18 +5524,18 @@ nsRuleNode::ComputePositionData(void* aS
      if (SetCoord(posData.mOffset.*(nsCSSRect::sides[side]),
                   coord, parentCoord, SETCOORD_LPAH | SETCOORD_INITIAL_AUTO,
                   aContext, mPresContext, canStoreInRuleTree)) {
