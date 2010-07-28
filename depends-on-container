@@ -1,0 +1,210 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Consolidate code for determining when widths and heights depend on a container.  (Bug 363249)
+
+diff --git a/layout/generic/nsAbsoluteContainingBlock.cpp b/layout/generic/nsAbsoluteContainingBlock.cpp
+--- a/layout/generic/nsAbsoluteContainingBlock.cpp
++++ b/layout/generic/nsAbsoluteContainingBlock.cpp
+@@ -221,39 +221,19 @@ nsAbsoluteContainingBlock::Reflow(nsCont
+ }
+ 
+ static inline PRBool IsFixedPaddingSize(nsStyleUnit aUnit) {
+   return aUnit == eStyleUnit_Coord;
+ }
+ static inline PRBool IsFixedMarginSize(nsStyleUnit aUnit) {
+   return aUnit == eStyleUnit_Coord;
+ }
+-static inline PRBool IsFixedMaxSize(nsStyleUnit aUnit) {
+-  return aUnit == eStyleUnit_None || aUnit == eStyleUnit_Coord;
+-}
+ static inline PRBool IsFixedOffset(nsStyleUnit aUnit) {
+   return aUnit == eStyleUnit_Coord;
+ }
+-static inline PRBool IsFixedHeight(nsStyleUnit aUnit) {
+-  return aUnit == eStyleUnit_Coord;
+-}
+-
+-static inline PRBool IsFixedWidth(const nsStyleCoord& aCoord)
+-{
+-  return aCoord.GetUnit() == eStyleUnit_Coord ||
+-         (aCoord.GetUnit() == eStyleUnit_Enumerated &&
+-          (aCoord.GetIntValue() == NS_STYLE_WIDTH_MAX_CONTENT ||
+-           aCoord.GetIntValue() == NS_STYLE_WIDTH_MIN_CONTENT));
+-}
+-
+-static inline PRBool IsFixedMaxWidth(const nsStyleCoord& aCoord)
+-{
+-  return aCoord.GetUnit() == eStyleUnit_None ||
+-         IsFixedWidth(aCoord);
+-}
+ 
+ PRBool
+ nsAbsoluteContainingBlock::FrameDependsOnContainer(nsIFrame* f,
+                                                    PRBool aCBWidthChanged,
+                                                    PRBool aCBHeightChanged)
+ {
+   const nsStylePosition* pos = f->GetStylePosition();
+   // See if f's position might have changed because it depends on a
+@@ -281,19 +261,19 @@ nsAbsoluteContainingBlock::FrameDependsO
+   const nsStyleMargin* margin = f->GetStyleMargin();
+   if (aCBWidthChanged) {
+     // See if f's width might have changed.
+     // If border-left, border-right, padding-left, padding-right,
+     // width, min-width, and max-width are all lengths, 'none', or enumerated,
+     // then our frame width does not depend on the parent width.
+     // Note that borders never depend on the parent width
+     // XXX All of the enumerated values except -moz-available are ok too.
+-    if (!IsFixedWidth(pos->mWidth) ||
+-        !IsFixedWidth(pos->mMinWidth) ||
+-        !IsFixedMaxWidth(pos->mMaxWidth) ||
++    if (pos->WidthDependsOnContainer() ||
++        pos->MinWidthDependsOnContainer() ||
++        pos->MaxWidthDependsOnContainer() ||
+         !IsFixedPaddingSize(padding->mPadding.GetLeftUnit()) ||
+         !IsFixedPaddingSize(padding->mPadding.GetRightUnit())) {
+       return PR_TRUE;
+     }
+ 
+     // See if f's position might have changed. If we're RTL then the
+     // rules are slightly different. We'll assume percentage or auto
+     // margins will always induce a dependency on the size
+@@ -320,22 +300,22 @@ nsAbsoluteContainingBlock::FrameDependsO
+   }
+   if (aCBHeightChanged) {
+     // See if f's height might have changed.
+     // If border-top, border-bottom, padding-top, padding-bottom,
+     // min-height, and max-height are all lengths or 'none',
+     // and height is a length or height and bottom are auto and top is not auto,
+     // then our frame height does not depend on the parent height.
+     // Note that borders never depend on the parent height
+-    if (!(IsFixedHeight(pos->mHeight.GetUnit()) ||
+-          (pos->mHeight.GetUnit() == eStyleUnit_Auto &&
++    if ((pos->HeightDependsOnContainer() &&
++         !(pos->mHeight.GetUnit() == eStyleUnit_Auto &&
+            pos->mOffset.GetBottomUnit() == eStyleUnit_Auto &&
+            pos->mOffset.GetTopUnit() != eStyleUnit_Auto)) ||
+-        !IsFixedHeight(pos->mMinHeight.GetUnit()) ||
+-        !IsFixedMaxSize(pos->mMaxHeight.GetUnit()) ||
++        pos->MinHeightDependsOnContainer() ||
++        pos->MaxHeightDependsOnContainer() ||
+         !IsFixedPaddingSize(padding->mPadding.GetTopUnit()) ||
+         !IsFixedPaddingSize(padding->mPadding.GetBottomUnit())) { 
+       return PR_TRUE;
+     }
+       
+     // See if f's position might have changed.
+     if (!IsFixedMarginSize(margin->mMargin.GetTopUnit()) ||
+         !IsFixedMarginSize(margin->mMargin.GetBottomUnit())) {
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -648,26 +648,16 @@ HasPercentageUnitSide(const nsStyleSides
+ {
+   NS_FOR_CSS_SIDES(side) {
+     if (eStyleUnit_Percent == aSides.GetUnit(side))
+       return PR_TRUE;
+   }
+   return PR_FALSE;
+ }
+ 
+-inline PRBool
+-WidthDependsOnContainer(const nsStyleCoord& aCoord)
+-{
+-  return aCoord.GetUnit() == eStyleUnit_Percent ||
+-         (aCoord.GetUnit() == eStyleUnit_Enumerated &&
+-          (aCoord.GetIntValue() == NS_STYLE_WIDTH_AVAILABLE ||
+-           aCoord.GetIntValue() == NS_STYLE_WIDTH_FIT_CONTENT));
+-
+-}
+-
+ static PRBool
+ IsPercentageAware(const nsIFrame* aFrame)
+ {
+   NS_ASSERTION(aFrame, "null frame is not allowed");
+ 
+   nsIAtom *fType = aFrame->GetType();
+   if (fType == nsGkAtoms::textFrame) {
+     // None of these things can ever be true for text frames.
+@@ -689,19 +679,20 @@ IsPercentageAware(const nsIFrame* aFrame
+   if (HasPercentageUnitSide(padding->mPadding)) {
+     return PR_TRUE;
+   }
+ 
+   // Note that borders can't be aware of percentages
+ 
+   const nsStylePosition* pos = aFrame->GetStylePosition();
+ 
+-  if (WidthDependsOnContainer(pos->mWidth) ||
+-      WidthDependsOnContainer(pos->mMaxWidth) ||
+-      WidthDependsOnContainer(pos->mMinWidth) ||
++  if ((pos->WidthDependsOnContainer() &&
++       pos->mWidth.GetUnit() != eStyleUnit_Auto) ||
++      pos->MaxWidthDependsOnContainer() ||
++      pos->MinWidthDependsOnContainer() ||
+       eStyleUnit_Percent == pos->mOffset.GetRightUnit() ||
+       eStyleUnit_Percent == pos->mOffset.GetLeftUnit()) {
+     return PR_TRUE;
+   }
+ 
+   if (eStyleUnit_Auto == pos->mWidth.GetUnit()) {
+     // We need to check for frames that shrink-wrap when they're auto
+     // width.
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -1046,24 +1046,52 @@ struct nsStylePosition {
+ 
+   nsChangeHint CalcDifference(const nsStylePosition& aOther) const;
+ #ifdef DEBUG
+   static nsChangeHint MaxDifference();
+ #endif
+   static PRBool ForceCompare() { return PR_TRUE; }
+ 
+   nsStyleSides  mOffset;                // [reset] coord, percent, auto
+-  nsStyleCoord  mWidth;                 // [reset] coord, percent, auto, enum
++  nsStyleCoord  mWidth;                 // [reset] coord, percent, enum, auto
+   nsStyleCoord  mMinWidth;              // [reset] coord, percent, enum
+-  nsStyleCoord  mMaxWidth;              // [reset] coord, percent, null, enum
++  nsStyleCoord  mMaxWidth;              // [reset] coord, percent, enum, none
+   nsStyleCoord  mHeight;                // [reset] coord, percent, auto
+   nsStyleCoord  mMinHeight;             // [reset] coord, percent
+-  nsStyleCoord  mMaxHeight;             // [reset] coord, percent, null
++  nsStyleCoord  mMaxHeight;             // [reset] coord, percent, none
+   PRUint8       mBoxSizing;             // [reset] see nsStyleConsts.h
+   nsStyleCoord  mZIndex;                // [reset] integer, auto
++
++  PRBool WidthDependsOnContainer() const
++    { return WidthCoordDependsOnContainer(mWidth); }
++  PRBool MinWidthDependsOnContainer() const
++    { return WidthCoordDependsOnContainer(mMinWidth); }
++  PRBool MaxWidthDependsOnContainer() const
++    { return WidthCoordDependsOnContainer(mMaxWidth); }
++  PRBool HeightDependsOnContainer() const
++    { return HeightCoordDependsOnContainer(mHeight); }
++  PRBool MinHeightDependsOnContainer() const
++    { return HeightCoordDependsOnContainer(mMinHeight); }
++  PRBool MaxHeightDependsOnContainer() const
++    { return HeightCoordDependsOnContainer(mMaxHeight); }
++
++private:
++  static PRBool WidthCoordDependsOnContainer(const nsStyleCoord &aCoord)
++  {
++    return aCoord.GetUnit() == eStyleUnit_Auto ||
++           aCoord.GetUnit() == eStyleUnit_Percent ||
++           (aCoord.GetUnit() == eStyleUnit_Enumerated &&
++            (aCoord.GetIntValue() == NS_STYLE_WIDTH_FIT_CONTENT ||
++             aCoord.GetIntValue() == NS_STYLE_WIDTH_AVAILABLE));
++  }
++  static PRBool HeightCoordDependsOnContainer(const nsStyleCoord &aCoord)
++  {
++    return aCoord.GetUnit() == eStyleUnit_Auto || // CSS 2.1, 10.6.4, item (5)
++           aCoord.GetUnit() == eStyleUnit_Percent;
++  }
+ };
+ 
+ struct nsStyleTextReset {
+   nsStyleTextReset(void);
+   nsStyleTextReset(const nsStyleTextReset& aOther);
+   ~nsStyleTextReset(void);
+ 
+   void* operator new(size_t sz, nsPresContext* aContext) CPP_THROW_NEW {
