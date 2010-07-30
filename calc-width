@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add support for calc() to the 'width' property.  (TODO:  Needs audit of users of nsStylePosition::mWidth.)  (Bug 363249)
+Add support for calc() to the 'width' property.  (TODO:  Needs audit of users of nsStylePosition::mWidth.)  (Bug 363249)  (FIXME: need tests)  (FIXME: double-check IntrinsicForContainer)  (FIXME: test intrinsic computation on multiple percentages within a calc())
 
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
@@ -38,65 +38,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  nsIFrame*
  nsLayoutUtils::GetLastContinuationWithChild(nsIFrame* aFrame)
  {
-@@ -1821,16 +1823,56 @@ GetIntrinsicCoord(const nsStyleCoord& aS
- }
- 
- #undef  DEBUG_INTRINSIC_WIDTH
- 
- #ifdef DEBUG_INTRINSIC_WIDTH
- static PRInt32 gNoiseIndent = 0;
- #endif
- 
-+struct IntrinsicForWidthCalcOps : public css::StyleCoordInputCalcOps,
-+                                  public css::BasicCoordCalcOps
-+{
-+  nsIRenderingContext *mRenderingContext;
-+  nsIFrame *mFrame;
-+  nsLayoutUtils::IntrinsicWidthType mType;
-+  nscoord mInputResult, mCoordOutsideWidth;
-+  float mPctOutsideWidth, mPctTotal;
-+
-+  IntrinsicForWidthCalcOps(nsIRenderingContext *aRenderingContext,
-+                           nsIFrame *aFrame,
-+                           nsLayoutUtils::IntrinsicWidthType aType,
-+                           nscoord aInputResult, nscoord aCoordOutsideWidth,
-+                           float aPctOutsideWidth, float aPctTotal)
-+    : mRenderingContext(aRenderingContext), mFrame(aFrame), mType(aType),
-+      mInputResult(aInputResult), mCoordOutsideWidth(aCoordOutsideWidth),
-+      mPctOutsideWidth(aPctOutsideWidth), mPctTotal(aPctTotal) {}
-+
-+  result_type ComputeLeafValue(const nsStyleCoord& aValue)
-+  {
-+    nscoord w, result;
-+    if (GetAbsoluteCoord(aValue, w) ||
-+        GetIntrinsicCoord(aValue, mRenderingContext, mFrame,
-+                          PROP_WIDTH, w)) {
-+      result = AddPercents(mType, w + mCoordOutsideWidth, mPctOutsideWidth);
-+    }
-+    else if (mType == nsLayoutUtils::MIN_WIDTH &&
-+             eStyleUnit_Percent == aValue.GetUnit() &&
-+             mFrame->IsFrameOfType(nsIFrame::eReplaced)) {
-+      // A percentage width on replaced elements means they can
-+      // shrink to 0.
-+      result = 0; // let |min| handle padding/border/margin
-+    }
-+    else {
-+      result = AddPercents(mType, mInputResult, mPctTotal);
-+    }
-+    return result;
-+  }
-+};
-+
- /* static */ nscoord
- nsLayoutUtils::IntrinsicForContainer(nsIRenderingContext *aRenderingContext,
-                                      nsIFrame *aFrame,
-                                      IntrinsicWidthType aType)
- {
-   NS_PRECONDITION(aFrame, "null frame");
-   NS_PRECONDITION(aType == MIN_WIDTH || aType == PREF_WIDTH, "bad type");
- 
-@@ -1970,29 +2012,21 @@ nsLayoutUtils::IntrinsicForContainer(nsI
- 
+@@ -1971,25 +1973,32 @@ nsLayoutUtils::IntrinsicForContainer(nsI
    coordOutsideWidth += offsets.hMargin;
    pctOutsideWidth += offsets.hPctMargin;
  
@@ -104,33 +46,38 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    result = NSCoordSaturatingAdd(result, coordOutsideWidth);
    pctTotal += pctOutsideWidth;
  
--  nscoord w;
+   nscoord w;
 -  if (GetAbsoluteCoord(styleWidth, w) ||
 -      GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
--                        PROP_WIDTH, w)) {
--    result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
--  }
++  if (GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
+                         PROP_WIDTH, w)) {
+     result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
+   }
 -  else if (aType == MIN_WIDTH && eStyleUnit_Percent == styleWidth.GetUnit() &&
 -           aFrame->IsFrameOfType(nsIFrame::eReplaced)) {
 -    // A percentage width on replaced elements means they can shrink to 0.
 -    result = 0; // let |min| handle padding/border/margin
--  }
--  else {
--    result = AddPercents(aType, result, pctTotal);
-+  {
-+    IntrinsicForWidthCalcOps ops(aRenderingContext, aFrame, aType,
-+                                 result, coordOutsideWidth, pctOutsideWidth,
-+                                 pctTotal);
-+    result = css::ComputeCalc(styleWidth, ops);
++  else if (styleWidth.IsCoordPercentCalcUnit()) {
++    css::LengthPercentPair lp = nsRuleNode::ReduceComputedCalc(styleWidth);
++    // A percentage width on replaced elements means they can
++    // shrink to 0; otherwise percents just yield the intrinsic width.
++    if (lp.mPercent > 0.0f &&
++        (aType != nsLayoutUtils::MIN_WIDTH ||
++         !aFrame->IsFrameOfType(nsIFrame::eReplaced))) {
++      result = AddPercents(aType, result, pctTotal);
++    } else {
++      result =
++        AddPercents(aType, lp.mLength + coordOutsideWidth, pctOutsideWidth);
++    }
+   }
+   else {
+     result = AddPercents(aType, result, pctTotal);
    }
  
    nscoord maxw;
    if (GetAbsoluteCoord(styleMaxWidth, maxw) ||
        GetIntrinsicCoord(styleMaxWidth, aRenderingContext, aFrame,
-                         PROP_MAX_WIDTH, maxw)) {
-     maxw = AddPercents(aType, maxw + coordOutsideWidth, pctOutsideWidth);
-     if (result > maxw)
-@@ -2078,25 +2112,22 @@ nsLayoutUtils::ComputeWidthValue(
+@@ -2078,25 +2087,22 @@ nsLayoutUtils::ComputeWidthValue(
    NS_WARN_IF_FALSE(aContainingBlockWidth != NS_UNCONSTRAINEDSIZE,
                     "have unconstrained width; this should only result from "
                     "very large sizes, not attempts at intrinsic width "
