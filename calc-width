@@ -23,47 +23,65 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  nsIFrame*
  nsLayoutUtils::GetLastContinuationWithChild(nsIFrame* aFrame)
  {
-@@ -1971,25 +1972,33 @@ nsLayoutUtils::IntrinsicForContainer(nsI
-   coordOutsideWidth += offsets.hMargin;
-   pctOutsideWidth += offsets.hPctMargin;
+@@ -1706,16 +1707,25 @@ static nscoord AddPercents(nsLayoutUtils
+     else
+       result = NSToCoordRound(float(result) / (1.0f - aPercent));
+   }
+   return result;
+ }
  
-   min += coordOutsideWidth;
-   result = NSCoordSaturatingAdd(result, coordOutsideWidth);
+ static PRBool GetAbsoluteCoord(const nsStyleCoord& aStyle, nscoord& aResult)
+ {
++  if (aStyle.IsCalcUnit()) {
++    if (aStyle.CalcHasPercent()) {
++      return PR_FALSE;
++    }
++    // If it has no percents, we can pass 0 for the percentage basis.
++    aResult = nsRuleNode::ComputeComputedCalc(this, 0);
++    return PR_TRUE;
++  }
++
+   if (eStyleUnit_Coord != aStyle.GetUnit())
+     return PR_FALSE;
+ 
+   aResult = aStyle.GetCoordValue();
+   return PR_TRUE;
+ }
+ 
+ static PRBool
+@@ -1976,22 +1986,30 @@ nsLayoutUtils::IntrinsicForContainer(nsI
    pctTotal += pctOutsideWidth;
  
    nscoord w;
--  if (GetAbsoluteCoord(styleWidth, w) ||
--      GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
-+  if (GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
+   if (GetAbsoluteCoord(styleWidth, w) ||
+       GetIntrinsicCoord(styleWidth, aRenderingContext, aFrame,
                          PROP_WIDTH, w)) {
      result = AddPercents(aType, w + coordOutsideWidth, pctOutsideWidth);
    }
 -  else if (aType == MIN_WIDTH && eStyleUnit_Percent == styleWidth.GetUnit() &&
--           aFrame->IsFrameOfType(nsIFrame::eReplaced)) {
--    // A percentage width on replaced elements means they can shrink to 0.
--    result = 0; // let |min| handle padding/border/margin
-+  else if (styleWidth.IsCoordPercentCalcUnit()) {
-+    css::LengthPercentPair lp = nsRuleNode::ReduceComputedCalc(styleWidth);
-+    // A percentage width on replaced elements means they can
-+    // shrink to 0 (which we accomplish by falling through to the length
-+    // case); otherwise percents just yield the intrinsic width.
-+    if (lp.mPercent > 0.0f &&
-+        (aType != nsLayoutUtils::MIN_WIDTH ||
-+         !aFrame->IsFrameOfType(nsIFrame::eReplaced))) {
-+      result = AddPercents(aType, result, pctTotal);
-+    } else {
-+      result =
-+        AddPercents(aType, lp.mLength + coordOutsideWidth, pctOutsideWidth);
-+    }
++  else if (aType == MIN_WIDTH &&
++           // The only cases of coord-percent-calc() units that
++           // GetAbsoluteCoord didn't handle are percent and calc()s
++           // containing percent.
++           styleWidth.IsCoordPercentCalcUnit() &&
+            aFrame->IsFrameOfType(nsIFrame::eReplaced)) {
+     // A percentage width on replaced elements means they can shrink to 0.
+     result = 0; // let |min| handle padding/border/margin
    }
    else {
++    // NOTE: We could really do a lot better for percents and calc()
++    // containing percent.  Doing better for percents wouldn't be
++    // backwards compatible, but we do have the option of fixing it for
++    // calc().
      result = AddPercents(aType, result, pctTotal);
    }
  
    nscoord maxw;
    if (GetAbsoluteCoord(styleMaxWidth, maxw) ||
        GetIntrinsicCoord(styleMaxWidth, aRenderingContext, aFrame,
-@@ -2078,25 +2087,22 @@ nsLayoutUtils::ComputeWidthValue(
+                         PROP_MAX_WIDTH, maxw)) {
+     maxw = AddPercents(aType, maxw + coordOutsideWidth, pctOutsideWidth);
+@@ -2078,25 +2096,22 @@ nsLayoutUtils::ComputeWidthValue(
    NS_WARN_IF_FALSE(aContainingBlockWidth != NS_UNCONSTRAINEDSIZE,
                     "have unconstrained width; this should only result from "
                     "very large sizes, not attempts at intrinsic width "
@@ -177,10 +195,48 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
             mPresContext, canStoreInRuleTree);
  
    SetCoord(posData.mHeight, pos->mHeight, parentPos->mHeight,
+diff --git a/layout/style/nsStyleCoord.cpp b/layout/style/nsStyleCoord.cpp
+--- a/layout/style/nsStyleCoord.cpp
++++ b/layout/style/nsStyleCoord.cpp
+@@ -206,16 +206,34 @@ nsStyleCoord::GetAngleValueInRadians() c
+   case eStyleUnit_Grad:   return angle * M_PI / 200.0;
+ 
+   default:
+     NS_NOTREACHED("unrecognized angular unit");
+     return 0.0;
+   }
+ }
+ 
++PRBool
++nsStyleCoord::CalcHasPercent() const
++{
++  NS_ABORT_IF_FALSE(IsCalcUnit(), "caller should check IsCalcUnit()");
++  nsStyleCoord::Array *a = GetArrayValue();
++  for (size_t i = 0, i_end = a->Count(); i < i_end; ++i) {
++    const nsStyleCoord &v = a->Item(i);
++    if (v.GetUnit() == eStyleUnit_Percent) {
++      return PR_TRUE;
++    }
++    if (v.IsCalcUnit() && CalcHasPercent(v)) {
++      return PR_TRUE;
++    }
++  }
++  return PR_FALSE;
++}
++
++
+ inline void*
+ nsStyleCoord::Array::operator new(size_t aSelfSize,
+                                   nsStyleContext *aAllocationContext,
+                                   size_t aItemCount) CPP_THROW_NEW
+ {
+   NS_ABORT_IF_FALSE(aItemCount > 0, "cannot have 0 item count");
+   return aAllocationContext->Alloc(
+            aSelfSize + sizeof(nsStyleCoord) * (aItemCount - 1));
 diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
 --- a/layout/style/nsStyleCoord.h
 +++ b/layout/style/nsStyleCoord.h
-@@ -119,16 +119,22 @@ public:
+@@ -119,16 +119,26 @@ public:
    PRBool IsAngleValue() const {
      return eStyleUnit_Degree <= mUnit && mUnit <= eStyleUnit_Radian;
    }
@@ -195,6 +251,10 @@ diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
 +           IsCalcUnit();
 +  }
 +
++  // Does this calc() expression have any percentages inside it?  Can be
++  // called only when IsCalcUnit() is true.
++  PRBool CalcHasPercent() const;
++
    PRBool IsArrayValue() const {
      return IsCalcUnit();
    }
@@ -206,7 +266,7 @@ diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
 diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 --- a/layout/style/nsStyleStruct.cpp
 +++ b/layout/style/nsStyleStruct.cpp
-@@ -1141,16 +1141,43 @@ nsChangeHint nsStylePosition::CalcDiffer
+@@ -1141,16 +1141,27 @@ nsChangeHint nsStylePosition::CalcDiffer
  #ifdef DEBUG
  /* static */
  nsChangeHint nsStylePosition::MaxDifference()
@@ -215,28 +275,12 @@ diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
  }
  #endif
  
-+static PRBool
-+CalcHasPercent(const nsStyleCoord &aCoord)
-+{
-+  nsStyleCoord::Array *a = aCoord.GetArrayValue();
-+  for (size_t i = 0, i_end = a->Count(); i < i_end; ++i) {
-+    const nsStyleCoord &v = a->Item(i);
-+    if (v.GetUnit() == eStyleUnit_Percent) {
-+      return PR_TRUE;
-+    }
-+    if (v.IsCalcUnit() && CalcHasPercent(v)) {
-+      return PR_TRUE;
-+    }
-+  }
-+  return PR_FALSE;
-+}
-+
 +/* static */ PRBool
 +nsStylePosition::WidthCoordDependsOnContainer(const nsStyleCoord &aCoord)
 +{
 +  return aCoord.GetUnit() == eStyleUnit_Auto ||
 +         aCoord.GetUnit() == eStyleUnit_Percent ||
-+         (aCoord.IsCalcUnit() && CalcHasPercent(aCoord)) ||
++         (aCoord.IsCalcUnit() && aCoord.CalcHasPercent()) ||
 +         (aCoord.GetUnit() == eStyleUnit_Enumerated &&
 +          (aCoord.GetIntValue() == NS_STYLE_WIDTH_FIT_CONTENT ||
 +           aCoord.GetIntValue() == NS_STYLE_WIDTH_AVAILABLE));
