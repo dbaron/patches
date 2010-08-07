@@ -1,0 +1,302 @@
+From: Graydon Hoare <graydon@mozilla.com>
+
+Add valgrind hint annotations to plarena.  (Bug 348798)
+
+diff --git a/nsprpub/lib/ds/plarena.c b/nsprpub/lib/ds/plarena.c
+--- a/nsprpub/lib/ds/plarena.c
++++ b/nsprpub/lib/ds/plarena.c
+@@ -131,16 +131,17 @@ PR_IMPLEMENT(void) PL_InitArenaPool(
+     pool->current = &pool->first;
+     pool->arenasize = size;                                  
+ #ifdef PL_ARENAMETER
+     memset(&pool->stats, 0, sizeof pool->stats);
+     pool->stats.name = strdup(name);
+     pool->stats.next = arena_stats_list;
+     arena_stats_list = &pool->stats;
+ #endif
++    VALGRIND_CREATE_MEMPOOL(&pool->first, 0, 0);
+ }
+ 
+ 
+ /*
+ ** PL_ArenaAllocate() -- allocate space from an arena pool
+ ** 
+ ** Description: PL_ArenaAllocate() allocates space from an arena
+ ** pool. 
+@@ -177,16 +178,17 @@ PR_IMPLEMENT(void *) PL_ArenaAllocate(PL
+     /* attempt to allocate from arenas at pool->current */
+     {
+         a = pool->current;
+         do {
+             if ( a->avail +nb <= a->limit )  {
+                 pool->current = a;
+                 rp = (char *)a->avail;
+                 a->avail += nb;
++                VALGRIND_MEMPOOL_ALLOC(a, rp, nb);
+                 return rp;
+             }
+         } while( NULL != (a = a->next) );
+     }
+ 
+     /* attempt to allocate from arena_freelist */
+     {
+         PLArena *p; /* previous pointer, for unlinking from freelist */
+@@ -197,51 +199,58 @@ PR_IMPLEMENT(void *) PL_ArenaAllocate(PL
+ 
+         for ( a = arena_freelist, p = NULL; a != NULL ; p = a, a = a->next ) {
+             if ( a->base +nb <= a->limit )  {
+                 if ( p == NULL )
+                     arena_freelist = a->next;
+                 else
+                     p->next = a->next;
+                 UnlockArena();
++
++                VALGRIND_CREATE_MEMPOOL(a, 0, 0);
++                VALGRIND_MAKE_MEM_NOACCESS(a->base, PR_UPTRDIFF(a->limit, a->base));
+                 a->avail = a->base;
+                 rp = (char *)a->avail;
+                 a->avail += nb;
+                 /* the newly allocated arena is linked after pool->current 
+                 *  and becomes pool->current */
+                 a->next = pool->current->next;
+                 pool->current->next = a;
+                 pool->current = a;
+                 if ( NULL == pool->first.next )
+                     pool->first.next = a;
++                VALGRIND_MEMPOOL_ALLOC(a, rp, nb);
+                 return(rp);
+             }
+         }
+         UnlockArena();
+     }
+ 
+     /* attempt to allocate from the heap */ 
+     {  
+         PRUint32 sz = PR_MAX(pool->arenasize, nb);
+         sz += sizeof *a + pool->mask;  /* header and alignment slop */
+         a = (PLArena*)PR_MALLOC(sz);
+         if ( NULL != a )  {
+             a->limit = (PRUword)a + sz;
+             a->base = a->avail = (PRUword)PL_ARENA_ALIGN(pool, a + 1);
++            VALGRIND_CREATE_MEMPOOL(a, 0, 0);
++            VALGRIND_MAKE_MEM_NOACCESS(a->base, PR_UPTRDIFF(a->limit, a->base));
+             rp = (char *)a->avail;
+             a->avail += nb;
+             /* the newly allocated arena is linked after pool->current 
+             *  and becomes pool->current */
+             a->next = pool->current->next;
+             pool->current->next = a;
+             pool->current = a;
+             if ( NULL == pool->first.next )
+                 pool->first.next = a;
+             PL_COUNT_ARENA(pool,++);
+             COUNT(pool, nmallocs);
++            VALGRIND_MEMPOOL_ALLOC(a, rp, nb);
+             return(rp);
+         }
+     }
+ 
+     /* we got to here, and there's no memory to allocate */
+     return(NULL);
+ } /* --- end PL_ArenaAllocate() --- */
+ 
+@@ -288,21 +297,23 @@ static void FreeArenaList(PLArenaPool *p
+     ClearArenaList(a, PL_FREE_PATTERN);
+ #endif
+ 
+     if (reallyFree) {
+         do {
+             *ap = a->next;
+             PL_CLEAR_ARENA(a);
+             PL_COUNT_ARENA(pool,--);
++            VALGRIND_DESTROY_MEMPOOL(a);
+             PR_DELETE(a);
+         } while ((a = *ap) != 0);
+     } else {
+         /* Insert the whole arena chain at the front of the freelist. */
+         do {
++            VALGRIND_DESTROY_MEMPOOL(*ap);
+             ap = &(*ap)->next;
+         } while (*ap);
+         LockArena();
+         *ap = arena_freelist;
+         arena_freelist = a;
+         head->next = 0;
+         UnlockArena();
+     }
+@@ -312,31 +323,49 @@ static void FreeArenaList(PLArenaPool *p
+ 
+ PR_IMPLEMENT(void) PL_ArenaRelease(PLArenaPool *pool, char *mark)
+ {
+     PLArena *a;
+ 
+     for (a = pool->first.next; a; a = a->next) {
+         if (PR_UPTRDIFF(mark, a->base) < PR_UPTRDIFF(a->avail, a->base)) {
+             a->avail = (PRUword)PL_ARENA_ALIGN(pool, mark);
++            VALGRIND_MEMPOOL_TRIM(a, a->base, PR_UPTRDIFF(a->avail, a->base));
+             FreeArenaList(pool, a, PR_FALSE);
+             return;
+         }
+     }
+ }
+ 
+ PR_IMPLEMENT(void) PL_FreeArenaPool(PLArenaPool *pool)
+ {
+     FreeArenaList(pool, &pool->first, PR_FALSE);
++#ifdef VALGRIND_HINTS
++    /* 
++     * Unfortunately we have callers who think that they need to 
++     * call finish before free, or free before finish, or only one
++     * of the two. Thus we tolerate being multiply-deinitialized. 
++     * 
++     * Note that this is the opposite decision as in the JSArena
++     * valgrind annotations, due to different patterns in that code's
++     * callees.
++     */
++    if (VALGRIND_MEMPOOL_EXISTS(&pool->first))
++      VALGRIND_DESTROY_MEMPOOL(&pool->first);
++#endif
+     COUNT(pool, ndeallocs);
+ }
+ 
+ PR_IMPLEMENT(void) PL_FinishArenaPool(PLArenaPool *pool)
+ {
+     FreeArenaList(pool, &pool->first, PR_TRUE);
++#ifdef VALGRIND_HINTS
++    if (VALGRIND_MEMPOOL_EXISTS(&pool->first))
++      VALGRIND_DESTROY_MEMPOOL(&pool->first);
++#endif
+ #ifdef PL_ARENAMETER
+     {
+         PLArenaStats *stats, **statsp;
+ 
+         if (pool->stats.name)
+             PR_DELETE(pool->stats.name);
+         for (statsp = &arena_stats_list; (stats = *statsp) != 0;
+              statsp = &stats->next) {
+diff --git a/nsprpub/lib/ds/plarena.h b/nsprpub/lib/ds/plarena.h
+--- a/nsprpub/lib/ds/plarena.h
++++ b/nsprpub/lib/ds/plarena.h
+@@ -43,16 +43,34 @@
+  * "Fast Allocation and Deallocation of Memory Based on Object Lifetimes"
+  * David R. Hanson, Software -- Practice and Experience, Vol. 20(1).
+  *
+  * Also supports LIFO allocation (PL_ARENA_MARK/PL_ARENA_RELEASE).
+  */
+ #include "prtypes.h"
+ #include "plarenas.h"
+ 
++#define VALGRIND_HINTS
++
++#ifdef VALGRIND_HINTS
++#include <valgrind/valgrind.h>
++#include <valgrind/memcheck.h>
++#else
++#define VALGRIND_DESTROY_MEMPOOL(pool)
++#define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed)
++#define VALGRIND_MEMPOOL_ALLOC(pool, addr, size)
++#define VALGRIND_MEMPOOL_FREE(pool, addr)
++#define VALGRIND_MEMPOOL_TRIM(pool, addr, size)
++#define VALGRIND_MOVE_MEMPOOL(poolA, poolB)
++#define VALGRIND_MEMPOOL_CHANGE(pool, addrA, addrB, size)
++#define VALGRIND_MEMPOOL_EXISTS(pool) 0
++#define VALGRIND_MAKE_MEM_NOACCESS(addr, size)
++#define VALGRIND_MAKE_MEM_UNDEFINED(addr, size)
++#endif
++
+ PR_BEGIN_EXTERN_C
+ 
+ typedef struct PLArena          PLArena;
+ 
+ struct PLArena {
+     PLArena     *next;          /* next arena for this lifetime */
+     PRUword     base;           /* aligned base address, follows this header */
+     PRUword     limit;          /* one beyond last byte in arena */
+@@ -106,43 +124,46 @@ struct PLArenaPool {
+ #endif
+ 
+ #define PL_ARENA_ALLOCATE(p, pool, nb) \
+     PR_BEGIN_MACRO \
+         PLArena *_a = (pool)->current; \
+         PRUint32 _nb = PL_ARENA_ALIGN(pool, nb); \
+         PRUword _p = _a->avail; \
+         PRUword _q = _p + _nb; \
+-        if (_q > _a->limit) \
++        if (_q > _a->limit) { \
+             _p = (PRUword)PL_ArenaAllocate(pool, _nb); \
+-        else \
++        } else { \
++            VALGRIND_MEMPOOL_ALLOC(_a, _a->avail, _nb); \
+             _a->avail = _q; \
++        } \
+         p = (void *)_p; \
+         PL_ArenaCountAllocation(pool, nb); \
+     PR_END_MACRO
+ 
++#define PL_ARENA_MARK(pool) ((void *) (pool)->current->avail)
++#define PR_UPTRDIFF(p,q) ((PRUword)(p) - (PRUword)(q))
++
+ #define PL_ARENA_GROW(p, pool, size, incr) \
+     PR_BEGIN_MACRO \
+         PLArena *_a = (pool)->current; \
+         PRUint32 _incr = PL_ARENA_ALIGN(pool, incr); \
+         PRUword _p = _a->avail; \
+         PRUword _q = _p + _incr; \
+         if (_p == (PRUword)(p) + PL_ARENA_ALIGN(pool, size) && \
+             _q <= _a->limit) { \
++            VALGRIND_MEMPOOL_CHANGE(_a, p, p, PR_UPTRDIFF(_q, _p)); \
+             _a->avail = _q; \
+             PL_ArenaCountInplaceGrowth(pool, size, incr); \
+         } else { \
+             p = PL_ArenaGrow(pool, p, size, incr); \
+         } \
+         PL_ArenaCountGrowth(pool, size, incr); \
+     PR_END_MACRO
+ 
+-#define PL_ARENA_MARK(pool) ((void *) (pool)->current->avail)
+-#define PR_UPTRDIFF(p,q) ((PRUword)(p) - (PRUword)(q))
+-
+ #define PL_CLEAR_UNUSED_PATTERN(a, pattern) \
+ 	   (PR_ASSERT((a)->avail <= (a)->limit), \
+ 	   memset((void*)(a)->avail, (pattern), (a)->limit - (a)->avail))
+ #ifdef DEBUG
+ #define PL_FREE_PATTERN 0xDA
+ #define PL_CLEAR_UNUSED(a) PL_CLEAR_UNUSED_PATTERN((a), PL_FREE_PATTERN)
+ #define PL_CLEAR_ARENA(a)  memset((void*)(a), PL_FREE_PATTERN, \
+                            (a)->limit - (PRUword)(a))
+@@ -153,16 +174,17 @@ struct PLArenaPool {
+ 
+ #define PL_ARENA_RELEASE(pool, mark) \
+     PR_BEGIN_MACRO \
+         char *_m = (char *)(mark); \
+         PLArena *_a = (pool)->current; \
+         if (PR_UPTRDIFF(_m, _a->base) <= PR_UPTRDIFF(_a->avail, _a->base)) { \
+             _a->avail = (PRUword)PL_ARENA_ALIGN(pool, _m); \
+             PL_CLEAR_UNUSED(_a); \
++            VALGRIND_MEMPOOL_TRIM(_a, _a->base, PR_UPTRDIFF(_m, _a->base)); \
+             PL_ArenaCountRetract(pool, _m); \
+         } else { \
+             PL_ArenaRelease(pool, _m); \
+         } \
+         PL_ArenaCountRelease(pool, _m); \
+     PR_END_MACRO
+ 
+ #ifdef PL_ARENAMETER
+@@ -172,16 +194,17 @@ struct PLArenaPool {
+ #endif
+ 
+ #define PL_ARENA_DESTROY(pool, a, pnext) \
+     PR_BEGIN_MACRO \
+         PL_COUNT_ARENA(pool,--); \
+         if ((pool)->current == (a)) (pool)->current = &(pool)->first; \
+         *(pnext) = (a)->next; \
+         PL_CLEAR_ARENA(a); \
++        VALGRIND_DESTROY_MEMPOOL(a); \
+         free(a); \
+         (a) = 0; \
+     PR_END_MACRO
+ 
+ #ifdef PL_ARENAMETER
+ 
+ #include <stdio.h>
+ 
