@@ -1,0 +1,112 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add valgrind annotations to teach valgrind about the nsPresArena pool allocator.
+
+diff --git a/layout/base/nsPresArena.cpp b/layout/base/nsPresArena.cpp
+--- a/layout/base/nsPresArena.cpp
++++ b/layout/base/nsPresArena.cpp
+@@ -55,16 +55,29 @@
+ 
+ #ifdef MOZ_CRASHREPORTER
+ #include "nsICrashReporter.h"
+ #include "nsCOMPtr.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsPrintfCString.h"
+ #endif
+ 
++#ifdef MOZ_VALGRIND
++#  include <valgrind/valgrind.h>
++#else
++#  define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_DESTROY_MEMPOOL(pool) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MEMPOOL_ALLOC(pool, addr, size) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MEMPOOL_FREE(pool, addr) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#endif
++
+ // Even on 32-bit systems, we allocate objects from the frame arena
+ // that require 8-byte alignment.  The cast to PRUword is needed
+ // because plarena isn't as careful about mask construction as it
+ // ought to be.
+ #define ALIGN_SHIFT 3
+ #define PL_ARENA_CONST_ALIGN_MASK ((PRUword(1) << ALIGN_SHIFT) - 1)
+ #include "plarena.h"
+ 
+@@ -282,27 +295,43 @@ struct nsPresArena::State {
+   nsTHashtable<FreeList> mFreeLists;
+   PLArenaPool mPool;
+ 
+   State()
+   {
+     mFreeLists.Init();
+     PL_INIT_ARENA_POOL(&mPool, "PresArena", ARENA_PAGE_SIZE);
+     PR_CallOnce(&ARENA_POISON_guard, ARENA_POISON_init);
++    VALGRIND_CREATE_MEMPOOL(PoolAddress(), 0, false);
+   }
+ 
+   ~State()
+   {
++    VALGRIND_DESTROY_MEMPOOL(PoolAddress());
+     PL_FinishArenaPool(&mPool);
+   }
+ 
++#ifdef MOZ_VALGRIND
++  // Valgrind requires an address be associated with each memory pool.
++  // Under the assumption that valgrind *does* handle nested memory pool
++  // allocation, we don't want the pool address to be the same as our
++  // mPool, since it, in turn, might talk to valgrind (although it
++  // doesn't now).  So return the address of our mFreeLists, which is
++  // known to be different from our mPool.
++  void* PoolAddress() { return &mFreeLists; }
++#endif
++
+   void* Allocate(PRUint32 aCode, size_t aSize)
+   {
+     NS_ABORT_IF_FALSE(aSize > 0, "PresArena cannot allocate zero bytes");
+ 
++#ifdef MOZ_VALGRIND
++    size_t origSize = aSize;
++#endif
++
+     // We only hand out aligned sizes
+     aSize = PL_ARENA_ALIGN(&mPool, aSize);
+ 
+     // If there is no free-list entry for this type already, we have
+     // to create one now, to record its size.
+     FreeList* list = mFreeLists.PutEntry(aCode);
+     if (!list) {
+       return nsnull;
+@@ -327,26 +356,30 @@ struct nsPresArena::State {
+         char* p = reinterpret_cast<char*>(result);
+         char* limit = p + list->mEntrySize;
+         for (; p < limit; p += sizeof(PRUword)) {
+           NS_ABORT_IF_FALSE(*reinterpret_cast<PRUword*>(p) == ARENA_POISON,
+                             "PresArena: poison overwritten");
+         }
+       }
+ #endif
++      VALGRIND_MEMPOOL_ALLOC(PoolAddress(), result, origSize);
+       return result;
+     }
+ 
+     // Allocate a new chunk from the arena
+     PL_ARENA_ALLOCATE(result, &mPool, aSize);
++    VALGRIND_MEMPOOL_ALLOC(PoolAddress(), result, origSize);
+     return result;
+   }
+ 
+   void Free(PRUint32 aCode, void* aPtr)
+   {
++    VALGRIND_MEMPOOL_ALLOC(PoolAddress(), aPtr);
++
+     // Try to recycle this entry.
+     FreeList* list = mFreeLists.GetEntry(aCode);
+     NS_ABORT_IF_FALSE(list, "no free list for pres arena object");
+     NS_ABORT_IF_FALSE(list->mEntrySize > 0, "PresArena cannot free zero bytes");
+ 
+     char* p = reinterpret_cast<char*>(aPtr);
+     char* limit = p + list->mEntrySize;
+     for (; p < limit; p += sizeof(PRUword)) {
