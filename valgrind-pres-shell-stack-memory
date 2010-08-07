@@ -1,0 +1,138 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add valgrind annotations to teach valgrind about the pres shell's stack allocator.
+
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -204,16 +204,31 @@
+ #include "nsIContentViewer.h"
+ #include "imgIEncoder.h"
+ #include "gfxPlatform.h"
+ 
+ #include "mozilla/FunctionTimer.h"
+ 
+ #include "Layers.h"
+ 
++#ifdef MOZ_VALGRIND
++#  include <valgrind/valgrind.h>
++#else
++#  define VALGRIND_CREATE_MEMPOOL(pool, rzB, is_zeroed) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_DESTROY_MEMPOOL(pool) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MEMPOOL_ALLOC(pool, addr, size) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MEMPOOL_FREE(pool, addr) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MOVE_MEMPOOL(poolA, poolB) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#endif
++
+ #ifdef NS_FUNCTION_TIMER
+ #define NS_TIME_FUNCTION_DECLARE_DOCURL                \
+   nsCAutoString docURL__("N/A");                       \
+   nsIURI *uri__ = mDocument->GetDocumentURI();         \
+   if (uri__) uri__->GetSpec(docURL__);
+ #define NS_TIME_FUNCTION_WITH_DOCURL                   \
+   NS_TIME_FUNCTION_DECLARE_DOCURL                      \
+   NS_TIME_FUNCTION_MIN_FMT(1.0,                        \
+@@ -572,16 +587,23 @@ StackArena::Push()
+   // allows callers not to worry about error checking.
+   if (mStackTop >= mMarkLength)
+   {
+     PRUint32 newLength = mStackTop + MARK_INCREMENT;
+     StackMark* newMarks = new StackMark[newLength];
+     if (newMarks) {
+       if (mMarkLength)
+         memcpy(newMarks, mMarks, sizeof(StackMark)*mMarkLength);
++
++#ifdef MOZ_VALGRIND
++      for (PRUint32 i = 0; i < mMarkLength; ++i) {
++        VALGRIND_MOVE_MEMPOOL(mMarks + i, newMarks + i);
++      }
++#endif
++
+       // Fill in any marks that we couldn't allocate during a prior call
+       // to Push().
+       for (; mMarkLength < mStackTop; ++mMarkLength) {
+         NS_NOTREACHED("should only hit this on out-of-memory");
+         newMarks[mMarkLength].mBlock = mCurBlock;
+         newMarks[mMarkLength].mPos = mPos;
+       }
+       delete [] mMarks;
+@@ -590,26 +612,35 @@ StackArena::Push()
+     }
+   }
+ 
+   // set a mark at the top (if we can)
+   NS_ASSERTION(mStackTop < mMarkLength, "out of memory");
+   if (mStackTop < mMarkLength) {
+     mMarks[mStackTop].mBlock = mCurBlock;
+     mMarks[mStackTop].mPos = mPos;
++
++    // Tell valgrind about each push/pop pair as a separate pool so that
++    // it will automatically treat all allocated objects as freed at the
++    // appropriate times.
++    VALGRIND_CREATE_MEMPOOL(mMarks + mStackTop, 0, false);
+   }
+ 
+   mStackTop++;
+ }
+ 
+ void*
+ StackArena::Allocate(size_t aSize)
+ {
+   NS_ASSERTION(mStackTop > 0, "Allocate called without Push");
+ 
++#ifdef MOZ_VALGRIND
++  size_t origSize = aSize;
++#endif
++
+   // make sure we are aligned. Beard said 8 was safer then 4. 
+   // Round size to multiple of 8
+   aSize = PR_ROUNDUP(aSize, 8);
+ 
+   // if the size makes the stack overflow. Grab another block for the stack
+   if (mPos + aSize >= BLOCK_INCREMENT)
+   {
+     NS_ASSERTION(aSize <= BLOCK_INCREMENT,"Requested memory is greater that our block size!!");
+@@ -619,16 +650,19 @@ StackArena::Allocate(size_t aSize)
+     mCurBlock =  mCurBlock->mNext;
+     mPos = 0;
+   }
+ 
+   // return the chunk they need.
+   void *result = mCurBlock->mBlock + mPos;
+   mPos += aSize;
+ 
++  VALGRIND_MEMPOOL_ALLOC(mMarks + PR_MIN(mStackTop, mMarkLength) - 1,
++                         result, aSize);
++
+   return result;
+ }
+ 
+ void
+ StackArena::Pop()
+ {
+   // pop off the mark
+   NS_ASSERTION(mStackTop > 0, "unmatched pop");
+@@ -641,16 +675,18 @@ StackArena::Pop()
+     if (mStackTop == 0) {
+       // But we do know if we've completely pushed the stack.
+       mCurBlock = mBlocks;
+       mPos = 0;
+     }
+     return;
+   }
+ 
++  VALGRIND_DESTROY_MEMPOOL(mMarks + mStackTop);
++
+ #ifdef DEBUG
+   // Mark the "freed" memory with 0xdd to help with debugging of memory
+   // allocation problems.
+   {
+     StackBlock *block = mMarks[mStackTop].mBlock, *block_end = mCurBlock;
+     size_t pos = mMarks[mStackTop].mPos;
+     for (; block != block_end; block = block->mNext, pos = 0) {
+       memset(block->mBlock + pos, 0xdd, sizeof(block->mBlock) - pos);
