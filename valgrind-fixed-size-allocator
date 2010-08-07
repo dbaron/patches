@@ -1,0 +1,132 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add valgrind annotations to teach valgrind about nsFixedSizeAllocator.
+
+diff --git a/xpcom/ds/nsFixedSizeAllocator.cpp b/xpcom/ds/nsFixedSizeAllocator.cpp
+--- a/xpcom/ds/nsFixedSizeAllocator.cpp
++++ b/xpcom/ds/nsFixedSizeAllocator.cpp
+@@ -40,16 +40,42 @@
+ 
+   Implementation for nsFixedSizeAllocator
+ 
+ */
+ 
+ #include "nsCRT.h"
+ #include "nsFixedSizeAllocator.h"
+ 
++#ifdef MOZ_VALGRIND
++#  include <valgrind/valgrind.h>
++#  include <valgrind/memcheck.h>
++#else
++#  define VALGRIND_MEMPOOL_ALLOC(pool, addr, size) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MEMPOOL_FREE(pool, addr) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#  define VALGRIND_MAKE_MEM_UNDEFINED(addr, len) \
++            PR_BEGIN_MACRO PR_END_MACRO
++#endif
++
++#ifdef MOZ_VALGRIND
++void
++nsFixedSizeAllocator::MempoolCreated()
++{
++    VALGRIND_CREATE_MEMPOOL(PoolAddress(), 0, false);
++}
++
++void
++nsFixedSizeAllocator::MempoolDestroyed()
++{
++    VALGRIND_DESTROY_MEMPOOL(PoolAddress());
++}
++#endif
++
+ nsFixedSizeAllocator::Bucket *
+ nsFixedSizeAllocator::AddBucket(size_t aSize)
+ {
+     void* p;
+     PL_ARENA_ALLOCATE(p, &mPool, sizeof(Bucket));
+     if (! p)
+         return nsnull;
+ 
+@@ -125,29 +151,36 @@ nsFixedSizeAllocator::Alloc(size_t aSize
+         bucket->mFirst = bucket->mFirst->mNext;
+     }
+     else {
+         PL_ARENA_ALLOCATE(next, &mPool, aSize);
+         if (!next)
+             return nsnull;
+     }
+ 
++    // as opposed to NOACCESS
++    VALGRIND_MAKE_MEM_UNDEFINED(next, aSize);
++
+ #ifdef DEBUG
+     memset(next, 0xc8, aSize);
+ #endif
+ 
++    VALGRIND_MEMPOOL_ALLOC(PoolAddress(), next, aSize);
++
+     return next;
+ }
+ 
+ void
+ nsFixedSizeAllocator::Free(void* aPtr, size_t aSize)
+ {
+     FreeEntry* entry = reinterpret_cast<FreeEntry*>(aPtr);
+     Bucket* bucket = FindBucket(aSize);
+ 
+ #ifdef DEBUG
+     NS_ASSERTION(bucket && bucket->mSize == aSize, "ack! corruption! bucket->mSize != aSize!");
+     memset(aPtr, 0xd8, bucket->mSize);
+ #endif
+ 
++    VALGRIND_MEMPOOL_FREE(PoolAddress(), aPtr);
++
+     entry->mNext = bucket->mFirst;
+     bucket->mFirst = entry;
+ }
+diff --git a/xpcom/ds/nsFixedSizeAllocator.h b/xpcom/ds/nsFixedSizeAllocator.h
+--- a/xpcom/ds/nsFixedSizeAllocator.h
++++ b/xpcom/ds/nsFixedSizeAllocator.h
+@@ -158,20 +158,40 @@ protected:
+     Bucket* mBuckets;
+ 
+     Bucket *
+     AddBucket(size_t aSize);
+ 
+     Bucket *
+     FindBucket(size_t aSize);
+ 
++#ifdef MOZ_VALGRIND
++  // Valgrind requires an address be associated with each memory pool.
++  // Under the assumption that valgrind *does* handle nested memory pool
++  // allocation, we don't want the pool address to be the same as our
++  // mPool, since it, in turn, might talk to valgrind (although it
++  // doesn't now).  So return the address of our mFreeLists, which is
++  // known to be different from our mPool.
++  void* PoolAddress() { return &mBuckets; }
++
++  void MempoolCreated();
++  void MempoolDestroyed();
++#endif
++
+ public:
+-    nsFixedSizeAllocator() : mBuckets(nsnull) {}
++    nsFixedSizeAllocator() : mBuckets(nsnull) {
++#ifdef MOZ_VALGRIND
++        MempoolCreated();
++#endif
++    }
+ 
+     ~nsFixedSizeAllocator() {
++#ifdef MOZ_VALGRIND
++        MempoolDestroyed();
++#endif
+         if (mBuckets)
+             PL_FinishArenaPool(&mPool);
+     }
+ 
+     /**
+      * Initialize the fixed size allocator. 'aName' is used to tag
+      * the underlying PLArena object for debugging and measurement
+      * purposes. 'aNumBuckets' specifies the number of elements in
