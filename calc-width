@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add support for calc() to the 'width' property.  (TODO:  Needs audit of users of nsStylePosition::mWidth.)  (Bug 585715)  (FIXME: test intrinsic computation on multiple percentages within a calc())
+Add support for calc() to the 'width' property.  (Bug 585715)  (FIXME: test intrinsic computation on multiple percentages within a calc())
 
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
@@ -113,6 +113,127 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
          NS_ASSERTION(result >= 0, "width less than zero");
          break;
        case NS_STYLE_WIDTH_MIN_CONTENT:
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -1152,39 +1152,16 @@ nsXULScrollFrame::GetMaxSize(nsBoxLayout
+   nsSize maxSize(NS_INTRINSICSIZE, NS_INTRINSICSIZE);
+ 
+   AddBorderAndPadding(maxSize);
+   PRBool widthSet, heightSet;
+   nsIBox::AddCSSMaxSize(this, maxSize, widthSet, heightSet);
+   return maxSize;
+ }
+ 
+-#if 0 // XXXldb I don't think this is even needed
+-/* virtual */ nscoord
+-nsXULScrollFrame::GetMinWidth(nsIRenderingContext *aRenderingContext)
+-{
+-  nsStyleUnit widthUnit = GetStylePosition()->mWidth.GetUnit();
+-  if (widthUnit == eStyleUnit_Percent || widthUnit == eStyleUnit_Auto) {
+-    nsMargin border = aReflowState.mComputedBorderPadding;
+-    aDesiredSize.mMaxElementWidth = border.right + border.left;
+-    mMaxElementWidth = aDesiredSize.mMaxElementWidth;
+-  } else {
+-    NS_NOTYETIMPLEMENTED("Use the info from the scrolled frame");
+-#if 0
+-    // if not set then use the cached size. If set then set it.
+-    if (aDesiredSize.mMaxElementWidth == -1)
+-      aDesiredSize.mMaxElementWidth = mMaxElementWidth;
+-    else
+-      mMaxElementWidth = aDesiredSize.mMaxElementWidth;
+-#endif
+-  }
+-  return 0;
+-}
+-#endif
+-
+ #ifdef NS_DEBUG
+ NS_IMETHODIMP
+ nsXULScrollFrame::GetFrameName(nsAString& aResult) const
+ {
+   return MakeFrameName(NS_LITERAL_STRING("XULScroll"), aResult);
+ }
+ #endif
+ 
+diff --git a/layout/generic/nsImageFrame.cpp b/layout/generic/nsImageFrame.cpp
+--- a/layout/generic/nsImageFrame.cpp
++++ b/layout/generic/nsImageFrame.cpp
+@@ -120,42 +120,41 @@ nsImageFrame::IconLoad* nsImageFrame::gI
+ nsIIOService* nsImageFrame::sIOService;
+ 
+ // test if the width and height are fixed, looking at the style data
+ static PRBool HaveFixedSize(const nsStylePosition* aStylePosition)
+ {
+   // check the width and height values in the reflow state's style struct
+   // - if width and height are specified as either coord or percentage, then
+   //   the size of the image frame is constrained
+-  nsStyleUnit widthUnit = aStylePosition->mWidth.GetUnit();
+-  nsStyleUnit heightUnit = aStylePosition->mHeight.GetUnit();
+-
+-  return ((widthUnit  == eStyleUnit_Coord ||
+-           widthUnit  == eStyleUnit_Percent) &&
+-          (heightUnit == eStyleUnit_Coord ||
+-           heightUnit == eStyleUnit_Percent));
++  return aStylePosition->mWidth.IsCoordPercentCalcUnit() &&
++         aStylePosition->mHeight.IsCoordPercentCalcUnit();
+ }
+ // use the data in the reflow state to decide if the image has a constrained size
+ // (i.e. width and height that are based on the containing block size and not the image size) 
+ // so we can avoid animated GIF related reflows
+ inline PRBool HaveFixedSize(const nsHTMLReflowState& aReflowState)
+ { 
+   NS_ASSERTION(aReflowState.mStylePosition, "crappy reflowState - null stylePosition");
+   // when an image has percent css style height or width, but ComputedHeight() 
+   // or ComputedWidth() of reflow state is  NS_UNCONSTRAINEDSIZE  
+   // it needs to return PR_FALSE to cause an incremental reflow later
+   // if an image is inside table like bug 156731 simple testcase III, 
+   // during pass 1 reflow, ComputedWidth() is NS_UNCONSTRAINEDSIZE
+   // in pass 2 reflow, ComputedWidth() is 0, it also needs to return PR_FALSE
+   // see bug 156731
+-  nsStyleUnit heightUnit = aReflowState.mStylePosition->mHeight.GetUnit();
+-  nsStyleUnit widthUnit = aReflowState.mStylePosition->mWidth.GetUnit();
+-  return ((eStyleUnit_Percent == heightUnit && NS_UNCONSTRAINEDSIZE == aReflowState.ComputedHeight()) ||
+-          (eStyleUnit_Percent == widthUnit && (NS_UNCONSTRAINEDSIZE == aReflowState.ComputedWidth() ||
+-           0 == aReflowState.ComputedWidth())))
++  const nsStyleCoord &height = aReflowState.mStylePosition->mHeight;
++  const nsStyleCoord &width = aReflowState.mStylePosition->mWidth;
++  return (((eStyleUnit_Percent == height.GetUnit() ||
++            height.IsCalcUnit() && height.CalcHasPercent()) &&
++           NS_UNCONSTRAINEDSIZE == aReflowState.ComputedHeight()) ||
++          ((eStyleUnit_Percent == width.GetUnit() ||
++            width.IsCalcUnit() && width.CalcHasPercent()) &&
++           (NS_UNCONSTRAINEDSIZE == aReflowState.ComputedWidth() ||
++            0 == aReflowState.ComputedWidth())))
+           ? PR_FALSE
+           : HaveFixedSize(aReflowState.mStylePosition); 
+ }
+ 
+ nsIFrame*
+ NS_NewImageFrame(nsIPresShell* aPresShell, nsStyleContext* aContext)
+ {
+   return new (aPresShell) nsImageFrame(aContext);
+diff --git a/layout/generic/nsSpacerFrame.cpp b/layout/generic/nsSpacerFrame.cpp
+--- a/layout/generic/nsSpacerFrame.cpp
++++ b/layout/generic/nsSpacerFrame.cpp
+@@ -167,16 +167,17 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+     if (eStyleUnit_Coord == unit) {
+       aMetrics.width = position->mWidth.GetCoordValue();
+     }
+     else if (eStyleUnit_Percent == unit) 
+     {
+       float factor = position->mWidth.GetPercentValue();
+       aMetrics.width = NSToCoordRound(factor * aPercentBase.width);
+     }
++    // else treat enumerated values and calc() like 'auto'
+ 
+     // height
+     unit = position->mHeight.GetUnit();
+     if (eStyleUnit_Coord == unit) {
+       aMetrics.height = position->mHeight.GetCoordValue();
+     }
+     else if (eStyleUnit_Percent == unit) 
+     {
 diff --git a/layout/reftests/css-calc/reftest.list b/layout/reftests/css-calc/reftest.list
 new file mode 100644
 --- /dev/null
