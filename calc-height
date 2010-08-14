@@ -1,7 +1,179 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add support for calc() to the 'height', 'min-height', and 'max-height' properties.  (Bug 585715)  (FIXME:  add reftests)  (FIXME:  audit all uses of nsStylePosition::mHeight etc.)
+Add support for calc() to the 'height', 'min-height', and 'max-height' properties.  (Bug 585715)  (FIXME:  add reftests)  (FIXME:  audit all uses of nsStylePosition::mMinHeight and mMaxHeight)
 
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -1805,17 +1805,18 @@ GetPercentHeight(const nsStyleCoord& aSt
+     return PR_FALSE;
+   }
+ 
+   const nsStylePosition *pos = f->GetStylePosition();
+   nscoord h;
+   if (!GetAbsoluteCoord(pos->mHeight, h) &&
+       !GetPercentHeight(pos->mHeight, f, h)) {
+     NS_ASSERTION(pos->mHeight.GetUnit() == eStyleUnit_Auto ||
+-                 pos->mHeight.GetUnit() == eStyleUnit_Percent,
++                 pos->mHeight.GetUnit() == eStyleUnit_Percent ||
++                 pos->mHeight.IsCalcUnit(),
+                  "unknown height unit");
+     nsIAtom* fType = f->GetType();
+     if (fType != nsGkAtoms::viewportFrame && fType != nsGkAtoms::canvasFrame &&
+         fType != nsGkAtoms::pageContentFrame) {
+       // There's no basis for the percentage height, so it acts like auto.
+       // Should we consider a max-height < min-height pair a basis for
+       // percentage heights?  The spec is somewhat unclear, and not doing
+       // so is simpler and avoids troubling discontinuities in behavior,
+@@ -2245,18 +2246,19 @@ nsLayoutUtils::ComputeHeightDependentVal
+ }
+ 
+ inline PRBool
+ IsAutoHeight(const nsStyleCoord &aCoord, nscoord aCBHeight)
+ {
+   nsStyleUnit unit = aCoord.GetUnit();
+   return unit == eStyleUnit_Auto ||  // only for 'height'
+          unit == eStyleUnit_None ||  // only for 'max-height'
+-         (unit == eStyleUnit_Percent &&
+-          aCBHeight == NS_AUTOHEIGHT);
++         (aCBHeight == NS_AUTOHEIGHT &&
++          (unit == eStyleUnit_Percent ||
++           (aCoord.IsCalcUnit() && aCoord.CalcHasPercent())));
+ }
+ 
+ #define MULDIV(a,b,c) (nscoord(PRInt64(a) * PRInt64(b) / PRInt64(c)))
+ 
+ /* static */ nsSize
+ nsLayoutUtils::ComputeSizeWithIntrinsicDimensions(
+                    nsIRenderingContext* aRenderingContext, nsIFrame* aFrame,
+                    const nsIFrame::IntrinsicSize& aIntrinsicSize,
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -2747,54 +2747,46 @@ nsBlockFrame::AttributeChanged(PRInt32  
+ 
+ static inline PRBool
+ IsPaddingZero(nsStyleUnit aUnit, const nsStyleCoord &aCoord)
+ {
+     return ((aUnit == eStyleUnit_Coord && aCoord.GetCoordValue() == 0) ||
+             (aUnit == eStyleUnit_Percent && aCoord.GetPercentValue() == 0.0));
+ }
+ 
++static inline PRBool
++IsNonAutoNonZero(const nsStyleCoord& aCoord)
++{
++  if (aCoord.GetUnit() == eStyleUnit_Auto)
++    return PR_FALSE;
++  if (aCoord.IsLengthPercentCalcUnit()) {
++    // If we evaluate the length/percent/calc at a percentage basis of
++    // both nscoord_MAX and 0, and it's zero both ways, then it's a zero
++    // length, percent, or combination thereof.
++    return nsRuleNode::ComputeLengthPercentCalc(aCoord, nscoord_MAX) != 0 ||
++           nsRuleNode::ComputeLengthPercentCalc(aCoord, 0) != 0 ||
++  }
++  NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit for height or min-height");
++  return PR_TRUE;
++}
++
+ /* virtual */ PRBool
+ nsBlockFrame::IsSelfEmpty()
+ {
+   // Blocks which are margin-roots (including inline-blocks) cannot be treated
+   // as empty for margin-collapsing and other purposes. They're more like
+   // replaced elements.
+   if (GetStateBits() & NS_BLOCK_MARGIN_ROOT)
+     return PR_FALSE;
+ 
+   const nsStylePosition* position = GetStylePosition();
+ 
+-  switch (position->mMinHeight.GetUnit()) {
+-    case eStyleUnit_Coord:
+-      if (position->mMinHeight.GetCoordValue() != 0)
+-        return PR_FALSE;
+-      break;
+-    case eStyleUnit_Percent:
+-      if (position->mMinHeight.GetPercentValue() != 0.0f)
+-        return PR_FALSE;
+-      break;
+-    default:
+-      return PR_FALSE;
+-  }
+-
+-  switch (position->mHeight.GetUnit()) {
+-    case eStyleUnit_Auto:
+-      break;
+-    case eStyleUnit_Coord:
+-      if (position->mHeight.GetCoordValue() != 0)
+-        return PR_FALSE;
+-      break;
+-    case eStyleUnit_Percent:
+-      if (position->mHeight.GetPercentValue() != 0.0f)
+-        return PR_FALSE;
+-      break;
+-    default:
+-      return PR_FALSE;
+-  }
++  if (IsNonAutoNonZero(position->mMinHeight) ||
++      IsNonAutoNonZero(position->mHeight))
++    return PR_FALSE;
+ 
+   const nsStyleBorder* border = GetStyleBorder();
+   const nsStylePadding* padding = GetStylePadding();
+   if (border->GetActualBorderWidth(NS_SIDE_TOP) != 0 ||
+       border->GetActualBorderWidth(NS_SIDE_BOTTOM) != 0 ||
+       !IsPaddingZero(padding->mPadding.GetTopUnit(),
+                      padding->mPadding.GetTop()) ||
+       !IsPaddingZero(padding->mPadding.GetBottomUnit(),
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3158,18 +3158,19 @@ nsFrame::GetIntrinsicRatio()
+ }
+ 
+ inline PRBool
+ IsAutoHeight(const nsStyleCoord &aCoord, nscoord aCBHeight)
+ {
+   nsStyleUnit unit = aCoord.GetUnit();
+   return unit == eStyleUnit_Auto ||  // only for 'height'
+          unit == eStyleUnit_None ||  // only for 'max-height'
+-         (unit == eStyleUnit_Percent && 
+-          aCBHeight == NS_AUTOHEIGHT);
++         (aCBHeight == NS_AUTOHEIGHT &&
++          (unit == eStyleUnit_Percent ||
++           (aCoord.IsCalcUnit() && aCoord.CalcHasPercent())));
+ }
+ 
+ /* virtual */ nsSize
+ nsFrame::ComputeSize(nsIRenderingContext *aRenderingContext,
+                      nsSize aCBSize, nscoord aAvailableWidth,
+                      nsSize aMargin, nsSize aBorder, nsSize aPadding,
+                      PRBool aShrinkWrap)
+ {
+@@ -3374,20 +3375,20 @@ nsFrame::DidReflow(nsPresContext*       
+                 NS_FRAME_HAS_DIRTY_CHILDREN);
+   }
+ 
+   // Notify the percent height observer if there is a percent height.
+   // The observer may be able to initiate another reflow with a computed
+   // height. This happens in the case where a table cell has no computed
+   // height but can fabricate one when the cell height is known.
+   if (aReflowState && aReflowState->mPercentHeightObserver &&
+-      (eStyleUnit_Percent == aReflowState->mStylePosition->mHeight.GetUnit())) {
+-
+-    nsIFrame* prevInFlow = GetPrevInFlow();
+-    if (!prevInFlow) { // 1st in flow
++      !GetPrevInFlow()) {
++    const nsStyleCoord &height = aReflowState->mStylePosition->mHeight;
++    if (eStyleUnit_Percent == height.GetUnit() ||
++        (height.IsCalcUnit() && height.CalcHasPercent())) {
+       aReflowState->mPercentHeightObserver->NotifyPercentHeight(*aReflowState);
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ /* virtual */ PRBool
 diff --git a/layout/generic/nsHTMLReflowMetrics.h b/layout/generic/nsHTMLReflowMetrics.h
 --- a/layout/generic/nsHTMLReflowMetrics.h
 +++ b/layout/generic/nsHTMLReflowMetrics.h
@@ -27,25 +199,132 @@ diff --git a/layout/generic/nsHTMLReflowMetrics.h b/layout/generic/nsHTMLReflowM
 diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
 --- a/layout/generic/nsHTMLReflowState.cpp
 +++ b/layout/generic/nsHTMLReflowState.cpp
-@@ -1807,16 +1807,17 @@ nsHTMLReflowState::InitConstraints(nsPre
+@@ -390,19 +390,25 @@ nsHTMLReflowState::InitResizeFlags(nsPre
+     mFlags.mVResize = mFlags.mVResize || NS_SUBTREE_DIRTY(frame);
+   } else {
+     // not 'auto' height
+     mFlags.mVResize = frame->GetSize().height !=
+                         mComputedHeight + mComputedBorderPadding.TopBottom();
+   }
+ 
+   PRBool dependsOnCBHeight =
+-    mStylePosition->mHeight.GetUnit() == eStyleUnit_Percent ||
+-    mStylePosition->mMinHeight.GetUnit() == eStyleUnit_Percent ||
+-    mStylePosition->mMaxHeight.GetUnit() == eStyleUnit_Percent ||
++    (mStylePosition->HeightDependsOnContainer() &&
++     // FIXME: condition this on not-abspos?
++     mStylePosition->mHeight.GetUnit() != eStyleUnit_Auto) ||
++    (mStylePosition->MinHeightDependsOnContainer() &&
++     // FIXME: condition this on not-abspos?
++     mStylePosition->mMinHeight.GetUnit() != eStyleUnit_Auto) ||
++    (mStylePosition->MaxHeightDependsOnContainer() &&
++     // FIXME: condition this on not-abspos?
++     mStylePosition->mMaxHeight.GetUnit() != eStyleUnit_Auto) ||
+     mStylePosition->mOffset.GetTopUnit() == eStyleUnit_Percent ||
+     mStylePosition->mOffset.GetBottomUnit() != eStyleUnit_Auto ||
+     frame->IsBoxFrame() ||
+     (mStylePosition->mHeight.GetUnit() == eStyleUnit_Auto &&
+      frame->GetIntrinsicSize().height.GetUnit() == eStyleUnit_Percent);
+ 
+   if (mStyleText->mLineHeight.GetUnit() == eStyleUnit_Enumerated) {
+     NS_ASSERTION(mStyleText->mLineHeight.GetIntValue() ==
+@@ -1574,16 +1580,17 @@ nsHTMLReflowState::ComputeContainingBloc
+       // If the ancestor is block-level, the containing block is formed by the
+       // padding edge of the ancestor
+       aContainingBlockWidth += aContainingBlockRS->mComputedPadding.LeftRight();
+       aContainingBlockHeight += aContainingBlockRS->mComputedPadding.TopBottom();
+     }
+   } else {
+     // an element in quirks mode gets a containing block based on looking for a
+     // parent with a non-auto height if the element has a percent height
++    // Note: We don't emulate this quirk for percents in calc().
+     if (NS_AUTOHEIGHT == aContainingBlockHeight) {
+       if (eCompatibility_NavQuirks == aPresContext->CompatibilityMode() &&
+           mStylePosition->mHeight.GetUnit() == eStyleUnit_Percent) {
+         aContainingBlockHeight = CalcQuirkContainingBlockHeight(aContainingBlockRS);
+       }
+     }
+   }
+ }
+@@ -1703,22 +1710,25 @@ nsHTMLReflowState::InitConstraints(nsPre
+           // use the cell's computed height 
+           aContainingBlockHeight = cbrs->mComputedHeight;
+         }
+       }
+     }
+ 
+     InitOffsets(aContainingBlockWidth, aBorder, aPadding);
+ 
+-    nsStyleUnit heightUnit = mStylePosition->mHeight.GetUnit();
++    const nsStyleCoord &height = mStylePosition->mHeight;
++    nsStyleUnit heightUnit = height.GetUnit();
+ 
+     // Check for a percentage based height and a containing block height
+     // that depends on the content height
+     // XXX twiddling heightUnit doesn't help anymore
+-    if (eStyleUnit_Percent == heightUnit) {
++    // FIXME Shouldn't we fix that?
++    if (eStyleUnit_Percent == heightUnit ||
++        (height.IsCalcUnit() && height.CalcHasPercent())) {
+       if (NS_AUTOHEIGHT == aContainingBlockHeight) {
+         // this if clause enables %-height on replaced inline frames,
+         // such as images.  See bug 54119.  The else clause "heightUnit = eStyleUnit_Auto;"
+         // used to be called exclusively.
+         if (NS_FRAME_REPLACED(NS_CSS_FRAME_TYPE_INLINE) == mFrameType ||
+             NS_FRAME_REPLACED_CONTAINS_BLOCK(
+                 NS_CSS_FRAME_TYPE_INLINE) == mFrameType) {
+           // Get the containing block reflow state
+@@ -1767,25 +1777,27 @@ nsHTMLReflowState::InitConstraints(nsPre
+     ComputeMinMaxValues(aContainingBlockWidth, aContainingBlockHeight, cbrs);
+ 
+     // Calculate the computed width and height. This varies by frame type
+ 
+     if (NS_CSS_FRAME_TYPE_INTERNAL_TABLE == mFrameType) {
+       // Internal table elements. The rules vary depending on the type.
+       // Calculate the computed width
+       PRBool rowOrRowGroup = PR_FALSE;
+-      nsStyleUnit widthUnit = mStylePosition->mWidth.GetUnit();
++      const nsStyleCoord &width = mStylePosition->mWidth;
++      nsStyleUnit widthUnit = width.GetUnit();
+       if ((NS_STYLE_DISPLAY_TABLE_ROW == mStyleDisplay->mDisplay) ||
+           (NS_STYLE_DISPLAY_TABLE_ROW_GROUP == mStyleDisplay->mDisplay)) {
+         // 'width' property doesn't apply to table rows and row groups
+         widthUnit = eStyleUnit_Auto;
+         rowOrRowGroup = PR_TRUE;
+       }
+ 
+-      if (eStyleUnit_Auto == widthUnit) {
++      // calc() acts like auto on internal table elements
++      if (eStyleUnit_Auto == widthUnit || width.IsCalcUnit()) {
+         mComputedWidth = availableWidth;
+ 
+         if ((mComputedWidth != NS_UNCONSTRAINEDSIZE) && !rowOrRowGroup){
+           // Internal table elements don't have margins. Only tables and
+           // cells have border and padding
+           mComputedWidth -= mComputedBorderPadding.left +
+             mComputedBorderPadding.right;
+           if (mComputedWidth < 0)
+@@ -1802,17 +1814,18 @@ nsHTMLReflowState::InitConstraints(nsPre
+       }
+ 
+       // Calculate the computed height
+       if ((NS_STYLE_DISPLAY_TABLE_COLUMN == mStyleDisplay->mDisplay) ||
+           (NS_STYLE_DISPLAY_TABLE_COLUMN_GROUP == mStyleDisplay->mDisplay)) {
          // 'height' property doesn't apply to table columns and column groups
          heightUnit = eStyleUnit_Auto;
        }
-       if (eStyleUnit_Auto == heightUnit) {
+-      if (eStyleUnit_Auto == heightUnit) {
++      // calc() acts like 'auto' on internal table elements
++      if (eStyleUnit_Auto == heightUnit || height.IsCalcUnit()) {
          mComputedHeight = NS_AUTOHEIGHT;
        } else {
          NS_ASSERTION(heightUnit == mStylePosition->mHeight.GetUnit(),
                       "unexpected height unit change");
-+        // FIXME: explicitly un-support calc() on internal table stuff
          mComputedHeight = nsLayoutUtils::
            ComputeHeightDependentValue(aContainingBlockHeight,
                                        mStylePosition->mHeight);
        }
- 
-       // Doesn't apply to table elements
-       mComputedMinWidth = mComputedMinHeight = 0;
-       mComputedMaxWidth = mComputedMaxHeight = NS_UNCONSTRAINEDSIZE;
-@@ -2276,31 +2277,33 @@ nsHTMLReflowState::ComputeMinMaxValues(n
+@@ -2276,31 +2289,33 @@ nsHTMLReflowState::ComputeMinMaxValues(n
    }
  
    // Check for percentage based values and a containing block height that
@@ -79,6 +358,45 @@ diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowS
  
    // The use of nsITheme::GetMinimumWidgetSize in nsFrame::ComputeSize
    // isn't sufficient in the case of heights that can grow, when the
+diff --git a/layout/generic/nsSpacerFrame.cpp b/layout/generic/nsSpacerFrame.cpp
+--- a/layout/generic/nsSpacerFrame.cpp
++++ b/layout/generic/nsSpacerFrame.cpp
+@@ -154,16 +154,17 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+   switch (type) {
+   case TYPE_WORD:
+     break;
+ 
+   case TYPE_LINE:
+     if (eStyleUnit_Coord == position->mHeight.GetUnit()) {
+       aMetrics.height = position->mHeight.GetCoordValue();
+     }
++    // else treat calc() and percent like 'auto'
+     break;
+ 
+   case TYPE_IMAGE:
+     // width
+     nsStyleUnit unit = position->mWidth.GetUnit();
+     if (eStyleUnit_Coord == unit) {
+       aMetrics.width = position->mWidth.GetCoordValue();
+     }
+@@ -179,16 +180,17 @@ SpacerFrame::GetDesiredSize(nsHTMLReflow
+     if (eStyleUnit_Coord == unit) {
+       aMetrics.height = position->mHeight.GetCoordValue();
+     }
+     else if (eStyleUnit_Percent == unit) 
+     {
+       float factor = position->mHeight.GetPercentValue();
+       aMetrics.height = NSToCoordRound(factor * aPercentBase.height);
+     }
++    // else treat calc() like 'auto'
+     break;
+   }
+ 
+   if (aMetrics.width || aMetrics.height) {
+     // Make sure that the other dimension is non-zero
+     if (!aMetrics.width) aMetrics.width = 1;
+     if (!aMetrics.height) aMetrics.height = 1;
+   }
 diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 --- a/layout/style/nsCSSParser.cpp
 +++ b/layout/style/nsCSSParser.cpp
@@ -377,3 +695,100 @@ diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
    nscoord height = aState.ComputedHeight();
    if (NS_AUTOHEIGHT != height) {
      nsMargin borderPadding = GetChildAreaOffset(&aState);
+diff --git a/layout/tables/nsTableRowFrame.cpp b/layout/tables/nsTableRowFrame.cpp
+--- a/layout/tables/nsTableRowFrame.cpp
++++ b/layout/tables/nsTableRowFrame.cpp
+@@ -542,16 +542,17 @@ nsTableRowFrame::CalcHeight(const nsHTML
+ 
+   const nsStylePosition* position = GetStylePosition();
+   if (eStyleUnit_Coord == position->mHeight.GetUnit()) {
+     SetFixedHeight(position->mHeight.GetCoordValue());
+   }
+   else if (eStyleUnit_Percent == position->mHeight.GetUnit()) {
+     SetPctHeight(position->mHeight.GetPercentValue());
+   }
++  // calc() is treated like 'auto' on table rows.
+ 
+   for (nsIFrame* kidFrame = mFrames.FirstChild(); kidFrame;
+        kidFrame = kidFrame->GetNextSibling()) {
+     nsTableCellFrame *cellFrame = do_QueryFrame(kidFrame);
+     if (cellFrame) {
+       nsSize desSize = cellFrame->GetDesiredSize();
+       if ((NS_UNCONSTRAINEDSIZE == aReflowState.availableHeight) && !GetPrevInFlow()) {
+         CalculateCellActualHeight(cellFrame, desSize.height);
+@@ -669,17 +670,17 @@ nsTableRowFrame::CalculateCellActualHeig
+       break;
+     case eStyleUnit_Percent: {
+       if (1 == rowSpan) 
+         SetPctHeight(position->mHeight.GetPercentValue());
+       // pct heights are handled when all of the cells are finished, so don't set specifiedHeight 
+       break;
+     }
+     case eStyleUnit_Auto:
+-    default:
++    default: // includes calc(), which we treat like 'auto'
+       break;
+   }
+ 
+   // If the specified height is greater than the desired height, then use the specified height
+   if (specifiedHeight > aDesiredHeight)
+     aDesiredHeight = specifiedHeight;
+ 
+   return NS_OK;
+@@ -1399,18 +1400,20 @@ void nsTableRowFrame::InitHasCellWithSty
+ 
+   for (nsIFrame* kidFrame = iter.First(); kidFrame; kidFrame = iter.Next()) {
+     nsTableCellFrame *cellFrame = do_QueryFrame(kidFrame);
+     if (!cellFrame) {
+       NS_NOTREACHED("Table row has a non-cell child.");
+       continue;
+     }
+     // Ignore row-spanning cells
++    const nsStyleCoord &cellHeight = cellFrame->GetStylePosition()->mHeight;
+     if (aTableFrame->GetEffectiveRowSpan(*cellFrame) == 1 &&
+-        cellFrame->GetStylePosition()->mHeight.GetUnit() != eStyleUnit_Auto) {
++        cellHeight.GetUnit() != eStyleUnit_Auto &&
++        !cellHeight.IsCalcUnit() /* calc() treated like 'auto' */) {
+       AddStateBits(NS_ROW_HAS_CELL_WITH_STYLE_HEIGHT);
+       return;
+     }
+   }
+   RemoveStateBits(NS_ROW_HAS_CELL_WITH_STYLE_HEIGHT);
+ }
+ 
+ /* ----- global methods ----- */
+diff --git a/layout/xul/base/src/nsBox.cpp b/layout/xul/base/src/nsBox.cpp
+--- a/layout/xul/base/src/nsBox.cpp
++++ b/layout/xul/base/src/nsBox.cpp
+@@ -686,21 +686,28 @@ nsIBox::AddCSSPrefSize(nsIBox* aBox, nsS
+     } else if (width.IsCalcUnit()) {
+         if (!width.CalcHasPercent()) {
+             // pass 0 for percentage basis since we know there are no %s
+             aSize.width = nsRuleNode::ComputeComputedCalc(width, 0);
+             aWidthSet = PR_TRUE;
+         }
+     }
+ 
+-    if (position->mHeight.GetUnit() == eStyleUnit_Coord) {
+-        aSize.height = position->mHeight.GetCoordValue();     
++    const nsStyleCoord &height = position->mHeight;
++    if (height.GetUnit() == eStyleUnit_Coord) {
++        aSize.height = height.GetCoordValue();
+         aHeightSet = PR_TRUE;
++    } else if (height.IsCalcUnit()) {
++        if (!height.CalcHasPercent()) {
++            // pass 0 for percentage basis since we know there are no %s
++            aSize.height = nsRuleNode::ComputeComputedCalc(height, 0);
++            aHeightSet = PR_TRUE;
++        }
+     }
+-    
++
+     nsIContent* content = aBox->GetContent();
+     // ignore 'height' and 'width' attributes if the actual element is not XUL
+     // For example, we might be magic XUL frames whose primary content is an HTML
+     // <select>
+     if (content && content->IsXUL()) {
+         nsAutoString value;
+         PRInt32 error;
+ 
