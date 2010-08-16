@@ -73,18 +73,54 @@ diff --git a/configure.in b/configure.in
 diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
 --- a/tools/trace-malloc/lib/nsTraceMalloc.c
 +++ b/tools/trace-malloc/lib/nsTraceMalloc.c
-@@ -926,16 +926,19 @@ stack_callback(void *pc, void *closure)
-  * On return, if *immediate_abort is set, then the return value is NULL
-  * and the thread is in a very dangerous situation (e.g. holding
-  * sem_pool_lock in Mac OS X pthreads); the caller should bail out
-  * without doing anything (such as acquiring locks).
-  */
- callsite *
- backtrace(tm_thread *t, int skip, int *immediate_abort)
- {
+@@ -690,16 +690,28 @@ calltree(void **stack, size_t num_stack_
+             }
+         }
+ 
+         /*
+          * Not in tree at all, or not logged to fp: let's find our symbolic
+          * callsite info.
+          */
+ 
 +#ifdef NS_TRACE_MALLOC_NO_STACKS
-+    return &calltree_root;
++        /*
++         * Fake the necessary information for our single fake stack
++         * frame.
++         */
++        details.library[0] = '\0';
++        details.loffset = 0;
++        details.filename[0] = '\0';
++        details.lineno = 0;
++        details.function[0] = '\0';
++        details.foffset = 0;
 +#else
+         /*
+          * NS_DescribeCodeAddress can (on Linux) acquire a lock inside
+          * the shared library loader.  Another thread might call malloc
+          * while holding that lock (when loading a shared library).  So
+          * we have to exit tmlock around this call.  For details, see
+          * https://bugzilla.mozilla.org/show_bug.cgi?id=363334#c3
+          *
+          * We could be more efficient by building the nodes in the
+@@ -709,16 +721,17 @@ calltree(void **stack, size_t num_stack_
+          */
+         TM_EXIT_LOCK(t);
+         rv = NS_DescribeCodeAddress(pc, &details);
+         TM_ENTER_LOCK(t);
+         if (NS_FAILED(rv)) {
+             tmstats.dladdr_failures++;
+             goto fail;
+         }
++#endif
+ 
+         /* Check whether we need to emit a library trace record. */
+         library_serial = 0;
+         library = NULL;
+         if (details.library[0]) {
+             if (!libraries) {
+                 libraries = PL_NewHashTable(100, PL_HashString,
+                                             PL_CompareStrings, PL_CompareValues,
+@@ -934,16 +947,32 @@ backtrace(tm_thread *t, int skip, int *i
      callsite *site;
      stack_buffer_info *info = &t->backtrace_buf;
      void ** new_stack_buffer;
@@ -93,24 +129,48 @@ diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsT
  
      t->suppress_tracing++;
  
-@@ -987,16 +990,17 @@ backtrace(tm_thread *t, int skip, int *i
++#ifdef NS_TRACE_MALLOC_NO_STACKS
++    /*
++     * Create a single fake stack frame so that all the tools get
++     * data in the correct format.
++     */
++    if (info->size < 1) {
++        PR_ASSERT(!info->buffer); /* !info->size == !info->buffer */
++        info->buffer = __libc_malloc(1 * sizeof(void*));
++        if (!info->buffer)
++            return NULL;
++        info->size = 1;
++    }
++
++    info->entries = 1;
++    info->buffer[0] = NULL;
++#else
+     /*
+      * NS_StackWalk can (on Windows) acquire a lock the shared library
+      * loader.  Another thread might call malloc while holding that lock
+      * (when loading a shared library).  So we can't be in tmlock during
+      * this call.  For details, see
+      * https://bugzilla.mozilla.org/show_bug.cgi?id=374829#c8
+      */
+ 
+@@ -973,16 +1002,17 @@ backtrace(tm_thread *t, int skip, int *i
+         info->size = new_stack_buffer_size;
+ 
+         /* and call NS_StackWalk again */
+         info->entries = 0;
+         NS_StackWalk(stack_callback, skip, info);
+ 
+         PR_ASSERT(info->entries * 2 == new_stack_buffer_size); /* same stack */
+     }
++#endif
+ 
+     TM_ENTER_LOCK(t);
+ 
+     site = calltree(info->buffer, info->entries, t);
+ 
+     tmstats.backtrace_calls++;
      if (!site) {
          tmstats.backtrace_failures++;
-         PR_ASSERT(tmstats.backtrace_failures < 100);
-     }
-     TM_EXIT_LOCK(t);
- 
-     t->suppress_tracing--;
-     return site;
-+#endif
- }
- 
- typedef struct allocation {
-     PLHashEntry entry;
-     size_t      size;
-     FILE        *trackfp;       /* for allocation tracking */
- } allocation;
- 
 diff --git a/xpcom/glue/DeadlockDetector.h b/xpcom/glue/DeadlockDetector.h
 --- a/xpcom/glue/DeadlockDetector.h
 +++ b/xpcom/glue/DeadlockDetector.h
