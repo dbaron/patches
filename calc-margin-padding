@@ -2,6 +2,27 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Add support for calc() to the '{margin,padding}-{top,right,bottom,left}' and '-moz-margin-{start,end}' properties.  (Bug 585715)
 
+diff --git a/layout/generic/Makefile.in b/layout/generic/Makefile.in
+--- a/layout/generic/Makefile.in
++++ b/layout/generic/Makefile.in
+@@ -147,16 +147,17 @@ FORCE_STATIC_LIB = 1
+ include $(topsrcdir)/config/config.mk
+ include $(topsrcdir)/ipc/chromium/chromium-config.mk
+ include $(topsrcdir)/config/rules.mk
+ 
+ LOCAL_INCLUDES += \
+ 		-I$(srcdir) \
+ 		-I$(srcdir)/../base \
+ 		-I$(srcdir)/../forms \
++		-I$(srcdir)/../style \
+ 		-I$(srcdir)/../tables \
+ 		-I$(srcdir)/../xul/base/src \
+ 		-I$(srcdir)/../../content/xul/content/src \
+ 		-I$(srcdir)/../../content/base/src \
+ 		-I$(srcdir)/../../content/html/content/src \
+ 		-I$(srcdir)/../../dom/base \
+ 		$(MOZ_CAIRO_CFLAGS) \
+ 		$(NULL)
 diff --git a/layout/generic/nsAbsoluteContainingBlock.cpp b/layout/generic/nsAbsoluteContainingBlock.cpp
 --- a/layout/generic/nsAbsoluteContainingBlock.cpp
 +++ b/layout/generic/nsAbsoluteContainingBlock.cpp
@@ -226,7 +247,136 @@ diff --git a/layout/generic/nsContainerFrame.cpp b/layout/generic/nsContainerFra
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -3103,22 +3103,24 @@ AddCoord(const nsStyleCoord& aStyle,
+@@ -123,16 +123,17 @@
+ #include "nsIObjectLoadingContent.h"
+ #include "nsExpirationTracker.h"
+ #ifdef MOZ_SVG
+ #include "nsSVGIntegrationUtils.h"
+ #include "nsSVGEffects.h"
+ #endif
+ 
+ #include "gfxContext.h"
++#include "CSSCalc.h"
+ 
+ using namespace mozilla;
+ 
+ static NS_DEFINE_CID(kLookAndFeelCID,  NS_LOOKANDFEEL_CID);
+ 
+ // Struct containing cached metrics for box-wrapped frames.
+ struct nsBoxLayoutMetrics
+ {
+@@ -3079,39 +3080,120 @@ nsIFrame::InlinePrefWidthData::ForceBrea
+ 
+   currentLine =
+     NSCoordSaturatingSubtract(currentLine, trailingWhitespace, nscoord_MAX);
+   prevLines = NS_MAX(prevLines, currentLine);
+   currentLine = trailingWhitespace = 0;
+   skipWhitespace = PR_TRUE;
+ }
+ 
++/**
++ * This class does calc() computation of lengths and percents separately,
++ * with support for min() and max().  However, its support for min() and
++ * max() is fundamentally broken in cases where percentages and lengths
++ * are mixed.
++ *
++ * It is used only for intrinsic width computation, where being an
++ * approximation is sometimes ok (although it would be good to fix at
++ * some point in the future).
++ */
++struct LengthPercentPairWithMinMaxCalcOps : public css::StyleCoordInputCalcOps
++{
++  struct result_type {
++    nscoord mLength;
++    float mPercent;
++
++    result_type(nscoord aLength, float aPercent)
++      : mLength(aLength), mPercent(aPercent) {}
++  };
++
++  result_type ComputeLeafValue(const nsStyleCoord& aValue)
++  {
++    if (aValue.GetUnit() == eStyleUnit_Percent) {
++      return result_type(0, aValue.GetPercentValue());
++    }
++    return result_type(aValue.GetCoordValue(), 0.0f);
++  }
++
++  result_type
++  MergeAdditive(nsCSSUnit aCalcFunction,
++                result_type aValue1, result_type aValue2)
++  {
++    if (aCalcFunction == eCSSUnit_Calc_Plus) {
++      return result_type(NSCoordSaturatingAdd(aValue1.mLength,
++                                              aValue2.mLength),
++                         aValue1.mPercent + aValue2.mPercent);
++    }
++    if (aCalcFunction == eCSSUnit_Calc_Minus) {
++      return result_type(NSCoordSaturatingSubtract(aValue1.mLength,
++                                                   aValue2.mLength, 0),
++                         aValue1.mPercent - aValue2.mPercent);
++    }
++    if (aCalcFunction == eCSSUnit_Calc_Minimum) {
++      // This is fundamentally incorrect; see the comment above the
++      // start of the class definition.
++      return result_type(NS_MIN(aValue1.mLength, aValue2.mLength),
++                         NS_MIN(aValue1.mPercent, aValue2.mPercent));
++    }
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Maximum,
++                      "unexpected unit");
++    // This is fundamentally incorrect; see the comment above the
++    // start of the class definition.
++    return result_type(NS_MAX(aValue1.mLength, aValue2.mLength),
++                       NS_MAX(aValue1.mPercent, aValue2.mPercent));
++  }
++
++  result_type
++  MergeMultiplicativeL(nsCSSUnit aCalcFunction,
++                       float aValue1, result_type aValue2)
++  {
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
++                      "unexpected unit");
++    return result_type(NSCoordSaturatingMultiply(aValue2.mLength, aValue1),
++                       aValue1 * aValue2.mPercent);
++  }
++
++  result_type
++  MergeMultiplicativeR(nsCSSUnit aCalcFunction,
++                       result_type aValue1, float aValue2)
++  {
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_R ||
++                      aCalcFunction == eCSSUnit_Calc_Divided,
++                      "unexpected unit");
++    if (aCalcFunction == eCSSUnit_Calc_Divided) {
++      aValue2 = 1.0f / aValue2;
++    }
++    return result_type(NSCoordSaturatingMultiply(aValue1.mLength, aValue2),
++                       aValue1.mPercent * aValue2);
++  }
++
++};
++
+ static void
+ AddCoord(const nsStyleCoord& aStyle,
+          nsIRenderingContext* aRenderingContext,
+          nsIFrame* aFrame,
+          nscoord* aCoord, float* aPercent)
+ {
+-  switch (aStyle.GetUnit()) {
+-    case eStyleUnit_Coord:
+-      *aCoord += aStyle.GetCoordValue();
+-      break;
+-    case eStyleUnit_Percent:
+-      *aPercent += aStyle.GetPercentValue();
+-      break;
+-    default:
+-      break;
+-  }
++  LengthPercentPairWithMinMaxCalcOps ops;
++  LengthPercentPairWithMinMaxCalcOps::result_type pair =
++    css::ComputeCalc(aStyle, ops);
++  *aCoord += pair.mLength;
++  *aPercent += pair.mPercent;
  }
  
  /* virtual */ nsIFrame::IntrinsicWidthOffsetData
@@ -234,23 +384,18 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  {
    IntrinsicWidthOffsetData result;
  
++  // FIXME: The handling of calc() with min() and max() by AddCoord
++  // is a rough approximation.  It could be improved, but only by
++  // changing the IntrinsicWidthOffsets API substantially.  See the
++  // comment above LengthPercentPairWithMinMaxCalcOps.
    const nsStyleMargin *styleMargin = GetStyleMargin();
-+  // FIXME: THIS BIT IS HARD!
    AddCoord(styleMargin->mMargin.GetLeft(), aRenderingContext, this,
             &result.hMargin, &result.hPctMargin);
    AddCoord(styleMargin->mMargin.GetRight(), aRenderingContext, this,
             &result.hMargin, &result.hPctMargin);
  
    const nsStylePadding *stylePadding = GetStylePadding();
-+  // FIXME: THIS BIT IS HARD!
    AddCoord(stylePadding->mPadding.GetLeft(), aRenderingContext, this,
-            &result.hPadding, &result.hPctPadding);
-   AddCoord(stylePadding->mPadding.GetRight(), aRenderingContext, this,
-            &result.hPadding, &result.hPctPadding);
- 
-   const nsStyleBorder *styleBorder = GetStyleBorder();
-   result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_LEFT);
-   result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_RIGHT);
 diff --git a/layout/generic/nsInlineFrame.cpp b/layout/generic/nsInlineFrame.cpp
 --- a/layout/generic/nsInlineFrame.cpp
 +++ b/layout/generic/nsInlineFrame.cpp
