@@ -1,7 +1,471 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add support for calc() to 'vertical-align' and 'text-indent'.  (Bug 585715)  (FIXME: add mochitests)  (FIXME: add reftests)  (FIXME: audit and fix all users of the relevant nsStyleCoords)
+Add support for calc() to 'vertical-align' and 'text-indent'.  (Bug 585715)  (FIXME: add mochitests)  (FIXME: add reftests)
 
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -709,19 +709,20 @@ nsBlockFrame::GetMinWidth(nsIRenderingCo
+       if (line->IsBlock()) {
+         data.ForceBreak(aRenderingContext);
+         data.currentLine = nsLayoutUtils::IntrinsicForContainer(aRenderingContext,
+                         line->mFirstChild, nsLayoutUtils::MIN_WIDTH);
+         data.ForceBreak(aRenderingContext);
+       } else {
+         if (!curFrame->GetPrevContinuation() &&
+             line == curFrame->begin_lines()) {
+-          const nsStyleCoord &indent = GetStyleText()->mTextIndent;
+-          if (indent.GetUnit() == eStyleUnit_Coord)
+-            data.currentLine += indent.GetCoordValue();
++          // Add the coordinate-part of the text-indent (but not the
++          // percentage part).
++          data.currentLine +=
++            nsRuleNode::ComputeCoordPercentCalc(GetStyleText()->mTextIndent);
+         }
+         // XXX Bug NNNNNN Should probably handle percentage text-indent.
+ 
+         data.line = &line;
+         data.lineContainer = curFrame;
+         nsIFrame *kid = line->mFirstChild;
+         for (PRInt32 i = 0, i_end = line->GetChildCount(); i != i_end;
+              ++i, kid = kid->GetNextSibling()) {
+@@ -784,19 +785,20 @@ nsBlockFrame::GetPrefWidth(nsIRenderingC
+       if (line->IsBlock()) {
+         data.ForceBreak(aRenderingContext);
+         data.currentLine = nsLayoutUtils::IntrinsicForContainer(aRenderingContext,
+                         line->mFirstChild, nsLayoutUtils::PREF_WIDTH);
+         data.ForceBreak(aRenderingContext);
+       } else {
+         if (!curFrame->GetPrevContinuation() &&
+             line == curFrame->begin_lines()) {
+-          const nsStyleCoord &indent = GetStyleText()->mTextIndent;
+-          if (indent.GetUnit() == eStyleUnit_Coord)
+-            data.currentLine += indent.GetCoordValue();
++          // Add the coordinate-part of the text-indent (but not the
++          // percentage part).
++          data.currentLine +=
++            nsRuleNode::ComputeCoordPercentCalc(GetStyleText()->mTextIndent);
+         }
+         // XXX Bug NNNNNN Should probably handle percentage text-indent.
+ 
+         data.line = &line;
+         data.lineContainer = curFrame;
+         nsIFrame *kid = line->mFirstChild;
+         for (PRInt32 i = 0, i_end = line->GetChildCount(); i != i_end;
+              ++i, kid = kid->GetNextSibling()) {
+@@ -6016,29 +6018,27 @@ nsBlockFrame::PaintTextDecorationLine(gf
+ /*virtual*/ void
+ nsBlockFrame::AdjustForTextIndent(const nsLineBox* aLine,
+                                   nscoord& start,
+                                   nscoord& width)
+ {
+   if (!GetPrevContinuation() && aLine == begin_lines().get()) {
+     // Adjust for the text-indent.  See similar code in
+     // nsLineLayout::BeginLineReflow.
+-    nscoord indent = 0;
+-    const nsStyleText* styleText = GetStyleText();
+-    nsStyleUnit unit = styleText->mTextIndent.GetUnit();
+-    if (eStyleUnit_Coord == unit) {
+-      indent = styleText->mTextIndent.GetCoordValue();
+-    } else if (eStyleUnit_Percent == unit) {
++    const nsStyleCoord &textIndent = GetStyleText()->mTextIndent;
++    nscoord pctBasis = 0;
++    if (textIndent.HasPercent()) {
++      // Only work out the percentage basis if we need to.
+       // It's a percentage of the containing block width.
+       nsIFrame* containingBlock =
+         nsHTMLReflowState::GetContainingBlockFor(this);
+       NS_ASSERTION(containingBlock, "Must have containing block!");
+-      indent = nscoord(styleText->mTextIndent.GetPercentValue() *
+-                       containingBlock->GetContentRect().width);
+-    }
++      pctBasis = containingBlock->GetContentRect().width;
++    }
++    nscoord indent = nsRuleNode::ComputeCoordPercentCalc(textIndent, pctBasis);
+ 
+     // Adjust the start position and the width of the decoration by the
+     // value of the indent.  Note that indent can be negative; that's OK.
+     // It'll just increase the width (which can also happen to be
+     // negative!).
+     start += indent;
+     width -= indent;
+   }
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -225,31 +225,27 @@ nsLineLayout::BeginLineReflow(nscoord aX
+   psd->mNoWrap = !mStyleText->WhiteSpaceCanWrap();
+   psd->mDirection = mBlockReflowState->mStyleVisibility->mDirection;
+   psd->mChangedFrameDirection = PR_FALSE;
+ 
+   // If this is the first line of a block then see if the text-indent
+   // property amounts to anything.
+ 
+   if (0 == mLineNumber && !HasPrevInFlow(mBlockReflowState->frame)) {
+-    nscoord indent = 0;
+-    nsStyleUnit unit = mStyleText->mTextIndent.GetUnit();
+-    if (eStyleUnit_Coord == unit) {
+-      indent = mStyleText->mTextIndent.GetCoordValue();
+-    }
+-    else if (eStyleUnit_Percent == unit) {
+-      nscoord width =
++    const nsStyleCoord &textIndent = mStyleText->mTextIndent;
++    nscoord pctBasis = 0;
++    if (textIndent.HasPercent()) {
++      pctBasis =
+         nsHTMLReflowState::GetContainingBlockContentWidth(mBlockReflowState);
+-      if ((0 != width) && (NS_UNCONSTRAINEDSIZE != width)) {
+-        indent = nscoord(mStyleText->mTextIndent.GetPercentValue() * width);
+-      }
++
+       if (GetFlag(LL_GOTLINEBOX)) {
+         mLineBox->DisableResizeReflowOptimization();
+       }
+     }
++    nscoord indent = nsRuleNode::ComputeCoordPercentCalc(textIndent, pctBasis);
+ 
+     mTextIndent = indent;
+ 
+     if (NS_STYLE_DIRECTION_RTL == psd->mDirection) {
+       psd->mRightEdge -= indent;
+     }
+     else {
+       psd->mX += indent;
+@@ -1746,186 +1742,184 @@ nsLineLayout::VerticalAlignFrames(PerSpa
+       // For other elements the logical height is the same as the
+       // frames height plus its margins.
+       logicalHeight = pfd->mBounds.height + pfd->mMargin.top +
+         pfd->mMargin.bottom;
+       topLeading = 0;
+     }
+ 
+     // Get vertical-align property
+-    const nsStyleTextReset* textStyle = frame->GetStyleTextReset();
+-    nsStyleUnit verticalAlignUnit = textStyle->mVerticalAlign.GetUnit();
++    const nsStyleCoord& verticalALign =
++      frame->GetStyleTextReset()->mVerticalAlign;
+ #ifdef NOISY_VERTICAL_ALIGN
+     printf("  [frame]");
+     nsFrame::ListTag(stdout, frame);
+     printf(": verticalAlignUnit=%d (enum == %d)\n",
+            verticalAlignUnit,
+-           ((eStyleUnit_Enumerated == verticalAlignUnit)
+-            ? textStyle->mVerticalAlign.GetIntValue()
++           ((eStyleUnit_Enumerated == verticalAlign.GetUnit())
++            ? verticalAlign.GetIntValue()
+             : -1));
+ #endif
+ 
+-    PRUint8 verticalAlignEnum;
+-    nscoord parentAscent, parentDescent, parentXHeight;
+-    nscoord parentSuperscript, parentSubscript;
+-    nscoord coordOffset, percentOffset, elementLineHeight;
+-    nscoord revisedBaselineY;
+-    switch (verticalAlignUnit) {
+-      case eStyleUnit_Enumerated:
+-      default:
+-        if (eStyleUnit_Enumerated == verticalAlignUnit) {
+-          verticalAlignEnum = textStyle->mVerticalAlign.GetIntValue();
++    if (verticalAlign.GetUnit() == eStyleUnit_Enumerated) {
++      switch (verticalAlign.GetIntValue()) {
++        default:
++        case NS_STYLE_VERTICAL_ALIGN_BASELINE:
++        {
++          // The elements baseline is aligned with the baseline of
++          // the parent.
++          pfd->mBounds.y = baselineY - pfd->mAscent;
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
+         }
+-        else {
+-          verticalAlignEnum = NS_STYLE_VERTICAL_ALIGN_BASELINE;
++
++        case NS_STYLE_VERTICAL_ALIGN_SUB:
++        {
++          // Lower the baseline of the box to the subscript offset
++          // of the parent's box. This is identical to the baseline
++          // alignment except for the addition of the subscript
++          // offset to the baseline Y.
++          nscoord parentSubscript;
++          fm->GetSubscriptOffset(parentSubscript);
++          nscoord revisedBaselineY = baselineY + parentSubscript;
++          pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
+         }
+-        switch (verticalAlignEnum) {
+-          default:
+-          case NS_STYLE_VERTICAL_ALIGN_BASELINE:
+-            // The elements baseline is aligned with the baseline of
+-            // the parent.
+-            pfd->mBounds.y = baselineY - pfd->mAscent;
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_SUB:
+-            // Lower the baseline of the box to the subscript offset
+-            // of the parent's box. This is identical to the baseline
+-            // alignment except for the addition of the subscript
+-            // offset to the baseline Y.
+-            fm->GetSubscriptOffset(parentSubscript);
+-            revisedBaselineY = baselineY + parentSubscript;
+-            pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_SUPER:
++        {
++          // Raise the baseline of the box to the superscript offset
++          // of the parent's box. This is identical to the baseline
++          // alignment except for the subtraction of the superscript
++          // offset to the baseline Y.
++          nscoord parentSuperscript;
++          fm->GetSuperscriptOffset(parentSuperscript);
++          nscoord revisedBaselineY = baselineY - parentSuperscript;
++          pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_SUPER:
+-            // Raise the baseline of the box to the superscript offset
+-            // of the parent's box. This is identical to the baseline
+-            // alignment except for the subtraction of the superscript
+-            // offset to the baseline Y.
+-            fm->GetSuperscriptOffset(parentSuperscript);
+-            revisedBaselineY = baselineY - parentSuperscript;
+-            pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_TOP:
++        {
++          pfd->mVerticalAlign = VALIGN_TOP;
++          nscoord subtreeHeight = logicalHeight;
++          if (frameSpan) {
++            subtreeHeight = frameSpan->mMaxY - frameSpan->mMinY;
++            NS_ASSERTION(subtreeHeight >= logicalHeight,
++                         "unexpected subtree height");
++          }
++          if (subtreeHeight > maxTopBoxHeight) {
++            maxTopBoxHeight = subtreeHeight;
++          }
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_TOP:
+-          {
+-            pfd->mVerticalAlign = VALIGN_TOP;
+-            nscoord subtreeHeight = logicalHeight;
+-            if (frameSpan) {
+-              subtreeHeight = frameSpan->mMaxY - frameSpan->mMinY;
+-              NS_ASSERTION(subtreeHeight >= logicalHeight,
+-                           "unexpected subtree height");
+-            }
+-            if (subtreeHeight > maxTopBoxHeight) {
+-              maxTopBoxHeight = subtreeHeight;
+-            }
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_BOTTOM:
++        {
++          pfd->mVerticalAlign = VALIGN_BOTTOM;
++          nscoord subtreeHeight = logicalHeight;
++          if (frameSpan) {
++            subtreeHeight = frameSpan->mMaxY - frameSpan->mMinY;
++            NS_ASSERTION(subtreeHeight >= logicalHeight,
++                         "unexpected subtree height");
+           }
++          if (subtreeHeight > maxBottomBoxHeight) {
++            maxBottomBoxHeight = subtreeHeight;
++          }
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_BOTTOM:
+-          {
+-            pfd->mVerticalAlign = VALIGN_BOTTOM;
+-            nscoord subtreeHeight = logicalHeight;
+-            if (frameSpan) {
+-              subtreeHeight = frameSpan->mMaxY - frameSpan->mMinY;
+-              NS_ASSERTION(subtreeHeight >= logicalHeight,
+-                           "unexpected subtree height");
+-            }
+-            if (subtreeHeight > maxBottomBoxHeight) {
+-              maxBottomBoxHeight = subtreeHeight;
+-            }
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_MIDDLE:
++        {
++          // Align the midpoint of the frame with 1/2 the parents
++          // x-height above the baseline.
++          nscoord parentXHeight;
++          fm->GetXHeight(parentXHeight);
++          if (frameSpan) {
++            pfd->mBounds.y = baselineY -
++              (parentXHeight + pfd->mBounds.height)/2;
+           }
++          else {
++            pfd->mBounds.y = baselineY - (parentXHeight + logicalHeight)/2 +
++              pfd->mMargin.top;
++          }
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_MIDDLE:
+-            // Align the midpoint of the frame with 1/2 the parents
+-            // x-height above the baseline.
+-            fm->GetXHeight(parentXHeight);
+-            if (frameSpan) {
+-              pfd->mBounds.y = baselineY -
+-                (parentXHeight + pfd->mBounds.height)/2;
+-            }
+-            else {
+-              pfd->mBounds.y = baselineY - (parentXHeight + logicalHeight)/2 +
+-                pfd->mMargin.top;
+-            }
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_TEXT_TOP:
++        {
++          // The top of the logical box is aligned with the top of
++          // the parent elements text.
++          nscoord parentAscent;
++          fm->GetMaxAscent(parentAscent);
++          if (frameSpan) {
++            pfd->mBounds.y = baselineY - parentAscent -
++              pfd->mBorderPadding.top + frameSpan->mTopLeading;
++          }
++          else {
++            pfd->mBounds.y = baselineY - parentAscent + pfd->mMargin.top;
++          }
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_TEXT_TOP:
+-            // The top of the logical box is aligned with the top of
+-            // the parent elements text.
+-            fm->GetMaxAscent(parentAscent);
+-            if (frameSpan) {
+-              pfd->mBounds.y = baselineY - parentAscent -
+-                pfd->mBorderPadding.top + frameSpan->mTopLeading;
+-            }
+-            else {
+-              pfd->mBounds.y = baselineY - parentAscent + pfd->mMargin.top;
+-            }
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
++        case NS_STYLE_VERTICAL_ALIGN_TEXT_BOTTOM:
++        {
++          // The bottom of the logical box is aligned with the
++          // bottom of the parent elements text.
++          nscoord parentDescent;
++          fm->GetMaxDescent(parentDescent);
++          if (frameSpan) {
++            pfd->mBounds.y = baselineY + parentDescent -
++              pfd->mBounds.height + pfd->mBorderPadding.bottom -
++              frameSpan->mBottomLeading;
++          }
++          else {
++            pfd->mBounds.y = baselineY + parentDescent -
++              pfd->mBounds.height - pfd->mMargin.bottom;
++          }
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
++        }
+ 
+-          case NS_STYLE_VERTICAL_ALIGN_TEXT_BOTTOM:
+-            // The bottom of the logical box is aligned with the
+-            // bottom of the parent elements text.
+-            fm->GetMaxDescent(parentDescent);
+-            if (frameSpan) {
+-              pfd->mBounds.y = baselineY + parentDescent -
+-                pfd->mBounds.height + pfd->mBorderPadding.bottom -
+-                frameSpan->mBottomLeading;
+-            }
+-            else {
+-              pfd->mBounds.y = baselineY + parentDescent -
+-                pfd->mBounds.height - pfd->mMargin.bottom;
+-            }
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break;
+-
+-          case NS_STYLE_VERTICAL_ALIGN_MIDDLE_WITH_BASELINE:
+-            // Align the midpoint of the frame with the baseline of the parent.
+-            if (frameSpan) {
+-              pfd->mBounds.y = baselineY - pfd->mBounds.height/2;
+-            }
+-            else {
+-              pfd->mBounds.y = baselineY - logicalHeight/2 + pfd->mMargin.top;
+-            }
+-            pfd->mVerticalAlign = VALIGN_OTHER;
+-            break; 	    
++        case NS_STYLE_VERTICAL_ALIGN_MIDDLE_WITH_BASELINE:
++        {
++          // Align the midpoint of the frame with the baseline of the parent.
++          if (frameSpan) {
++            pfd->mBounds.y = baselineY - pfd->mBounds.height/2;
++          }
++          else {
++            pfd->mBounds.y = baselineY - logicalHeight/2 + pfd->mMargin.top;
++          }
++          pfd->mVerticalAlign = VALIGN_OTHER;
++          break;
+         }
+-        break;
+-
+-      case eStyleUnit_Coord:
+-        // According to the CSS2 spec (10.8.1), a positive value
+-        // "raises" the box by the given distance while a negative value
+-        // "lowers" the box by the given distance (with zero being the
+-        // baseline). Since Y coordinates increase towards the bottom of
+-        // the screen we reverse the sign.
+-        coordOffset = textStyle->mVerticalAlign.GetCoordValue();
+-        revisedBaselineY = baselineY - coordOffset;
+-        pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
+-        pfd->mVerticalAlign = VALIGN_OTHER;
+-        break;
+-
+-      case eStyleUnit_Percent:
+-        // Similar to a length value (eStyleUnit_Coord) except that the
+-        // percentage is a function of the elements line-height value.
+-        elementLineHeight = nsHTMLReflowState::
+-          CalcLineHeight(frame->GetStyleContext(),
+-                         mBlockReflowState->ComputedHeight());
+-        percentOffset = nscoord(
+-          textStyle->mVerticalAlign.GetPercentValue() * elementLineHeight
+-          );
+-        revisedBaselineY = baselineY - percentOffset;
+-        pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
+-        pfd->mVerticalAlign = VALIGN_OTHER;
+-        break;
++      }
++    } else {
++      // We have either a coord, a percent, or a calc().
++      nscoord pctBasis = 0;
++      if (verticalAlign.HasPercent()) {
++        // Percentages are like lengths, except treated as a percentage
++        // of the elements line-height value.
++        pctBasis = nsHTMLReflowState::CalcLineHeight(
++          frame->GetStyleContext(), mBlockReflowState->ComputedHeight());
++      }
++      nscoord offset =
++        nsRuleNode::ComputeLengthPercentCalc(verticalAlign, pctBasis);
++      // According to the CSS2 spec (10.8.1), a positive value
++      // "raises" the box by the given distance while a negative value
++      // "lowers" the box by the given distance (with zero being the
++      // baseline). Since Y coordinates increase towards the bottom of
++      // the screen we reverse the sign.
++      nscoord revisedBaselineY = baselineY - offset;
++      pfd->mBounds.y = revisedBaselineY - pfd->mAscent;
++      pfd->mVerticalAlign = VALIGN_OTHER;
+     }
+ 
+     // Update minY/maxY for frames that we just placed. Do not factor
+     // text into the equation.
+     if (pfd->mVerticalAlign == VALIGN_OTHER) {
+       // Text frames do not contribute to the min/max Y values for the
+       // line (instead their parent frame's font-size contributes).
+       // XXXrbs -- relax this restriction because it causes text frames
 diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 --- a/layout/style/nsCSSParser.cpp
 +++ b/layout/style/nsCSSParser.cpp
