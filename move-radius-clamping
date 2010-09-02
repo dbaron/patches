@@ -1,11 +1,12 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Move skip-sides handling from nsCSSRendering::ComputePixelRadii to nsIFrame::ComputeBorderRadius.  This fixes a bug (ignoring skip-sides) in nsDisplayBoxShadowOuter::ComputeVisibility, and improves the no-border-radius optimizations when skip-sides allow us to take them.  (Bug 485501)
+Move clamping of border-radii that are too big from nsCSSRendering::ComputePixelRadii to nsIFrame::ComputeBorderRadius.  This also fixes a bug in nsDisplayBoxShadowOuter::ComputeVisibility.  (Bug 485501)
 
 diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 --- a/layout/base/nsCSSRendering.cpp
 +++ b/layout/base/nsCSSRendering.cpp
-@@ -466,58 +466,28 @@ RectToGfxRect(const nsRect& rect, nscoor
+@@ -465,52 +465,25 @@ RectToGfxRect(const nsRect& rect, nscoor
+                  gfxFloat(rect.y) / twipsPerPixel,
                   gfxFloat(rect.width) / twipsPerPixel,
                   gfxFloat(rect.height) / twipsPerPixel);
  }
@@ -13,58 +14,52 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
  /*
   * Compute the float-pixel radii that should be used for drawing
   * this border/outline, given the various input bits.
-  *
-- * If a side is skipped via skipSides, its corners are forced to 0.
-  * All corner radii are then adjusted so they do not require more
-  * space than outerRect, according to the algorithm in css3-background.
+- *
+- * All corner radii are then adjusted so they do not require more
+- * space than outerRect, according to the algorithm in css3-background.
   */
  static void
  ComputePixelRadii(const nscoord *aTwipsRadii,
-                   const nsRect& outerRect,
--                  PRIntn skipSides,
+-                  const nsRect& outerRect,
                    nscoord twipsPerPixel,
                    gfxCornerSizes *oBorderRadii)
  {
-   nscoord twipsRadii[8];
-   memcpy(twipsRadii, aTwipsRadii, sizeof twipsRadii);
- 
--  if (skipSides & SIDE_BIT_TOP) {
--    twipsRadii[NS_CORNER_TOP_LEFT_X] = 0;
--    twipsRadii[NS_CORNER_TOP_LEFT_Y] = 0;
--    twipsRadii[NS_CORNER_TOP_RIGHT_X] = 0;
--    twipsRadii[NS_CORNER_TOP_RIGHT_Y] = 0;
--  }
--
--  if (skipSides & SIDE_BIT_RIGHT) {
--    twipsRadii[NS_CORNER_TOP_RIGHT_X] = 0;
--    twipsRadii[NS_CORNER_TOP_RIGHT_Y] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_RIGHT_X] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_RIGHT_Y] = 0;
--  }
--
--  if (skipSides & SIDE_BIT_BOTTOM) {
--    twipsRadii[NS_CORNER_BOTTOM_RIGHT_X] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_RIGHT_Y] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_LEFT_X] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_LEFT_Y] = 0;
--  }
--
--  if (skipSides & SIDE_BIT_LEFT) {
--    twipsRadii[NS_CORNER_BOTTOM_LEFT_X] = 0;
--    twipsRadii[NS_CORNER_BOTTOM_LEFT_Y] = 0;
--    twipsRadii[NS_CORNER_TOP_LEFT_X] = 0;
--    twipsRadii[NS_CORNER_TOP_LEFT_Y] = 0;
--  }
+-  nscoord twipsRadii[8];
+-  memcpy(twipsRadii, aTwipsRadii, sizeof twipsRadii);
 -
    gfxFloat radii[8];
    NS_FOR_CSS_HALF_CORNERS(corner)
-     radii[corner] = twipsRadii[corner] / twipsPerPixel;
+-    radii[corner] = gfxFloat(twipsRadii[corner]) / twipsPerPixel;
+-
+-  // css3-background specifies this algorithm for reducing
+-  // corner radii when they are too big.
+-  gfxFloat maxWidth = gfxFloat(outerRect.width) / twipsPerPixel;
+-  gfxFloat maxHeight = gfxFloat(outerRect.height) / twipsPerPixel;
+-  gfxFloat f = 1.0f;
+-  NS_FOR_CSS_SIDES(side) {
+-    PRUint32 hc1 = NS_SIDE_TO_HALF_CORNER(side, PR_FALSE, PR_TRUE);
+-    PRUint32 hc2 = NS_SIDE_TO_HALF_CORNER(side, PR_TRUE, PR_TRUE);
+-    gfxFloat length = NS_SIDE_IS_VERTICAL(side) ? maxHeight : maxWidth;
+-    gfxFloat sum = radii[hc1] + radii[hc2];
+-    // avoid floating point division in the normal case
+-    if (length < sum)
+-      f = NS_MIN(f, length/sum);
+-  }
+-  if (f < 1.0) {
+-    NS_FOR_CSS_HALF_CORNERS(corner) {
+-      radii[corner] *= f;
+-    }
+-  }
++    radii[corner] = gfxFloat(aTwipsRadii[corner]) / twipsPerPixel;
  
-   // css3-background specifies this algorithm for reducing
-   // corner radii when they are too big.
-   gfxFloat maxWidth = outerRect.width / twipsPerPixel;
-   gfxFloat maxHeight = outerRect.height / twipsPerPixel;
-@@ -624,17 +594,17 @@ nsCSSRendering::PaintBorderWithStyleBord
+   (*oBorderRadii)[C_TL] = gfxSize(radii[NS_CORNER_TOP_LEFT_X],
+                                   radii[NS_CORNER_TOP_LEFT_Y]);
+   (*oBorderRadii)[C_TR] = gfxSize(radii[NS_CORNER_TOP_RIGHT_X],
+                                   radii[NS_CORNER_TOP_RIGHT_Y]);
+   (*oBorderRadii)[C_BR] = gfxSize(radii[NS_CORNER_BOTTOM_RIGHT_X],
+                                   radii[NS_CORNER_BOTTOM_RIGHT_Y]);
+   (*oBorderRadii)[C_BL] = gfxSize(radii[NS_CORNER_BOTTOM_LEFT_X],
+@@ -594,17 +567,18 @@ nsCSSRendering::PaintBorderWithStyleBord
    border = aStyleBorder.GetComputedBorder();
    if ((0 == border.left) && (0 == border.right) &&
        (0 == border.top) && (0 == border.bottom)) {
@@ -73,8 +68,9 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    }
  
    nsIFrame::ComputeBorderRadius(aStyleBorder.mBorderRadius,
--                                aForFrame->GetSize(), twipsRadii);
-+                                aForFrame->GetSize(), aSkipSides, twipsRadii);
+-                                aForFrame->GetSize(), aSkipSides, twipsRadii);
++                                aForFrame->GetSize(), aBorderArea,
++                                aSkipSides, twipsRadii);
  
    // Turn off rendering for all of the zero sized sides
    if (aSkipSides & SIDE_BIT_TOP) border.top = 0;
@@ -83,7 +79,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    if (aSkipSides & SIDE_BIT_LEFT) border.left = 0;
  
    // get the inside and outside parts of the border
-@@ -653,18 +623,17 @@ nsCSSRendering::PaintBorderWithStyleBord
+@@ -623,17 +597,17 @@ nsCSSRendering::PaintBorderWithStyleBord
    // convert the border widths
    gfxFloat borderWidths[4] = { gfxFloat(border.top / twipsPerPixel),
                                 gfxFloat(border.right / twipsPerPixel),
@@ -92,9 +88,8 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
  
    // convert the radii
    gfxCornerSizes borderRadii;
--  ComputePixelRadii(twipsRadii, outerRect, aSkipSides, twipsPerPixel,
--                    &borderRadii);
-+  ComputePixelRadii(twipsRadii, outerRect, twipsPerPixel, &borderRadii);
+-  ComputePixelRadii(twipsRadii, outerRect, twipsPerPixel, &borderRadii);
++  ComputePixelRadii(twipsRadii, twipsPerPixel, &borderRadii);
  
    PRUint8 borderStyles[4];
    nscolor borderColors[4];
@@ -103,18 +98,19 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    // pull out styles, colors, composite colors
    NS_FOR_CSS_SIDES (i) {
      PRBool foreground;
-@@ -745,17 +714,17 @@ nsCSSRendering::PaintOutline(nsPresConte
+@@ -712,20 +686,16 @@ nsCSSRendering::PaintOutline(nsPresConte
+   }
+ 
    nsIFrame* bgFrame = nsCSSRendering::FindNonTransparentBackgroundFrame
      (aForFrame, PR_FALSE);
    nsStyleContext* bgContext = bgFrame->GetStyleContext();
    nscolor bgColor =
      bgContext->GetVisitedDependentColor(eCSSProperty_background_color);
  
-   // get the radius for our outline
-   nsIFrame::ComputeBorderRadius(ourOutline->mOutlineRadius, aBorderArea.Size(),
--                                twipsRadii);
-+                                0, twipsRadii);
- 
+-  // get the radius for our outline
+-  nsIFrame::ComputeBorderRadius(ourOutline->mOutlineRadius, aBorderArea.Size(),
+-                                0, twipsRadii);
+-
    // When the outline property is set on :-moz-anonymous-block or
    // :-moz-anonyomus-positioned-block pseudo-elements, it inherited that
    // outline from the inline that was broken because it contained a
@@ -122,7 +118,21 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    // block inside the inline is narrow, so union the actual contents of
    // the anonymous blocks.
    nsIFrame *frameForArea = aForFrame;
-@@ -801,18 +770,17 @@ nsCSSRendering::PaintOutline(nsPresConte
+   do {
+@@ -761,26 +731,30 @@ nsCSSRendering::PaintOutline(nsPresConte
+   // encroach into the content area.  A safer calculation would be to
+   // shorten insideRect by the radius one each side before performing this test.
+   if (innerRect.Contains(aDirtyRect))
+     return;
+ 
+   nsRect outerRect = innerRect;
+   outerRect.Inflate(width, width);
+ 
++  // get the radius for our outline
++  nsIFrame::ComputeBorderRadius(ourOutline->mOutlineRadius,
++                                aBorderArea.Size(), outerRect, 0, twipsRadii);
++
+   // Get our conversion values
    nscoord twipsPerPixel = aPresContext->DevPixelsToAppUnits(1);
  
    // get the outer rectangles
@@ -131,9 +141,8 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    // convert the radii
    nsMargin outlineMargin(width, width, width, width);
    gfxCornerSizes outlineRadii;
--  ComputePixelRadii(twipsRadii, outerRect, 0, twipsPerPixel,
--                    &outlineRadii);
-+  ComputePixelRadii(twipsRadii, outerRect, twipsPerPixel, &outlineRadii);
+-  ComputePixelRadii(twipsRadii, outerRect, twipsPerPixel, &outlineRadii);
++  ComputePixelRadii(twipsRadii, twipsPerPixel, &outlineRadii);
  
    PRUint8 outlineStyle = ourOutline->GetOutlineStyle();
    PRUint8 outlineStyles[4] = { outlineStyle,
@@ -142,7 +151,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
                                 outlineStyle };
  
    // This handles treating the initial color as 'currentColor'; if we
-@@ -860,17 +828,17 @@ nsCSSRendering::PaintFocus(nsPresContext
+@@ -828,17 +802,17 @@ nsCSSRendering::PaintFocus(nsPresContext
    nscoord oneCSSPixel = nsPresContext::CSSPixelsToAppUnits(1);
    nscoord oneDevPixel = aPresContext->DevPixelsToAppUnits(1);
  
@@ -151,8 +160,8 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    gfxCornerSizes focusRadii;
    {
      nscoord twipsRadii[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
--    ComputePixelRadii(twipsRadii, aFocusRect, 0, oneDevPixel, &focusRadii);
-+    ComputePixelRadii(twipsRadii, aFocusRect, oneDevPixel, &focusRadii);
+-    ComputePixelRadii(twipsRadii, aFocusRect, oneDevPixel, &focusRadii);
++    ComputePixelRadii(twipsRadii, oneDevPixel, &focusRadii);
    }
    gfxFloat focusWidths[4] = { gfxFloat(oneCSSPixel / oneDevPixel),
                                gfxFloat(oneCSSPixel / oneDevPixel),
@@ -161,7 +170,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
  
    PRUint8 focusStyles[4] = { NS_STYLE_BORDER_STYLE_DOTTED,
                               NS_STYLE_BORDER_STYLE_DOTTED,
-@@ -1162,21 +1130,20 @@ nsCSSRendering::PaintBoxShadowOuter(nsPr
+@@ -1130,20 +1104,20 @@ nsCSSRendering::PaintBoxShadowOuter(nsPr
      hasBorderRadius = PR_FALSE;
      // For opaque (rectangular) theme widgets we can take the generic
      // border-box path with border-radius disabled.
@@ -170,14 +179,13 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
      nativeTheme = PR_FALSE;
      nscoord twipsRadii[8];
      hasBorderRadius = nsIFrame::ComputeBorderRadius(styleBorder->mBorderRadius,
--                        aFrameArea.Size(), twipsRadii);
-+                        aFrameArea.Size(), aForFrame->GetSkipSides(),
-+                        twipsRadii);
+-                        aFrameArea.Size(), aForFrame->GetSkipSides(),
+-                        twipsRadii);
++                        aFrameArea.Size(), aFrameArea,
++                        aForFrame->GetSkipSides(), twipsRadii);
      if (hasBorderRadius) {
--      PRIntn sidesToSkip = aForFrame->GetSkipSides();
--      ComputePixelRadii(twipsRadii, aFrameArea, sidesToSkip, twipsPerPixel,
--                        &borderRadii);
-+      ComputePixelRadii(twipsRadii, aFrameArea, twipsPerPixel, &borderRadii);
+-      ComputePixelRadii(twipsRadii, aFrameArea, twipsPerPixel, &borderRadii);
++      ComputePixelRadii(twipsRadii, twipsPerPixel, &borderRadii);
      }
    }
  
@@ -186,7 +194,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    gfxRect frameGfxRect = RectToGfxRect(frameRect, twipsPerPixel);
    frameGfxRect.Round();
  
-@@ -1343,31 +1310,29 @@ nsCSSRendering::PaintBoxShadowInner(nsPr
+@@ -1310,29 +1284,30 @@ nsCSSRendering::PaintBoxShadowInner(nsPr
      // box shadows since chrome can be aware of the platform theme.
      return;
    }
@@ -195,8 +203,9 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    nscoord twipsRadii[8];
    PRBool hasBorderRadius = nsIFrame::ComputeBorderRadius(
                               styleBorder->mBorderRadius, aFrameArea.Size(),
--                             twipsRadii);
-+                             aForFrame->GetSkipSides(), twipsRadii);
+-                             aForFrame->GetSkipSides(), twipsRadii);
++                             aFrameArea.Size(), aForFrame->GetSkipSides(),
++                             twipsRadii);
    nscoord twipsPerPixel = aPresContext->DevPixelsToAppUnits(1);
  
    nsRect paddingRect = aFrameArea;
@@ -207,12 +216,9 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    gfxCornerSizes innerRadii;
    if (hasBorderRadius) {
      gfxCornerSizes borderRadii;
--    PRIntn sidesToSkip = aForFrame->GetSkipSides();
--
--    ComputePixelRadii(twipsRadii, aFrameArea, sidesToSkip,
--                      twipsPerPixel, &borderRadii);
-+
-+    ComputePixelRadii(twipsRadii, aFrameArea, twipsPerPixel, &borderRadii);
+ 
+-    ComputePixelRadii(twipsRadii, aFrameArea, twipsPerPixel, &borderRadii);
++    ComputePixelRadii(twipsRadii, twipsPerPixel, &borderRadii);
      gfxFloat borderSizes[4] = {
        gfxFloat(border.top / twipsPerPixel),
        gfxFloat(border.right / twipsPerPixel),
@@ -221,7 +227,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
      };
      nsCSSBorderRenderer::ComputeInnerRadii(borderRadii, borderSizes,
                                             &innerRadii);
-@@ -2235,20 +2200,20 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+@@ -2200,20 +2175,20 @@ nsCSSRendering::PaintBackgroundWithSC(ns
    nscoord appUnitsPerPixel = aPresContext->AppUnitsPerDevPixel();
  
    // Same coordinate space as aBorderArea & aBGClipRect
@@ -230,13 +236,13 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    {
      nscoord radii[8];
      haveRoundedCorners = nsIFrame::ComputeBorderRadius(aBorder.mBorderRadius,
--                           aForFrame->GetSize(), radii);
-+                           aForFrame->GetSize(), aForFrame->GetSkipSides(),
-+                           radii);
+-                           aForFrame->GetSize(), aForFrame->GetSkipSides(),
+-                           radii);
++                           aForFrame->GetSize(), aBorderArea,
++                           aForFrame->GetSkipSides(), radii);
      if (haveRoundedCorners)
--      ComputePixelRadii(radii, aBorderArea, aForFrame->GetSkipSides(),
--                        appUnitsPerPixel, &bgRadii);
-+      ComputePixelRadii(radii, aBorderArea, appUnitsPerPixel, &bgRadii);
+-      ComputePixelRadii(radii, aBorderArea, appUnitsPerPixel, &bgRadii);
++      ComputePixelRadii(radii, appUnitsPerPixel, &bgRadii);
    }
  
    // The 'bgClipArea' (used only by the image tiling logic, far below)
@@ -245,24 +251,26 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    // SetupCurrentBackgroundClip.  (Arguably it should be the
    // intersection, but that breaks the table painter -- in particular,
    // taking the intersection breaks reftests/bugs/403249-1[ab].)
-@@ -3927,23 +3892,22 @@ nsAutoClipToBorderRadius::nsAutoClipToBo
+@@ -3890,24 +3865,25 @@ nsAutoClipToBorderRadius::nsAutoClipToBo
+                             nsIRenderingContext &aRenderingContext,
+                             nsIFrame *aFrame, nsPoint aOffsetToFrame)
  {
    // This has some code in common with SetupBackgroundClip and
    // PaintBackgroundWithSC, but it looks hard to refactor, and this
    // isn't too bad.
    const nsStyleBorder *border = aFrame->GetStyleBorder();
    nscoord radii[8];
++  nsSize frameSize = aFrame->GetSize();
    PRBool haveRoundedCorners = nsIFrame::ComputeBorderRadius(
-                                 border->mBorderRadius, aFrame->GetSize(),
--                                radii);
-+                                aFrame->GetSkipSides(), radii);
+-                                border->mBorderRadius, aFrame->GetSize(),
++                                border->mBorderRadius, frameSize, frameSize,
+                                 aFrame->GetSkipSides(), radii);
    if (haveRoundedCorners) {
      PRInt32 appUnitsPerPixel = aFrame->PresContext()->AppUnitsPerDevPixel();
  
      gfxCornerSizes pixelRadii;
--    ComputePixelRadii(radii, aFrame->GetRect(), aFrame->GetSkipSides(),
--                      appUnitsPerPixel, &pixelRadii);
-+    ComputePixelRadii(radii, aFrame->GetRect(), appUnitsPerPixel, &pixelRadii);
+-    ComputePixelRadii(radii, aFrame->GetRect(), appUnitsPerPixel, &pixelRadii);
++    ComputePixelRadii(radii, appUnitsPerPixel, &pixelRadii);
  
      nsMargin bp = aFrame->GetUsedBorderAndPadding();
      aFrame->ApplySkipSides(bp);
@@ -274,7 +282,7 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 --- a/layout/base/nsDisplayList.cpp
 +++ b/layout/base/nsDisplayList.cpp
-@@ -998,17 +998,18 @@ nsDisplayBoxShadowOuter::ComputeVisibili
+@@ -998,18 +998,18 @@ nsDisplayBoxShadowOuter::ComputeVisibili
    if (!frameRect.Contains(visibleBounds))
      return PR_TRUE;
  
@@ -283,9 +291,10 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
    nscoord twipsRadii[8];
    PRBool hasBorderRadii = nsIFrame::ComputeBorderRadius(
                              mFrame->GetStyleBorder()->mBorderRadius,
--                            frameRect.Size(), twipsRadii);
-+                            frameRect.Size(), mFrame->GetSkipSides(),
-+                            twipsRadii);
+-                            frameRect.Size(), mFrame->GetSkipSides(),
+-                            twipsRadii);
++                            frameRect.Size(), frameRect.Size(),
++                            mFrame->GetSkipSides(), twipsRadii);
    if (!hasBorderRadii)
      return PR_FALSE;
  
@@ -297,7 +306,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -734,20 +734,19 @@ nsIFrame::GetContentRect() const
+@@ -734,16 +734,17 @@ nsIFrame::GetContentRect() const
    nsRect r(mRect);
    r.Deflate(bp);
    return r;
@@ -306,70 +315,57 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  PRBool
  nsIFrame::ComputeBorderRadius(const nsStyleCorners& aBorderRadius,
                                const nsSize& aFrameSize,
-+                              PRIntn aSkipSides,
++                              const nsSize& aBorderArea,
+                               PRIntn aSkipSides,
                                nscoord aRadii[8])
  {
--  PRBool result = PR_FALSE;
--
    // Percentages are relative to whichever side they're on.
    NS_FOR_CSS_HALF_CORNERS(i) {
      const nsStyleCoord c = aBorderRadius.Get(i);
      nscoord axis =
        NS_HALF_CORNER_IS_X(i) ? aFrameSize.width : aFrameSize.height;
+@@ -787,25 +788,40 @@ nsIFrame::ComputeBorderRadius(const nsSt
  
-     switch (c.GetUnit()) {
-       case eStyleUnit_Percent:
-@@ -758,20 +757,54 @@ nsIFrame::ComputeBorderRadius(const nsSt
-         aRadii[i] = c.GetCoordValue();
-         break;
+   if (aSkipSides & (1 << NS_SIDE_LEFT)) {
+     aRadii[NS_CORNER_BOTTOM_LEFT_X] = 0;
+     aRadii[NS_CORNER_BOTTOM_LEFT_Y] = 0;
+     aRadii[NS_CORNER_TOP_LEFT_X] = 0;
+     aRadii[NS_CORNER_TOP_LEFT_Y] = 0;
+   }
  
-       default:
-         NS_NOTREACHED("ComputeBorderRadius: bad unit");
-         aRadii[i] = 0;
-         break;
-     }
--
--    if (aRadii[i])
-+  }
-+
-+  if (aSkipSides & (1 << NS_SIDE_TOP)) {
-+    aRadii[NS_CORNER_TOP_LEFT_X] = 0;
-+    aRadii[NS_CORNER_TOP_LEFT_Y] = 0;
-+    aRadii[NS_CORNER_TOP_RIGHT_X] = 0;
-+    aRadii[NS_CORNER_TOP_RIGHT_Y] = 0;
-+  }
-+
-+  if (aSkipSides & (1 << NS_SIDE_RIGHT)) {
-+    aRadii[NS_CORNER_TOP_RIGHT_X] = 0;
-+    aRadii[NS_CORNER_TOP_RIGHT_Y] = 0;
-+    aRadii[NS_CORNER_BOTTOM_RIGHT_X] = 0;
-+    aRadii[NS_CORNER_BOTTOM_RIGHT_Y] = 0;
-+  }
-+
-+  if (aSkipSides & (1 << NS_SIDE_BOTTOM)) {
-+    aRadii[NS_CORNER_BOTTOM_RIGHT_X] = 0;
-+    aRadii[NS_CORNER_BOTTOM_RIGHT_Y] = 0;
-+    aRadii[NS_CORNER_BOTTOM_LEFT_X] = 0;
-+    aRadii[NS_CORNER_BOTTOM_LEFT_Y] = 0;
-+  }
-+
-+  if (aSkipSides & (1 << NS_SIDE_LEFT)) {
-+    aRadii[NS_CORNER_BOTTOM_LEFT_X] = 0;
-+    aRadii[NS_CORNER_BOTTOM_LEFT_Y] = 0;
-+    aRadii[NS_CORNER_TOP_LEFT_X] = 0;
-+    aRadii[NS_CORNER_TOP_LEFT_Y] = 0;
-+  }
-+
-+  PRBool result = PR_FALSE;
-+  NS_FOR_CSS_HALF_CORNERS(i) {
-+    if (aRadii[i]) {
-       result = PR_TRUE;
+-  PRBool result = PR_FALSE;
+-  NS_FOR_CSS_HALF_CORNERS(i) {
+-    if (aRadii[i]) {
+-      result = PR_TRUE;
+-      break;
+-    }
 -  }
-+      break;
+-
+-  return result;
++  // css3-background specifies this algorithm for reducing
++  // corner radii when they are too big.
++  PRBool haveRadius = PR_FALSE;
++  double ratio = 1.0f;
++  NS_FOR_CSS_SIDES(side) {
++    PRUint32 hc1 = NS_SIDE_TO_HALF_CORNER(side, PR_FALSE, PR_TRUE);
++    PRUint32 hc2 = NS_SIDE_TO_HALF_CORNER(side, PR_TRUE, PR_TRUE);
++    nscoord length =
++      NS_SIDE_IS_VERTICAL(side) ? aBorderArea.height : aBorderArea.width;
++    nscoord sum = aRadii[hc1] + aRadii[hc2];
++    if (sum)
++      haveRadius = PR_TRUE;
++
++    // avoid floating point division in the normal case
++    if (length < sum)
++      ratio = NS_MIN(ratio, length/sum);
++  }
++  if (ratio < 1.0) {
++    NS_FOR_CSS_HALF_CORNERS(corner) {
++      aRadii[corner] *= ratio;
 +    }
 +  }
 +
-   return result;
++  return haveRadius;
  }
  
  nsStyleContext*
@@ -377,11 +373,11 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  {
    NS_PRECONDITION(aIndex >= 0, "invalid index number");
    return nsnull;
+ }
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
-@@ -914,19 +914,21 @@ public:
-    */
+@@ -915,19 +915,30 @@ public:
    nsRect GetPaddingRect() const;
    nsRect GetContentRect() const;
  
@@ -389,11 +385,22 @@ diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
     * Get the size, in app units, of the border radii. It returns FALSE iff all
     * returned radii == 0 (so no border radii), TRUE otherwise.
     * For the aRadii indexes, use the NS_CORNER_* constants in nsStyleConsts.h
-+   * If a side is skipped via aSkipSides, its corners are forced to 0.
+    * If a side is skipped via aSkipSides, its corners are forced to 0.
++   *
++   * All corner radii are then adjusted so they do not require more
++   * space than aBorderArea, according to the algorithm in css3-background.
++   *
++   * aFrameSize is used as the basis for percentage widths and heights.
++   * aBorderArea is used for the adjustment of radii that might be too
++   * large.
++   * FIXME: In the long run, we can probably get away with only one of
++   * these, especially if we change the way we handle outline-radius (by
++   * removing it and inflating the border radius)
     */
    static PRBool ComputeBorderRadius(const nsStyleCorners& aBorderRadius,
                                      const nsSize& aFrameSize,
-+                                    PRIntn aSkipSides,
++                                    const nsSize& aBorderArea,
+                                     PRIntn aSkipSides,
                                      nscoord aRadii[8]);
  
    /**
@@ -401,4 +408,3 @@ diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
     * the frame (its top border edge).  Only valid when Reflow is not
     * needed and when the frame returned nsHTMLReflowMetrics::
     * ASK_FOR_BASELINE as ascent in its reflow metrics.
-    */
