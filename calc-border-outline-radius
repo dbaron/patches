@@ -1,0 +1,492 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add support for calc() on -moz-border-radius and -moz-outline-radius.  (Bug 585715)
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -3201,24 +3201,22 @@ nsLayoutUtils::SetFontFromStyle(nsIRende
+   const nsStyleVisibility* visibility = aSC->GetStyleVisibility();
+ 
+   aRC->SetFont(font->mFont, visibility->mLanguage,
+                aSC->PresContext()->GetUserFontSet());
+ }
+ 
+ static PRBool NonZeroStyleCoord(const nsStyleCoord& aCoord)
+ {
+-  switch (aCoord.GetUnit()) {
+-  case eStyleUnit_Percent:
+-    return aCoord.GetPercentValue() > 0;
+-  case eStyleUnit_Coord:
+-    return aCoord.GetCoordValue() > 0;
+-  default:
+-    return PR_TRUE;
++  if (aCoord.IsCoordPercentCalcUnit()) {
++    return nsRuleNode::ComputeCoordPercentCalc(aCoord, nscoord_MAX) == 0 &&
++           nsRuleNode::ComputeCoordPercentCalc(aCoord, 0) == 0;
+   }
++
++  return PR_TRUE;
+ }
+ 
+ /* static */ PRBool
+ nsLayoutUtils::HasNonZeroCorner(const nsStyleCorners& aCorners)
+ {
+   NS_FOR_CSS_HALF_CORNERS(corner) {
+     if (NonZeroStyleCoord(aCorners.Get(corner)))
+       return PR_TRUE;
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -744,29 +744,21 @@ nsIFrame::ComputeBorderRadii(const nsSty
+                              nscoord aRadii[8])
+ {
+   // Percentages are relative to whichever side they're on.
+   NS_FOR_CSS_HALF_CORNERS(i) {
+     const nsStyleCoord c = aBorderRadius.Get(i);
+     nscoord axis =
+       NS_HALF_CORNER_IS_X(i) ? aFrameSize.width : aFrameSize.height;
+ 
+-    switch (c.GetUnit()) {
+-      case eStyleUnit_Percent:
+-        aRadii[i] = (nscoord)(c.GetPercentValue() * axis);
+-        break;
+-
+-      case eStyleUnit_Coord:
+-        aRadii[i] = c.GetCoordValue();
+-        break;
+-
+-      default:
+-        NS_NOTREACHED("ComputeBorderRadii: bad unit");
+-        aRadii[i] = 0;
+-        break;
++    if (c.IsCoordPercentCalcUnit()) {
++      aRadii[i] = nsRuleNode::ComputeCoordPercentCalc(c, axis);
++    } else {
++      NS_NOTREACHED("ComputeBorderRadii: bad unit");
++      aRadii[i] = 0;
+     }
+   }
+ 
+   if (aSkipSides & (1 << NS_SIDE_TOP)) {
+     aRadii[NS_CORNER_TOP_LEFT_X] = 0;
+     aRadii[NS_CORNER_TOP_LEFT_Y] = 0;
+     aRadii[NS_CORNER_TOP_RIGHT_X] = 0;
+     aRadii[NS_CORNER_TOP_RIGHT_Y] = 0;
+diff --git a/layout/reftests/css-calc/border-radius-1-ref.html b/layout/reftests/css-calc/border-radius-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/css-calc/border-radius-1-ref.html
+@@ -0,0 +1,13 @@
++<!DOCTYPE HTML>
++<title>test for border-radius: calc()</title>
++<style>
++
++p {
++  height: 200px;
++  width: 400px;
++  background: blue;
++  -moz-border-radius: 13px 14px 4px 8px / 5px 2px 10px 3px;
++}
++
++</style>
++<p></p>
+diff --git a/layout/reftests/css-calc/border-radius-1.html b/layout/reftests/css-calc/border-radius-1.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/css-calc/border-radius-1.html
+@@ -0,0 +1,13 @@
++<!DOCTYPE HTML>
++<title>test for border-radius: calc()</title>
++<style>
++
++p {
++  height: 200px;
++  width: 400px;
++  background: blue;
++  -moz-border-radius: -moz-calc(2% + 5px) -moz-calc(4% - 2px) -moz-calc(min(20px, 1%)) -moz-max(3px, 2%) / -moz-calc(3% - min(1px, 1%)) -moz-calc(1%) -moz-calc(10px) 3px;
++}
++
++</style>
++<p></p>
+diff --git a/layout/reftests/css-calc/reftest.list b/layout/reftests/css-calc/reftest.list
+--- a/layout/reftests/css-calc/reftest.list
++++ b/layout/reftests/css-calc/reftest.list
+@@ -1,8 +1,9 @@
++== border-radius-1.html border-radius-1-ref.html
+ == height-block-1.html height-block-1-ref.html
+ == height-table-1.html height-table-1-ref.html
+ == margin-block-1.html margin-block-1-ref.html
+ == max-height-block-1.html max-height-block-1-ref.html
+ == max-width-block-1.html width-block-1-ref.html
+ == max-width-block-intrinsic-1.html max-width-block-intrinsic-1-ref.html
+ == min-height-block-1.html height-block-1-ref.html
+ == min-width-block-1.html width-block-1-ref.html
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -5064,23 +5064,23 @@ CSSParserImpl::ParseDirectionalBoxProper
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseBoxCornerRadius(nsCSSProperty aPropID)
+ {
+   nsCSSValue dimenX, dimenY;
+   // required first value
+-  if (! ParseNonNegativeVariant(dimenX, VARIANT_HLP, nsnull))
++  if (! ParseNonNegativeVariant(dimenX, VARIANT_HLP | VARIANT_CALC, nsnull))
+     return PR_FALSE;
+ 
+   // optional second value (forbidden if first value is inherit/initial)
+   if (dimenX.GetUnit() != eCSSUnit_Inherit &&
+       dimenX.GetUnit() != eCSSUnit_Initial) {
+-    ParseNonNegativeVariant(dimenY, VARIANT_LP, nsnull);
++    ParseNonNegativeVariant(dimenY, VARIANT_LP | VARIANT_CALC, nsnull);
+   }
+ 
+   if (dimenX == dimenY || dimenY.GetUnit() == eCSSUnit_Null) {
+     AppendValue(aPropID, dimenX);
+   } else {
+     nsCSSValue value;
+     value.SetPairValue(dimenX, dimenY);
+     AppendValue(aPropID, value);
+@@ -5094,27 +5094,29 @@ CSSParserImpl::ParseBoxCornerRadii(const
+   // Rectangles are used as scratch storage.
+   // top => top-left, right => top-right,
+   // bottom => bottom-right, left => bottom-left.
+   nsCSSRect dimenX, dimenY;
+   PRInt32 countX = 0, countY = 0;
+ 
+   NS_FOR_CSS_SIDES (side) {
+     if (! ParseNonNegativeVariant(dimenX.*nsCSSRect::sides[side],
+-                                  side > 0 ? VARIANT_LP : VARIANT_HLP, nsnull))
++                                  (side > 0 ? 0 : VARIANT_INHERIT) |
++                                    VARIANT_LP | VARIANT_CALC,
++                                  nsnull))
+       break;
+     countX++;
+   }
+   if (countX == 0)
+     return PR_FALSE;
+ 
+   if (ExpectSymbol('/', PR_TRUE)) {
+     NS_FOR_CSS_SIDES (side) {
+       if (! ParseNonNegativeVariant(dimenY.*nsCSSRect::sides[side],
+-                                    VARIANT_LP, nsnull))
++                                    VARIANT_LP | VARIANT_CALC, nsnull))
+         break;
+       countY++;
+     }
+     if (countY == 0)
+       return PR_FALSE;
+   }
+   if (!ExpectEndProperty())
+     return PR_FALSE;
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -5196,17 +5196,18 @@ nsRuleNode::ComputeBorderData(void* aSta
+       int cx = NS_FULL_TO_HALF_CORNER(corner, false);
+       int cy = NS_FULL_TO_HALF_CORNER(corner, true);
+       const nsCSSValue& radius = borderRadius.GetCorner(corner);
+       nsStyleCoord parentX = parentBorder->mBorderRadius.Get(cx);
+       nsStyleCoord parentY = parentBorder->mBorderRadius.Get(cy);
+       nsStyleCoord coordX, coordY;
+ 
+       if (SetPairCoords(radius, coordX, coordY, parentX, parentY,
+-                        SETCOORD_LPH | SETCOORD_INITIAL_ZERO,
++                        SETCOORD_LPH | SETCOORD_INITIAL_ZERO |
++                          SETCOORD_STORE_CALC,
+                         aContext, mPresContext, canStoreInRuleTree)) {
+         border->mBorderRadius.Set(cx, coordX);
+         border->mBorderRadius.Set(cy, coordY);
+       }
+     }
+   }
+ 
+   // float-edge: enum, inherit, initial
+@@ -5404,17 +5405,18 @@ nsRuleNode::ComputeOutlineData(void* aSt
+       int cx = NS_FULL_TO_HALF_CORNER(corner, false);
+       int cy = NS_FULL_TO_HALF_CORNER(corner, true);
+       const nsCSSValue& radius = outlineRadius.GetCorner(corner);
+       nsStyleCoord parentX = parentOutline->mOutlineRadius.Get(cx);
+       nsStyleCoord parentY = parentOutline->mOutlineRadius.Get(cy);
+       nsStyleCoord coordX, coordY;
+ 
+       if (SetPairCoords(radius, coordX, coordY, parentX, parentY,
+-                        SETCOORD_LPH | SETCOORD_INITIAL_ZERO,
++                        SETCOORD_LPH | SETCOORD_INITIAL_ZERO |
++                          SETCOORD_STORE_CALC,
+                         aContext, mPresContext, canStoreInRuleTree)) {
+         outline->mOutlineRadius.Set(cx, coordX);
+         outline->mOutlineRadius.Set(cy, coordY);
+       }
+     }
+   }
+ 
+   // outline-style: enum, inherit, initial
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -744,17 +744,17 @@ struct nsStyleBorder {
+ 
+   nsChangeHint CalcDifference(const nsStyleBorder& aOther) const;
+ #ifdef DEBUG
+   static nsChangeHint MaxDifference();
+ #endif
+   static PRBool ForceCompare() { return PR_FALSE; }
+   PRBool ImageBorderDiffers() const;
+ 
+-  nsStyleCorners mBorderRadius;    // [reset] coord, percent
++  nsStyleCorners mBorderRadius;    // [reset] coord, percent, calc
+   nsStyleSides  mBorderImageSplit; // [reset] integer, percent
+   PRUint8       mFloatEdge;       // [reset] see nsStyleConsts.h
+   PRUint8       mBorderImageHFill; // [reset]
+   PRUint8       mBorderImageVFill; // [reset]
+   nsBorderColors** mBorderColors; // [reset] multiple levels of color for a border.
+   nsRefPtr<nsCSSShadowArray> mBoxShadow; // [reset] NULL for 'none'
+   PRBool        mHaveBorderImageWidth; // [reset]
+   nsMargin      mBorderImageWidth; // [reset]
+@@ -956,17 +956,17 @@ struct nsStyleOutline {
+ 
+   void RecalcData(nsPresContext* aContext);
+   nsChangeHint CalcDifference(const nsStyleOutline& aOther) const;
+ #ifdef DEBUG
+   static nsChangeHint MaxDifference();
+ #endif
+   static PRBool ForceCompare() { return PR_FALSE; }
+ 
+-  nsStyleCorners  mOutlineRadius; // [reset] coord, percent
++  nsStyleCorners  mOutlineRadius; // [reset] coord, percent, calc
+ 
+   // Note that this is a specified value.  You can get the actual values
+   // with GetOutlineWidth.  You cannot get the computed value directly.
+   nsStyleCoord  mOutlineWidth;    // [reset] coord, enum (see nsStyleConsts.h)
+   nscoord       mOutlineOffset;   // [reset]
+ 
+   PRBool GetOutlineWidth(nscoord& aWidth) const
+   {
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -160,57 +160,104 @@ var gCSSProperties = {
+ 	},
+ 	"-moz-border-radius": {
+ 		domProp: "MozBorderRadius",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "-moz-border-radius-bottomleft", "-moz-border-radius-bottomright", "-moz-border-radius-topleft", "-moz-border-radius-topright" ],
+ 		initial_values: [ "0", "0px", "0px 0 0 0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", "3em 2px", "2pt 3% 4em", "2px 2px 2px 2px", // circular
+-						"3% / 2%", "1px / 4px", "2em / 1em", "3em 2px / 2px 3em", "2pt 3% 4em / 4pt 1% 5em", "2px 2px 2px 2px / 4px 4px 4px 4px", "1pt / 2pt 3pt", "4pt 5pt / 3pt" // elliptical
++						"3% / 2%", "1px / 4px", "2em / 1em", "3em 2px / 2px 3em", "2pt 3% 4em / 4pt 1% 5em", "2px 2px 2px 2px / 4px 4px 4px 4px", "1pt / 2pt 3pt", "4pt 5pt / 3pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
++			"2px 2px -moz-calc(2px + 1%) 2px",
++			"1px 2px 2px 2px / 2px 2px -moz-calc(2px + 1%) 2px",
+ 					  ],
+ 		invalid_values: [ "2px -2px", "inherit 2px", "inherit / 2px", "2px inherit", "2px / inherit", "2px 2px 2px 2px 2px", "1px / 2px 2px 2px 2px 2px" ]
+ 	},
+ 	"-moz-border-radius-bottomleft": {
+ 		domProp: "MozBorderRadiusBottomleft",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-border-radius-bottomright": {
+ 		domProp: "MozBorderRadiusBottomright",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-border-radius-topleft": {
+ 		domProp: "MozBorderRadiusTopleft",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-border-radius-topright": {
+ 		domProp: "MozBorderRadiusTopright",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px" ], /* 0% ? */
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-border-right-colors": {
+ 		domProp: "MozBorderRightColors",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "none" ],
+@@ -602,57 +649,104 @@ var gCSSProperties = {
+ 	},
+ 	"-moz-outline-radius": {
+ 		domProp: "MozOutlineRadius",
+ 		inherited: false,
+ 		type: CSS_TYPE_TRUE_SHORTHAND,
+ 		subproperties: [ "-moz-outline-radius-bottomleft", "-moz-outline-radius-bottomright", "-moz-outline-radius-topleft", "-moz-outline-radius-topright" ],
+ 		initial_values: [ "0", "0px", "0%" ],
+ 		other_values: [ "3%", "1px", "2em", "3em 2px", "2pt 3% 4em", "2px 2px 2px 2px", // circular
+-						"3% / 2%", "1px / 4px", "2em / 1em", "3em 2px / 2px 3em", "2pt 3% 4em / 4pt 1% 5em", "2px 2px 2px 2px / 4px 4px 4px 4px", "1pt / 2pt 3pt", "4pt 5pt / 3pt" // elliptical
++						"3% / 2%", "1px / 4px", "2em / 1em", "3em 2px / 2px 3em", "2pt 3% 4em / 4pt 1% 5em", "2px 2px 2px 2px / 4px 4px 4px 4px", "1pt / 2pt 3pt", "4pt 5pt / 3pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
++			"2px 2px -moz-calc(2px + 1%) 2px",
++			"1px 2px 2px 2px / 2px 2px -moz-calc(2px + 1%) 2px",
+ 					  ],
+ 		invalid_values: [ "2px -2px", "inherit 2px", "inherit / 2px", "2px inherit", "2px / inherit", "2px 2px 2px 2px 2px", "1px / 2px 2px 2px 2px 2px" ]
+ 	},
+ 	"-moz-outline-radius-bottomleft": {
+ 		domProp: "MozOutlineRadiusBottomleft",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px", "0%" ],
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-outline-radius-bottomright": {
+ 		domProp: "MozOutlineRadiusBottomright",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px", "0%" ],
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-outline-radius-topleft": {
+ 		domProp: "MozOutlineRadiusTopleft",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px", "0%" ],
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-outline-radius-topright": {
+ 		domProp: "MozOutlineRadiusTopright",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "0", "0px", "0%" ],
+ 		other_values: [ "3%", "1px", "2em", // circular
+-						"3% 2%", "1px 4px", "2em 2pt" // elliptical
++						"3% 2%", "1px 4px", "2em 2pt", // elliptical
++			"-moz-calc(2px)",
++			"-moz-calc(50%)",
++			"-moz-calc(3*25px)",
++			"-moz-calc(3*25px) 5px",
++			"5px -moz-calc(3*25px)",
++			"-moz-calc(20%) -moz-calc(3*25px)",
++			"-moz-calc(25px*3)",
++			"-moz-calc(3*25px + 50%)",
++			"-moz-min(30%, 30em,200px, min(500px ,40em))",
+ 					  ],
+ 		invalid_values: [ "-1px", "4px -2px", "inherit 2px", "2px inherit" ]
+ 	},
+ 	"-moz-padding-end": {
+ 		domProp: "MozPaddingEnd",
+ 		inherited: false,
+ 		type: CSS_TYPE_SHORTHAND_AND_LONGHAND,
+ 		get_computed: logical_box_prop_get_computed,
