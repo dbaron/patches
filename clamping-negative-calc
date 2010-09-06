@@ -1,0 +1,210 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Fix places where I missed clamping negative calc() to 0.  (Bug 585715)
+
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -800,16 +800,28 @@ public:
+ 
+   static PRBool IsPaddingZero(const nsStyleCoord &aCoord)
+   {
+     return (aCoord.GetUnit() == eStyleUnit_Coord &&
+             aCoord.GetCoordValue() == 0) ||
+            (aCoord.GetUnit() == eStyleUnit_Percent &&
+             aCoord.GetPercentValue() == 0.0) ||
+            (aCoord.IsCalcUnit() &&
++            // clamp negative calc() to 0
++            nsRuleNode::ComputeCoordPercentCalc(aCoord, nscoord_MAX) <= 0 &&
++            nsRuleNode::ComputeCoordPercentCalc(aCoord, 0) <= 0);
++  }
++
++  static PRBool IsMarginZero(const nsStyleCoord &aCoord)
++  {
++    return (aCoord.GetUnit() == eStyleUnit_Coord &&
++            aCoord.GetCoordValue() == 0) ||
++           (aCoord.GetUnit() == eStyleUnit_Percent &&
++            aCoord.GetPercentValue() == 0.0) ||
++           (aCoord.IsCalcUnit() &&
+             nsRuleNode::ComputeCoordPercentCalc(aCoord, nscoord_MAX) == 0 &&
+             nsRuleNode::ComputeCoordPercentCalc(aCoord, 0) == 0);
+   }
+ 
+   /*
+    * Calculate the used values for 'width' and 'height' for a replaced element.
+    *
+    *   http://www.w3.org/TR/CSS21/visudet.html#min-max-widths
+diff --git a/layout/generic/nsContainerFrame.cpp b/layout/generic/nsContainerFrame.cpp
+--- a/layout/generic/nsContainerFrame.cpp
++++ b/layout/generic/nsContainerFrame.cpp
+@@ -624,17 +624,18 @@ nsContainerFrame::DoInlineIntrinsicWidth
+   // messy the bidi situations are, since per CSS2.1 section 8.6
+   // (implemented in bug 328168), the startSide border is always on the
+   // first line.
+   // This frame is a first-in-flow, but it might have a previous bidi
+   // continuation, in which case that continuation should handle the startSide
+   // border.
+   if (!GetPrevContinuation()) {
+     aData->currentLine +=
+-      GetCoord(stylePadding->mPadding.Get(startSide), 0) +
++      // clamp negative calc() to 0
++      NS_MAX(GetCoord(stylePadding->mPadding.Get(startSide), 0), 0) +
+       styleBorder->GetActualBorderWidth(startSide) +
+       GetCoord(styleMargin->mMargin.Get(startSide), 0);
+   }
+ 
+   const nsLineList_iterator* savedLine = aData->line;
+   nsIFrame* const savedLineContainer = aData->lineContainer;
+ 
+   nsContainerFrame *lastInFlow;
+@@ -665,17 +666,18 @@ nsContainerFrame::DoInlineIntrinsicWidth
+   // messy the bidi situations are, since per CSS2.1 section 8.6
+   // (implemented in bug 328168), the endSide border is always on the
+   // last line.
+   // We reached the last-in-flow, but it might have a next bidi
+   // continuation, in which case that continuation should handle
+   // the endSide border.
+   if (!lastInFlow->GetNextContinuation()) {
+     aData->currentLine +=
+-      GetCoord(stylePadding->mPadding.Get(endSide), 0) +
++      // clamp negative calc() to 0
++      NS_MAX(GetCoord(stylePadding->mPadding.Get(endSide), 0), 0) +
+       styleBorder->GetActualBorderWidth(endSide) +
+       GetCoord(styleMargin->mMargin.Get(endSide), 0);
+   }
+ }
+ 
+ /* virtual */ nsSize
+ nsContainerFrame::ComputeAutoSize(nsIRenderingContext *aRenderingContext,
+                                   nsSize aCBSize, nscoord aAvailableWidth,
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3360,49 +3360,55 @@ struct LengthPercentPairWithMinMaxCalcOp
+   }
+ 
+ };
+ 
+ static void
+ AddCoord(const nsStyleCoord& aStyle,
+          nsIRenderingContext* aRenderingContext,
+          nsIFrame* aFrame,
+-         nscoord* aCoord, float* aPercent)
++         nscoord* aCoord, float* aPercent,
++         PRBool aClampNegativeToZero)
+ {
+   if (!aStyle.IsCoordPercentCalcUnit()) {
+     return;
+   }
+ 
+   LengthPercentPairWithMinMaxCalcOps ops;
+   LengthPercentPairWithMinMaxCalcOps::result_type pair =
+     css::ComputeCalc(aStyle, ops);
++  if (aClampNegativeToZero) {
++    // This is far from ideal when one is negative and one is positive.
++    pair.mLength = NS_MAX(pair.mLength, 0);
++    pair.mPercent = NS_MAX(pair.mPercent, 0.0);
++  }
+   *aCoord += pair.mLength;
+   *aPercent += pair.mPercent;
+ }
+ 
+ /* virtual */ nsIFrame::IntrinsicWidthOffsetData
+ nsFrame::IntrinsicWidthOffsets(nsIRenderingContext* aRenderingContext)
+ {
+   IntrinsicWidthOffsetData result;
+ 
+   // FIXME: The handling of calc() with min() and max() by AddCoord
+   // is a rough approximation.  It could be improved, but only by
+   // changing the IntrinsicWidthOffsets API substantially.  See the
+   // comment above LengthPercentPairWithMinMaxCalcOps.
+   const nsStyleMargin *styleMargin = GetStyleMargin();
+   AddCoord(styleMargin->mMargin.GetLeft(), aRenderingContext, this,
+-           &result.hMargin, &result.hPctMargin);
++           &result.hMargin, &result.hPctMargin, PR_FALSE);
+   AddCoord(styleMargin->mMargin.GetRight(), aRenderingContext, this,
+-           &result.hMargin, &result.hPctMargin);
++           &result.hMargin, &result.hPctMargin, PR_FALSE);
+ 
+   const nsStylePadding *stylePadding = GetStylePadding();
+   AddCoord(stylePadding->mPadding.GetLeft(), aRenderingContext, this,
+-           &result.hPadding, &result.hPctPadding);
++           &result.hPadding, &result.hPctPadding, PR_TRUE);
+   AddCoord(stylePadding->mPadding.GetRight(), aRenderingContext, this,
+-           &result.hPadding, &result.hPctPadding);
++           &result.hPadding, &result.hPctPadding, PR_TRUE);
+ 
+   const nsStyleBorder *styleBorder = GetStyleBorder();
+   result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_LEFT);
+   result.hBorder += styleBorder->GetActualBorderWidth(NS_SIDE_RIGHT);
+ 
+   const nsStyleDisplay *disp = GetStyleDisplay();
+   if (IsThemed(disp)) {
+     nsPresContext *presContext = PresContext();
+diff --git a/layout/generic/nsInlineFrame.cpp b/layout/generic/nsInlineFrame.cpp
+--- a/layout/generic/nsInlineFrame.cpp
++++ b/layout/generic/nsInlineFrame.cpp
+@@ -92,17 +92,17 @@ nsInlineFrame::GetType() const
+ {
+   return nsGkAtoms::inlineFrame;
+ }
+ 
+ static inline PRBool
+ IsMarginZero(const nsStyleCoord &aCoord)
+ {
+   return aCoord.GetUnit() == eStyleUnit_Auto ||
+-         nsLayoutUtils::IsPaddingZero(aCoord);
++         nsLayoutUtils::IsMarginZero(aCoord);
+ }
+ 
+ /* virtual */ PRBool
+ nsInlineFrame::IsSelfEmpty()
+ {
+ #if 0
+   // I used to think inline frames worked this way, but it seems they
+   // don't.  At least not in our codebase.
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -339,17 +339,19 @@ nsStylePadding::Destroy(nsPresContext* a
+   this->~nsStylePadding();
+   aContext->FreeToShell(sizeof(nsStylePadding), this);
+ }
+ 
+ void nsStylePadding::RecalcData()
+ {
+   if (IsFixedData(mPadding, PR_FALSE)) {
+     NS_FOR_CSS_SIDES(side) {
+-      mCachedPadding.side(side) = CalcCoord(mPadding.Get(side), nsnull, 0);
++      // Clamp negative calc() to 0.
++      mCachedPadding.side(side) =
++        NS_MAX(CalcCoord(mPadding.Get(side), nsnull, 0), 0);
+     }
+     mHasCachedPadding = PR_TRUE;
+   }
+   else
+     mHasCachedPadding = PR_FALSE;
+ }
+ 
+ nsChangeHint nsStylePadding::CalcDifference(const nsStylePadding& aOther) const
+@@ -580,18 +582,19 @@ nsStyleOutline::nsStyleOutline(const nsS
+ 
+ void 
+ nsStyleOutline::RecalcData(nsPresContext* aContext)
+ {
+   if (NS_STYLE_BORDER_STYLE_NONE == GetOutlineStyle()) {
+     mCachedOutlineWidth = 0;
+     mHasCachedOutline = PR_TRUE;
+   } else if (IsFixedUnit(mOutlineWidth, PR_TRUE)) {
++    // Clamp negative calc() to 0.
+     mCachedOutlineWidth =
+-      CalcCoord(mOutlineWidth, aContext->GetBorderWidthTable(), 3);
++      NS_MAX(CalcCoord(mOutlineWidth, aContext->GetBorderWidthTable(), 3), 0);
+     mCachedOutlineWidth =
+       NS_ROUND_BORDER_TO_PIXELS(mCachedOutlineWidth, mTwipsPerPixel);
+     mHasCachedOutline = PR_TRUE;
+   }
+   else
+     mHasCachedOutline = PR_FALSE;
+ }
+ 
