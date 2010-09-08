@@ -5,7 +5,7 @@ Clip replaced elements (for now, images, canvases, videos, and windowless plugin
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -1771,16 +1771,48 @@ nsIFrame::BuildDisplayListForChild(nsDis
+@@ -1771,16 +1771,37 @@ nsIFrame::BuildDisplayListForChild(nsDis
    // because in the absence of z-index this is the correct order for them.
    // This doesn't affect correctness because the positioned descendants list
    // is sorted by z-order and content in BuildDisplayListForStackingContext,
@@ -14,36 +14,25 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    return NS_OK;
  }
  
-+nsresult
-+nsIFrame::DisplayReplacedContentInBorderRadius(nsDisplayListBuilder* aBuilder,
-+                                               const nsRect& aDirtyRect,
-+                                               const nsDisplayListSet& aLists)
++void
++nsIFrame::WrapReplacedContentForBorderRadius(nsDisplayListBuilder* aBuilder,
++                                             nsDisplayList* aFromList,
++                                             const nsDisplayListSet& aToLists)
 +{
 +  nscoord radii[8];
 +  if (GetContentBoxBorderRadii(radii)) {
 +    // If we have a border-radius, we have to clip our content to that
 +    // radius.
 +    nsDisplayListCollection set;
-+    nsresult rv = BuildReplacedContentDisplayList(aBuilder, aDirtyRect, set);
++    set.Content()->AppendToTop(aFromList);
 +    nsRect clipRect = GetContentRect() - GetPosition() +
 +                      aBuilder->ToReferenceFrame(this);
 +    OverflowClip(aBuilder, set, aLists, clipRect, radii, PR_FALSE, PR_TRUE);
 +
-+    return rv;
++    return;
 +  }
 +
-+  return BuildReplacedContentDisplayList(aBuilder, aDirtyRect, aLists);
-+}
-+
-+/* virtual */ nsresult
-+nsIFrame::BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                          const nsRect& aDirtyRect,
-+                                          const nsDisplayListSet& aLists)
-+{
-+  NS_ABORT_IF_FALSE(PR_FALSE,
-+                    "subclasses using DisplayReplacedContentInBorderRadius "
-+                    "must override BuildReplacedContentDisplayList");
-+  return NS_ERROR_UNEXPECTED;
++  aToLists.Content()->AppendToTop(aFromList);
 +}
 +
  NS_IMETHODIMP  
@@ -57,7 +46,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 diff --git a/layout/generic/nsHTMLCanvasFrame.cpp b/layout/generic/nsHTMLCanvasFrame.cpp
 --- a/layout/generic/nsHTMLCanvasFrame.cpp
 +++ b/layout/generic/nsHTMLCanvasFrame.cpp
-@@ -278,17 +278,26 @@ nsHTMLCanvasFrame::BuildDisplayList(nsDi
+@@ -278,22 +278,29 @@ nsHTMLCanvasFrame::BuildDisplayList(nsDi
                                      const nsDisplayListSet& aLists)
  {
    if (!IsVisibleForPainting(aBuilder))
@@ -67,52 +56,33 @@ diff --git a/layout/generic/nsHTMLCanvasFrame.cpp b/layout/generic/nsHTMLCanvasF
    NS_ENSURE_SUCCESS(rv, rv);
  
 -  rv = aLists.Content()->AppendNewToTop(
-+  return DisplayReplacedContentInBorderRadius(aBuilder, aDirtyRect, aLists);
-+}
++  nsDisplayList replacedContent;
 +
-+/* virtual */ nsresult
-+nsHTMLCanvasFrame::BuildReplacedContentDisplayList(
-+                     nsDisplayListBuilder* aBuilder,
-+                     const nsRect& aDirtyRect,
-+                     const nsDisplayListSet& aLists)
-+{
-+  nsresult rv = aLists.Content()->AppendNewToTop(
++  rv = replacedContent.AppendNewToTop(
        new (aBuilder) nsDisplayCanvas(aBuilder, this));
    NS_ENSURE_SUCCESS(rv, rv);
  
-   return DisplaySelectionOverlay(aBuilder, aLists.Content(),
-                                  nsISelectionDisplay::DISPLAY_IMAGES);
+-  return DisplaySelectionOverlay(aBuilder, aLists.Content(),
+-                                 nsISelectionDisplay::DISPLAY_IMAGES);
++  rv = DisplaySelectionOverlay(aBuilder, &replacedContent,
++                               nsISelectionDisplay::DISPLAY_IMAGES);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  WrapReplacedContentForBorderRadius(aBuilder, &replacedContent, aLists);
++
++  return NS_OK;
  }
  
  nsIAtom*
-diff --git a/layout/generic/nsHTMLCanvasFrame.h b/layout/generic/nsHTMLCanvasFrame.h
---- a/layout/generic/nsHTMLCanvasFrame.h
-+++ b/layout/generic/nsHTMLCanvasFrame.h
-@@ -60,16 +60,20 @@ public:
- 
-   NS_DECL_FRAMEARENA_HELPERS
- 
-   nsHTMLCanvasFrame(nsStyleContext* aContext) : nsSplittableFrame(aContext) {}
- 
-   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
-                               const nsRect&           aDirtyRect,
-                               const nsDisplayListSet& aLists);
-+  virtual nsresult
-+  BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                  const nsRect& aDirtyRect,
-+                                  const nsDisplayListSet& aLists);
- 
-   already_AddRefed<Layer> BuildLayer(nsDisplayListBuilder* aBuilder,
-                                      LayerManager* aManager,
-                                      nsDisplayItem* aItem);
- 
-   /* get the size of the canvas's image */
-   nsIntSize GetCanvasSize();
+ nsHTMLCanvasFrame::GetType() const
+ {
+   return nsGkAtoms::HTMLCanvasFrame;
+ }
  
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
-@@ -1124,16 +1124,34 @@ public:
+@@ -1124,16 +1124,25 @@ public:
     */
    nsresult BuildDisplayListForChild(nsDisplayListBuilder*   aBuilder,
                                      nsIFrame*               aChild,
@@ -125,18 +95,9 @@ diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 +   * border radius, but only need clipping at all when they have a
 +   * border radius.
 +   */
-+  nsresult DisplayReplacedContentInBorderRadius(nsDisplayListBuilder* aBuilder,
-+                                                const nsRect& aDirtyRect,
-+                                                const nsDisplayListSet& aLists);
-+
-+  /**
-+   * A helper to be implemented for classes using
-+   * DisplayReplacedContentInBorderRadius.
-+   */
-+  virtual nsresult
-+  BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                  const nsRect& aDirtyRect,
-+                                  const nsDisplayListSet& aLists);
++  void WrapReplacedContentForBorderRadius(nsDisplayListBuilder* aBuilder,
++                                          nsDisplayList* aFromList,
++                                          const nsDisplayListSet& aToLists);
 +
 +  /**
     * Does this frame need a view?
@@ -150,30 +111,18 @@ diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 diff --git a/layout/generic/nsImageFrame.cpp b/layout/generic/nsImageFrame.cpp
 --- a/layout/generic/nsImageFrame.cpp
 +++ b/layout/generic/nsImageFrame.cpp
-@@ -1192,20 +1192,30 @@ nsImageFrame::BuildDisplayList(nsDisplay
-     return NS_OK;
- 
-   // REVIEW: We don't need any special logic here for deciding which layer
+@@ -1195,17 +1195,18 @@ nsImageFrame::BuildDisplayList(nsDisplay
    // to put the background in ... it goes in aLists.BorderBackground() and
    // then if we have a block parent, it will put our background in the right
    // place.
    nsresult rv = DisplayBorderBackgroundOutline(aBuilder, aLists);
    NS_ENSURE_SUCCESS(rv, rv);
-+
-+  return DisplayReplacedContentInBorderRadius(aBuilder, aDirtyRect, aLists);
-+}
-+
-+/* virtual */ nsresult
-+nsImageFrame::BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                              const nsRect& aDirtyRect,
-+                                              const nsDisplayListSet& aLists)
-+{
-+  nsresult rv;
    // REVIEW: Checking mRect.IsEmpty() makes no sense to me, so I removed it.
    // It can't have been protecting us against bad situations with zero-size
    // images since adding a border would make the rect non-empty.
 -    
 +
++  nsDisplayList replacedContent;
    if (mComputedSize.width != 0 && mComputedSize.height != 0) {
      nsCOMPtr<nsIImageLoadingContent> imageLoader = do_QueryInterface(mContent);
      NS_ASSERTION(imageLoader, "Not an image loading content?");
@@ -182,34 +131,62 @@ diff --git a/layout/generic/nsImageFrame.cpp b/layout/generic/nsImageFrame.cpp
      if (imageLoader) {
        imageLoader->GetRequest(nsIImageLoadingContent::CURRENT_REQUEST,
                                getter_AddRefs(currentRequest));
-diff --git a/layout/generic/nsImageFrame.h b/layout/generic/nsImageFrame.h
---- a/layout/generic/nsImageFrame.h
-+++ b/layout/generic/nsImageFrame.h
-@@ -103,16 +103,20 @@ public:
+@@ -1228,23 +1229,23 @@ nsImageFrame::BuildDisplayList(nsDisplay
+       haveSize = PR_TRUE;
  
-   virtual void DestroyFrom(nsIFrame* aDestructRoot);
-   NS_IMETHOD Init(nsIContent*      aContent,
-                   nsIFrame*        aParent,
-                   nsIFrame*        aPrevInFlow);
-   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
-                               const nsRect&           aDirtyRect,
-                               const nsDisplayListSet& aLists);
-+  virtual nsresult
-+  BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                  const nsRect& aDirtyRect,
-+                                  const nsDisplayListSet& aLists);
-   virtual nscoord GetMinWidth(nsIRenderingContext *aRenderingContext);
-   virtual nscoord GetPrefWidth(nsIRenderingContext *aRenderingContext);
-   virtual nsSize GetIntrinsicRatio();
-   NS_IMETHOD Reflow(nsPresContext*          aPresContext,
-                     nsHTMLReflowMetrics&     aDesiredSize,
-                     const nsHTMLReflowState& aReflowState,
-                     nsReflowStatus&          aStatus);
+     // We should never have the size and not have an image container
+     NS_ABORT_IF_FALSE(!haveSize || imgCon, "Have size but not container?");
+ 
+     if (!imageOK || !haveSize) {
+       // No image yet, or image load failed. Draw the alt-text and an icon
+       // indicating the status
+-      rv = aLists.Content()->AppendNewToTop(new (aBuilder)
++      rv = replacedContent.AppendNewToTop(new (aBuilder)
+           nsDisplayGeneric(aBuilder, this, PaintAltFeedback, "AltFeedback",
+                            nsDisplayItem::TYPE_ALT_FEEDBACK));
+       NS_ENSURE_SUCCESS(rv, rv);
+     }
+     else {
+-      rv = aLists.Content()->AppendNewToTop(new (aBuilder)
++      rv = replacedContent.AppendNewToTop(new (aBuilder)
+           nsDisplayImage(aBuilder, this, imgCon));
+       NS_ENSURE_SUCCESS(rv, rv);
+ 
+       // If we were previously displaying an icon, we're not anymore
+       if (mDisplayingIcon) {
+         gIconLoad->RemoveIconObserver(this);
+         mDisplayingIcon = PR_FALSE;
+       }
+@@ -1309,18 +1310,23 @@ nsImageFrame::BuildDisplayList(nsDisplay
+             }
+           }
+         }
+       }
+     }
+   }
+ #endif
    
+-  return DisplaySelectionOverlay(aBuilder, aLists.Content(),
+-                                 nsISelectionDisplay::DISPLAY_IMAGES);
++  rv = DisplaySelectionOverlay(aBuilder, &replacedContent,
++                               nsISelectionDisplay::DISPLAY_IMAGES);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  WrapReplacedContentForBorderRadius(aBuilder, &replacedContent, aLists);
++
++  return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsImageFrame::GetImageMap(nsPresContext *aPresContext, nsIImageMap **aImageMap)
+ {
+   nsImageMap *map = GetImageMap(aPresContext);
+   return CallQueryInterface(map, aImageMap);
+ }
 diff --git a/layout/generic/nsObjectFrame.cpp b/layout/generic/nsObjectFrame.cpp
 --- a/layout/generic/nsObjectFrame.cpp
 +++ b/layout/generic/nsObjectFrame.cpp
-@@ -1320,34 +1320,40 @@ nsObjectFrame::BuildDisplayList(nsDispla
+@@ -1320,40 +1320,48 @@ nsObjectFrame::BuildDisplayList(nsDispla
                                  const nsDisplayListSet& aLists)
  {
    // XXX why are we painting collapsed object frames?
@@ -219,11 +196,11 @@ diff --git a/layout/generic/nsObjectFrame.cpp b/layout/generic/nsObjectFrame.cpp
    nsresult rv = DisplayBorderBackgroundOutline(aBuilder, aLists);
    NS_ENSURE_SUCCESS(rv, rv);
 -  
--  nsPresContext::nsPresContextType type = PresContext()->Type();
++
+   nsPresContext::nsPresContextType type = PresContext()->Type();
  
    // If we are painting in Print Preview do nothing....
--  if (type == nsPresContext::eContext_PrintPreview)
-+  if (PresContext()->Type() == nsPresContext::eContext_PrintPreview)
+   if (type == nsPresContext::eContext_PrintPreview)
      return NS_OK;
  
    DO_GLOBAL_REFLOW_COUNT_DSP("nsObjectFrame");
@@ -235,49 +212,35 @@ diff --git a/layout/generic/nsObjectFrame.cpp b/layout/generic/nsObjectFrame.cpp
    }
  #endif
  
-+  return DisplayReplacedContentInBorderRadius(aBuilder, aDirtyRect, aLists);
-+}
++  nsDisplayList replacedContent;
 +
-+/* virtual */ nsresult
-+nsObjectFrame::BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                               const nsRect& aDirtyRect,
-+                                               const nsDisplayListSet& aLists)
-+{
    // determine if we are printing
 -  if (type == nsPresContext::eContext_Print)
-+  if (PresContext()->Type() == nsPresContext::eContext_Print)
-     return aLists.Content()->AppendNewToTop(new (aBuilder)
+-    return aLists.Content()->AppendNewToTop(new (aBuilder)
++  if (type == nsPresContext::eContext_Print) {
++    rv = replacedContent.AppendNewToTop(new (aBuilder)
          nsDisplayGeneric(aBuilder, this, PaintPrintPlugin, "PrintPlugin",
                           nsDisplayItem::TYPE_PRINT_PLUGIN));
- 
-   return aLists.Content()->AppendNewToTop(new (aBuilder)
-       nsDisplayPlugin(aBuilder, this));
+-
+-  return aLists.Content()->AppendNewToTop(new (aBuilder)
+-      nsDisplayPlugin(aBuilder, this));
++  } else {
++    rv = replacedContent.AppendNewToTop(new (aBuilder)
++        nsDisplayPlugin(aBuilder, this));
++  }
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  WrapReplacedContentForBorderRadius(aBuilder, &replacedContent, aLists);
++
++  return NS_OK;
  }
  
-diff --git a/layout/generic/nsObjectFrame.h b/layout/generic/nsObjectFrame.h
---- a/layout/generic/nsObjectFrame.h
-+++ b/layout/generic/nsObjectFrame.h
-@@ -80,16 +80,20 @@ public:
-                     const nsHTMLReflowState& aReflowState,
-                     nsReflowStatus& aStatus);
-   NS_IMETHOD DidReflow(nsPresContext* aPresContext,
-                        const nsHTMLReflowState* aReflowState,
-                        nsDidReflowStatus aStatus);
-   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
-                               const nsRect&           aDirtyRect,
-                               const nsDisplayListSet& aLists);
-+  virtual nsresult
-+  BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                  const nsRect& aDirtyRect,
-+                                  const nsDisplayListSet& aLists);
- 
-   NS_IMETHOD  HandleEvent(nsPresContext* aPresContext,
-                           nsGUIEvent* aEvent,
-                           nsEventStatus* aEventStatus);
- 
- #ifdef XP_MACOSX
-   NS_IMETHOD HandlePress(nsPresContext* aPresContext,
-                          nsGUIEvent*    aEvent,
+ void
+ nsObjectFrame::PrintPlugin(nsIRenderingContext& aRenderingContext,
+                            const nsRect& aDirtyRect)
+ {
+   nsCOMPtr<nsIObjectLoadingContent> obj(do_QueryInterface(mContent));
+   if (!obj)
 diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
 --- a/layout/generic/nsVideoFrame.cpp
 +++ b/layout/generic/nsVideoFrame.cpp
@@ -299,7 +262,7 @@ diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
  
  using namespace mozilla;
  using namespace mozilla::layers;
-@@ -412,16 +413,26 @@ nsVideoFrame::BuildDisplayList(nsDisplay
+@@ -412,40 +413,44 @@ nsVideoFrame::BuildDisplayList(nsDisplay
    if (!IsVisibleForPainting(aBuilder))
      return NS_OK;
  
@@ -308,45 +271,42 @@ diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
    nsresult rv = DisplayBorderBackgroundOutline(aBuilder, aLists);
    NS_ENSURE_SUCCESS(rv, rv);
  
-+  return DisplayReplacedContentInBorderRadius(aBuilder, aDirtyRect, aLists);
-+}
-+
-+/* virtual */ nsresult
-+nsVideoFrame::BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                              const nsRect& aDirtyRect,
-+                                              const nsDisplayListSet& aLists)
-+{
-+  nsresult rv;
++  nsDisplayList replacedContent;
 +
    if (HasVideoElement() && !ShouldDisplayPoster()) {
-     rv = aLists.Content()->AppendNewToTop(
+-    rv = aLists.Content()->AppendNewToTop(
++    rv = replacedContent.AppendNewToTop(
        new (aBuilder) nsDisplayVideo(aBuilder, this));
      NS_ENSURE_SUCCESS(rv, rv);
    }
  
    // Add child frames to display list. We expect up to two children, an image
    // frame for the poster, and the box frame for the video controls.
-diff --git a/layout/generic/nsVideoFrame.h b/layout/generic/nsVideoFrame.h
---- a/layout/generic/nsVideoFrame.h
-+++ b/layout/generic/nsVideoFrame.h
-@@ -65,16 +65,20 @@ public:
-   nsVideoFrame(nsStyleContext* aContext);
+   for (nsIFrame *child = mFrames.FirstChild();
+        child;
+        child = child->GetNextSibling()) {
+     if (child->GetType() == nsGkAtoms::imageFrame && ShouldDisplayPoster()) {
+       rv = child->BuildDisplayListForStackingContext(aBuilder,
+                                                      aDirtyRect - child->GetOffsetTo(this),
+-                                                     aLists.Content());
++                                                     &replacedContent);
+       NS_ENSURE_SUCCESS(rv,rv);
+     } else if (child->GetType() == nsGkAtoms::boxFrame) {
+       rv = child->BuildDisplayListForStackingContext(aBuilder,
+                                                      aDirtyRect - child->GetOffsetTo(this),
+-                                                     aLists.Content());
++                                                     &replacedContent);
+       NS_ENSURE_SUCCESS(rv,rv);
+     }
+   }
  
-   NS_DECL_QUERYFRAME
-   NS_DECL_FRAMEARENA_HELPERS
++  WrapReplacedContentForBorderRadius(aBuilder, &replacedContent, aLists);
++
+   return NS_OK;
+ }
  
-   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
-                               const nsRect&           aDirtyRect,
-                               const nsDisplayListSet& aLists);
-+  virtual nsresult
-+  BuildReplacedContentDisplayList(nsDisplayListBuilder* aBuilder,
-+                                  const nsRect& aDirtyRect,
-+                                  const nsDisplayListSet& aLists);
- 
-   NS_IMETHOD AttributeChanged(PRInt32 aNameSpaceID,
-                               nsIAtom* aAttribute,
-                               PRInt32 aModType);
- 
-   /* get the size of the video's display */
-   nsSize GetVideoIntrinsicSize(nsIRenderingContext *aRenderingContext);
-   virtual nsSize GetIntrinsicRatio();
+ nsIAtom*
+ nsVideoFrame::GetType() const
+ {
+   return nsGkAtoms::HTMLVideoFrame;
+ }
