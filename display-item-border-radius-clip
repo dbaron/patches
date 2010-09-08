@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Add a (wrapping) display item that clips its contents to the curvature of a border-radius.  (Bug 459144, patch 13)
+Add a (wrapping) display item that clips its contents to the curvature of a border-radius.  (Bug 459144, patch 13)  r=roc  a2.0=blocking2.0:beta6
 
 diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.cpp
 --- a/layout/base/FrameLayerBuilder.cpp
@@ -219,7 +219,7 @@ diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.c
  }
  
  Layer*
-@@ -1590,69 +1592,96 @@ FrameLayerBuilder::DrawThebesLayer(Thebe
+@@ -1590,69 +1592,75 @@ FrameLayerBuilder::DrawThebesLayer(Thebe
                   NSIntPixelsToAppUnits(offset.y, appUnitsPerDevPixel));
  
    for (i = items.Length(); i > 0; --i) {
@@ -300,30 +300,12 @@ diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.c
 -        currentClip = cdi->mClipRect;
 +        currentClip = cdi->mClip;
          aContext->Save();
-         aContext->NewPath();
+-        aContext->NewPath();
 -        gfxRect clip(currentClip.x, currentClip.y, currentClip.width, currentClip.height);
 -        clip.ScaleInverse(presContext->AppUnitsPerDevPixel());
-+        PRInt32 A2D = presContext->AppUnitsPerDevPixel();
-+        gfxRect clip = nsLayoutUtils::RectToGfxRect(currentClip.mClipRect, A2D);
-         aContext->Rectangle(clip, PR_TRUE);
-         aContext->Clip();
-+
-+        for (PRUint32 j = 0, jEnd = currentClip.mRoundedClipRects.Length();
-+             j < jEnd; ++j) {
-+          const Clip::RoundedRect &rr = currentClip.mRoundedClipRects[j];
-+
-+          gfxCornerSizes pixelRadii;
-+          nsCSSRendering::ComputePixelRadii(rr.mRadii, A2D, &pixelRadii);
-+
-+          clip = nsLayoutUtils::RectToGfxRect(rr.mRect, A2D);
-+          clip.Round();
-+          clip.Condition();
-+          // REVIEW: This might make contentArea empty.  Is that OK?
-+
-+          aContext->NewPath();
-+          aContext->RoundedRectangle(clip, pixelRadii);
-+          aContext->Clip();
-+        }
+-        aContext->Rectangle(clip, PR_TRUE);
+-        aContext->Clip();
++        currentClip.ApplyTo(aContext, presContext);
        }
      }
  
@@ -332,7 +314,7 @@ diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.c
        // using the temporary BasicLayerManager.
        cdi->mTempLayerManager->BeginTransactionWithTarget(aContext);
        cdi->mTempLayerManager->EndTransaction(DrawThebesLayer, builder);
-@@ -1671,9 +1700,37 @@ void
+@@ -1671,9 +1679,65 @@ void
  FrameLayerBuilder::DumpRetainedLayerTree()
  {
    if (mRetainingManager) {
@@ -342,8 +324,8 @@ diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.c
  #endif
  
 +FrameLayerBuilder::Clip::Clip(const Clip& aOther, nsDisplayItem* aClipItem)
-+  : mHaveClipRect(PR_TRUE),
-+    mRoundedClipRects(aOther.mRoundedClipRects)
++  : mRoundedClipRects(aOther.mRoundedClipRects),
++    mHaveClipRect(PR_TRUE)
 +{
 +  nsDisplayItem::Type type = aClipItem->GetType();
 +  NS_ABORT_IF_FALSE(type == nsDisplayItem::TYPE_CLIP ||
@@ -367,6 +349,34 @@ diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.c
 +  }
 +
 +  // FIXME: Optimize away excess rounded rectangles due to the new addition.
++}
++
++void
++FrameLayerBuilder::Clip::ApplyTo(gfxContext* aContext,
++                                 nsPresContext* aPresContext)
++{
++  aContext->NewPath();
++  PRInt32 A2D = aPresContext->AppUnitsPerDevPixel();
++  gfxRect clip = nsLayoutUtils::RectToGfxRect(mClipRect, A2D);
++  aContext->Rectangle(clip, PR_TRUE);
++  aContext->Clip();
++
++  for (PRUint32 i = 0, iEnd = mRoundedClipRects.Length();
++       i < iEnd; ++i) {
++    const Clip::RoundedRect &rr = mRoundedClipRects[i];
++
++    gfxCornerSizes pixelRadii;
++    nsCSSRendering::ComputePixelRadii(rr.mRadii, A2D, &pixelRadii);
++
++    clip = nsLayoutUtils::RectToGfxRect(rr.mRect, A2D);
++    clip.Round();
++    clip.Condition();
++    // REVIEW: This might make clip empty.  Is that OK?
++
++    aContext->NewPath();
++    aContext->RoundedRectangle(clip, pixelRadii);
++    aContext->Clip();
++  }
 +}
 +
  } // namespace mozilla
@@ -395,7 +405,7 @@ diff --git a/layout/base/FrameLayerBuilder.h b/layout/base/FrameLayerBuilder.h
     * Given a frame and a display item key that uniquely identifies a
     * display item for the frame, find the layer that was last used to
     * render that display item. Returns null if there is no such layer.
-@@ -258,16 +259,61 @@ public:
+@@ -258,16 +259,65 @@ public:
    /**
     * Try to determine whether the ThebesLayer aLayer paints an opaque
     * single color everywhere it's visible in aRect.
@@ -430,14 +440,18 @@ diff --git a/layout/base/FrameLayerBuilder.h b/layout/base/FrameLayerBuilder.h
 +        return !(*this == aOther);
 +      }
 +    };
-+    PRBool mHaveClipRect;
 +    nsRect mClipRect;
 +    nsTArray<RoundedRect> mRoundedClipRects;
++    PRPackedBool mHaveClipRect;
 +
 +    Clip() : mHaveClipRect(PR_FALSE) {}
 +
 +    // Construct as the intersection of aOther and aClipItem.
 +    Clip(const Clip& aOther, nsDisplayItem* aClipItem);
++
++    // Apply this |Clip| to the given gfxContext.  Any saving of state
++    // or clearing of other clips must be done by the caller.
++    void ApplyTo(gfxContext* aContext, nsPresContext* aPresContext);
 +
 +    bool operator==(const Clip& aOther) const {
 +      return mHaveClipRect == aOther.mHaveClipRect &&
@@ -457,7 +471,7 @@ diff --git a/layout/base/FrameLayerBuilder.h b/layout/base/FrameLayerBuilder.h
     */
    class DisplayItemData {
    public:
-@@ -318,28 +364,24 @@ protected:
+@@ -318,28 +368,24 @@ protected:
     * of ClippedDisplayItems. (ThebesLayerItemsEntry is the hash entry
     * for that hashtable.)
     * These are only stored during the paint process, so that the
