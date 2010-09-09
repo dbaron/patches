@@ -1,0 +1,778 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Remove support for min() and max() in calc(): remove support for parsing and storage.
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3262,20 +3262,19 @@ nsIFrame::InlinePrefWidthData::ForceBrea
+   currentLine =
+     NSCoordSaturatingSubtract(currentLine, trailingWhitespace, nscoord_MAX);
+   prevLines = NS_MAX(prevLines, currentLine);
+   currentLine = trailingWhitespace = 0;
+   skipWhitespace = PR_TRUE;
+ }
+ 
+ /**
+- * This class does calc() computation of lengths and percents separately,
+- * with support for min() and max().  However, its support for min() and
+- * max() is fundamentally broken in cases where percentages and lengths
+- * are mixed.
++ * This class does calc() computation of lengths and percents separately.
++ *
++ * FIXME: remove this in the next patch
+  *
+  * It is used only for intrinsic width computation, where being an
+  * approximation is sometimes ok (although it would be good to fix at
+  * some point in the future).
+  */
+ struct LengthPercentPairWithMinMaxCalcOps : public css::StyleCoordInputCalcOps
+ {
+   struct result_type {
+@@ -3298,33 +3297,21 @@ struct LengthPercentPairWithMinMaxCalcOp
+   MergeAdditive(nsCSSUnit aCalcFunction,
+                 result_type aValue1, result_type aValue2)
+   {
+     if (aCalcFunction == eCSSUnit_Calc_Plus) {
+       return result_type(NSCoordSaturatingAdd(aValue1.mLength,
+                                               aValue2.mLength),
+                          aValue1.mPercent + aValue2.mPercent);
+     }
+-    if (aCalcFunction == eCSSUnit_Calc_Minus) {
+-      return result_type(NSCoordSaturatingSubtract(aValue1.mLength,
+-                                                   aValue2.mLength, 0),
+-                         aValue1.mPercent - aValue2.mPercent);
+-    }
+-    if (aCalcFunction == eCSSUnit_Calc_Minimum) {
+-      // This is fundamentally incorrect; see the comment above the
+-      // start of the class definition.
+-      return result_type(NS_MIN(aValue1.mLength, aValue2.mLength),
+-                         NS_MIN(aValue1.mPercent, aValue2.mPercent));
+-    }
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Maximum,
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Minus,
+                       "unexpected unit");
+-    // This is fundamentally incorrect; see the comment above the
+-    // start of the class definition.
+-    return result_type(NS_MAX(aValue1.mLength, aValue2.mLength),
+-                       NS_MAX(aValue1.mPercent, aValue2.mPercent));
++    return result_type(NSCoordSaturatingSubtract(aValue1.mLength,
++                                                 aValue2.mLength, 0),
++                       aValue1.mPercent - aValue2.mPercent);
+   }
+ 
+   result_type
+   MergeMultiplicativeL(nsCSSUnit aCalcFunction,
+                        float aValue1, result_type aValue2)
+   {
+     NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
+                       "unexpected unit");
+diff --git a/layout/style/CSSCalc.h b/layout/style/CSSCalc.h
+--- a/layout/style/CSSCalc.h
++++ b/layout/style/CSSCalc.h
+@@ -95,17 +95,17 @@ namespace css {
+  * right side of a Times_R or Divided) or ComputeLeafValue (otherwise).
+  * (The CalcOps in the CSS parser that reduces purely numeric
+  * expressions in turn calls ComputeCalc on numbers; other ops can
+  * presume that expressions in the number positions have already been
+  * normalized to a single numeric value and derive from
+  * NumbersAlreadyNormalizedCalcOps.)
+  *
+  * For non-leaves, one of the Merge functions will be called:
+- *   MergeAdditive for Plus, Minus, Minimum, and Maximum
++ *   MergeAdditive for Plus and Minus
+  *   MergeMultiplicativeL for Times_L (number * value)
+  *   MergeMultiplicativeR for Times_R (value * number) and Divided
+  */
+ template <class CalcOps>
+ static typename CalcOps::result_type
+ ComputeCalc(const typename CalcOps::input_type& aValue, CalcOps &aOps)
+ {
+   switch (CalcOps::GetUnit(aValue)) {
+@@ -132,61 +132,49 @@ ComputeCalc(const typename CalcOps::inpu
+     case eCSSUnit_Calc_Times_R:
+     case eCSSUnit_Calc_Divided: {
+       typename CalcOps::input_array_type *arr = aValue.GetArrayValue();
+       NS_ABORT_IF_FALSE(arr->Count() == 2, "unexpected length");
+       typename CalcOps::result_type lhs = ComputeCalc(arr->Item(0), aOps);
+       float rhs = aOps.ComputeNumber(arr->Item(1));
+       return aOps.MergeMultiplicativeR(CalcOps::GetUnit(aValue), lhs, rhs);
+     }
+-    case eCSSUnit_Calc_Minimum:
+-    case eCSSUnit_Calc_Maximum: {
+-      typename CalcOps::input_array_type *arr = aValue.GetArrayValue();
+-      typename CalcOps::result_type result = ComputeCalc(arr->Item(0), aOps);
+-      for (size_t i = 1, i_end = arr->Count(); i < i_end; ++i) {
+-        typename CalcOps::result_type tmp = ComputeCalc(arr->Item(i), aOps);
+-        result = aOps.MergeAdditive(CalcOps::GetUnit(aValue), result, tmp);
+-      }
+-      return result;
+-    }
+     default: {
+       return aOps.ComputeLeafValue(aValue);
+     }
+   }
+ }
+ 
+ #define CHECK_UNIT(u_)                                                        \
+   PR_STATIC_ASSERT(int(eCSSUnit_##u_) + 14 == int(eStyleUnit_##u_));          \
+   PR_STATIC_ASSERT(eCSSUnit_##u_ >= eCSSUnit_Calc);                           \
+-  PR_STATIC_ASSERT(eCSSUnit_##u_ <= eCSSUnit_Calc_Maximum);
++  PR_STATIC_ASSERT(eCSSUnit_##u_ <= eCSSUnit_Calc_Divided);
+ 
+ CHECK_UNIT(Calc)
+ CHECK_UNIT(Calc_Plus)
+ CHECK_UNIT(Calc_Minus)
+ CHECK_UNIT(Calc_Times_L)
+ CHECK_UNIT(Calc_Times_R)
+ CHECK_UNIT(Calc_Divided)
+-CHECK_UNIT(Calc_Minimum)
+-CHECK_UNIT(Calc_Maximum)
+ 
+ #undef CHECK_UNIT
+ 
+ inline nsStyleUnit
+ ConvertCalcUnit(nsCSSUnit aUnit)
+ {
+   NS_ABORT_IF_FALSE(eCSSUnit_Calc <= aUnit &&
+-                    aUnit <= eCSSUnit_Calc_Maximum, "out of range");
++                    aUnit <= eCSSUnit_Calc_Divided, "out of range");
+   return nsStyleUnit(aUnit + 14);
+ }
+ 
+ inline nsCSSUnit
+ ConvertCalcUnit(nsStyleUnit aUnit)
+ {
+   NS_ABORT_IF_FALSE(eStyleUnit_Calc <= aUnit &&
+-                    aUnit <= eStyleUnit_Calc_Maximum, "out of range");
++                    aUnit <= eStyleUnit_Calc_Divided, "out of range");
+   return nsCSSUnit(aUnit - 14);
+ }
+ 
+ /**
+  * The input unit operation for input_type being nsCSSValue.
+  */
+ struct CSSValueInputCalcOps
+ {
+@@ -236,25 +224,19 @@ struct BasicCoordCalcOps
+ 
+   result_type
+   MergeAdditive(nsCSSUnit aCalcFunction,
+                 result_type aValue1, result_type aValue2)
+   {
+     if (aCalcFunction == eCSSUnit_Calc_Plus) {
+       return NSCoordSaturatingAdd(aValue1, aValue2);
+     }
+-    if (aCalcFunction == eCSSUnit_Calc_Minus) {
+-      return NSCoordSaturatingSubtract(aValue1, aValue2, 0);
+-    }
+-    if (aCalcFunction == eCSSUnit_Calc_Minimum) {
+-      return NS_MIN(aValue1, aValue2);
+-    }
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Maximum,
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Minus,
+                       "unexpected unit");
+-    return NS_MAX(aValue1, aValue2);
++    return NSCoordSaturatingSubtract(aValue1, aValue2, 0);
+   }
+ 
+   result_type
+   MergeMultiplicativeL(nsCSSUnit aCalcFunction,
+                        float aValue1, result_type aValue2)
+   {
+     NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
+                       "unexpected unit");
+@@ -281,25 +263,19 @@ struct BasicFloatCalcOps
+ 
+   result_type
+   MergeAdditive(nsCSSUnit aCalcFunction,
+                 result_type aValue1, result_type aValue2)
+   {
+     if (aCalcFunction == eCSSUnit_Calc_Plus) {
+       return aValue1 + aValue2;
+     }
+-    if (aCalcFunction == eCSSUnit_Calc_Minus) {
+-      return aValue1 - aValue2;
+-    }
+-    if (aCalcFunction == eCSSUnit_Calc_Minimum) {
+-      return NS_MIN(aValue1, aValue2);
+-    }
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Maximum,
++    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Minus,
+                       "unexpected unit");
+-    return NS_MAX(aValue1, aValue2);
++    return aValue1 - aValue2;
+   }
+ 
+   result_type
+   MergeMultiplicativeL(nsCSSUnit aCalcFunction,
+                        float aValue1, result_type aValue2)
+   {
+     NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
+                       "unexpected unit");
+@@ -361,31 +337,26 @@ static void
+ SerializeCalcInternal(const typename CalcOps::input_type& aValue, CalcOps &aOps);
+ 
+ // Serialize the toplevel value in a calc() tree.  See big comment
+ // above.
+ template <class CalcOps>
+ static void
+ SerializeCalc(const typename CalcOps::input_type& aValue, CalcOps &aOps)
+ {
+-  aOps.Append("-moz-");
++  aOps.Append("-moz-calc(");
+   nsCSSUnit unit = CalcOps::GetUnit(aValue);
+-  if (unit != eCSSUnit_Calc_Minimum && unit != eCSSUnit_Calc_Maximum) {
+-    aOps.Append("calc(");
+-  }
+   if (unit == eCSSUnit_Calc) {
+     const typename CalcOps::input_array_type *array = aValue.GetArrayValue();
+     NS_ABORT_IF_FALSE(array->Count() == 1, "unexpected length");
+     SerializeCalcInternal(array->Item(0), aOps);
+   } else {
+     SerializeCalcInternal(aValue, aOps);
+   }
+-  if (unit != eCSSUnit_Calc_Minimum && unit != eCSSUnit_Calc_Maximum) {
+-    aOps.Append(")");
+-  }
++  aOps.Append(")");
+ }
+ 
+ static inline PRBool
+ IsCalcAdditiveUnit(nsCSSUnit aUnit)
+ {
+   return aUnit == eCSSUnit_Calc_Plus ||
+          aUnit == eCSSUnit_Calc_Minus;
+ }
+@@ -400,33 +371,17 @@ IsCalcMultiplicativeUnit(nsCSSUnit aUnit
+ 
+ // Serialize a non-toplevel value in a calc() tree.  See big comment
+ // above.
+ template <class CalcOps>
+ /* static */ void
+ SerializeCalcInternal(const typename CalcOps::input_type& aValue, CalcOps &aOps)
+ {
+   nsCSSUnit unit = CalcOps::GetUnit(aValue);
+-  if (eCSSUnit_Calc_Minimum == unit || eCSSUnit_Calc_Maximum == unit) {
+-    const typename CalcOps::input_array_type *array = aValue.GetArrayValue();
+-    if (eCSSUnit_Calc_Minimum == unit) {
+-      aOps.Append("min(");
+-    } else {
+-      aOps.Append("max(");
+-    }
+-
+-    for (size_t i = 0, i_end = array->Count(); i < i_end; ++i) {
+-      if (i != 0) {
+-        aOps.Append(", ");
+-      }
+-      SerializeCalcInternal(array->Item(i), aOps);
+-    }
+-
+-    aOps.Append(")");
+-  } else if (IsCalcAdditiveUnit(unit)) {
++  if (IsCalcAdditiveUnit(unit)) {
+     const typename CalcOps::input_array_type *array = aValue.GetArrayValue();
+     NS_ABORT_IF_FALSE(array->Count() == 2, "unexpected length");
+ 
+     SerializeCalcInternal(array->Item(0), aOps);
+ 
+     if (eCSSUnit_Calc_Plus == unit) {
+       aOps.Append(" + ");
+     } else {
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -114,17 +114,16 @@ namespace css = mozilla::css;
+ #define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
+ #define VARIANT_GRADIENT        0x200000  // eCSSUnit_Gradient
+ #define VARIANT_CUBIC_BEZIER    0x400000  // CSS transition timing function
+ #define VARIANT_ALL             0x800000  //
+ #define VARIANT_IMAGE_RECT    0x01000000  // eCSSUnit_Function
+ // This is an extra bit that says that a VARIANT_ANGLE allows unitless zero:
+ #define VARIANT_ZERO_ANGLE    0x02000000  // unitless zero for angles
+ #define VARIANT_CALC          0x04000000  // eCSSUnit_Calc
+-#define VARIANT_CALC_NO_MIN_MAX 0x08000000 // no min() and max() for calc()
+ #define VARIANT_ELEMENT       0x10000000  // eCSSUnit_Element
+ 
+ // Common combinations of variants
+ #define VARIANT_AL   (VARIANT_AUTO | VARIANT_LENGTH)
+ #define VARIANT_LP   (VARIANT_LENGTH | VARIANT_PERCENT)
+ #define VARIANT_AH   (VARIANT_AUTO | VARIANT_INHERIT)
+ #define VARIANT_AHLP (VARIANT_AH | VARIANT_LP)
+ #define VARIANT_AHI  (VARIANT_AH | VARIANT_INTEGER)
+@@ -154,18 +153,17 @@ namespace css = mozilla::css;
+ #define VARIANT_HN   (VARIANT_INHERIT | VARIANT_NUMBER)
+ #define VARIANT_HON  (VARIANT_HN | VARIANT_NONE)
+ #define VARIANT_HOS  (VARIANT_INHERIT | VARIANT_NONE | VARIANT_STRING)
+ #define VARIANT_LPN  (VARIANT_LP | VARIANT_NUMBER)
+ #define VARIANT_TIMING_FUNCTION (VARIANT_KEYWORD | VARIANT_CUBIC_BEZIER)
+ #define VARIANT_UK   (VARIANT_URL | VARIANT_KEYWORD)
+ #define VARIANT_UO   (VARIANT_URL | VARIANT_NONE)
+ #define VARIANT_ANGLE_OR_ZERO (VARIANT_ANGLE | VARIANT_ZERO_ANGLE)
+-#define VARIANT_TRANSFORM_LPCALC (VARIANT_LP | VARIANT_CALC | \
+-                                  VARIANT_CALC_NO_MIN_MAX)
++#define VARIANT_TRANSFORM_LPCALC (VARIANT_LP | VARIANT_CALC)
+ #define VARIANT_IMAGE (VARIANT_URL | VARIANT_NONE | VARIANT_GRADIENT | \
+                        VARIANT_IMAGE_RECT | VARIANT_ELEMENT)
+ 
+ //----------------------------------------------------------------------
+ 
+ namespace {
+ 
+ // Rule processing function
+@@ -463,18 +461,16 @@ protected:
+ 
+   PRBool ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask);
+   PRBool ParseCalcAdditiveExpression(nsCSSValue& aValue,
+                                      PRInt32& aVariantMask);
+   PRBool ParseCalcMultiplicativeExpression(nsCSSValue& aValue,
+                                            PRInt32& aVariantMask,
+                                            PRBool *aHadFinalWS);
+   PRBool ParseCalcTerm(nsCSSValue& aValue, PRInt32& aVariantMask);
+-  PRBool ParseCalcMinMax(nsCSSValue& aValue, nsCSSUnit aUnit,
+-                         PRInt32& aVariantMask);
+   PRBool RequireWhitespace();
+ 
+   // for 'clip' and '-moz-image-region'
+   PRBool ParseRect(nsCSSProperty aPropID);
+   PRBool ParseContent();
+   PRBool ParseCounterData(nsCSSProperty aPropID);
+   PRBool ParseCue();
+   PRBool ParseCursor();
+@@ -4206,18 +4202,17 @@ CSSParserImpl::TranslateDimension(nsCSSV
+   VARIANT_AUTO | \
+   VARIANT_INHERIT | \
+   VARIANT_NONE | \
+   VARIANT_NORMAL | \
+   VARIANT_SYSFONT | \
+   VARIANT_GRADIENT | \
+   VARIANT_CUBIC_BEZIER | \
+   VARIANT_ALL | \
+-  VARIANT_CALC | \
+-  VARIANT_CALC_NO_MIN_MAX
++  VARIANT_CALC
+ 
+ // Note that callers passing VARIANT_CALC in aVariantMask will get
+ // full-range parsing inside the calc() expression, and the code that
+ // computes the calc will be required to clamp the resulting value to an
+ // appropriate range.
+ PRBool
+ CSSParserImpl::ParseNonNegativeVariant(nsCSSValue& aValue,
+                                        PRInt32 aVariantMask,
+@@ -4490,22 +4485,19 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+         SkipUntil(')');
+         return PR_FALSE;
+       }
+       return PR_TRUE;
+     }
+   }
+   if ((aVariantMask & VARIANT_CALC) &&
+       (eCSSToken_Function == tk->mType) &&
+-      (tk->mIdent.LowerCaseEqualsLiteral("-moz-calc") ||
+-       tk->mIdent.LowerCaseEqualsLiteral("-moz-min") ||
+-       tk->mIdent.LowerCaseEqualsLiteral("-moz-max"))) {
++      tk->mIdent.LowerCaseEqualsLiteral("-moz-calc")) {
+     // calc() currently allows only lengths and percents inside it.
+-    return ParseCalc(aValue,
+-                     aVariantMask & (VARIANT_LP | VARIANT_CALC_NO_MIN_MAX));
++    return ParseCalc(aValue, aVariantMask & VARIANT_LP);
+   }
+ 
+   UngetToken();
+   return PR_FALSE;
+ }
+ 
+ 
+ PRBool
+@@ -6914,84 +6906,42 @@ CSSParserImpl::ParseBorderColors(nsCSSPr
+       cur->mNext = new nsCSSValueList;
+       cur = cur->mNext;
+     }
+   }
+   AppendValue(aProperty, value);
+   return PR_TRUE;
+ }
+ 
+-static PRBool
+-HasMinMax(const nsCSSValue::Array *aArray)
+-{
+-  for (PRUint32 i = 0, i_end = aArray->Count(); i != i_end; ++i) {
+-    const nsCSSValue &v = aArray->Item(i);
+-    if (v.IsCalcUnit() &&
+-        (v.GetUnit() == eCSSUnit_Calc_Minimum ||
+-         v.GetUnit() == eCSSUnit_Calc_Maximum ||
+-         HasMinMax(v.GetArrayValue()))) {
+-      return PR_TRUE;
+-    }
+-  }
+-  return PR_FALSE;
+-}
+-
+-// Parse the top level of a calc() expression, which can be calc(),
+-// min(), or max().
++// Parse the top level of a calc() expression.
+ PRBool
+ CSSParserImpl::ParseCalc(nsCSSValue &aValue, PRInt32 aVariantMask)
+ {
+   // Parsing calc expressions requires, in a number of cases, looking
+   // for a token that is *either* a value of the property or a number.
+   // This can be done without lookahead when we assume that the property
+   // values cannot themselves be numbers.
+   NS_ASSERTION(!(aVariantMask & VARIANT_NUMBER), "unexpected variant mask");
+   NS_ABORT_IF_FALSE(aVariantMask != 0, "unexpected variant mask");
+ 
+-  PRBool noMinMax = aVariantMask & VARIANT_CALC_NO_MIN_MAX;
+-  aVariantMask &= ~VARIANT_CALC_NO_MIN_MAX;
+-
+-  nsCSSUnit unit;
+-  if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-min")) {
+-    unit = eCSSUnit_Calc_Minimum;
+-  } else if (mToken.mIdent.LowerCaseEqualsLiteral("-moz-max")) {
+-    unit = eCSSUnit_Calc_Maximum;
+-  } else {
+-    NS_ASSERTION(mToken.mIdent.LowerCaseEqualsLiteral("-moz-calc"),
+-                 "unexpected function");
+-    unit = eCSSUnit_Calc;
+-  }
+-
+-  if (unit != eCSSUnit_Calc) {
+-    if (noMinMax) {
+-      SkipUntil(')');
+-      return PR_FALSE;
+-    }
+-    return ParseCalcMinMax(aValue, unit, aVariantMask);
+-  }
+-
+   // One-iteration loop so we can break to the error-handling case.
+   do {
+     // The toplevel of a calc() is always an nsCSSValue::Array of length 1.
+     nsRefPtr<nsCSSValue::Array> arr = nsCSSValue::Array::Create(1);
+     if (!arr) {
+       mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+       break;
+     }
+ 
+     if (!ParseCalcAdditiveExpression(arr->Item(0), aVariantMask))
+       break;
+ 
+     if (!ExpectSymbol(')', PR_TRUE))
+       break;
+ 
+-    if (noMinMax && HasMinMax(arr)) {
+-      return PR_FALSE;
+-    }
+-
+     aValue.SetArrayValue(arr, eCSSUnit_Calc);
+     return PR_TRUE;
+   } while (PR_FALSE);
+ 
+   SkipUntil(')');
+   return PR_FALSE;
+ }
+ 
+@@ -7184,24 +7134,16 @@ CSSParserImpl::ParseCalcTerm(nsCSSValue&
+   if (mToken.IsSymbol('(')) {
+     if (!ParseCalcAdditiveExpression(aValue, aVariantMask) ||
+         !ExpectSymbol(')', PR_TRUE)) {
+       SkipUntil(')');
+       return PR_FALSE;
+     }
+     return PR_TRUE;
+   }
+-  // ... or a min() or max() expression
+-  if (mToken.mType == eCSSToken_Function &&
+-      (mToken.mIdent.LowerCaseEqualsLiteral("min") ||
+-       mToken.mIdent.LowerCaseEqualsLiteral("max"))) {
+-    nsCSSUnit unit = mToken.mIdent.LowerCaseEqualsLiteral("min")
+-                       ? eCSSUnit_Calc_Minimum : eCSSUnit_Calc_Maximum;
+-    return ParseCalcMinMax(aValue, unit, aVariantMask);
+-  }
+   // ... or just a value
+   UngetToken();
+   if (!ParseVariant(aValue, aVariantMask, nsnull)) {
+     return PR_FALSE;
+   }
+   // If we did the value parsing, we need to adjust aVariantMask to
+   // reflect which option we took (see above).
+   if (aVariantMask & VARIANT_NUMBER) {
+@@ -7209,79 +7151,16 @@ CSSParserImpl::ParseCalcTerm(nsCSSValue&
+       aVariantMask = VARIANT_NUMBER;
+     } else {
+       aVariantMask &= ~PRInt32(VARIANT_NUMBER);
+     }
+   }
+   return PR_TRUE;
+ }
+ 
+-// This function handles and modifies aVariantMask exactly as
+-// described for ParcCalcTerm above.
+-PRBool
+-CSSParserImpl::ParseCalcMinMax(nsCSSValue& aValue, nsCSSUnit aUnit,
+-                               PRInt32& aVariantMask)
+-{
+-  NS_ABORT_IF_FALSE(aVariantMask != 0, "unexpected variant mask");
+-  NS_ASSERTION(aUnit == eCSSUnit_Calc_Minimum ||
+-               aUnit == eCSSUnit_Calc_Maximum,
+-               "unexpected unit");
+-  NS_ASSERTION(mToken.mType == eCSSToken_Function, "unexpected current token");
+-  NS_ASSERTION(aUnit != eCSSUnit_Calc_Minimum ||
+-               mToken.mIdent.LowerCaseEqualsLiteral("min") ||
+-               mToken.mIdent.LowerCaseEqualsLiteral("-moz-min"),
+-               "unexpected current token");
+-  NS_ASSERTION(aUnit != eCSSUnit_Calc_Maximum ||
+-               mToken.mIdent.LowerCaseEqualsLiteral("max") ||
+-               mToken.mIdent.LowerCaseEqualsLiteral("-moz-max"),
+-               "unexpected current token");
+-
+-  nsAutoTArray<nsCSSValue, 4> values;
+-  for (;;) {
+-    nsCSSValue *v = values.AppendElement();
+-    if (!v) {
+-      mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+-      return PR_FALSE;
+-    }
+-
+-    if (!ParseCalcAdditiveExpression(*v, aVariantMask))
+-      return PR_FALSE;
+-
+-    NS_ABORT_IF_FALSE(!(aVariantMask & VARIANT_NUMBER) ||
+-                      !(aVariantMask & ~PRInt32(VARIANT_NUMBER)),
+-                      "parsing additive expr did not adjust variant mask");
+-    NS_ABORT_IF_FALSE(aVariantMask != 0, "unexpected variant mask");
+-
+-    if (ExpectSymbol(',', PR_TRUE))
+-      continue;
+-
+-    if (ExpectSymbol(')', PR_TRUE))
+-      break;
+-
+-    SkipUntil(')');
+-    return PR_FALSE;
+-  }
+-
+-  // We allow min() and max() to take 1 or more arguments; the code
+-  // above already ensures that.
+-  NS_ABORT_IF_FALSE(values.Length() > 0, "unexpected length");
+-
+-  nsRefPtr<nsCSSValue::Array> arr = nsCSSValue::Array::Create(values.Length());
+-  if (!arr) {
+-    mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+-    return PR_FALSE;
+-  }
+-  for (PRUint32 i = 0, i_end = values.Length(); i < i_end; ++i) {
+-    arr->Item(i) = values[i];
+-  }
+-
+-  aValue.SetArrayValue(arr, aUnit);
+-  return PR_TRUE;
+-}
+-
+ // This function consumes all consecutive whitespace and returns whether
+ // there was any.
+ PRBool
+ CSSParserImpl::RequireWhitespace()
+ {
+   if (!GetToken(PR_FALSE))
+     return PR_FALSE;
+   if (mToken.mType != eCSSToken_WhiteSpace) {
+diff --git a/layout/style/nsCSSValue.cpp b/layout/style/nsCSSValue.cpp
+--- a/layout/style/nsCSSValue.cpp
++++ b/layout/style/nsCSSValue.cpp
+@@ -759,20 +759,17 @@ nsCSSValue::AppendToString(nsCSSProperty
+       if (index + 1 != array->Count())
+         aResult.AppendLiteral(", ");
+     }
+ 
+     /* Finally, append the closing parenthesis. */
+     aResult.AppendLiteral(")");
+   }
+   else if (IsCalcUnit()) {
+-    NS_ABORT_IF_FALSE(GetUnit() == eCSSUnit_Calc ||
+-                      GetUnit() == eCSSUnit_Calc_Maximum ||
+-                      GetUnit() == eCSSUnit_Calc_Minimum,
+-                      "unexpected unit");
++    NS_ABORT_IF_FALSE(GetUnit() == eCSSUnit_Calc, "unexpected unit");
+     CSSValueSerializeCalcOps ops(aProperty, aResult);
+     css::SerializeCalc(*this, ops);
+   }
+   else if (eCSSUnit_Integer == unit) {
+     nsAutoString tmpStr;
+     tmpStr.AppendInt(GetIntValue(), 10);
+     aResult.Append(tmpStr);
+   }
+@@ -997,18 +994,16 @@ nsCSSValue::AppendToString(nsCSSProperty
+     case eCSSUnit_Font_Format:  break;
+     case eCSSUnit_Function:     break;
+     case eCSSUnit_Calc:         break;
+     case eCSSUnit_Calc_Plus:    break;
+     case eCSSUnit_Calc_Minus:   break;
+     case eCSSUnit_Calc_Times_L: break;
+     case eCSSUnit_Calc_Times_R: break;
+     case eCSSUnit_Calc_Divided: break;
+-    case eCSSUnit_Calc_Minimum: break;
+-    case eCSSUnit_Calc_Maximum: break;
+     case eCSSUnit_Integer:      break;
+     case eCSSUnit_Enumerated:   break;
+     case eCSSUnit_EnumColor:    break;
+     case eCSSUnit_Color:        break;
+     case eCSSUnit_Percent:      aResult.Append(PRUnichar('%'));    break;
+     case eCSSUnit_Number:       break;
+     case eCSSUnit_Gradient:     break;
+     case eCSSUnit_Pair:         break;
+diff --git a/layout/style/nsCSSValue.h b/layout/style/nsCSSValue.h
+--- a/layout/style/nsCSSValue.h
++++ b/layout/style/nsCSSValue.h
+@@ -112,36 +112,32 @@ enum nsCSSUnit {
+   eCSSUnit_Array        = 20,     // (nsCSSValue::Array*) a list of values
+   eCSSUnit_Counter      = 21,     // (nsCSSValue::Array*) a counter(string,[string]) value
+   eCSSUnit_Counters     = 22,     // (nsCSSValue::Array*) a counters(string,string[,string]) value
+   eCSSUnit_Cubic_Bezier = 23,     // (nsCSSValue::Array*) a list of float values
+   eCSSUnit_Function     = 24,     // (nsCSSValue::Array*) a function with
+                                   //  parameters.  First elem of array is name,
+                                   //  the rest of the values are arguments.
+ 
+-  // The top level of a calc() expression is either -moz-calc()
+-  // (eCSSUnit_Calc), -moz-min() (eCSSUnit_Calc_Minimum), or -moz-max()
+-  // (eCSSUnit_Calc_Maximum).  All remaining eCSSUnit_Calc_* units only
+-  // occur inside these toplevel calc values.
++  // The top level of a calc() expression is eCSSUnit_Calc.  All
++  // remaining eCSSUnit_Calc_* units only occur inside these toplevel
++  // calc values.
+ 
+   // eCSSUnit_Calc has an array with exactly 1 element.  eCSSUnit_Calc
+   // exists so we can distinguish calc(2em) from 2em as specified values
+   // (but we drop this distinction for nsStyleCoord when we store
+   // computed values).
+   eCSSUnit_Calc         = 25,     // (nsCSSValue::Array*) calc() value
+   // Plus, Minus, Times_* and Divided have arrays with exactly 2
+   // elements.  a + b + c + d is grouped as ((a + b) + c) + d
+   eCSSUnit_Calc_Plus    = 26,     // (nsCSSValue::Array*) + node within calc()
+   eCSSUnit_Calc_Minus   = 27,     // (nsCSSValue::Array*) - within calc
+   eCSSUnit_Calc_Times_L = 28,     // (nsCSSValue::Array*) num * val within calc
+   eCSSUnit_Calc_Times_R = 29,     // (nsCSSValue::Array*) val * num within calc
+   eCSSUnit_Calc_Divided = 30,     // (nsCSSValue::Array*) / within calc
+-  // Minimum and Maximum have arrays with 1 or more elements
+-  eCSSUnit_Calc_Minimum = 31,     // (nsCSSValue::Array*) min() within calc
+-  eCSSUnit_Calc_Maximum = 32,     // (nsCSSValue::Array*) max() within calc
+ 
+   eCSSUnit_URL          = 40,     // (nsCSSValue::URL*) value
+   eCSSUnit_Image        = 41,     // (nsCSSValue::Image*) value
+   eCSSUnit_Gradient     = 42,     // (nsCSSValueGradient*) value
+ 
+   eCSSUnit_Pair         = 50,     // (nsCSSValuePair*) pair of values
+   eCSSUnit_Rect         = 51,     // (nsCSSRect*) rectangle (four values)
+   eCSSUnit_List         = 52,     // (nsCSSValueList*) list of values
+@@ -272,22 +268,22 @@ public:
+     { return eCSSUnit_Point <= mUnit && mUnit <= eCSSUnit_Pixel; }
+   PRBool    IsAngularUnit() const  
+     { return eCSSUnit_Degree <= mUnit && mUnit <= eCSSUnit_Radian; }
+   PRBool    IsFrequencyUnit() const  
+     { return eCSSUnit_Hertz <= mUnit && mUnit <= eCSSUnit_Kilohertz; }
+   PRBool    IsTimeUnit() const  
+     { return eCSSUnit_Seconds <= mUnit && mUnit <= eCSSUnit_Milliseconds; }
+   PRBool    IsCalcUnit() const
+-    { return eCSSUnit_Calc <= mUnit && mUnit <= eCSSUnit_Calc_Maximum; }
++    { return eCSSUnit_Calc <= mUnit && mUnit <= eCSSUnit_Calc_Divided; }
+ 
+   PRBool    UnitHasStringValue() const
+     { return eCSSUnit_String <= mUnit && mUnit <= eCSSUnit_Element; }
+   PRBool    UnitHasArrayValue() const
+-    { return eCSSUnit_Array <= mUnit && mUnit <= eCSSUnit_Calc_Maximum; }
++    { return eCSSUnit_Array <= mUnit && mUnit <= eCSSUnit_Calc_Divided; }
+ 
+   PRInt32 GetIntValue() const
+   {
+     NS_ABORT_IF_FALSE(mUnit == eCSSUnit_Integer ||
+                       mUnit == eCSSUnit_Enumerated ||
+                       mUnit == eCSSUnit_EnumColor,
+                       "not an int value");
+     return mValue.mInt;
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -321,19 +321,17 @@ static nscoord CalcLengthWith(const nsCS
+     // result.  We ensure that we don't get to this code for other
+     // properties by not calling CalcLength in those cases:  SetCoord
+     // only calls CalcLength for a calc when it is appropriate to do so.
+     case eCSSUnit_Calc:
+     case eCSSUnit_Calc_Plus:
+     case eCSSUnit_Calc_Minus:
+     case eCSSUnit_Calc_Times_L:
+     case eCSSUnit_Calc_Times_R:
+-    case eCSSUnit_Calc_Divided:
+-    case eCSSUnit_Calc_Minimum:
+-    case eCSSUnit_Calc_Maximum: {
++    case eCSSUnit_Calc_Divided: {
+       CalcLengthCalcOps ops(aFontSize, aStyleFont, aStyleContext, aPresContext,
+                             aUseProvidedRootEmSize, aUseUserFontSet,
+                             aCanStoreInRuleTree);
+       return css::ComputeCalc(aValue, ops);
+     }
+     default:
+       NS_NOTREACHED("unexpected unit");
+       break;
+diff --git a/layout/style/nsStyleCoord.cpp b/layout/style/nsStyleCoord.cpp
+--- a/layout/style/nsStyleCoord.cpp
++++ b/layout/style/nsStyleCoord.cpp
+@@ -122,18 +122,16 @@ PRBool nsStyleCoord::operator==(const ns
+     case eStyleUnit_Enumerated:
+       return mValue.mInt == aOther.mValue.mInt;
+     case eStyleUnit_Calc:
+     case eStyleUnit_Calc_Plus:
+     case eStyleUnit_Calc_Minus:
+     case eStyleUnit_Calc_Times_L:
+     case eStyleUnit_Calc_Times_R:
+     case eStyleUnit_Calc_Divided:
+-    case eStyleUnit_Calc_Minimum:
+-    case eStyleUnit_Calc_Maximum:
+       return *this->GetArrayValue() == *aOther.GetArrayValue();
+   }
+   NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
+   return PR_FALSE;
+ }
+ 
+ void nsStyleCoord::Reset()
+ {
+diff --git a/layout/style/nsStyleCoord.h b/layout/style/nsStyleCoord.h
+--- a/layout/style/nsStyleCoord.h
++++ b/layout/style/nsStyleCoord.h
+@@ -65,19 +65,17 @@ enum nsStyleUnit {
+   // NOTE:  They are in the same order as the eCSSUnit_Calc_* values so
+   // that converting between the two sets is just addition/subtraction.
+   eStyleUnit_Calc         = 39,     // (Array*) calc() toplevel, to
+                                     // distinguish 50% from calc(50%), etc.
+   eStyleUnit_Calc_Plus    = 40,     // (Array*) + node within calc()
+   eStyleUnit_Calc_Minus   = 41,     // (Array*) - within calc
+   eStyleUnit_Calc_Times_L = 42,     // (Array*) num * val within calc
+   eStyleUnit_Calc_Times_R = 43,     // (Array*) val * num within calc
+-  eStyleUnit_Calc_Divided = 44,     // (Array*) / within calc
+-  eStyleUnit_Calc_Minimum = 45,     // (Array*) min() within calc
+-  eStyleUnit_Calc_Maximum = 46      // (Array*) max() within calc
++  eStyleUnit_Calc_Divided = 44      // (Array*) / within calc
+ };
+ 
+ typedef union {
+   PRInt32     mInt;   // nscoord is a PRInt32 for now
+   float       mFloat;
+   // An mPointer is a weak pointer to a value that is guaranteed to
+   // outlive the nsStyleCoord.  In the case of nsStyleCoord::Array*, it
+   // is a pointer owned by the style context, allocated through
+@@ -116,17 +114,17 @@ public:
+     return mUnit;
+   }
+ 
+   PRBool IsAngleValue() const {
+     return eStyleUnit_Degree <= mUnit && mUnit <= eStyleUnit_Radian;
+   }
+ 
+   PRBool IsCalcUnit() const {
+-    return eStyleUnit_Calc <= mUnit && mUnit <= eStyleUnit_Calc_Maximum;
++    return eStyleUnit_Calc <= mUnit && mUnit <= eStyleUnit_Calc_Divided;
+   }
+ 
+   PRBool IsCoordPercentCalcUnit() const {
+     return mUnit == eStyleUnit_Coord ||
+            mUnit == eStyleUnit_Percent ||
+            IsCalcUnit();
+   }
+ 
