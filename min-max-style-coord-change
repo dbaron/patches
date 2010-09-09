@@ -2,6 +2,306 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Simplify storage of computed calc() as a result of removing min() and max().
 
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -3261,106 +3261,52 @@ nsIFrame::InlinePrefWidthData::ForceBrea
+ 
+   currentLine =
+     NSCoordSaturatingSubtract(currentLine, trailingWhitespace, nscoord_MAX);
+   prevLines = NS_MAX(prevLines, currentLine);
+   currentLine = trailingWhitespace = 0;
+   skipWhitespace = PR_TRUE;
+ }
+ 
+-/**
+- * This class does calc() computation of lengths and percents separately.
+- *
+- * FIXME: remove this in the next patch
+- *
+- * It is used only for intrinsic width computation, where being an
+- * approximation is sometimes ok (although it would be good to fix at
+- * some point in the future).
+- */
+-struct LengthPercentPairWithMinMaxCalcOps : public css::StyleCoordInputCalcOps
+-{
+-  struct result_type {
+-    nscoord mLength;
+-    float mPercent;
+-
+-    result_type(nscoord aLength, float aPercent)
+-      : mLength(aLength), mPercent(aPercent) {}
+-  };
+-
+-  result_type ComputeLeafValue(const nsStyleCoord& aValue)
+-  {
+-    if (aValue.GetUnit() == eStyleUnit_Percent) {
+-      return result_type(0, aValue.GetPercentValue());
+-    }
+-    return result_type(aValue.GetCoordValue(), 0.0f);
+-  }
+-
+-  result_type
+-  MergeAdditive(nsCSSUnit aCalcFunction,
+-                result_type aValue1, result_type aValue2)
+-  {
+-    if (aCalcFunction == eCSSUnit_Calc_Plus) {
+-      return result_type(NSCoordSaturatingAdd(aValue1.mLength,
+-                                              aValue2.mLength),
+-                         aValue1.mPercent + aValue2.mPercent);
+-    }
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Minus,
+-                      "unexpected unit");
+-    return result_type(NSCoordSaturatingSubtract(aValue1.mLength,
+-                                                 aValue2.mLength, 0),
+-                       aValue1.mPercent - aValue2.mPercent);
+-  }
+-
+-  result_type
+-  MergeMultiplicativeL(nsCSSUnit aCalcFunction,
+-                       float aValue1, result_type aValue2)
+-  {
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_L,
+-                      "unexpected unit");
+-    return result_type(NSCoordSaturatingMultiply(aValue2.mLength, aValue1),
+-                       aValue1 * aValue2.mPercent);
+-  }
+-
+-  result_type
+-  MergeMultiplicativeR(nsCSSUnit aCalcFunction,
+-                       result_type aValue1, float aValue2)
+-  {
+-    NS_ABORT_IF_FALSE(aCalcFunction == eCSSUnit_Calc_Times_R ||
+-                      aCalcFunction == eCSSUnit_Calc_Divided,
+-                      "unexpected unit");
+-    if (aCalcFunction == eCSSUnit_Calc_Divided) {
+-      aValue2 = 1.0f / aValue2;
+-    }
+-    return result_type(NSCoordSaturatingMultiply(aValue1.mLength, aValue2),
+-                       aValue1.mPercent * aValue2);
+-  }
+-
+-};
+-
+ static void
+ AddCoord(const nsStyleCoord& aStyle,
+          nsIRenderingContext* aRenderingContext,
+          nsIFrame* aFrame,
+          nscoord* aCoord, float* aPercent,
+          PRBool aClampNegativeToZero)
+ {
+-  if (!aStyle.IsCoordPercentCalcUnit()) {
+-    return;
+-  }
+-
+-  LengthPercentPairWithMinMaxCalcOps ops;
+-  LengthPercentPairWithMinMaxCalcOps::result_type pair =
+-    css::ComputeCalc(aStyle, ops);
+-  if (aClampNegativeToZero) {
+-    // This is far from ideal when one is negative and one is positive.
+-    pair.mLength = NS_MAX(pair.mLength, 0);
+-    pair.mPercent = NS_MAX(pair.mPercent, 0.0f);
+-  }
+-  *aCoord += pair.mLength;
+-  *aPercent += pair.mPercent;
++  switch (aStyle.GetUnit()) {
++    case eStyleUnit_Coord: {
++      NS_ASSERTION(!aClampNegativeToZero || aStyle.GetCoordValue() >= 0,
++                   "unexpected negative value");
++      *aCoord += aStyle.GetCoordValue();
++      return;
++    }
++    case eStyleUnit_Percent: {
++      NS_ASSERTION(!aClampNegativeToZero || aStyle.GetPercentValue() >= 0.0f,
++                   "unexpected negative value");
++      *aPercent += aStyle.GetPercentValue();
++      return;
++    }
++    case eStyleUnit_Calc: {
++      const nsStyleCoord::Calc *calc = aStyle.GetCalcValue();
++      if (aClampNegativeToZero) {
++        // This is far from ideal when one is negative and one is positive.
++        *aCoord += NS_MAX(calc->mLength, 0);
++        *aPercent += NS_MAX(calc->mPercent, 0.0f);
++      } else {
++        *aCoord += calc->mLength;
++        *aPercent += calc->mPercent;
++      }
++      return;
++    }
++    default: {
++      return;
++    }
++  }
+ }
+ 
+ /* virtual */ nsIFrame::IntrinsicWidthOffsetData
+ nsFrame::IntrinsicWidthOffsets(nsIRenderingContext* aRenderingContext)
+ {
+   IntrinsicWidthOffsetData result;
+ 
+   // FIXME: The handling of calc() with min() and max() by AddCoord
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -3830,64 +3830,16 @@ nsComputedDOMStyle::GetBorderStyleFor(mo
+   val->SetIdent(
+     nsCSSProps::ValueToKeywordEnum(GetStyleBorder()->GetBorderStyle(aSide),
+                                    nsCSSProps::kBorderStyleKTable));
+ 
+   NS_ADDREF(*aValue = val);
+   return NS_OK;
+ }
+ 
+-struct StyleCoordSerializeCalcOps {
+-  StyleCoordSerializeCalcOps(nsAString& aResult)
+-    : mResult(aResult)
+-  {
+-  }
+-
+-  typedef nsStyleCoord input_type;
+-  typedef nsStyleCoord::Array input_array_type;
+-
+-  static nsCSSUnit GetUnit(const input_type& aValue) {
+-    if (aValue.IsCalcUnit()) {
+-      return css::ConvertCalcUnit(aValue.GetUnit());
+-    }
+-    return eCSSUnit_Null;
+-  }
+-
+-  void Append(const char* aString)
+-  {
+-    mResult.AppendASCII(aString);
+-  }
+-
+-  void AppendLeafValue(const input_type& aValue)
+-  {
+-    nsRefPtr<nsROCSSPrimitiveValue> val = new nsROCSSPrimitiveValue();
+-    if (aValue.GetUnit() == eStyleUnit_Percent) {
+-      val->SetPercent(aValue.GetPercentValue());
+-    } else {
+-      NS_ABORT_IF_FALSE(aValue.GetUnit() == eStyleUnit_Coord,
+-                        "unexpected unit");
+-      val->SetAppUnits(aValue.GetCoordValue());
+-    }
+-
+-    nsAutoString tmp;
+-    val->GetCssText(tmp);
+-    mResult.Append(tmp);
+-  }
+-
+-  void AppendNumber(const input_type& aValue)
+-  {
+-    NS_ABORT_IF_FALSE(PR_FALSE,
+-                      "should not have numbers in nsStyleCoord calc()");
+-  }
+-
+-private:
+-  nsAString &mResult;
+-};
+-
+-
+ void
+ nsComputedDOMStyle::SetValueToCoord(nsROCSSPrimitiveValue* aValue,
+                                     const nsStyleCoord& aCoord,
+                                     PRBool aClampNegativeCalc,
+                                     PercentageBaseGetter aPercentageBaseGetter,
+                                     const PRInt32 aTable[],
+                                     nscoord aMinAppUnits,
+                                     nscoord aMaxAppUnits)
+@@ -3937,46 +3889,63 @@ nsComputedDOMStyle::SetValueToCoord(nsRO
+       aValue->SetIdent(nsCSSProps::ValueToKeywordEnum(aCoord.GetIntValue(),
+                                                       aTable));
+       break;
+ 
+     case eStyleUnit_None:
+       aValue->SetIdent(eCSSKeyword_none);
+       break;
+ 
++    case eStyleUnit_Calc:
++      nscoord percentageBase;
++      if (!aCoord.CalcHasPercent()) {
++        nscoord val = nsRuleNode::ComputeCoordPercentCalc(aCoord, 0);
++        if (aClampNegativeCalc && val < 0) {
++          NS_ABORT_IF_FALSE(aCoord.IsCalcUnit(),
++                            "parser should have rejected value");
++          val = 0;
++        }
++        aValue->SetAppUnits(NS_MAX(aMinAppUnits, NS_MIN(val, aMaxAppUnits)));
++      } else if (aPercentageBaseGetter &&
++                 (this->*aPercentageBaseGetter)(percentageBase)) {
++        nscoord val =
++          nsRuleNode::ComputeCoordPercentCalc(aCoord, percentageBase);
++        if (aClampNegativeCalc && val < 0) {
++          NS_ABORT_IF_FALSE(aCoord.IsCalcUnit(),
++                            "parser should have rejected value");
++          val = 0;
++        }
++        aValue->SetAppUnits(NS_MAX(aMinAppUnits, NS_MIN(val, aMaxAppUnits)));
++      } else {
++        nsAutoString tmp;
++        nsStyleCoord::Calc *calc = aCoord.GetCalcValue();
++
++        nsRefPtr<nsROCSSPrimitiveValue> val = new nsROCSSPrimitiveValue();
++
++        nsAutoString tmp, result;
++
++        result.AppendLiteral("-moz-calc(");
++
++        val->SetAppUnits(calc->mLength);
++        val->GetCssText(tmp);
++        result.Append(tmp);
++
++        result.AppendLiteral(" + ");
++
++        val->SetPercent(calc->mPercent);
++        val->GetCssText(tmp);
++        result.Append(tmp);
++
++        result.AppendLiteral(")");
++
++        aValue->SetString(tmp); // not really SetString
++      }
++      break;
+     default:
+-      if (aCoord.IsCalcUnit()) {
+-        nscoord percentageBase;
+-        if (!aCoord.CalcHasPercent()) {
+-          nscoord val = nsRuleNode::ComputeCoordPercentCalc(aCoord, 0);
+-          if (aClampNegativeCalc && val < 0) {
+-            NS_ABORT_IF_FALSE(aCoord.IsCalcUnit(),
+-                              "parser should have rejected value");
+-            val = 0;
+-          }
+-          aValue->SetAppUnits(NS_MAX(aMinAppUnits, NS_MIN(val, aMaxAppUnits)));
+-        } else if (aPercentageBaseGetter &&
+-                   (this->*aPercentageBaseGetter)(percentageBase)) {
+-          nscoord val =
+-            nsRuleNode::ComputeCoordPercentCalc(aCoord, percentageBase);
+-          if (aClampNegativeCalc && val < 0) {
+-            NS_ABORT_IF_FALSE(aCoord.IsCalcUnit(),
+-                              "parser should have rejected value");
+-            val = 0;
+-          }
+-          aValue->SetAppUnits(NS_MAX(aMinAppUnits, NS_MIN(val, aMaxAppUnits)));
+-        } else {
+-          nsAutoString tmp;
+-          StyleCoordSerializeCalcOps ops(tmp);
+-          css::SerializeCalc(aCoord, ops);
+-          aValue->SetString(tmp); // not really SetString
+-        }
+-      } else {
+-        NS_ERROR("Can't handle this unit");
+-      }
++      NS_ERROR("Can't handle this unit");
+       break;
+   }
+ }
+ 
+ nscoord
+ nsComputedDOMStyle::StyleCoordToNSCoord(const nsStyleCoord& aCoord,
+                                         PercentageBaseGetter aPercentageBaseGetter,
+                                         nscoord aDefaultValue,
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
