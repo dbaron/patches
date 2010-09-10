@@ -2,23 +2,24 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Change the blur radius for -moz-box-shadow and text-shadow to match what is specified in css3-background, and the blur radius for canvas to follow what is specified in HTML5.  (Bug 590039)
 
-This removes a meaningless but confusing factor of one (the result of
-(3/2) as an integer division) in gfxAlphaBoxBlur::CalculateBlurRadius
-that was added in changeset ce9f05b57b95 for bug 467518.
-CalculateBlurRadius represents multiplication by 1.880, both without and
-with this patch, and follows the formula in the feGaussianBlur section
-of the SVG spec.
+This fixes the multiplication by 1.5 in
+gfxAlphaBoxBlur::CalculateBlurRadius (originally added in changeset
+ce9f05b57b95 for bug 467518) to work correctly.  It was previously a
+multiplication by 1 due to integer division.  CalculateBlurRadius
+previously multiplied by 1.880; it now multiplies by 2.820.
 
 This changes canvas shadow handling to multiply shadowBlur by 2 before
 taking its square root, as described in the spec.  This means that
-canvas shadow blurs 8px or smaller behave as they did before, but canvas
-shadow blurs larger than 8px are multiplied by 1.414 relative to their
-old sizes.
+canvas shadow blurs 8px or smaller are 1.5 times larger than they were
+previously (due to the CalculateBlurRadius change), and canvas shadow
+blurs larger than 8px are 2.121 times larger than they were previously
+(due to the CalculateBlurRadius change *and* the additional factor of
+sqrt(2)).
 
 This changes text-shadow and -moz-box-shadow handling to use
 CalculateBlurRadius on half of the value given instead of passing the
 value through directly.  This means that text-shadow and box-shadow
-blurs are multiplied by 0.940 relative to their old sizes.
+blurs are multiplied by 1.410 relative to their old sizes.
 
 diff --git a/content/canvas/src/nsCanvasRenderingContext2D.cpp b/content/canvas/src/nsCanvasRenderingContext2D.cpp
 --- a/content/canvas/src/nsCanvasRenderingContext2D.cpp
@@ -46,7 +47,7 @@ diff --git a/content/canvas/src/nsCanvasRenderingContext2D.cpp b/content/canvas/
 diff --git a/gfx/thebes/gfxBlur.cpp b/gfx/thebes/gfxBlur.cpp
 --- a/gfx/thebes/gfxBlur.cpp
 +++ b/gfx/thebes/gfxBlur.cpp
-@@ -458,17 +458,20 @@ gfxAlphaBoxBlur::Paint(gfxContext* aDest
+@@ -458,17 +458,28 @@ gfxAlphaBoxBlur::Paint(gfxContext* aDest
          aDestinationCtx->Clip();
          aDestinationCtx->Mask(mImageSurface, offset);
          aDestinationCtx->Restore();
@@ -59,9 +60,17 @@ diff --git a/gfx/thebes/gfxBlur.cpp b/gfx/thebes/gfxBlur.cpp
 -static const gfxFloat GAUSSIAN_SCALE_FACTOR = (3 * sqrt(2 * M_PI) / 4) * (3/2);
 +/**
 + * Compute the box blur size (which we're calling the blur radius) from
-+ * the standard deviation of a Gaussian.
++ * the standard deviation.
++ *
++ * Much of this, the 3 * sqrt(2 * pi) / 4, is the known value for
++ * approximating a Gaussian using box blurs.  This yields quite a good
++ * approximation for a Gaussian.  Then we multiply this by 1.5 since our
++ * code wants the radius of the entire triple-box-blur kernel instead of
++ * the diameter of an individual box blur.  For more details, see:
++ *   http://www.w3.org/TR/SVG11/filters.html#feGaussianBlurElement
++ *   https://bugzilla.mozilla.org/show_bug.cgi?id=590039#c19
 + */
-+static const gfxFloat GAUSSIAN_SCALE_FACTOR = (3 * sqrt(2 * M_PI) / 4);
++static const gfxFloat GAUSSIAN_SCALE_FACTOR = (3 * sqrt(2 * M_PI) / 4) * 1.5;
  
  gfxIntSize gfxAlphaBoxBlur::CalculateBlurRadius(const gfxPoint& aStd)
  {
@@ -69,6 +78,77 @@ diff --git a/gfx/thebes/gfxBlur.cpp b/gfx/thebes/gfxBlur.cpp
          static_cast<PRInt32>(floor(aStd.x * GAUSSIAN_SCALE_FACTOR + 0.5)),
          static_cast<PRInt32>(floor(aStd.y * GAUSSIAN_SCALE_FACTOR + 0.5)));
  }
+diff --git a/gfx/thebes/gfxBlur.h b/gfx/thebes/gfxBlur.h
+--- a/gfx/thebes/gfxBlur.h
++++ b/gfx/thebes/gfxBlur.h
+@@ -39,17 +39,22 @@
+ #define GFX_BLUR_H
+ 
+ #include "gfxContext.h"
+ #include "gfxImageSurface.h"
+ #include "gfxTypes.h"
+ #include "gfxThebesUtils.h"
+ 
+ /**
+- * Implementation of a box blur approximation of a Gaussian blur.
++ * Implementation of a triple box blur approximation of a Gaussian blur.
++ *
++ * A Gaussian blur is good for blurring because, when done independently
++ * in the horizontal and vertical directions, it matches the result that
++ * would be obtained using a different (rotated) set of axes.  A triple
++ * box blur is a very close approximation of a Gaussian.
+  *
+  * Creates an 8-bit alpha channel context for callers to draw in,
+  * spreads the contents of that context, blurs the contents, and applies
+  * it as an alpha mask on a different existing context.
+  * 
+  * A spread N makes each output pixel the maximum value of all source
+  * pixels within a square of side length 2N+1 centered on the output pixel.
+  * 
+@@ -63,17 +68,21 @@ public:
+     gfxAlphaBoxBlur();
+ 
+     ~gfxAlphaBoxBlur();
+ 
+     /**
+      * Constructs a box blur and initializes the temporary surface.
+      * @param aRect The coordinates of the surface to create in device units.
+      *
+-     * @param aBlurRadius The blur radius in pixels
++     * @param aBlurRadius The blur radius in pixels.  This is the radius of
++     *   the entire (triple) kernel function.  Each individual box blur has
++     *   radius approximately 1/3 this value, or diameter approximately 2/3
++     *   this value.  This parameter should nearly always be computed using
++     *   CalculateBlurRadius, below.
+      *
+      * @param aDirtyRect A pointer to a dirty rect, measured in device units, if available.
+      *  This will be used for optimizing the blur operation. It is safe to pass NULL here.
+      *
+      * @param aSkipRect A pointer to a rect, measured in device units, that represents an area
+      *  where blurring is unnecessary and shouldn't be done for speed reasons. It is safe to
+      *  pass NULL here.
+      */
+@@ -105,17 +114,19 @@ public:
+      *
+      * @param aDestinationCtx The graphics context on which to apply the
+      *  blurred mask.
+      */
+     void Paint(gfxContext* aDestinationCtx, const gfxPoint& offset = gfxPoint(0.0, 0.0));
+ 
+     /**
+      * Calculates a blur radius that, when used with box blur, approximates
+-     * a Gaussian blur with the given standard deviation.
++     * a Gaussian blur with the given standard deviation.  The result of
++     * this function should be used as the aBlurRadius parameter to Init,
++     * above.
+      */
+     static gfxIntSize CalculateBlurRadius(const gfxPoint& aStandardDeviation);
+ 
+ protected:
+     /**
+      * The spread radius, in pixels.
+      */
+     gfxIntSize mSpreadRadius;
 diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 --- a/layout/base/nsCSSRendering.cpp
 +++ b/layout/base/nsCSSRendering.cpp
