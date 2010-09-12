@@ -1,0 +1,587 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Change storage of background-size and background-position to allow percentages and lengths.  (Bug 594394)
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -876,33 +876,27 @@ nsCSSRendering::PaintFocus(nsPresContext
+  */
+ static void
+ ComputeBackgroundAnchorPoint(const nsStyleBackground::Layer& aLayer,
+                              const nsSize& aOriginBounds,
+                              const nsSize& aImageSize,
+                              nsPoint* aTopLeft,
+                              nsPoint* aAnchorPoint)
+ {
+-  if (!aLayer.mPosition.mXIsPercent) {
+-    aTopLeft->x = aAnchorPoint->x = aLayer.mPosition.mXPosition.mCoord;
+-  }
+-  else {
+-    double percent = aLayer.mPosition.mXPosition.mFloat;
+-    aAnchorPoint->x = NSToCoordRound(percent*aOriginBounds.width);
+-    aTopLeft->x = NSToCoordRound(percent*(aOriginBounds.width - aImageSize.width));
+-  }
+-
+-  if (!aLayer.mPosition.mYIsPercent) {
+-    aTopLeft->y = aAnchorPoint->y = aLayer.mPosition.mYPosition.mCoord;
+-  }
+-  else {
+-    double percent = aLayer.mPosition.mYPosition.mFloat;
+-    aAnchorPoint->y = NSToCoordRound(percent*aOriginBounds.height);
+-    aTopLeft->y = NSToCoordRound(percent*(aOriginBounds.height - aImageSize.height));
+-  }
++  double percentX = aLayer.mPosition.mXPosition.mPercent;
++  nscoord lengthX = aLayer.mPosition.mXPosition.mLength;
++  aAnchorPoint->x = lengthX + NSToCoordRound(percentX*aOriginBounds.width);
++  aTopLeft->x = lengthX +
++    NSToCoordRound(percentX*(aOriginBounds.width - aImageSize.width));
++
++  double percentY = aLayer.mPosition.mYPosition.mPercent;
++  nscoord lengthY = aLayer.mPosition.mYPosition.mLength;
++  aAnchorPoint->y = lengthY + NSToCoordRound(percentY*aOriginBounds.height);
++  aTopLeft->y = lengthY +
++    NSToCoordRound(percentY*(aOriginBounds.height - aImageSize.height));
+ }
+ 
+ nsIFrame*
+ nsCSSRendering::FindNonTransparentBackgroundFrame(nsIFrame* aFrame,
+                                                   PRBool aStartAtParent /*= PR_FALSE*/)
+ {
+   NS_ASSERTION(aFrame, "Cannot find NonTransparentBackgroundFrame in a null frame");
+ 
+@@ -2298,25 +2292,24 @@ nsCSSRendering::PaintBackgroundWithSC(ns
+                              dirtyRect, aBorderArea, bgClipArea, *bg,
+                              layer);
+       }
+     }
+   }
+ }
+ 
+ static inline float
+-ScaleDimension(nsStyleBackground::Size::Dimension aDimension,
++ScaleDimension(const nsStyleBackground::Size::Dimension& aDimension,
+                PRUint8 aType,
+                nscoord aLength, nscoord aAvailLength)
+ {
+   switch (aType) {
+-    case nsStyleBackground::Size::ePercentage:
+-      return double(aDimension.mFloat) * (double(aAvailLength) / double(aLength));
+-    case nsStyleBackground::Size::eLength:
+-      return double(aDimension.mCoord) / double(aLength);
++    case nsStyleBackground::Size::eLengthPercentage:
++      return (double(aDimension.mPercent) * double(aAvailLength) +
++              double(aDimension.mLength)) / double(aLength);
+     default:
+       NS_ABORT_IF_FALSE(PR_FALSE, "bad aDimension.mType");
+       return 1.0f;
+     case nsStyleBackground::Size::eAuto:
+       NS_ABORT_IF_FALSE(PR_FALSE, "aDimension.mType == eAuto isn't handled");
+       return 1.0f;
+   }
+ }
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -1747,26 +1747,30 @@ nsComputedDOMStyle::DoGetBackgroundPosit
+     if (!valY || !itemList->AppendCSSValue(valY)) {
+       delete valueList;
+       delete valY;
+       return NS_ERROR_OUT_OF_MEMORY;
+     }
+ 
+     const nsStyleBackground::Position &pos = bg->mLayers[i].mPosition;
+ 
+-    if (pos.mXIsPercent) {
+-      valX->SetPercent(pos.mXPosition.mFloat);
++    if (pos.mXPosition.mLength != 0) {
++      NS_ABORT_IF_FALSE(pos.mXPosition.mPercent == 0.0f,
++                        "can't have both until calc() implemented");
++      valX->SetAppUnits(pos.mXPosition.mLength);
+     } else {
+-      valX->SetAppUnits(pos.mXPosition.mCoord);
++      valX->SetPercent(pos.mXPosition.mPercent);
+     }
+ 
+-    if (pos.mYIsPercent) {
+-      valY->SetPercent(pos.mYPosition.mFloat);
++    if (pos.mYPosition.mLength != 0) {
++      NS_ABORT_IF_FALSE(pos.mYPosition.mPercent == 0.0f,
++                        "can't have both until calc() implemented");
++      valY->SetAppUnits(pos.mYPosition.mLength);
+     } else {
+-      valY->SetAppUnits(pos.mYPosition.mCoord);
++      valY->SetPercent(pos.mYPosition.mPercent);
+     }
+   }
+ 
+   NS_ADDREF(*aValue = valueList);
+   return NS_OK;
+ }
+ 
+ nsresult
+@@ -1824,32 +1828,42 @@ nsComputedDOMStyle::DoGetMozBackgroundSi
+         if (!valY || !itemList->AppendCSSValue(valY)) {
+           delete valueList;
+           delete valY;
+           return NS_ERROR_OUT_OF_MEMORY;
+         }
+ 
+         if (size.mWidthType == nsStyleBackground::Size::eAuto) {
+           valX->SetIdent(eCSSKeyword_auto);
+-        } else if (size.mWidthType == nsStyleBackground::Size::ePercentage) {
+-          valX->SetPercent(size.mWidth.mFloat);
+         } else {
+-          NS_ABORT_IF_FALSE(size.mWidthType == nsStyleBackground::Size::eLength,
++          NS_ABORT_IF_FALSE(size.mWidthType ==
++                              nsStyleBackground::Size::eLengthPercentage,
+                             "bad mWidthType");
+-          valX->SetAppUnits(size.mWidth.mCoord);
++          if (size.mWidth.mLength != 0) {
++            NS_ABORT_IF_FALSE(size.mWidth.mPercent == 0.0f,
++                              "can't have both until calc() implemented");
++            valX->SetAppUnits(size.mWidth.mLength);
++          } else {
++            valX->SetPercent(size.mWidth.mPercent);
++          }
+         }
+ 
+         if (size.mHeightType == nsStyleBackground::Size::eAuto) {
+           valY->SetIdent(eCSSKeyword_auto);
+-        } else if (size.mHeightType == nsStyleBackground::Size::ePercentage) {
+-          valY->SetPercent(size.mHeight.mFloat);
+         } else {
+-          NS_ABORT_IF_FALSE(size.mHeightType == nsStyleBackground::Size::eLength,
++          NS_ABORT_IF_FALSE(size.mHeightType ==
++                              nsStyleBackground::Size::eLengthPercentage,
+                             "bad mHeightType");
+-          valY->SetAppUnits(size.mHeight.mCoord);
++          if (size.mHeight.mLength != 0) {
++            NS_ABORT_IF_FALSE(size.mHeight.mPercent == 0.0f,
++                              "can't have both until calc() implemented");
++            valY->SetAppUnits(size.mHeight.mLength);
++          } else {
++            valY->SetPercent(size.mHeight.mPercent);
++          }
+         }
+         break;
+       }
+     }
+   }
+ 
+   NS_ADDREF(*aValue = valueList);
+   return NS_OK;
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -4462,55 +4462,52 @@ struct BackgroundItemComputer<nsCSSValue
+                   aCanStoreInRuleTree);
+   }
+ };
+ 
+ struct BackgroundPositionAxis {
+   nsCSSValue nsCSSValuePairList::*specified;
+   nsStyleBackground::Position::PositionCoord
+     nsStyleBackground::Position::*result;
+-  PRPackedBool nsStyleBackground::Position::*isPercent;
+ };
+ 
+ static const BackgroundPositionAxis gBGPosAxes[] = {
+   { &nsCSSValuePairList::mXValue,
+-    &nsStyleBackground::Position::mXPosition,
+-    &nsStyleBackground::Position::mXIsPercent },
++    &nsStyleBackground::Position::mXPosition },
+   { &nsCSSValuePairList::mYValue,
+-    &nsStyleBackground::Position::mYPosition,
+-    &nsStyleBackground::Position::mYIsPercent }
++    &nsStyleBackground::Position::mYPosition }
+ };
+ 
+ NS_SPECIALIZE_TEMPLATE
+ struct BackgroundItemComputer<nsCSSValuePairList, nsStyleBackground::Position>
+ {
+   static void ComputeValue(nsStyleContext* aStyleContext,
+                            const nsCSSValuePairList* aSpecifiedValue,
+                            nsStyleBackground::Position& aComputedValue,
+                            PRBool& aCanStoreInRuleTree)
+   {
+     nsStyleBackground::Position &position = aComputedValue;
+     for (const BackgroundPositionAxis *axis = gBGPosAxes,
+                         *axis_end = gBGPosAxes + NS_ARRAY_LENGTH(gBGPosAxes);
+          axis != axis_end; ++axis) {
+       const nsCSSValue &specified = aSpecifiedValue->*(axis->specified);
+       if (eCSSUnit_Percent == specified.GetUnit()) {
+-        (position.*(axis->result)).mFloat = specified.GetPercentValue();
+-        position.*(axis->isPercent) = PR_TRUE;
++        (position.*(axis->result)).mLength = 0;
++        (position.*(axis->result)).mPercent = specified.GetPercentValue();
+       }
+       else if (specified.IsLengthUnit()) {
+-        (position.*(axis->result)).mCoord =
++        (position.*(axis->result)).mLength =
+           CalcLength(specified, aStyleContext, aStyleContext->PresContext(),
+                      aCanStoreInRuleTree);
+-        position.*(axis->isPercent) = PR_FALSE;
++        (position.*(axis->result)).mPercent = 0.0f;
+       }
+       else if (eCSSUnit_Enumerated == specified.GetUnit()) {
+-        (position.*(axis->result)).mFloat =
++        (position.*(axis->result)).mLength = 0;
++        (position.*(axis->result)).mPercent =
+           GetFloatFromBoxPosition(specified.GetIntValue());
+-        position.*(axis->isPercent) = PR_TRUE;
+       } else {
+         NS_NOTREACHED("unexpected unit");
+       }
+     }
+   }
+ };
+ 
+ 
+@@ -4570,25 +4567,27 @@ struct BackgroundItemComputer<nsCSSValue
+                              widthValue.GetIntValue() == NS_STYLE_BG_SIZE_COVER),
+                             "null height value not corresponding to allowable "
+                             "non-null width value");
+         }
+ #endif
+         size.*(axis->type) = size.mWidthType;
+       }
+       else if (eCSSUnit_Percent == specified.GetUnit()) {
+-        (size.*(axis->result)).mFloat = specified.GetPercentValue();
+-        size.*(axis->type) = nsStyleBackground::Size::ePercentage;
++        (size.*(axis->result)).mLength = 0;
++        (size.*(axis->result)).mPercent = specified.GetPercentValue();
++        size.*(axis->type) = nsStyleBackground::Size::eLengthPercentage;
+       }
+       else {
+         NS_ABORT_IF_FALSE(specified.IsLengthUnit(), "unexpected unit");
+-        (size.*(axis->result)).mCoord =
++        (size.*(axis->result)).mLength =
+           CalcLength(specified, aStyleContext, aStyleContext->PresContext(),
+                      aCanStoreInRuleTree);
+-        size.*(axis->type) = nsStyleBackground::Size::eLength;
++        (size.*(axis->result)).mPercent = 0.0f;
++        size.*(axis->type) = nsStyleBackground::Size::eLengthPercentage;
+       }
+     }
+ 
+     NS_ABORT_IF_FALSE(size.mWidthType < nsStyleBackground::Size::eDimensionType_COUNT,
+                       "bad width type");
+     NS_ABORT_IF_FALSE(size.mHeightType < nsStyleBackground::Size::eDimensionType_COUNT,
+                       "bad height type");
+     NS_ABORT_IF_FALSE((size.mWidthType != nsStyleBackground::Size::eContain &&
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -2177,25 +2177,29 @@ nsStyleAnimation::ExtractComputedValue(n
+           nsCSSValuePairList **resultTail = &result;
+           NS_ABORT_IF_FALSE(bg->mPositionCount > 0, "unexpected count");
+           for (PRUint32 i = 0, i_end = bg->mPositionCount; i != i_end; ++i) {
+             nsCSSValuePairList *item = new nsCSSValuePairList;
+             *resultTail = item;
+             resultTail = &item->mNext;
+ 
+             const nsStyleBackground::Position &pos = bg->mLayers[i].mPosition;
+-            if (pos.mXIsPercent) {
+-              item->mXValue.SetPercentValue(pos.mXPosition.mFloat);
++            if (pos.mXPosition.mLength == 0) {
++              item->mXValue.SetPercentValue(pos.mXPosition.mPercent);
+             } else {
+-              nscoordToCSSValue(pos.mXPosition.mCoord, item->mXValue);
++              NS_ABORT_IF_FALSE(pos.mXPosition.mPercent == 0.0f,
++                                "calc() isn't supported yet");
++              nscoordToCSSValue(pos.mXPosition.mLength, item->mXValue);
+             }
+-            if (pos.mYIsPercent) {
+-              item->mYValue.SetPercentValue(pos.mYPosition.mFloat);
++            if (pos.mYPosition.mLength == 0) {
++              item->mYValue.SetPercentValue(pos.mYPosition.mPercent);
+             } else {
+-              nscoordToCSSValue(pos.mYPosition.mCoord, item->mYValue);
++              NS_ABORT_IF_FALSE(pos.mYPosition.mPercent == 0.0f,
++                                "calc() isn't supported yet");
++              nscoordToCSSValue(pos.mYPosition.mLength, item->mYValue);
+             }
+           }
+ 
+           aComputedValue.SetAndAdoptCSSValuePairListValue(result);
+           break;
+         }
+ 
+         case eCSSProperty_background_size: {
+@@ -2211,40 +2215,46 @@ nsStyleAnimation::ExtractComputedValue(n
+ 
+             const nsStyleBackground::Size &size = bg->mLayers[i].mSize;
+             switch (size.mWidthType) {
+               case nsStyleBackground::Size::eContain:
+               case nsStyleBackground::Size::eCover:
+                 item->mXValue.SetIntValue(size.mWidthType,
+                                           eCSSUnit_Enumerated);
+                 break;
+-              case nsStyleBackground::Size::ePercentage:
+-                item->mXValue.SetPercentValue(size.mWidth.mFloat);
+-                break;
+               case nsStyleBackground::Size::eAuto:
+                 item->mXValue.SetAutoValue();
+                 break;
+-              case nsStyleBackground::Size::eLength:
+-                nscoordToCSSValue(size.mWidth.mCoord, item->mXValue);
++              case nsStyleBackground::Size::eLengthPercentage:
++                if (size.mWidth.mLength == 0) {
++                  item->mXValue.SetPercentValue(size.mWidth.mPercent);
++                } else {
++                  NS_ABORT_IF_FALSE(size.mWidth.mPercent == 0.0f,
++                                    "calc() isn't supported yet");
++                  nscoordToCSSValue(size.mWidth.mLength, item->mXValue);
++                }
+                 break;
+             }
+ 
+             switch (size.mHeightType) {
+               case nsStyleBackground::Size::eContain:
+               case nsStyleBackground::Size::eCover:
+                 // leave it null
+                 break;
+-              case nsStyleBackground::Size::ePercentage:
+-                item->mYValue.SetPercentValue(size.mHeight.mFloat);
+-                break;
+               case nsStyleBackground::Size::eAuto:
+                 item->mYValue.SetAutoValue();
+                 break;
+-              case nsStyleBackground::Size::eLength:
+-                nscoordToCSSValue(size.mHeight.mCoord, item->mYValue);
++              case nsStyleBackground::Size::eLengthPercentage:
++                if (size.mHeight.mLength == 0) {
++                  item->mYValue.SetPercentValue(size.mHeight.mPercent);
++                } else {
++                  NS_ABORT_IF_FALSE(size.mHeight.mPercent == 0.0f,
++                                    "calc() isn't supported yet");
++                  nscoordToCSSValue(size.mHeight.mLength, item->mYValue);
++                }
+                 break;
+             }
+           }
+ 
+           aComputedValue.SetAndAdoptCSSValuePairListValue(result);
+           break;
+         }
+ 
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1810,60 +1810,44 @@ PRBool nsStyleBackground::IsTransparent(
+   return BottomLayer().mImage.IsEmpty() &&
+          mImageCount == 1 &&
+          NS_GET_A(mBackgroundColor) == 0;
+ }
+ 
+ void
+ nsStyleBackground::Position::SetInitialValues()
+ {
+-  mXPosition.mFloat = 0.0f;
+-  mYPosition.mFloat = 0.0f;
+-  mXIsPercent = PR_TRUE;
+-  mYIsPercent = PR_TRUE;
++  mXPosition.mPercent = 0.0f;
++  mXPosition.mLength = 0;
++  mYPosition.mPercent = 0.0f;
++  mYPosition.mLength = 0;
+ }
+ 
+ void
+ nsStyleBackground::Size::SetInitialValues()
+ {
+   mWidthType = mHeightType = eAuto;
+ }
+ 
+-PRBool
++bool
+ nsStyleBackground::Size::operator==(const Size& aOther) const
+ {
+   NS_ABORT_IF_FALSE(mWidthType < eDimensionType_COUNT,
+                     "bad mWidthType for this");
+   NS_ABORT_IF_FALSE(mHeightType < eDimensionType_COUNT,
+                     "bad mHeightType for this");
+   NS_ABORT_IF_FALSE(aOther.mWidthType < eDimensionType_COUNT,
+                     "bad mWidthType for aOther");
+   NS_ABORT_IF_FALSE(aOther.mHeightType < eDimensionType_COUNT,
+                     "bad mHeightType for aOther");
+ 
+-  if (mWidthType != aOther.mWidthType || mHeightType != aOther.mHeightType)
+-    return PR_FALSE;
+-
+-  if (mWidthType == ePercentage) {
+-    if (mWidth.mFloat != aOther.mWidth.mFloat)
+-      return PR_FALSE;
+-  } else if (mWidthType == eLength) {
+-    if (mWidth.mCoord != aOther.mWidth.mCoord)
+-      return PR_FALSE;
+-  }
+-
+-  if (mHeightType == ePercentage) {
+-    if (mHeight.mFloat != aOther.mHeight.mFloat)
+-      return PR_FALSE;
+-  } else if (mHeightType == eLength) {
+-    if (mHeight.mCoord != aOther.mHeight.mCoord)
+-      return PR_FALSE;
+-  }
+-
+-  return PR_TRUE;
++  return mWidthType == aOther.mWidthType &&
++         mHeightType == aOther.mHeightType &&
++         (mWidthType != eLengthPercentage || mWidth == aOther.mWidth) &&
++         (mHeightType != eLengthPercentage || mHeight == aOther.mHeight);
+ }
+ 
+ nsStyleBackground::Layer::Layer()
+ {
+ }
+ 
+ nsStyleBackground::Layer::~Layer()
+ {
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -344,102 +344,113 @@ struct nsStyleBackground {
+ #ifdef DEBUG
+   static nsChangeHint MaxDifference();
+ #endif
+   static PRBool ForceCompare() { return PR_FALSE; }
+ 
+   struct Position;
+   friend struct Position;
+   struct Position {
+-    typedef union {
+-      nscoord mCoord; // for lengths
+-      float   mFloat; // for percents
+-    } PositionCoord;
++    struct PositionCoord {
++      // A 'background-position' can be a linear combination of length
++      // and percent (thanks to calc(), which can combine them).
++      nscoord mLength;
++      float   mPercent;
++
++      bool operator==(const PositionCoord& aOther) const
++        { return mLength == aOther.mLength && mPercent == aOther.mPercent; }
++      bool operator!=(const PositionCoord& aOther) const
++        { return !(*this == aOther); }
++    };
+     PositionCoord mXPosition, mYPosition;
+-    PRPackedBool mXIsPercent, mYIsPercent;
+ 
+     // Initialize nothing
+     Position() {}
+ 
+     // Initialize to initial values
+     void SetInitialValues();
+ 
+     // True if the effective background image position described by this depends
+     // on the size of the corresponding frame.
+     PRBool DependsOnFrameSize() const {
+-      return (mXIsPercent && mXPosition.mFloat != 0.0f) ||
+-             (mYIsPercent && mYPosition.mFloat != 0.0f);
++      return mXPosition.mPercent != 0.0f || mYPosition.mPercent != 0.0f;
+     }
+ 
+-    PRBool operator==(const Position& aOther) const {
+-      return mXIsPercent == aOther.mXIsPercent &&
+-             (mXIsPercent ? (mXPosition.mFloat == aOther.mXPosition.mFloat)
+-                          : (mXPosition.mCoord == aOther.mXPosition.mCoord)) &&
+-             mYIsPercent == aOther.mYIsPercent &&
+-             (mYIsPercent ? (mYPosition.mFloat == aOther.mYPosition.mFloat)
+-                          : (mYPosition.mCoord == aOther.mYPosition.mCoord));
++    bool operator==(const Position& aOther) const {
++      return mXPosition == aOther.mXPosition &&
++             mYPosition == aOther.mYPosition;
+     }
+-    PRBool operator!=(const Position& aOther) const {
++    bool operator!=(const Position& aOther) const {
+       return !(*this == aOther);
+     }
+   };
+ 
+   struct Size;
+   friend struct Size;
+   struct Size {
+-    typedef union {
+-      nscoord mCoord; // for lengths
+-      float mFloat; // for percents
+-    } Dimension;
++    struct Dimension {
++      // A 'background-size' can be a linear combination of length
++      // and percent (thanks to calc(), which can combine them).
++      nscoord mLength;
++      float   mPercent;
++
++      bool operator==(const Dimension& aOther) const
++        { return mLength == aOther.mLength && mPercent == aOther.mPercent; }
++      bool operator!=(const Dimension& aOther) const
++        { return !(*this == aOther); }
++    };
+     Dimension mWidth, mHeight;
+ 
+-    // Dimension types which might change how a layer is painted when the
+-    // corresponding frame's dimensions change *must* precede all dimension
+-    // types which are agnostic to frame size; see DependsOnFrameSize below.
++    // Except for eLengthPercentage, Dimension types which might change
++    // how a layer is painted when the corresponding frame's dimensions
++    // change *must* precede all dimension types which are agnostic to
++    // frame size; see DependsOnFrameSize below.
+     enum DimensionType {
+       // If one of mWidth and mHeight is eContain or eCover, then both are.
+       // Also, these two values must equal the corresponding values in
+       // kBackgroundSizeKTable.
+       eContain, eCover,
+ 
+-      ePercentage,
+-
+       eAuto,
+-      eLength,
++      eLengthPercentage,
+       eDimensionType_COUNT
+     };
+     PRUint8 mWidthType, mHeightType;
+ 
+     // True if the effective image size described by this depends on
+     // the size of the corresponding frame.  Gradients depend on the
+     // frame size when their dimensions are 'auto', images don't; both
+     // types depend on the frame size when their dimensions are
+     // 'contain', 'cover', or a percentage.
+     // -moz-element also depends on the frame size when the dimensions
+     // are 'auto' since it could be an SVG gradient or pattern which
+     // behaves exactly like a CSS gradient.
+-    PRBool DependsOnFrameSize(nsStyleImageType aType) const {
++    bool DependsOnFrameSize(nsStyleImageType aType) const {
++      if ((mWidthType == eLengthPercentage && mWidth.mPercent != 0.0f) ||
++          (mHeightType == eLengthPercentage && mHeight.mPercent != 0.0f)) {
++        return true;
++      }
+       if (aType == eStyleImageType_Image) {
+-        return mWidthType <= ePercentage || mHeightType <= ePercentage;
++        return mWidthType <= eCover || mHeightType <= eCover;
+       } else {
+         NS_ABORT_IF_FALSE(aType == eStyleImageType_Gradient ||
+                           aType == eStyleImageType_Element,
+                           "unrecognized image type");
+         return mWidthType <= eAuto || mHeightType <= eAuto;
+       }
+     }
+ 
+     // Initialize nothing
+     Size() {}
+ 
+     // Initialize to initial values
+     void SetInitialValues();
+ 
+-    PRBool operator==(const Size& aOther) const;
+-    PRBool operator!=(const Size& aOther) const {
++    bool operator==(const Size& aOther) const;
++    bool operator!=(const Size& aOther) const {
+       return !(*this == aOther);
+     }
+   };
+ 
+   struct Layer;
+   friend struct Layer;
+   struct Layer {
+     PRUint8 mAttachment;                // [reset] See nsStyleConsts.h
