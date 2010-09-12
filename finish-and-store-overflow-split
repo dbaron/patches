@@ -1,0 +1,261 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Change FinishAndStoreOverflow API to take two overflow areas.  (Bug 542595)
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -6066,18 +6066,19 @@ inline PRBool
+ IsInlineFrame(nsIFrame *aFrame)
+ {
+   nsIAtom *type = aFrame->GetType();
+   return type == nsGkAtoms::inlineFrame ||
+          type == nsGkAtoms::positionedInlineFrame;
+ }
+ 
+ void 
+-nsIFrame::FinishAndStoreOverflow(nsRect* aOverflowArea, nsSize aNewSize)
+-{
++nsIFrame::FinishAndStoreOverflow(nsRect aOverflowAreas[2], nsSize aNewSize)
++{
++  // FIXME: Deal with two overflow areas.
+   // This is now called FinishAndStoreOverflow() instead of 
+   // StoreOverflow() because frame-generic ways of adding overflow
+   // can happen here, e.g. CSS2 outline and native theme.
+   NS_ASSERTION(aNewSize.width == 0 || aNewSize.height == 0 ||
+                aOverflowArea->Contains(nsRect(nsPoint(0, 0), aNewSize)),
+                "Computed overflow area must contain frame bounds");
+ 
+   // If we clip our children, clear accumulated overflow area. The
+@@ -6822,17 +6823,17 @@ nsFrame::DoLayout(nsBoxLayoutState& aSta
+       SetSize(nsSize(ourRect.width, ourRect.height));
+     }
+   }
+ 
+   // Should we do this if IsCollapsed() is true?
+   nsSize size(GetSize());
+   desiredSize.mOverflowArea.UnionRect(desiredSize.mOverflowArea,
+                                       nsRect(nsPoint(0, 0), size));
+-  FinishAndStoreOverflow(&desiredSize.mOverflowArea, size);
++  FinishAndStoreOverflow(desiredSize.mOverflowAreas, size);
+ 
+   SyncLayout(aState);
+ 
+   return rv;
+ }
+ 
+ nsresult
+ nsFrame::BoxReflow(nsBoxLayoutState&        aState,
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -677,33 +677,34 @@ nsHTMLScrollFrame::ReflowContents(Scroll
+ void
+ nsHTMLScrollFrame::PlaceScrollArea(const ScrollReflowState& aState,
+                                    const nsPoint& aScrollPosition)
+ {
+   nsIFrame *scrolledFrame = mInner.mScrolledFrame;
+   // Set the x,y of the scrolled frame to the correct value
+   scrolledFrame->SetPosition(mInner.mScrollPort.TopLeft() - aScrollPosition);
+ 
+-  nsRect scrolledArea;
++  nsRect scrolledArea[2];
+   // Preserve the width or height of empty rects
+   nsSize portSize = mInner.mScrollPort.Size();
+   nsRect scrolledRect = mInner.GetScrolledRectInternal(aState.mContentsOverflowArea, portSize);
+-  scrolledArea.UnionRectIncludeEmpty(scrolledRect,
+-                                     nsRect(nsPoint(0,0), portSize));
++  scrolledArea[0].UnionRectIncludeEmpty(scrolledRect,
++                                        nsRect(nsPoint(0,0), portSize));
++  scrolledArea[1] = scrolledArea[0];
+ 
+   // Store the new overflow area. Note that this changes where an outline
+   // of the scrolled frame would be painted, but scrolled frames can't have
+   // outlines (the outline would go on this scrollframe instead).
+   // Using FinishAndStoreOverflow is needed so the overflow rect
+   // gets set correctly.  It also messes with the overflow rect in the
+   // -moz-hidden-unscrollable case, but scrolled frames can't have
+   // 'overflow' either.
+   // This needs to happen before SyncFrameViewAfterReflow so
+   // HasOverflowRect() will return the correct value.
+-  scrolledFrame->FinishAndStoreOverflow(&scrolledArea,
++  scrolledFrame->FinishAndStoreOverflow(scrolledArea,
+                                         scrolledFrame->GetSize());
+ 
+   // Note that making the view *exactly* the size of the scrolled area
+   // is critical, since the view scrolling code uses the size of the
+   // scrolled view to clamp scroll requests.
+   // Normally the scrolledFrame won't have a view but in some cases it
+   // might create its own.
+   nsContainerFrame::SyncFrameViewAfterReflow(scrolledFrame->PresContext(),
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -2117,20 +2117,21 @@ public:
+    */
+   nsRect GetVisualOverflowRectRelativeToSelf() const;
+ 
+   /**
+    * Store the overflow area in the frame's mOverflow.mDeltas fields or
+    * as a frame property in the frame manager so that it can be retrieved
+    * later without reflowing the frame.
+    */
+-  void FinishAndStoreOverflow(nsRect* aOverflowArea, nsSize aNewSize);
++  void FinishAndStoreOverflow(nsRect aOverflowAreas[2], nsSize aNewSize);
+ 
+   void FinishAndStoreOverflow(nsHTMLReflowMetrics* aMetrics) {
+-    FinishAndStoreOverflow(&aMetrics->mOverflowArea, nsSize(aMetrics->width, aMetrics->height));
++    FinishAndStoreOverflow(aMetrics->mOverflowAreas,
++                           nsSize(aMetrics->width, aMetrics->height));
+   }
+ 
+   /**
+    * Returns whether the frame has an overflow rect that is different from
+    * its border-box.
+    */
+   PRBool HasVisualOverflowRect() const {
+     return mOverflow[eVisualOverflow].mType != NS_FRAME_OVERFLOW_NONE;
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -2587,16 +2587,17 @@ nsLineLayout::RelativePositionFrames(Per
+       RelativePositionFrames(pfd->mSpan, r);
+     } else {
+       r = pfd->mCombinedArea;
+       if (pfd->GetFlag(PFD_ISTEXTFRAME)) {
+         if (pfd->GetFlag(PFD_RECOMPUTEOVERFLOW)) {
+           nsTextFrame* f = static_cast<nsTextFrame*>(frame);
+           r = f->RecomputeOverflowRect();
+         }
++        // FIXME
+         frame->FinishAndStoreOverflow(&r, frame->GetSize());
+       }
+ 
+       // If we have something that's not an inline but with a complex frame
+       // hierarchy inside that contains views, they need to be
+       // positioned.
+       // All descendant views must be repositioned even if this frame
+       // does have a view in case this frame's view does not have a
+@@ -2616,12 +2617,13 @@ nsLineLayout::RelativePositionFrames(Per
+     combinedAreaResult.UnionRect(combinedAreaResult, r + origin);
+   }
+ 
+   // If we just computed a spans combined area, we need to update its
+   // overflow rect...
+   if (psd->mFrame) {
+     PerFrameData* spanPFD = psd->mFrame;
+     nsIFrame* frame = spanPFD->mFrame;
++    // FIXME
+     frame->FinishAndStoreOverflow(&combinedAreaResult, frame->GetSize());
+   }
+   aCombinedArea = combinedAreaResult;
+ }
+diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp
++++ b/layout/tables/nsTableFrame.cpp
+@@ -2000,16 +2000,17 @@ nsTableFrame::AdjustForCollapsingRowsCol
+     yTotalOffset += rgFrame->CollapseRowGroupIfNecessary(yTotalOffset, rgWidth);
+     ConsiderChildOverflow(overflowArea, rgFrame);
+   }
+ 
+   aDesiredSize.height -= yTotalOffset;
+   aDesiredSize.width   = width;
+   overflowArea.UnionRect(nsRect(0, 0, aDesiredSize.width, aDesiredSize.height),
+                          overflowArea);
++  // FIXME
+   FinishAndStoreOverflow(&overflowArea,
+                          nsSize(aDesiredSize.width, aDesiredSize.height));
+ }
+ 
+ 
+ nscoord
+ nsTableFrame::GetCollapsedWidth(nsMargin aBorderPadding)
+ {
+@@ -3009,25 +3010,23 @@ void ResizeCells(nsTableFrame& aTableFra
+     groupDesiredSize.mOverflowArea = nsRect(0, 0, groupDesiredSize.width,
+                                       groupDesiredSize.height);
+     nsTableRowFrame* rowFrame = rgFrame->GetFirstRow();
+     while (rowFrame) {
+       rowFrame->DidResize();
+       rgFrame->ConsiderChildOverflow(groupDesiredSize.mOverflowArea, rowFrame);
+       rowFrame = rowFrame->GetNextRow();
+     }
+-    rgFrame->FinishAndStoreOverflow(&groupDesiredSize.mOverflowArea,
+-                                    nsSize(groupDesiredSize.width, groupDesiredSize.height));
++    rgFrame->FinishAndStoreOverflow(&groupDesiredSize);
+     // make the coordinates of |desiredSize.mOverflowArea| incorrect
+     // since it's about to go away:
+     groupDesiredSize.mOverflowArea.MoveBy(rgFrame->GetPosition());
+     tableDesiredSize.mOverflowArea.UnionRect(tableDesiredSize.mOverflowArea, groupDesiredSize.mOverflowArea);
+   }
+-  aTableFrame.FinishAndStoreOverflow(&tableDesiredSize.mOverflowArea,
+-                                     nsSize(tableDesiredSize.width, tableDesiredSize.height));
++  aTableFrame.FinishAndStoreOverflow(&tableDesiredSize);
+ }
+ 
+ void
+ nsTableFrame::DistributeHeightToRows(const nsHTMLReflowState& aReflowState,
+                                      nscoord                  aAmount)
+ {
+   nscoord cellSpacingY = GetCellSpacingY();
+ 
+diff --git a/layout/tables/nsTableRowFrame.cpp b/layout/tables/nsTableRowFrame.cpp
+--- a/layout/tables/nsTableRowFrame.cpp
++++ b/layout/tables/nsTableRowFrame.cpp
+@@ -1276,16 +1276,17 @@ nsTableRowFrame::CollapseRowIfNecessary(
+           cellFrame->InvalidateFrameSubtree();
+         }
+         
+         cellFrame->SetRect(cRect);
+ 
+         // XXXbz This looks completely bogus in the cases when we didn't
+         // collapse the cell!
+         nsRect cellOverflow = nsRect(0, 0, cRect.width, cRect.height);
++        // FIXME
+         cellFrame->FinishAndStoreOverflow(&cellOverflow, nsSize(cRect.width,
+                                               cRect.height));
+         nsTableFrame::RePositionViews(cellFrame);
+         ConsiderChildOverflow(overflowArea, cellFrame);
+                 
+         if (aRowOffset == 0) {
+           nsTableFrame::InvalidateFrame(cellFrame, oldCellRect,
+                                         oldCellOverflowRect, PR_FALSE);
+@@ -1293,16 +1294,17 @@ nsTableRowFrame::CollapseRowIfNecessary(
+       }
+       kidFrame = iter.Next(); // Get the next child
+     }
+   }
+ 
+   SetRect(rowRect);
+   overflowArea.UnionRect(nsRect(0,0,rowRect.width, rowRect.height),
+                          overflowArea);
++  // FIXME
+   FinishAndStoreOverflow(&overflowArea, nsSize(rowRect.width,
+                                               rowRect.height));
+ 
+   nsTableFrame::RePositionViews(this);
+   nsTableFrame::InvalidateFrame(this, oldRect, oldOverflowRect, PR_FALSE);
+   return shift;
+ }
+ 
+diff --git a/layout/tables/nsTableRowGroupFrame.cpp b/layout/tables/nsTableRowGroupFrame.cpp
+--- a/layout/tables/nsTableRowGroupFrame.cpp
++++ b/layout/tables/nsTableRowGroupFrame.cpp
+@@ -882,16 +882,17 @@ nsTableRowGroupFrame::CollapseRowGroupIf
+ 
+   if (aYTotalOffset != 0) {
+     InvalidateFrameSubtree();
+   }
+   
+   SetRect(groupRect);
+   overflowArea.UnionRect(nsRect(0, 0, groupRect.width, groupRect.height),
+                          overflowArea);
++  // FIXME
+   FinishAndStoreOverflow(&overflowArea, nsSize(groupRect.width,
+                                               groupRect.height));
+   nsTableFrame::RePositionViews(this);
+   nsTableFrame::InvalidateFrame(this, oldGroupRect, oldGroupOverflowRect,
+                                 PR_FALSE);
+ 
+   return yGroupOffset;
+ }
