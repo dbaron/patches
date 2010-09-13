@@ -1,0 +1,339 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Support calc() on background-position, background-size, -moz-transform-origin, and background-image gradient stop positions.  (Bug 594934)
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -6348,17 +6348,19 @@ CSSParserImpl::ParseBackgroundItem(CSSPa
+         return PR_FALSE;
+       haveImage = PR_TRUE;
+       if (!ParseSingleValueProperty(aState.mImage->mValue,
+                                     eCSSProperty_background_image)) {
+         return PR_FALSE;
+       }
+     } else if (tt == eCSSToken_Dimension ||
+                tt == eCSSToken_Number ||
+-               tt == eCSSToken_Percentage) {
++               tt == eCSSToken_Percentage ||
++               (tt == eCSSToken_Function &&
++                mToken.mIdent.LowerCaseEqualsLiteral("-moz-calc"))) {
+       if (havePosition)
+         return PR_FALSE;
+       havePosition = PR_TRUE;
+       nsCSSValuePair scratch;
+       if (!ParseBoxPositionValues(scratch, PR_FALSE)) {
+         return PR_FALSE;
+       }
+       aState.mPosition->mXValue = scratch.mXValue;
+@@ -6458,26 +6460,27 @@ CSSParserImpl::ParseBackgroundPosition()
+  * @return Whether or not the operation succeeded.
+  */
+ PRBool CSSParserImpl::ParseBoxPositionValues(nsCSSValuePair &aOut,
+                                              PRBool aAcceptsInherit)
+ {
+   // First try a percentage or a length value
+   nsCSSValue &xValue = aOut.mXValue,
+              &yValue = aOut.mYValue;
+-  PRInt32 variantMask = aAcceptsInherit ? VARIANT_HLP : VARIANT_LP;
++  PRInt32 variantMask =
++    (aAcceptsInherit ? VARIANT_INHERIT : 0) | VARIANT_LP | VARIANT_CALC;
+   if (ParseVariant(xValue, variantMask, nsnull)) {
+     if (eCSSUnit_Inherit == xValue.GetUnit() ||
+         eCSSUnit_Initial == xValue.GetUnit()) {  // both are inherited or both are set to initial
+       yValue = xValue;
+       return PR_TRUE;
+     }
+-    // We have one percentage/length. Get the optional second
+-    // percentage/length/keyword.
+-    if (ParseVariant(yValue, VARIANT_LP, nsnull)) {
++    // We have one percentage/length/calc. Get the optional second
++    // percentage/length/calc/keyword.
++    if (ParseVariant(yValue, VARIANT_LP | VARIANT_CALC, nsnull)) {
+       // We have two numbers
+       return PR_TRUE;
+     }
+ 
+     if (ParseEnum(yValue, nsCSSProps::kBackgroundPositionKTable)) {
+       PRInt32 yVal = yValue.GetIntValue();
+       if (!(yVal & BG_CTB)) {
+         // The second keyword can only be 'center', 'top', or 'bottom'
+@@ -6507,18 +6510,18 @@ PRBool CSSParserImpl::ParseBoxPositionVa
+       bit = xValue.GetIntValue();
+       if (mask & (bit & ~BG_CENTER)) {
+         // Only the 'center' keyword can be duplicated.
+         return PR_FALSE;
+       }
+       mask |= bit;
+     }
+     else {
+-      // Only one keyword.  See if we have a length or percentage.
+-      if (ParseVariant(yValue, VARIANT_LP, nsnull)) {
++      // Only one keyword.  See if we have a length, percentage, or calc.
++      if (ParseVariant(yValue, VARIANT_LP | VARIANT_CALC, nsnull)) {
+         if (!(mask & BG_CLR)) {
+           // The first keyword can only be 'center', 'left', or 'right'
+           return PR_FALSE;
+         }
+ 
+         xValue = BoxPositionMaskToCSSValue(mask, PR_TRUE);
+         return PR_TRUE;
+       }
+@@ -6580,41 +6583,43 @@ CSSParserImpl::ParseBackgroundSize()
+  * property.  These can be one or two lengths (or the 'auto' keyword) or
+  * percentages corresponding to the element's dimensions or the single keywords
+  * 'contain' or 'cover'.  'initial' and 'inherit' must be handled by the caller
+  * if desired.
+  *
+  * @param aOut The nsCSSValuePair in which to place the result.
+  * @return Whether or not the operation succeeded.
+  */
++#define BG_SIZE_VARIANT (VARIANT_LP | VARIANT_AUTO | VARIANT_CALC)
+ PRBool CSSParserImpl::ParseBackgroundSizeValues(nsCSSValuePair &aOut)
+ {
+   // First try a percentage or a length value
+   nsCSSValue &xValue = aOut.mXValue,
+              &yValue = aOut.mYValue;
+-  if (ParseNonNegativeVariant(xValue, VARIANT_LP | VARIANT_AUTO, nsnull)) {
+-    // We have one percentage/length/auto. Get the optional second
+-    // percentage/length/keyword.
+-    if (ParseNonNegativeVariant(yValue, VARIANT_LP | VARIANT_AUTO, nsnull)) {
+-      // We have a second percentage/length/auto.
++  if (ParseNonNegativeVariant(xValue, BG_SIZE_VARIANT, nsnull)) {
++    // We have one percentage/length/calc/auto. Get the optional second
++    // percentage/length/calc/keyword.
++    if (ParseNonNegativeVariant(yValue, BG_SIZE_VARIANT, nsnull)) {
++      // We have a second percentage/length/calc/auto.
+       return PR_TRUE;
+     }
+ 
+     // If only one percentage or length value is given, it sets the
+     // horizontal size only, and the vertical size will be as if by 'auto'.
+     yValue.SetAutoValue();
+     return PR_TRUE;
+   }
+ 
+   // Now address 'contain' and 'cover'.
+   if (!ParseEnum(xValue, nsCSSProps::kBackgroundSizeKTable))
+     return PR_FALSE;
+   yValue.Reset();
+   return PR_TRUE;
+ }
++#undef BG_SIZE_VARIANT
+ 
+ PRBool
+ CSSParserImpl::ParseBorderColor()
+ {
+   static const nsCSSProperty kBorderColorSources[] = {
+     eCSSProperty_border_left_color_ltr_source,
+     eCSSProperty_border_left_color_rtl_source,
+     eCSSProperty_border_right_color_ltr_source,
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -1470,16 +1470,20 @@ nsComputedDOMStyle::DoGetBackgroundColor
+   return NS_OK;
+ }
+ 
+ static void
+ AppendCSSGradientLength(const nsStyleCoord& aValue,
+                         nsROCSSPrimitiveValue* aPrimitive,
+                         nsAString& aString)
+ {
++  if (aValue.IsCalcUnit()) {
++    // FIXME: serialize calc()
++  }
++
+   nsAutoString tokenString;
+   if (aValue.GetUnit() == eStyleUnit_Coord)
+     aPrimitive->SetAppUnits(aValue.GetCoordValue());
+   else
+     aPrimitive->SetPercent(aValue.GetPercentValue());
+   aPrimitive->GetCssText(tokenString);
+   aString.Append(tokenString);
+ }
+@@ -1747,30 +1751,30 @@ nsComputedDOMStyle::DoGetBackgroundPosit
+     if (!valY || !itemList->AppendCSSValue(valY)) {
+       delete valueList;
+       delete valY;
+       return NS_ERROR_OUT_OF_MEMORY;
+     }
+ 
+     const nsStyleBackground::Position &pos = bg->mLayers[i].mPosition;
+ 
+-    if (pos.mXPosition.mLength != 0) {
+-      NS_ABORT_IF_FALSE(pos.mXPosition.mPercent == 0.0f,
+-                        "can't have both until calc() implemented");
++    if (pos.mXPosition.mLength == 0) {
++      valX->SetPercent(pos.mXPosition.mPercent);
++    } else if (pos.mXPosition.mPercent == 0.0f) {
+       valX->SetAppUnits(pos.mXPosition.mLength);
+     } else {
+-      valX->SetPercent(pos.mXPosition.mPercent);
++      // FIXME: serialize calc()
+     }
+ 
+-    if (pos.mYPosition.mLength != 0) {
+-      NS_ABORT_IF_FALSE(pos.mYPosition.mPercent == 0.0f,
+-                        "can't have both until calc() implemented");
++    if (pos.mYPosition.mLength == 0) {
++      valY->SetPercent(pos.mYPosition.mPercent);
++    } else if (pos.mYPosition.mPercent == 0.0f) {
+       valY->SetAppUnits(pos.mYPosition.mLength);
+     } else {
+-      valY->SetPercent(pos.mYPosition.mPercent);
++      // FIXME: serialize calc()
+     }
+   }
+ 
+   NS_ADDREF(*aValue = valueList);
+   return NS_OK;
+ }
+ 
+ nsresult
+@@ -1832,37 +1836,37 @@ nsComputedDOMStyle::DoGetMozBackgroundSi
+         }
+ 
+         if (size.mWidthType == nsStyleBackground::Size::eAuto) {
+           valX->SetIdent(eCSSKeyword_auto);
+         } else {
+           NS_ABORT_IF_FALSE(size.mWidthType ==
+                               nsStyleBackground::Size::eLengthPercentage,
+                             "bad mWidthType");
+-          if (size.mWidth.mLength != 0) {
+-            NS_ABORT_IF_FALSE(size.mWidth.mPercent == 0.0f,
+-                              "can't have both until calc() implemented");
++          if (size.mWidth.mLength == 0) {
++            valX->SetPercent(size.mWidth.mPercent);
++          } else if (size.mWidth.mPercent == 0.0f) {
+             valX->SetAppUnits(size.mWidth.mLength);
+           } else {
+-            valX->SetPercent(size.mWidth.mPercent);
++            // FIXME serialize calc()
+           }
+         }
+ 
+         if (size.mHeightType == nsStyleBackground::Size::eAuto) {
+           valY->SetIdent(eCSSKeyword_auto);
+         } else {
+           NS_ABORT_IF_FALSE(size.mHeightType ==
+                               nsStyleBackground::Size::eLengthPercentage,
+                             "bad mHeightType");
+-          if (size.mHeight.mLength != 0) {
+-            NS_ABORT_IF_FALSE(size.mHeight.mPercent == 0.0f,
+-                              "can't have both until calc() implemented");
++          if (size.mHeight.mLength == 0) {
++            valY->SetPercent(size.mHeight.mPercent);
++          } else if (size.mHeight.mPercent == 0.0f) {
+             valY->SetAppUnits(size.mHeight.mLength);
+           } else {
+-            valY->SetPercent(size.mHeight.mPercent);
++            // FIXME serialize calc()
+           }
+         }
+         break;
+       }
+     }
+   }
+ 
+   NS_ADDREF(*aValue = valueList);
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -765,17 +765,17 @@ static PRBool SetColor(const nsCSSValue&
+ }
+ 
+ static void SetGradientCoord(const nsCSSValue& aValue, nsPresContext* aPresContext,
+                              nsStyleContext* aContext, nsStyleCoord& aResult,
+                              PRBool& aCanStoreInRuleTree)
+ {
+   // OK to pass bad aParentCoord since we're not passing SETCOORD_INHERIT
+   if (!SetCoord(aValue, aResult, nsStyleCoord(),
+-                SETCOORD_LPO | SETCOORD_BOX_POSITION,
++                SETCOORD_LPO | SETCOORD_BOX_POSITION | SETCOORD_STORE_CALC,
+                 aContext, aPresContext, aCanStoreInRuleTree)) {
+     NS_NOTREACHED("unexpected unit for gradient anchor point");
+     aResult.SetNoneValue();
+   }
+ }
+ 
+ static void SetGradient(const nsCSSValue& aValue, nsPresContext* aPresContext,
+                         nsStyleContext* aContext, nsStyleGradient& aResult,
+@@ -4305,17 +4305,17 @@ nsRuleNode::ComputeDisplayData(void* aSt
+     PRBool result =
+ #endif
+       SetPairCoords(displayData.mTransformOrigin,
+                     display->mTransformOrigin[0],
+                     display->mTransformOrigin[1],
+                     parentDisplay->mTransformOrigin[0],
+                     parentDisplay->mTransformOrigin[1],
+                     SETCOORD_LPH | SETCOORD_INITIAL_HALF |
+-                    SETCOORD_BOX_POSITION,
++                    SETCOORD_BOX_POSITION | SETCOORD_STORE_CALC,
+                     aContext, mPresContext, canStoreInRuleTree);
+     NS_ASSERTION(result, "Malformed -moz-transform-origin parse!");
+   }
+ 
+   COMPUTE_END_RESET(Display, display)
+ }
+ 
+ const void*
+@@ -4486,16 +4486,24 @@ struct BackgroundItemComputer<nsCSSValue
+         (position.*(axis->result)).mPercent = specified.GetPercentValue();
+       }
+       else if (specified.IsLengthUnit()) {
+         (position.*(axis->result)).mLength =
+           CalcLength(specified, aStyleContext, aStyleContext->PresContext(),
+                      aCanStoreInRuleTree);
+         (position.*(axis->result)).mPercent = 0.0f;
+       }
++      else if (specified.IsCalcUnit()) {
++        LengthPercentPairCalcOps ops(aStyleContext,
++                                     aStyleContext->PresContext(),
++                                     aCanStoreInRuleTree);
++        nsRuleNode::ComputedCalc vals = ComputeCalc(specified, ops);
++        (size.*(axis->result)).mLength = vals.mLength;
++        (size.*(axis->result)).mPercent = vals.mPercent;
++      }
+       else if (eCSSUnit_Enumerated == specified.GetUnit()) {
+         (position.*(axis->result)).mLength = 0;
+         (position.*(axis->result)).mPercent =
+           GetFloatFromBoxPosition(specified.GetIntValue());
+       } else {
+         NS_NOTREACHED("unexpected unit");
+       }
+     }
+@@ -4563,23 +4571,31 @@ struct BackgroundItemComputer<nsCSSValue
+ #endif
+         size.*(axis->type) = size.mWidthType;
+       }
+       else if (eCSSUnit_Percent == specified.GetUnit()) {
+         (size.*(axis->result)).mLength = 0;
+         (size.*(axis->result)).mPercent = specified.GetPercentValue();
+         size.*(axis->type) = nsStyleBackground::Size::eLengthPercentage;
+       }
+-      else {
+-        NS_ABORT_IF_FALSE(specified.IsLengthUnit(), "unexpected unit");
++      else if (specified.IsLengthUnit()) {
+         (size.*(axis->result)).mLength =
+           CalcLength(specified, aStyleContext, aStyleContext->PresContext(),
+                      aCanStoreInRuleTree);
+         (size.*(axis->result)).mPercent = 0.0f;
+         size.*(axis->type) = nsStyleBackground::Size::eLengthPercentage;
++      } else {
++        NS_ABORT_IF_FALSE(specified.IsCalcUnit(), "unexpected unit");
++        LengthPercentPairCalcOps ops(aStyleContext,
++                                     aStyleContext->PresContext(),
++                                     aCanStoreInRuleTree);
++        nsRuleNode::ComputedCalc vals = ComputeCalc(specified, ops);
++        (size.*(axis->result)).mLength = vals.mLength;
++        (size.*(axis->result)).mPercent = vals.mPercent;
++        size.*(axis->type) = nsStyleBackground::Size::eLengthPercentage;
+       }
+     }
+ 
+     NS_ABORT_IF_FALSE(size.mWidthType < nsStyleBackground::Size::eDimensionType_COUNT,
+                       "bad width type");
+     NS_ABORT_IF_FALSE(size.mHeightType < nsStyleBackground::Size::eDimensionType_COUNT,
+                       "bad height type");
+     NS_ABORT_IF_FALSE((size.mWidthType != nsStyleBackground::Size::eContain &&
