@@ -1,0 +1,283 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Allow calc() as an intermediate common animation unit for background-position and background-size.  (Bug 520234)
+
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -88,16 +88,39 @@ GetCommonUnit(nsCSSProperty aProperty,
+       // We can use calc() as the common unit.
+       return nsStyleAnimation::eUnit_Calc;
+     }
+     return nsStyleAnimation::eUnit_Null;
+   }
+   return aFirstUnit;
+ }
+ 
++static
++nsCSSUnit
++GetCommonUnit(nsCSSProperty aProperty,
++              nsCSSUnit aFirstUnit,
++              nsCSSUnit aSecondUnit)
++{
++  if (aFirstUnit != aSecondUnit) {
++    if (nsCSSProps::PropHasFlags(aProperty, CSS_PROPERTY_STORES_CALC) &&
++        (aFirstUnit == eCSSUnit_Pixel ||
++         aFirstUnit == eCSSUnit_Percent ||
++         aFirstUnit == eCSSUnit_Calc) &&
++        (aSecondUnit == eCSSUnit_Pixel ||
++         aSecondUnit == eCSSUnit_Percent ||
++         aSecondUnit == eCSSUnit_Calc)) {
++      // We can use calc() as the common unit.
++      return eCSSUnit_Calc;
++    }
++    return eCSSUnit_Null;
++  }
++  return aFirstUnit;
++}
++
++
+ // Greatest Common Divisor
+ static PRUint32
+ gcd(PRUint32 a, PRUint32 b)
+ {
+   // Euclid's algorithm; O(N) in the worst case.  (There are better
+   // ways, but we don't need them for stroke-dasharray animation.)
+   NS_ABORT_IF_FALSE(a > 0 && b > 0, "positive numbers expected");
+ 
+@@ -121,16 +144,47 @@ lcm(PRUint32 a, PRUint32 b)
+ }
+ 
+ // Like nsStyleCoord::Calc, but with length in float pixels instead of nscoord.
+ struct CalcValue {
+   float mLength, mPercent;
+   PRBool mHasPercent;
+ };
+ 
++// Requires a canonical calc() value that we generated.
++static CalcValue
++ExtractCalcValueInternal(const nsCSSValue& aValue)
++{
++  NS_ABORT_IF_FALSE(aValue.GetUnit() == eCSSUnit_Calc, "unexpected unit");
++  nsCSSValue::Array *arr = aValue.GetArrayValue();
++  NS_ABORT_IF_FALSE(arr->Count() == 1, "unexpected length");
++
++  const nsCSSValue &topval = arr->Item(0);
++  CalcValue result;
++  if (topval.GetUnit() == eCSSUnit_Pixel) {
++    result.mLength = topval.GetFloatValue();
++    result.mPercent = 0.0f;
++    result.mHasPercent = PR_FALSE;
++  } else {
++    NS_ABORT_IF_FALSE(topval.GetUnit() == eCSSUnit_Calc_Plus,
++                      "unexpected unit");
++    nsCSSValue::Array *arr2 = topval.GetArrayValue();
++    const nsCSSValue &len = arr2->Item(0);
++    const nsCSSValue &pct = arr2->Item(1);
++    NS_ABORT_IF_FALSE(len.GetUnit() == eCSSUnit_Pixel, "unexpected unit");
++    NS_ABORT_IF_FALSE(pct.GetUnit() == eCSSUnit_Percent, "unexpected unit");
++    result.mLength = len.GetFloatValue();
++    result.mPercent = pct.GetPercentValue();
++    result.mHasPercent = PR_TRUE;
++  }
++
++  return result;
++}
++
++// Requires a canonical calc() value that we generated.
+ static CalcValue
+ ExtractCalcValue(const nsStyleAnimation::Value& aValue)
+ {
+   CalcValue result;
+   if (aValue.GetUnit() == nsStyleAnimation::eUnit_Coord) {
+     result.mLength =
+       nsPresContext::AppUnitsToFloatCSSPixels(aValue.GetCoordValue());
+     result.mPercent = 0.0f;
+@@ -141,39 +195,36 @@ ExtractCalcValue(const nsStyleAnimation:
+     result.mLength = 0.0f;
+     result.mPercent = aValue.GetPercentValue();
+     result.mHasPercent = PR_TRUE;
+     return result;
+   }
+   NS_ABORT_IF_FALSE(aValue.GetUnit() == nsStyleAnimation::eUnit_Calc,
+                     "unexpected unit");
+   nsCSSValue *val = aValue.GetCSSValueValue();
+-  NS_ABORT_IF_FALSE(val->GetUnit() == eCSSUnit_Calc, "unexpected unit");
+-  nsCSSValue::Array *arr = val->GetArrayValue();
+-  NS_ABORT_IF_FALSE(arr->Count() == 1, "unexpected length");
++  return ExtractCalcValueInternal(*val);
++}
+ 
+-  const nsCSSValue &topval = arr->Item(0);
+-  if (topval.GetUnit() == eCSSUnit_Pixel) {
+-    result.mLength = topval.GetFloatValue();
++static CalcValue
++ExtractCalcValue(const nsCSSValue& aValue)
++{
++  CalcValue result;
++  if (aValue.GetUnit() == eCSSUnit_Pixel) {
++    result.mLength = aValue.GetFloatValue();
+     result.mPercent = 0.0f;
+     result.mHasPercent = PR_FALSE;
+-  } else {
+-    NS_ABORT_IF_FALSE(topval.GetUnit() == eCSSUnit_Calc_Plus,
+-                      "unexpected unit");
+-    nsCSSValue::Array *arr2 = topval.GetArrayValue();
+-    const nsCSSValue &len = arr2->Item(0);
+-    const nsCSSValue &pct = arr2->Item(1);
+-    NS_ABORT_IF_FALSE(len.GetUnit() == eCSSUnit_Pixel, "unexpected unit");
+-    NS_ABORT_IF_FALSE(pct.GetUnit() == eCSSUnit_Percent, "unexpected unit");
+-    result.mLength = len.GetFloatValue();
+-    result.mPercent = pct.GetPercentValue();
++    return result;
++  }
++  if (aValue.GetUnit() == eCSSUnit_Percent) {
++    result.mLength = 0.0f;
++    result.mPercent = aValue.GetPercentValue();
+     result.mHasPercent = PR_TRUE;
++    return result;
+   }
+-
+-  return result;
++  return ExtractCalcValueInternal(aValue);
+ }
+ 
+ static bool
+ SetCalcValue(const nsStyleCoord::Calc* aCalc, nsCSSValue& aValue)
+ {
+   nsCSSValue::Array *arr = nsCSSValue::Array::Create(1);
+   if (!arr)
+     return false;
+@@ -300,41 +351,50 @@ nsStyleAnimation::ComputeDistance(nsCSSP
+       CalcValue v2 = ExtractCalcValue(aEndValue);
+       aDistance = sqrt(v1.mLength * v1.mLength + v1.mPercent * v1.mPercent +
+                        v2.mLength * v2.mLength + v2.mPercent * v2.mPercent);
+       return PR_TRUE;
+     }
+     case eUnit_CSSValuePair: {
+       const nsCSSValuePair *pair1 = aStartValue.GetCSSValuePairValue();
+       const nsCSSValuePair *pair2 = aEndValue.GetCSSValuePairValue();
+-      if (pair1->mXValue.GetUnit() != pair2->mXValue.GetUnit() ||
+-          pair1->mYValue.GetUnit() != pair2->mYValue.GetUnit()) {
+-        // At least until we have calc()
++      nsCSSUnit unit[2];
++      unit[0] = GetCommonUnit(aProperty, pair1->mXValue.GetUnit(),
++                              pair2->mXValue.GetUnit());
++      unit[1] = GetCommonUnit(aProperty, pair1->mYValue.GetUnit(),
++                              pair2->mYValue.GetUnit());
++      if (unit[0] == eCSSUnit_Null || unit[1] == eCSSUnit_Null) {
+         return PR_FALSE;
+       }
+ 
+       double squareDistance = 0.0;
+-      static nsCSSValue nsCSSValuePair::* const pairValues[] = {
++      static nsCSSValue nsCSSValuePair::* const pairValues[2] = {
+         &nsCSSValuePair::mXValue, &nsCSSValuePair::mYValue
+       };
+-      for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(pairValues); ++i) {
++      for (PRUint32 i = 0; i < 2; ++i) {
+         nsCSSValue nsCSSValuePair::*member = pairValues[i];
+-        NS_ABORT_IF_FALSE((pair1->*member).GetUnit() ==
+-                            (pair2->*member).GetUnit(),
+-                          "should have returned above");
+         double diff;
+-        switch ((pair1->*member).GetUnit()) {
++        switch (unit[i]) {
+           case eCSSUnit_Pixel:
+             diff = (pair1->*member).GetFloatValue() -
+                    (pair2->*member).GetFloatValue();
+             break;
+           case eCSSUnit_Percent:
+             diff = (pair1->*member).GetPercentValue() -
+                    (pair2->*member).GetPercentValue();
+             break;
++          case eCSSUnit_Calc: {
++            CalcValue v1 = ExtractCalcValue(pair1->*member);
++            CalcValue v2 = ExtractCalcValue(pair2->*member);
++            aDistance = sqrt(v1.mLength * v1.mLength +
++                             v1.mPercent * v1.mPercent +
++                             v2.mLength * v2.mLength +
++                             v2.mPercent * v2.mPercent);
++            break;
++          }
+           default:
+             NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
+             return PR_FALSE;
+         }
+         squareDistance += diff * diff;
+       }
+ 
+       aDistance = sqrt(squareDistance);
+@@ -647,16 +707,17 @@ AddCSSValueCalc(double aCoeff1, const ns
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Percent ||
+                     aValue2.GetUnit() == eCSSUnit_Pixel ||
+                     aValue2.IsCalcUnit(), "unexpected unit");
+   nsRefPtr<nsCSSValue::Array> a1 = nsCSSValue::Array::Create(2),
+                               a2 = nsCSSValue::Array::Create(2),
+                               atop = nsCSSValue::Array::Create(2),
+                               acalc = nsCSSValue::Array::Create(1);
+   // Don't nest the eCSSUnit_Calc in our input inside any expressions.
++  // FIXME: extract calc!
+   a1->Item(0).SetFloatValue(aCoeff1, eCSSUnit_Number);
+   a1->Item(1) = aValue1.GetUnit() == eCSSUnit_Calc
+                   ? aValue1.GetArrayValue()->Item(0) : aValue1;
+   a2->Item(0).SetFloatValue(aCoeff2, eCSSUnit_Number);
+   a2->Item(1) = aValue2.GetUnit() == eCSSUnit_Calc
+                   ? aValue2.GetArrayValue()->Item(0) : aValue2;
+   atop->Item(0).SetArrayValue(a1, eCSSUnit_Calc_Times_L);
+   atop->Item(1).SetArrayValue(a2, eCSSUnit_Calc_Times_L);
+@@ -1378,41 +1439,45 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+         arr->Item(0).SetFloatValue(len, eCSSUnit_Pixel);
+       }
+       aResultValue.SetAndAdoptCSSValueValue(val, eUnit_Calc);
+       return PR_TRUE;
+     }
+     case eUnit_CSSValuePair: {
+       const nsCSSValuePair *pair1 = aValue1.GetCSSValuePairValue();
+       const nsCSSValuePair *pair2 = aValue2.GetCSSValuePairValue();
+-      if (pair1->mXValue.GetUnit() != pair2->mXValue.GetUnit() ||
+-          pair1->mYValue.GetUnit() != pair2->mYValue.GetUnit()) {
+-        // At least until we have calc()
++      nsCSSUnit unit[2];
++      unit[0] = GetCommonUnit(aProperty, pair1->mXValue.GetUnit(),
++                              pair2->mXValue.GetUnit());
++      unit[1] = GetCommonUnit(aProperty, pair1->mYValue.GetUnit(),
++                              pair2->mYValue.GetUnit());
++      if (unit[0] == eCSSUnit_Null || unit[1] == eCSSUnit_Null) {
+         return PR_FALSE;
+       }
+ 
+       nsAutoPtr<nsCSSValuePair> result(new nsCSSValuePair);
+-      static nsCSSValue nsCSSValuePair::* const pairValues[] = {
++      static nsCSSValue nsCSSValuePair::* const pairValues[2] = {
+         &nsCSSValuePair::mXValue, &nsCSSValuePair::mYValue
+       };
+-      for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(pairValues); ++i) {
++      for (PRUint32 i = 0; i < 2; ++i) {
+         nsCSSValue nsCSSValuePair::*member = pairValues[i];
+-        NS_ABORT_IF_FALSE((pair1->*member).GetUnit() ==
+-                            (pair2->*member).GetUnit(),
+-                          "should have returned above");
+-        switch ((pair1->*member).GetUnit()) {
++        switch (unit[i]) {
+           case eCSSUnit_Pixel:
+             AddCSSValuePixel(aCoeff1, pair1->*member, aCoeff2, pair2->*member,
+                              result->*member);
+             break;
+           case eCSSUnit_Percent:
+             AddCSSValuePercent(aCoeff1, pair1->*member,
+                                aCoeff2, pair2->*member,
+                                result->*member);
+             break;
++          case eCSSUnit_Calc:
++            AddCSSValueCalc(aCoeff1, pair1->*member, aCoeff2, pair2->*member,
++                            result->*member);
++            break;
+           default:
+             NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
+             return PR_FALSE;
+         }
+       }
+ 
+       aResultValue.SetAndAdoptCSSValuePairValue(result.forget(),
+                                                 eUnit_CSSValuePair);
