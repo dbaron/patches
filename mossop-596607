@@ -1,0 +1,247 @@
+From: Dave Townsend <dtownsend@oxymoronical.com>
+
+Bug 596607: Broken extension registrations in the windows registry causes the extension manager to fail. r=robstrong, a=blocks-beta7
+
+diff --git a/toolkit/mozapps/extensions/XPIProvider.jsm b/toolkit/mozapps/extensions/XPIProvider.jsm
+--- a/toolkit/mozapps/extensions/XPIProvider.jsm
++++ b/toolkit/mozapps/extensions/XPIProvider.jsm
+@@ -1914,32 +1914,41 @@ var XPIProvider = {
+ 
+     let migrateData = null;
+     let cache = null;
+     if (schema != DB_SCHEMA) {
+       // The schema has changed so migrate data from the old schema
+       migrateData = XPIDatabase.migrateData(schema);
+     }
+ 
+-    XPIDatabase.beginTransaction();
+-
+-    // Catch any errors during the main startup and rollback the database changes
+-    try {
+-      // If the database exists then the previous file cache can be trusted
+-      // otherwise create an empty database
+-      let db = FileUtils.getFile(KEY_PROFILEDIR, [FILE_DATABASE], true);
+-      if (db.exists()) {
+-        cache = Prefs.getCharPref(PREF_INSTALL_CACHE, null);
+-      }
+-      else {
++    // If the database exists then the previous file cache can be trusted
++    // otherwise create an empty database
++    let db = FileUtils.getFile(KEY_PROFILEDIR, [FILE_DATABASE], true);
++    if (db.exists()) {
++      cache = Prefs.getCharPref(PREF_INSTALL_CACHE, null);
++    }
++    else {
++      try {
+         LOG("Database is missing, recreating");
+         XPIDatabase.openConnection();
+         XPIDatabase.createSchema();
+       }
+-
++      catch (e) {
++        try {
++          db.remove(true);
++        }
++        catch (e) {
++        }
++        return;
++      }
++    }
++
++    // Catch any errors during the main startup and rollback the database changes
++    XPIDatabase.beginTransaction();
++    try {
+       // Load the list of bootstrapped add-ons first so processFileChanges can
+       // modify it
+       this.bootstrappedAddons = JSON.parse(Prefs.getCharPref(PREF_BOOTSTRAP_ADDONS,
+                                            "{}"));
+       let state = this.getInstallLocationStates();
+       if (aAppChanged || changed || cache == null ||
+           cache != JSON.stringify(state)) {
+         try {
+@@ -3230,16 +3239,18 @@ var XPIDatabase = {
+       this.connection.schemaVersion = DB_SCHEMA;
+       Services.prefs.setIntPref(PREF_DB_SCHEMA, DB_SCHEMA);
+       this.commitTransaction();
+     }
+     catch (e) {
+       ERROR("Failed to create database schema");
+       logSQLError(this.connection.lastError, this.connection.lastErrorString);
+       this.rollbackTransaction();
++      this.connection.close();
++      this.connection = null;
+       throw e;
+     }
+   },
+ 
+   /**
+    * Synchronously reads the multi-value locale strings for a locale
+    *
+    * @param  aLocale
+@@ -6186,18 +6197,20 @@ WinRegInstallLocation.prototype = {
+     let count = aKey.valueCount;
+     for (let i = 0; i < count; ++i) {
+       let id = aKey.getValueName(i);
+ 
+       let file = Cc["@mozilla.org/file/local;1"].
+                 createInstance(Ci.nsILocalFile);
+       file.initWithPath(aKey.readStringValue(id));
+ 
+-      if (!file.exists())
++      if (!file.exists()) {
+         WARN("Ignoring missing add-on in " + file.path);
++        continue;
++      }
+ 
+       this._IDToFileMap[id] = file;
+       this._FileToIDMap[file.path] = id;
+     }
+   },
+ 
+   /**
+    * Gets the name of this install location.
+diff --git a/toolkit/mozapps/extensions/test/xpcshell/test_bug596607.js b/toolkit/mozapps/extensions/test/xpcshell/test_bug596607.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/mozapps/extensions/test/xpcshell/test_bug596607.js
+@@ -0,0 +1,140 @@
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/
++ */
++
++// Tests that a reference to a non-existent extension in the registry doesn't
++// break things
++createAppInfo("xpcshell@tests.mozilla.org", "XPCShell", "1", "1.9.2");
++
++// Enable loading extensions from the user and system scopes
++Services.prefs.setIntPref("extensions.enabledScopes",
++                          AddonManager.SCOPE_PROFILE + AddonManager.SCOPE_USER +
++                          AddonManager.SCOPE_SYSTEM);
++
++var addon1 = {
++  id: "addon1@tests.mozilla.org",
++  version: "1.0",
++  name: "Test 1",
++  targetApplications: [{
++    id: "xpcshell@tests.mozilla.org",
++    minVersion: "1",
++    maxVersion: "1"
++  }]
++};
++
++var addon2 = {
++  id: "addon2@tests.mozilla.org",
++  version: "2.0",
++  name: "Test 2",
++  targetApplications: [{
++    id: "xpcshell@tests.mozilla.org",
++    minVersion: "1",
++    maxVersion: "2"
++  }]
++};
++
++const addon1Dir = writeInstallRDFForExtension(addon1, gProfD, "addon1");
++const addon2Dir = writeInstallRDFForExtension(addon2, gProfD, "addon2");
++const addon3Dir = gProfD.clone();
++addon3Dir.append("addon3@tests.mozilla.org");
++
++function run_test() {
++  // This test only works where there is a registry.
++  if (!("nsIWindowsRegKey" in AM_Ci))
++    return;
++
++  do_test_pending();
++
++  run_test_1();
++}
++
++// Tests whether starting a fresh profile with a bad entry works
++function run_test_1() {
++  MockRegistry.setValue(AM_Ci.nsIWindowsRegKey.ROOT_KEY_LOCAL_MACHINE,
++                        "SOFTWARE\\Mozilla\\XPCShell\\Extensions",
++                        "addon1@tests.mozilla.org", addon1Dir.path);
++  MockRegistry.setValue(AM_Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
++                        "SOFTWARE\\Mozilla\\XPCShell\\Extensions",
++                        "addon2@tests.mozilla.org", addon2Dir.path);
++  MockRegistry.setValue(AM_Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
++                        "SOFTWARE\\Mozilla\\XPCShell\\Extensions",
++                        "addon3@tests.mozilla.org", addon3Dir.path);
++
++  startupManager();
++
++  AddonManager.getAddonsByIDs(["addon1@tests.mozilla.org",
++                               "addon2@tests.mozilla.org",
++                               "addon3@tests.mozilla.org"], function([a1, a2, a3]) {
++    do_check_neq(a1, null);
++    do_check_true(a1.isActive);
++    do_check_false(hasFlag(a1.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a1.scope, AddonManager.SCOPE_SYSTEM);
++
++    do_check_neq(a2, null);
++    do_check_true(a2.isActive);
++    do_check_false(hasFlag(a2.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a2.scope, AddonManager.SCOPE_USER);
++
++    do_check_eq(a3, null);
++
++    shutdownManager();
++
++    run_test_2();
++  });
++}
++
++// Tests whether removing the bad entry has any effect
++function run_test_2() {
++  MockRegistry.setValue(AM_Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
++                        "SOFTWARE\\Mozilla\\XPCShell\\Extensions",
++                        "addon3@tests.mozilla.org", addon3Dir.path);
++
++  startupManager(false);
++
++  AddonManager.getAddonsByIDs(["addon1@tests.mozilla.org",
++                               "addon2@tests.mozilla.org",
++                               "addon3@tests.mozilla.org"], function([a1, a2, a3]) {
++    do_check_neq(a1, null);
++    do_check_true(a1.isActive);
++    do_check_false(hasFlag(a1.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a1.scope, AddonManager.SCOPE_SYSTEM);
++
++    do_check_neq(a2, null);
++    do_check_true(a2.isActive);
++    do_check_false(hasFlag(a2.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a2.scope, AddonManager.SCOPE_USER);
++
++    do_check_eq(a3, null);
++
++    shutdownManager();
++
++    run_test_3();
++  });
++}
++
++// Tests adding the bad entry to an existing profile has any effect
++function run_test_3() {
++  MockRegistry.setValue(AM_Ci.nsIWindowsRegKey.ROOT_KEY_CURRENT_USER,
++                        "SOFTWARE\\Mozilla\\XPCShell\\Extensions",
++                        "addon3@tests.mozilla.org", null);
++
++  startupManager(false);
++
++  AddonManager.getAddonsByIDs(["addon1@tests.mozilla.org",
++                               "addon2@tests.mozilla.org",
++                               "addon3@tests.mozilla.org"], function([a1, a2, a3]) {
++    do_check_neq(a1, null);
++    do_check_true(a1.isActive);
++    do_check_false(hasFlag(a1.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a1.scope, AddonManager.SCOPE_SYSTEM);
++
++    do_check_neq(a2, null);
++    do_check_true(a2.isActive);
++    do_check_false(hasFlag(a2.permissions, AddonManager.PERM_CAN_UNINSTALL));
++    do_check_eq(a2.scope, AddonManager.SCOPE_USER);
++
++    do_check_eq(a3, null);
++
++    do_test_finished();
++  });
++}
