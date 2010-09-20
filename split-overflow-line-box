@@ -1,0 +1,177 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make nsLineBox track two separate overflow areas.  (Bug 542595)
+
+diff --git a/layout/generic/nsLineBox.cpp b/layout/generic/nsLineBox.cpp
+--- a/layout/generic/nsLineBox.cpp
++++ b/layout/generic/nsLineBox.cpp
+@@ -201,19 +201,25 @@ nsLineBox::List(FILE* out, PRInt32 aInde
+           static_cast<const void*>(this), GetChildCount(),
+           StateToString(cbuf, sizeof(cbuf)));
+   if (IsBlock() && !GetCarriedOutBottomMargin().IsZero()) {
+     fprintf(out, "bm=%d ", GetCarriedOutBottomMargin().get());
+   }
+   fprintf(out, "{%d,%d,%d,%d} ",
+           mBounds.x, mBounds.y, mBounds.width, mBounds.height);
+   if (mData) {
+-    fprintf(out, "ca={%d,%d,%d,%d} ",
+-            mData->mCombinedArea.x, mData->mCombinedArea.y,
+-            mData->mCombinedArea.width, mData->mCombinedArea.height);
++    fprintf(out, "vis-overflow={%d,%d,%d,%d} scr-overflow={%d,%d,%d,%d} ",
++            mData->mOverflowAreas[eVisualOverflow].x,
++            mData->mOverflowAreas[eVisualOverflow].y,
++            mData->mOverflowAreas[eVisualOverflow].width,
++            mData->mOverflowAreas[eVisualOverflow].height,
++            mData->mOverflowAreas[eScrollableOverflow].x,
++            mData->mOverflowAreas[eScrollableOverflow].y,
++            mData->mOverflowAreas[eScrollableOverflow].width,
++            mData->mOverflowAreas[eScrollableOverflow].height);
+   }
+   fprintf(out, "<\n");
+ 
+   nsIFrame* frame = mFirstChild;
+   PRInt32 n = GetChildCount();
+   while (--n >= 0) {
+     frame->List(out, aIndent + 1);
+     frame = frame->GetNextSibling();
+@@ -414,17 +420,20 @@ nsLineBox::SetCarriedOutBottomMargin(nsC
+     }
+   }
+   return changed;
+ }
+ 
+ void
+ nsLineBox::MaybeFreeData()
+ {
+-  if (mData && (mData->mCombinedArea == mBounds)) {
++  if (mData && 
++      // REVIEW: should this use IsExactEqual?
++      mData->mOverflowAreas[eVisualOverflow] == mBounds &&
++      mData->mOverflowAreas[eScrollableOverflow] == mBounds) {
+     if (IsInline()) {
+       if (mInlineData->mFloats.IsEmpty()) {
+         delete mInlineData;
+         mInlineData = nsnull;
+       }
+     }
+     else if (mBlockData->mCarriedOutBottomMargin.IsZero()) {
+       delete mBlockData;
+@@ -484,38 +493,42 @@ nsLineBox::RemoveFloat(nsIFrame* aFrame)
+       MaybeFreeData();
+       return PR_TRUE;
+     }
+   }
+   return PR_FALSE;
+ }
+ 
+ void
+-nsLineBox::SetCombinedArea(const nsRect& aCombinedArea)
+-{  
+-  NS_ASSERTION(aCombinedArea.width >= 0, "illegal width for combined area");
+-  NS_ASSERTION(aCombinedArea.height >= 0, "illegal height for combined area");
+-  if (aCombinedArea != mBounds) {
+-    if (mData) {
+-      mData->mCombinedArea = aCombinedArea;
+-    }
+-    else {
++nsLineBox::SetOverflowAreas(const nsRect& aOverflowAreas)
++{
++  NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++    NS_ASSERTION(aOverflowAreas[i].width >= 0, "illegal width for combined area");
++    NS_ASSERTION(aOverflowAreas[i].height >= 0, "illegal height for combined area");
++  }
++  // REVIEW: should this use IsExactEqual?
++  if (aOverflowAreas[eVisualOverflow] != mBounds ||
++      aOverflowAreas[eScrollableOverflow] != mBounds) {
++    if (!mData) {
+       if (IsInline()) {
+-        mInlineData = new ExtraInlineData(aCombinedArea);
++        mInlineData = new ExtraInlineData(aOverflowAreas);
+       }
+       else {
+-        mBlockData = new ExtraBlockData(aCombinedArea);
++        mBlockData = new ExtraBlockData(aOverflowAreas);
+       }
+     }
++    NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++      mData->mOverflowAreas[i] = aOverflowAreas[i];
++    }
+   }
+-  else {
+-    if (mData) {
+-      // Store away new value so that MaybeFreeData compares against
+-      // the right value.
+-      mData->mCombinedArea = aCombinedArea;
++  else if (mData) {
++    // Store away new value so that MaybeFreeData compares against
++    // the right value.
++    NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++      mData->mOverflowAreas[i] = aOverflowAreas[i];
+     }
+     MaybeFreeData();
+   }
+ }
+ 
+ //----------------------------------------------------------------------
+ 
+ 
+diff --git a/layout/generic/nsLineBox.h b/layout/generic/nsLineBox.h
+--- a/layout/generic/nsLineBox.h
++++ b/layout/generic/nsLineBox.h
+@@ -405,25 +405,27 @@ public:
+   void FreeFloats(nsFloatCacheFreeList& aFreeList);
+   void AppendFloats(nsFloatCacheFreeList& aFreeList);
+   PRBool RemoveFloat(nsIFrame* aFrame);
+ 
+   // Combined area is the area of the line that should influence the
+   // overflow area of its parent block.  The combined area should be
+   // used for painting-related things, but should never be used for
+   // layout (except for handling of 'overflow').
+-  void SetCombinedArea(const nsRect& aCombinedArea);
+-  nsRect GetCombinedArea() {
+-    return mData ? mData->mCombinedArea : mBounds;
++  void SetOverflowAreas(const nsRect& aOverflowAreas);
++  nsRect GetOverflowArea(nsOverflowType aType) {
++    return mData ? mData->mOverflowAreas[aType] : mBounds;
+   }
+ 
+   void SlideBy(nscoord aDY) {
+     mBounds.y += aDY;
+     if (mData) {
+-      mData->mCombinedArea.y += aDY;
++      NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++        mData->mOverflowAreas[i].y += aDY;
++      }
+     }
+   }
+ 
+   /**
+    * The ascent (distance from top to baseline) of the linebox is the
+    * ascent of the anonymous inline box (for which we don't actually
+    * create a frame) that wraps all the consecutive inline children of a
+    * block.
+@@ -512,19 +514,22 @@ public:
+     PRUint32 mHadFloatPushed : 1;
+     PRUint32 mBreakType : 4;
+ 
+     // FIXME: Move this out of FlagBits
+     PRUint32 mChildCount;
+   };
+ 
+   struct ExtraData {
+-    ExtraData(const nsRect& aBounds) : mCombinedArea(aBounds) {
++    ExtraData(const nsRect& aBounds) {
++      NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++        mOverflowAreas[i] = aBounds;
++      }
+     }
+-    nsRect mCombinedArea;
++    nsRect mOverflowAreas[2];
+   };
+ 
+   struct ExtraBlockData : public ExtraData {
+     ExtraBlockData(const nsRect& aBounds)
+       : ExtraData(aBounds),
+         mCarriedOutBottomMargin()
+     {
+     }
