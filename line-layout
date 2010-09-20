@@ -1,0 +1,276 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make nsLineLayout track two separate overflow areas.  (Bug 542595)
+
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -4267,16 +4267,17 @@ nsBlockFrame::PlaceLine(nsBlockReflowSta
+       } // bidiUtils
+     } // not visual mode
+   } // bidi enabled
+ #endif // IBMBIDI
+ 
+   // From here on, pfd->mBounds rectangles are incorrect because bidi
+   // might have moved frames around!
+   nsRect combinedArea;
++  // FIXME
+   aLineLayout.RelativePositionFrames(combinedArea);  // XXXldb This returned width as -15, 2001-06-12, Bugzilla
+   aLine->SetCombinedArea(combinedArea);
+   if (addedBullet) {
+     aLineLayout.RemoveBulletFrame(mBullet);
+   }
+ 
+   // Inline lines do not have margins themselves; however they are
+   // impacted by prior block margins. If this line ends up having some
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -952,17 +952,19 @@ nsLineLayout::ReflowFrame(nsIFrame* aFra
+   }
+ #endif
+ 
+   // Unlike with non-inline reflow, the overflow area here does *not*
+   // include the accumulation of the frame's bounds and its inline
+   // descendants' bounds. Nor does it include the outline area; it's
+   // just the union of the bounds of any absolute children. That is
+   // added in later by nsLineLayout::ReflowInlineFrames.
+-  pfd->mCombinedArea = metrics.mOverflowArea;
++  NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++    pfd->mOverflowAreas[i] = metrics.mOverflowAreas[i];
++  }
+ 
+   pfd->mBounds.width = metrics.width;
+   pfd->mBounds.height = metrics.height;
+ 
+   // Size the frame, but |RelativePositionFrames| will size the view.
+   aFrame->SetSize(nsSize(metrics.width, metrics.height));
+ 
+   // Tell the frame that we're done reflowing it
+@@ -1359,17 +1361,19 @@ nsLineLayout::AddBulletFrame(nsIFrame* a
+     pfd->SetFlag(PFD_ISBULLET, PR_TRUE);
+     if (aMetrics.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE)
+       pfd->mAscent = aFrame->GetBaseline();
+     else
+       pfd->mAscent = aMetrics.ascent;
+ 
+     // Note: y value will be updated during vertical alignment
+     pfd->mBounds = aFrame->GetRect();
+-    pfd->mCombinedArea = aMetrics.mOverflowArea;
++    NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++      pfd->mOverflowAreas[i] = aMetrics.mOverflowAreas[i];
++    }
+   }
+   return rv;
+ }
+ 
+ #ifdef DEBUG
+ void
+ nsLineLayout::DumpPerSpanData(PerSpanData* psd, PRInt32 aIndent)
+ {
+@@ -2506,58 +2510,64 @@ nsLineLayout::HorizontalAlignFrames(nsRe
+       pfd->mBounds.x += dx;
+       pfd->mFrame->SetRect(pfd->mBounds);
+     }
+     aLineBounds.x += dx;
+   }
+ }
+ 
+ void
+-nsLineLayout::RelativePositionFrames(nsRect& aCombinedArea)
++nsLineLayout::RelativePositionFrames(nsRect aOverflowAreas[2])
+ {
+-  RelativePositionFrames(mRootSpan, aCombinedArea);
++  RelativePositionFrames(mRootSpan, aOverflowAreas);
+ }
+ 
+ void
+-nsLineLayout::RelativePositionFrames(PerSpanData* psd, nsRect& aCombinedArea)
++nsLineLayout::RelativePositionFrames(PerSpanData* psd, nsRect aOverflowAreas[2])
+ {
+-  nsRect combinedAreaResult;
++  nsRect overflowAreas[2];
+   if (nsnull != psd->mFrame) {
+-    // The span's overflow area comes in three parts:
++    // The span's overflow areas come in three parts:
+     // -- this frame's width and height
+-    // -- the pfd->mCombinedArea, which is the area of a bullet or the union
++    // -- pfd->mOverflowAreas, which is the area of a bullet or the union
+     // of a relatively positioned frame's absolute children
+     // -- the bounds of all inline descendants
+     // The former two parts are computed right here, we gather the descendants
+     // below.
+     // At this point psd->mFrame->mBounds might be out of date since
+     // bidi reordering can move and resize the frames. So use the frame's
+     // rect instead of mBounds.
+     nsRect adjustedBounds(nsPoint(0, 0), psd->mFrame->mFrame->GetSize());
+ 
+     // Text-shadow overflow
+     if (mPresContext->CompatibilityMode() != eCompatibility_NavQuirks) {
+       nsRect shadowRect = nsLayoutUtils::GetTextShadowRectsUnion(adjustedBounds,
+                                                                  psd->mFrame->mFrame);
+       adjustedBounds.UnionRect(adjustedBounds, shadowRect);
+     }
+ 
+-    combinedAreaResult.UnionRect(psd->mFrame->mCombinedArea, adjustedBounds);
++    // Text shadow is only part of visual overflow and not scrollable overflow.
++    overflowAreas[eVisualOverflow].UnionRect(
++      psd->mFrame->mOverflowAreas[eVisualOverflow], adjustedBounds);
++    overflowAreas[eScrollableOverflow] =
++      psd->mFrame->mOverflowAreas[eScrollableOverflow];
+   }
+   else {
+     // The minimum combined area for the frames that are direct
+     // children of the block starts at the upper left corner of the
+     // line and is sized to match the size of the line's bounding box
+     // (the same size as the values returned from VerticalAlignFrames)
+-    combinedAreaResult.x = psd->mLeftEdge;
++    overflowAreas[eVisualOverflow].x = psd->mLeftEdge;
+     // If this turns out to be negative, the rect will be treated as empty.
+     // Which is just fine.
+-    combinedAreaResult.width = psd->mX - combinedAreaResult.x;
+-    combinedAreaResult.y = mTopEdge;
+-    combinedAreaResult.height = mFinalLineHeight;
++    overflowAreas[eVisualOverflow].width = psd->mX - overflowArea.x;
++    overflowAreas[eVisualOverflow].y = mTopEdge;
++    overflowAreas[eVisualOverflow].height = mFinalLineHeight;
++
++    overflowAreas[eScrollableOverflow] = overflowAreas[eVisualOverflow];
+   }
+ 
+   for (PerFrameData* pfd = psd->mFirstFrame; pfd; pfd = pfd->mNext) {
+     nsIFrame* frame = pfd->mFrame;
+     nsPoint origin = frame->GetPosition();
+ 
+     // Adjust the origin of the frame
+     if (pfd->GetFlag(PFD_RELATIVEPOS)) {
+@@ -2576,29 +2586,32 @@ nsLineLayout::RelativePositionFrames(Per
+                                                  frame->GetView(),
+                                                  &pfd->mCombinedArea, //ignored
+                                                  NS_FRAME_NO_SIZE_VIEW);
+ 
+     // Note: the combined area of a child is in its coordinate
+     // system. We adjust the childs combined area into our coordinate
+     // system before computing the aggregated value by adding in
+     // <b>x</b> and <b>y</b> which were computed above.
+-    nsRect r;
++    nsRect r[2];
+     if (pfd->mSpan) {
+       // Compute a new combined area for the child span before
+       // aggregating it into our combined area.
+       RelativePositionFrames(pfd->mSpan, r);
+     } else {
+-      r = pfd->mCombinedArea;
++      NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++        r[i] = pfd->mCombinedArea[i];
++      }
+       if (pfd->GetFlag(PFD_ISTEXTFRAME)) {
+         if (pfd->GetFlag(PFD_RECOMPUTEOVERFLOW)) {
+           nsTextFrame* f = static_cast<nsTextFrame*>(frame);
+-          r = f->RecomputeOverflowRect();
++          // FIXME: We should probably separate these!
++          r[eVisualOverflow] = r[eScrollableOverflow] = f->RecomputeOverflowRect();
+         }
+-        frame->FinishAndStoreOverflow(&r, frame->GetSize());
++        frame->FinishAndStoreOverflow(r, frame->GetSize());
+       }
+ 
+       // If we have something that's not an inline but with a complex frame
+       // hierarchy inside that contains views, they need to be
+       // positioned.
+       // All descendant views must be repositioned even if this frame
+       // does have a view in case this frame's view does not have a
+       // widget and some of the descendant views do have widgets --
+@@ -2606,23 +2619,28 @@ nsLineLayout::RelativePositionFrames(Per
+       nsContainerFrame::PositionChildViews(frame);
+     }
+ 
+     // Do this here (rather than along with setting the overflow rect
+     // below) so we get leaf frames as well.  No need to worry
+     // about the root span, since it doesn't have a frame.
+     if (frame->HasView())
+       nsContainerFrame::SyncFrameViewAfterReflow(mPresContext, frame,
+-                                                 frame->GetView(), &r,
++                                                 frame->GetView(),
++                                                 &r[eVisualOverflow],
+                                                  NS_FRAME_NO_MOVE_VIEW);
+ 
+-    combinedAreaResult.UnionRect(combinedAreaResult, r + origin);
++    NS_FOR_FRAME_OVERFLOW_TYPES(i) {
++      overflowAreas[i].UnionRect(overflowAreas[i], r[i] + origin);
++    }
+   }
+ 
+   // If we just computed a spans combined area, we need to update its
+   // overflow rect...
+   if (psd->mFrame) {
+     PerFrameData* spanPFD = psd->mFrame;
+     nsIFrame* frame = spanPFD->mFrame;
+-    frame->FinishAndStoreOverflow(&combinedAreaResult, frame->GetSize());
++    frame->FinishAndStoreOverflow(overflowAreas, frame->GetSize());
+   }
+-  aCombinedArea = combinedAreaResult;
++  NS_FOR_FRAME_OVEFLOW_TYPES(i) {
++    aOverflowAreas = overflowAreas;
++  }
+ }
+diff --git a/layout/generic/nsLineLayout.h b/layout/generic/nsLineLayout.h
+--- a/layout/generic/nsLineLayout.h
++++ b/layout/generic/nsLineLayout.h
+@@ -134,17 +134,17 @@ public:
+ 
+   void HorizontalAlignFrames(nsRect& aLineBounds, PRBool aAllowJustify);
+ 
+   /**
+    * Handle all the relative positioning in the line, compute the
+    * combined area (== overflow area) for the line, and handle view
+    * sizing/positioning and the setting of the overflow rect.
+    */
+-  void RelativePositionFrames(nsRect& aCombinedArea);
++  void RelativePositionFrames(nsRect aOverflowAreas[2]);
+ 
+   //----------------------------------------
+ 
+   // Supporting methods and data for flags
+ protected:
+ #define LL_FIRSTLETTERSTYLEOK          0x00000008
+ #define LL_ISTOPOFPAGE                 0x00000010
+ #define LL_IMPACTEDBYFLOATS            0x00000040
+@@ -420,17 +420,17 @@ protected:
+     PerSpanData* mSpan;
+ 
+     // The frame
+     nsIFrame* mFrame;
+ 
+     // From metrics
+     nscoord mAscent;
+     nsRect mBounds;
+-    nsRect mCombinedArea;
++    nsRect mOverflowAreas[2];
+ 
+     // From reflow-state
+     nsMargin mMargin;
+     nsMargin mBorderPadding;
+     nsMargin mOffsets;
+ 
+     // state for text justification
+     PRInt32 mJustificationNumSpaces;
+@@ -590,17 +590,17 @@ protected:
+                   nsHTMLReflowMetrics& aMetrics);
+ 
+   void VerticalAlignFrames(PerSpanData* psd);
+ 
+   void PlaceTopBottomFrames(PerSpanData* psd,
+                             nscoord aDistanceFromTop,
+                             nscoord aLineHeight);
+ 
+-  void RelativePositionFrames(PerSpanData* psd, nsRect& aCombinedArea);
++  void RelativePositionFrames(PerSpanData* psd, nsRect aOverflowAreas[2]);
+ 
+   PRBool TrimTrailingWhiteSpaceIn(PerSpanData* psd, nscoord* aDeltaWidth);
+ 
+   void ComputeJustificationWeights(PerSpanData* psd, PRInt32* numSpaces, PRInt32* numLetters);
+ 
+   struct FrameJustificationState {
+     PRInt32 mTotalNumSpaces;
+     PRInt32 mTotalNumLetters;
