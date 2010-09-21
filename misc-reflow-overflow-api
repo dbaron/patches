@@ -2,6 +2,68 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Fix miscellaneous reflow methods to use new overflow area APIs.  (Bug 542595)
 
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -7708,28 +7708,32 @@ PresShell::DoReflow(nsIFrame* target, PR
+   // root frame, then its desired size had better not change!  If it's
+   // initiated at the root, then the size better not change unless its
+   // height was unconstrained to start with.
+   NS_ASSERTION((target == rootFrame && size.height == NS_UNCONSTRAINEDSIZE) ||
+                (desiredSize.width == size.width &&
+                 desiredSize.height == size.height),
+                "non-root frame's desired size changed during an "
+                "incremental reflow");
+-  NS_ASSERTION(desiredSize.mOverflowArea ==
++  NS_ASSERTION(desiredSize.VisibleOverflow() ==
+                  nsRect(nsPoint(0, 0),
+                         nsSize(desiredSize.width, desiredSize.height)),
+                "reflow roots must not have visible overflow");
++  NS_ASSERTION(desiredSize.ScrollableOverflow() ==
++                 nsRect(nsPoint(0, 0),
++                        nsSize(desiredSize.width, desiredSize.height)),
++               "reflow roots must not have scrollable overflow");
+   NS_ASSERTION(status == NS_FRAME_COMPLETE,
+                "reflow roots should never split");
+ 
+   target->SetSize(nsSize(desiredSize.width, desiredSize.height));
+ 
+   nsContainerFrame::SyncFrameViewAfterReflow(mPresContext, target,
+                                              target->GetView(),
+-                                             &desiredSize.mOverflowArea);
++                                             desiredSize.VisibleOverflow());
+   nsContainerFrame::SyncWindowProperties(mPresContext, target,
+                                          target->GetView());
+ 
+   target->DidReflow(mPresContext, nsnull, NS_FRAME_REFLOW_FINISHED);
+   if (target == rootFrame && size.height == NS_UNCONSTRAINEDSIZE) {
+     mPresContext->SetVisibleArea(nsRect(0, 0, desiredSize.width,
+                                         desiredSize.height));
+   }
+diff --git a/layout/generic/nsAbsoluteContainingBlock.cpp b/layout/generic/nsAbsoluteContainingBlock.cpp
+--- a/layout/generic/nsAbsoluteContainingBlock.cpp
++++ b/layout/generic/nsAbsoluteContainingBlock.cpp
+@@ -476,18 +476,18 @@ nsAbsoluteContainingBlock::ReflowAbsolut
+                border.top + kidReflowState.mComputedOffsets.top + kidReflowState.mComputedMargin.top,
+                kidDesiredSize.width, kidDesiredSize.height);
+   aKidFrame->SetRect(rect);
+ 
+   nsIView* view = aKidFrame->GetView();
+   if (view) {
+     // Size and position the view and set its opacity, visibility, content
+     // transparency, and clip
+-    nsContainerFrame::SyncFrameViewAfterReflow(aPresContext, aKidFrame,
+-                        view, kidDesiredSize.mOverflowAreas[eVisualOverflow]);
++    nsContainerFrame::SyncFrameViewAfterReflow(aPresContext, aKidFrame, view,
++                                               kidDesiredSize.VisualOverflow());
+   } else {
+     nsContainerFrame::PositionChildViews(aKidFrame);
+   }
+ 
+   if (oldRect.TopLeft() != rect.TopLeft() || 
+       (aDelegatingFrame->GetStateBits() & NS_FRAME_FIRST_REFLOW)) {
+     // The frame moved
+     aKidFrame->GetParent()->Invalidate(oldOverflowRect);
 diff --git a/layout/generic/nsBRFrame.cpp b/layout/generic/nsBRFrame.cpp
 --- a/layout/generic/nsBRFrame.cpp
 +++ b/layout/generic/nsBRFrame.cpp
@@ -362,3 +424,70 @@ diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFra
  {
    nsGfxScrollFrameInner::ScrollbarStyles ss = GetScrollbarStyles();
    if (ss.mVertical != NS_STYLE_OVERFLOW_SCROLL || !mInner.mVScrollbarBox)
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -2613,17 +2613,17 @@ nsLineLayout::RelativePositionFrames(Per
+     }
+ 
+     // Do this here (rather than along with setting the overflow rect
+     // below) so we get leaf frames as well.  No need to worry
+     // about the root span, since it doesn't have a frame.
+     if (frame->HasView())
+       nsContainerFrame::SyncFrameViewAfterReflow(mPresContext, frame,
+                                                  frame->GetView(),
+-                                                 r[eVisualOverflow],
++                                                 r.VisualOverflow(),
+                                                  NS_FRAME_NO_MOVE_VIEW);
+ 
+     overflowAreas.UnionWith(r + origin);
+   }
+ 
+   // If we just computed a spans combined area, we need to update its
+   // overflow rect...
+   if (psd->mFrame) {
+diff --git a/layout/tables/nsTableCellFrame.cpp b/layout/tables/nsTableCellFrame.cpp
+--- a/layout/tables/nsTableCellFrame.cpp
++++ b/layout/tables/nsTableCellFrame.cpp
+@@ -610,17 +610,17 @@ void nsTableCellFrame::VerticallyAlignCh
+     nsContainerFrame::PositionChildViews(firstKid);
+ 
+     // Invalidate new overflow rect
+     firstKid->InvalidateFrameSubtree();
+   }
+   if (HasView()) {
+     nsContainerFrame::SyncFrameViewAfterReflow(PresContext(), this,
+                                                GetView(),
+-                                               &desiredSize.mOverflowArea, 0);
++                                               desiredSize.VisualOverflow(), 0);
+   }
+ }
+ 
+ // Per CSS 2.1, we map 'sub', 'super', 'text-top', 'text-bottom',
+ // length, percentage, and calc() values to 'baseline'.
+ PRUint8
+ nsTableCellFrame::GetVerticalAlign() const
+ {
+diff --git a/layout/tables/nsTableRowFrame.cpp b/layout/tables/nsTableRowFrame.cpp
+--- a/layout/tables/nsTableRowFrame.cpp
++++ b/layout/tables/nsTableRowFrame.cpp
+@@ -403,17 +403,18 @@ nsTableRowFrame::DidResize()
+       // Note that if the cell's *content* needs to change in response
+       // to this height, it will get a special height reflow.
+     }
+     // Get the next child
+     childFrame = iter.Next();
+   }
+   FinishAndStoreOverflow(&desiredSize);
+   if (HasView()) {
+-    nsContainerFrame::SyncFrameViewAfterReflow(PresContext(), this, GetView(), &desiredSize.mOverflowArea, 0);
++    nsContainerFrame::SyncFrameViewAfterReflow(PresContext(), this, GetView(),
++                                               desiredSize.VisualOverflow(), 0);
+   }
+   // Let our base class do the usual work
+ }
+ 
+ // returns max-ascent amongst all cells that have 'vertical-align: baseline'
+ // *including* cells with rowspans
+ nscoord nsTableRowFrame::GetMaxCellAscent() const
+ {
