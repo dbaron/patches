@@ -5,7 +5,94 @@ Make hit testing for border-radius follow the curvature of the border.  (Bug 595
 diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 --- a/layout/base/nsDisplayList.cpp
 +++ b/layout/base/nsDisplayList.cpp
-@@ -722,16 +722,26 @@ static PRBool RoundedRectContainsRect(co
+@@ -694,20 +694,86 @@ nsDisplayBackground::nsDisplayBackground
+   // Perform necessary RegisterWidgetGeometry
+   if (mIsThemed &&
+       (disp->mAppearance == NS_THEME_MOZ_MAC_UNIFIED_TOOLBAR ||
+        disp->mAppearance == NS_THEME_TOOLBAR)) {
+     RegisterThemeWidgetGeometry(aFrame);
+   }
+ }
+ 
++// Helper for RoundedRectIntersectsRect.
++static PRBool
++CheckCorner(nscoord aXOffset, nscoord aYOffset,
++            nscoord aXRadius, nscoord aYRadius)
++{
++  NS_ABORT_IF_FALSE(aXOffset > 0 && aYOffset > 0,
++                    "must not pass nonpositives to CheckCorner");
++  NS_ABORT_IF_FALSE(aXRadius >= 0 && aYRadius >= 0,
++                    "must not pass negatives to CheckCorner");
++
++  // Avoid floating point math unless we're either (1) within the
++  // quarter-ellipse area at the rounded corner or (2) outside the
++  // rounding.
++  if (aXOffset >= aXRadius || aYOffset >= aYRadius)
++    return PR_TRUE;
++
++  // Convert coordinates to a unit circle with (0,0) as the center of
++  // curvature, and see if we're inside the circle or outside.
++  float scaledX = float(aXRadius - aXOffset) / float(aXRadius);
++  float scaledY = float(aYRadius - aYOffset) / float(aYRadius);
++  return scaledX * scaledX + scaledY * scaledY < 1.0f;
++}
++
++
++/**
++ * Return whether any part of aTestRect is inside of the rounded
++ * rectangle formed by aBounds and aRadii (which are indexed by the
++ * NS_CORNER_* constants in nsStyleConsts.h).
++ *
++ * See also RoundedRectContainsRect.
++ */
++static PRBool
++RoundedRectIntersectsRect(const nsRect& aRoundedRect, nscoord aRadii[8],
++                          const nsRect& aTestRect)
++{
++  if (!aTestRect.Intersects(aRoundedRect)) {
++    return PR_FALSE;
++  }
++
++  // distances from this edge of aRoundedRect to opposite edge of aTestRect,
++  // which we know are positive due to the Intersects check above.
++  nsMargin insets;
++  insets.top = aTestRect.YMost() - aRoundedRect.y;
++  insets.right = aRoundedRect.XMost() - aTestRect.x;
++  insets.bottom = aRoundedRect.YMost() - aTestRect.y;
++  insets.left = aTestRect.XMost() - aRoundedRect.x;
++
++  // Check whether the bottom-right corner of aTestRect is inside the
++  // top left corner of aBounds when rounded by aRadii, etc.  If any
++  // corner is not, then fail; otherwise succeed.
++  return CheckCorner(insets.left, insets.top,
++                     aRadii[NS_CORNER_TOP_LEFT_X],
++                     aRadii[NS_CORNER_TOP_LEFT_Y]) &&
++         CheckCorner(insets.right, insets.top,
++                     aRadii[NS_CORNER_TOP_RIGHT_X],
++                     aRadii[NS_CORNER_TOP_RIGHT_Y]) &&
++         CheckCorner(insets.right, insets.bottom,
++                     aRadii[NS_CORNER_BOTTOM_RIGHT_X],
++                     aRadii[NS_CORNER_BOTTOM_RIGHT_Y]) &&
++         CheckCorner(insets.left, insets.bottom,
++                     aRadii[NS_CORNER_BOTTOM_LEFT_X],
++                     aRadii[NS_CORNER_BOTTOM_LEFT_Y]);
++}
++
+ // Returns TRUE if aContainedRect is guaranteed to be contained in
+ // the rounded rect defined by aRoundedRect and aRadii. Complex cases are
+ // handled conservatively by returning FALSE in some situations where
+ // a more thorough analysis could return TRUE.
++//
++// See also RoundedRectIntersectsRect.
+ static PRBool RoundedRectContainsRect(const nsRect& aRoundedRect,
+                                       const nscoord aRadii[8],
+                                       const nsRect& aContainedRect) {
+   // rectFullHeight and rectFullWidth together will approximately contain
+   // the total area of the frame minus the rounded corners.
+   nsRect rectFullHeight = aRoundedRect;
+   nscoord xDiff = NS_MAX(aRadii[NS_CORNER_TOP_LEFT_X], aRadii[NS_CORNER_BOTTOM_LEFT_X]);
+   rectFullHeight.x += xDiff;
+@@ -722,16 +788,26 @@ static PRBool RoundedRectContainsRect(co
    rectFullWidth.height -= NS_MAX(aRadii[NS_CORNER_BOTTOM_LEFT_Y],
                                   aRadii[NS_CORNER_BOTTOM_RIGHT_Y]) + yDiff;
    if (rectFullWidth.Contains(aContainedRect))
@@ -32,7 +119,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
      return PR_FALSE;
  
    // Return false if the background was propagated away from this
-@@ -924,16 +934,26 @@ nsDisplayOutline::ComputeVisibility(nsDi
+@@ -924,16 +1000,26 @@ nsDisplayOutline::ComputeVisibility(nsDi
        return PR_FALSE;
      }
    }
@@ -108,108 +195,3 @@ diff --git a/layout/base/nsDisplayList.h b/layout/base/nsDisplayList.h
   * 
   * GetUnderlyingFrame() is troublesome for wrapped lists because if the wrapped
   * list has many items, it's not clear which one has the 'underlying frame'.
-diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
---- a/layout/base/nsLayoutUtils.cpp
-+++ b/layout/base/nsLayoutUtils.cpp
-@@ -3744,16 +3744,72 @@ nsLayoutUtils::GetEditableRootContentByC
-   nsresult rv = domHTMLDoc->GetBody(getter_AddRefs(body));
-   nsCOMPtr<nsIContent> content = do_QueryInterface(body);
-   if (NS_SUCCEEDED(rv) && content && content->IsEditable()) {
-     return content;
-   }
-   return nsnull;
- }
- 
-+static PRBool
-+CheckCorner(nscoord aXOffset, nscoord aYOffset,
-+            nscoord aXRadius, nscoord aYRadius)
-+{
-+  NS_ABORT_IF_FALSE(aXOffset > 0 && aYOffset > 0,
-+                    "must not pass nonpositives to CheckCorner");
-+  NS_ABORT_IF_FALSE(aXRadius >= 0 && aYRadius >= 0,
-+                    "must not pass negatives to CheckCorner");
-+
-+  // Avoid floating point math unless we're either (1) within the
-+  // quarter-ellipse area at the rounded corner or (2) outside the
-+  // rounding.
-+  if (aXOffset >= aXRadius || aYOffset >= aYRadius)
-+    return PR_TRUE;
-+
-+  // Convert coordinates to a unit circle with (0,0) as the center of
-+  // curvature, and see if we're inside the circle or outside.
-+  float scaledX = float(aXRadius - aXOffset) / float(aXRadius);
-+  float scaledY = float(aYRadius - aYOffset) / float(aYRadius);
-+  return scaledX * scaledX + scaledY * scaledY < 1.0f;
-+}
-+
-+/* static */ PRBool
-+nsLayoutUtils::IntersectsRoundedRect(const nsRect& aTestRect,
-+                                     const nsRect& aBounds,
-+                                     nscoord aRadii[8])
-+{
-+  if (!aTestRect.Intersects(aBounds)) {
-+    return PR_FALSE;
-+  }
-+
-+  // distances from this edge of aBounds to opposite edge of aTestRect,
-+  // which we know are positive due to the Intersects check above.
-+  nsMargin insets;
-+  insets.top = aTestRect.YMost() - aBounds.y;
-+  insets.right = aBounds.XMost() - aTestRect.x;
-+  insets.bottom = aBounds.YMost() - aTestRect.y;
-+  insets.left = aTestRect.XMost() - aBounds.x;
-+
-+  // Check whether the bottom-right corner of aTestRect is inside the
-+  // top left corner of aBounds when rounded by aRadii, etc.  If any
-+  // corner is not, then fail; otherwise succeed.
-+  return CheckCorner(insets.left, insets.top,
-+                     aRadii[NS_CORNER_TOP_LEFT_X],
-+                     aRadii[NS_CORNER_TOP_LEFT_Y]) &&
-+         CheckCorner(insets.right, insets.top,
-+                     aRadii[NS_CORNER_TOP_RIGHT_X],
-+                     aRadii[NS_CORNER_TOP_RIGHT_Y]) &&
-+         CheckCorner(insets.right, insets.bottom,
-+                     aRadii[NS_CORNER_BOTTOM_RIGHT_X],
-+                     aRadii[NS_CORNER_BOTTOM_RIGHT_Y]) &&
-+         CheckCorner(insets.left, insets.bottom,
-+                     aRadii[NS_CORNER_BOTTOM_LEFT_X],
-+                     aRadii[NS_CORNER_BOTTOM_LEFT_Y]);
-+}
-+
- nsSetAttrRunnable::nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
-                                      const nsAString& aValue)
-   : mContent(aContent),
-     mAttrName(aAttrName),
-     mValue(aValue)
- {
-   NS_ASSERTION(aContent && aAttrName, "Missing stuff, prepare to crash");
- }
-diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
---- a/layout/base/nsLayoutUtils.h
-+++ b/layout/base/nsLayoutUtils.h
-@@ -1241,16 +1241,25 @@ public:
-    * Returns true if the passed in prescontext needs the dark grey background
-    * that goes behind the page of a print preview presentation.
-    */
-   static PRBool NeedsPrintPreviewBackground(nsPresContext* aPresContext) {
-     return aPresContext->IsRootPaginatedDocument() &&
-       (aPresContext->Type() == nsPresContext::eContext_PrintPreview ||
-        aPresContext->Type() == nsPresContext::eContext_PageLayout);
-   }
-+
-+  /**
-+   * Return whether any part of aTestRect is inside of the rounded
-+   * rectangle formed by aBounds and aRadii (which are indexed by the
-+   * NS_CORNER_* constants in nsStyleConsts.h).
-+   */
-+  static PRBool IntersectsRoundedRect(const nsRect& aTestRect,
-+                                      const nsRect& aBounds,
-+                                      nscoord aRadii[8]);
- };
- 
- class nsSetAttrRunnable : public nsRunnable
- {
- public:
-   nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
-                     const nsAString& aValue);
-   nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
