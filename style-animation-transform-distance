@@ -1,0 +1,118 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Change distance computation for transforms so that distance ratios match interpolation.  (Bug 598099)  (FIXME: Value normalization via AddWeighted isn't really right if different transforms use a different metric, but I suppose we could try to make them consistent)
+
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -552,55 +552,77 @@ nsStyleAnimation::ComputeDistance(nsCSSP
+         shadow1 = shadow1->mNext;
+         shadow2 = shadow2->mNext;
+         NS_ABORT_IF_FALSE(!shadow1 == !shadow2, "lists should be same length");
+       }
+       aDistance = sqrt(squareDistance);
+       return PR_TRUE;
+     }
+     case eUnit_Transform: {
+-      const nsCSSValueList *list1 = aStartValue.GetCSSValueListValue();
+-      const nsCSSValueList *list2 = aEndValue.GetCSSValueListValue();
++      // Call AddWeighted to normalize to the format we use for
++      // interpolation.  (This is far from ideal, but it provides good
++      // behavior for distance along a running transition.)
++      Value normValue1, normValue2;
++      if (!AddWeighted(aProperty, 1.0, aStartValue, 0.0, aEndValue,
++                       normValue1) ||
++          !AddWeighted(aProperty, 0.0, aStartValue, 1.0, aEndValue,
++                       normValue2)) {
++        return PR_FALSE;
++      }
++      const nsCSSValueList *list1 = normValue1.GetCSSValueListValue();
++      const nsCSSValueList *list2 = normValue2.GetCSSValueListValue();
+ 
+-      nsStyleTransformMatrix matrix1, matrix2; // initialized to identity
+-
+-      PRBool dummy;
++      NS_ABORT_IF_FALSE((list1->mValue.GetUnit() == eCSSUnit_None) ==
++                        (list2->mValue.GetUnit() == eCSSUnit_None),
++                        "none-ness should match after AddWeighted");
+       if (list1->mValue.GetUnit() != eCSSUnit_None) {
+-        matrix1 = nsStyleTransformMatrix::ReadTransforms(list1, nsnull,
+-                                                         nsnull, dummy);
+-      }
+-      if (list2->mValue.GetUnit() != eCSSUnit_None) {
+-        matrix2 = nsStyleTransformMatrix::ReadTransforms(list2, nsnull,
+-                                                         nsnull, dummy);
++        aDistance = 0;
++        return PR_TRUE;
+       }
+ 
+-      double diff;
+       double squareDistance = 0.0;
+-      for (PRUint32 i = 0; i < 4; ++i) {
+-        diff = matrix1.GetMainMatrixEntry(i) - matrix2.GetMainMatrixEntry(i);
+-        squareDistance += diff * diff;
++      for (; list1 && list2; list1 = list1->mNext, list2 = list2->mNext) {
++        NS_ABORT_IF_FALSE(list1->mValue.GetUnit() == eCSSUnit_Function &&
++                          list2->mValue.GetUnit() == eCSSUnit_Function,
++                          "unexpected unit");
++        const nsCSSValue::Array *a1 = list1->mValue.GetArrayValue(),
++                                *a2 = list2->mValue.GetArrayValue();
++        NS_ABORT_IF_FALSE(a1->Item(0).GetUnit() == eCSSUnit_Ident &&
++                          a2->Item(0).GetUnit() == eCSSUnit_Ident,
++                          "unexpected unit");
++        NS_ABORT_IF_FALSE(a1->Item(0) == a2->Item(0),
++                          "unexpected function mismatch");
++        NS_ABORT_IF_FALSE(a1->Count() == a2->Count(),
++                          "unexpected count mismatch");
++        for (size_t i = 1, iEnd = NS_MIN(a1->Count(), a2->Count());
++             i < iEnd; ++i) {
++          const nsCSSValue &v1 = a1->Item(i), &v2 = a2->Item(i);
++          NS_ABORT_IF_FALSE(v1.GetUnit() == v2.GetUnit(),
++                            "unit mismatch");
++          NS_ABORT_IF_FALSE(v1.GetUnit() == eCSSUnit_Pixel ||
++                            v1.GetUnit() == eCSSUnit_Percent ||
++                            v1.GetUnit() == eCSSUnit_Radian ||
++                            v1.GetUnit() == eCSSUnit_Number,
++                            "unexpected unit");
++          NS_ABORT_IF_FALSE(v2.GetUnit() == eCSSUnit_Pixel ||
++                            v2.GetUnit() == eCSSUnit_Percent ||
++                            v2.GetUnit() == eCSSUnit_Radian ||
++                            v2.GetUnit() == eCSSUnit_Number,
++                            "unexpected unit");
++          double diff;
++          if (v1.GetUnit() == eCSSUnit_Percent) {
++            diff = v2.GetPercentValue() - v1.GetPercentValue();
++          } else {
++            diff = v2.GetFloatValue() - v1.GetFloatValue();
++          }
++          squareDistance += diff * diff;
++        }
+       }
+-      diff = nsPresContext::AppUnitsToFloatCSSPixels(
+-        matrix1.GetCoordXTranslation() - matrix2.GetCoordXTranslation());
+-      squareDistance += diff * diff;
+-      diff = nsPresContext::AppUnitsToFloatCSSPixels(
+-        matrix1.GetCoordYTranslation() - matrix2.GetCoordYTranslation());
+-      squareDistance += diff * diff;
+-      diff = matrix1.GetWidthRelativeXTranslation() -
+-             matrix2.GetWidthRelativeXTranslation();
+-      squareDistance += diff * diff;
+-      diff = matrix1.GetWidthRelativeYTranslation() -
+-             matrix2.GetWidthRelativeYTranslation();
+-      squareDistance += diff * diff;
+-      diff = matrix1.GetHeightRelativeXTranslation() -
+-             matrix2.GetHeightRelativeXTranslation();
+-      squareDistance += diff * diff;
+-      diff = matrix1.GetHeightRelativeYTranslation() -
+-             matrix2.GetHeightRelativeYTranslation();
+-      squareDistance += diff * diff;
++      NS_ABORT_IF_FALSE(!list1 && !list2,
++                        "list lengths should match after AddWeighted");
+ 
+       aDistance = sqrt(squareDistance);
+       return PR_TRUE;
+     }
+     case eUnit_CSSValuePairList: {
+       const nsCSSValuePairList *list1 = aStartValue.GetCSSValuePairListValue();
+       const nsCSSValuePairList *list2 = aEndValue.GetCSSValuePairListValue();
+       double squareDistance = 0.0;
