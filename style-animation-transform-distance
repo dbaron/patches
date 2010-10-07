@@ -5,7 +5,7 @@ Change distance computation for transforms so that distance ratios match interpo
 diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
 --- a/layout/style/nsStyleAnimation.cpp
 +++ b/layout/style/nsStyleAnimation.cpp
-@@ -552,55 +552,77 @@ nsStyleAnimation::ComputeDistance(nsCSSP
+@@ -552,55 +552,88 @@ nsStyleAnimation::ComputeDistance(nsCSSP
          shadow1 = shadow1->mNext;
          shadow2 = shadow2->mNext;
          NS_ABORT_IF_FALSE(!shadow1 == !shadow2, "lists should be same length");
@@ -68,25 +68,36 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +        for (size_t i = 1, iEnd = NS_MIN(a1->Count(), a2->Count());
 +             i < iEnd; ++i) {
 +          const nsCSSValue &v1 = a1->Item(i), &v2 = a2->Item(i);
-+          NS_ABORT_IF_FALSE(v1.GetUnit() == v2.GetUnit(),
-+                            "unit mismatch");
 +          NS_ABORT_IF_FALSE(v1.GetUnit() == eCSSUnit_Pixel ||
 +                            v1.GetUnit() == eCSSUnit_Percent ||
++                            v1.GetUnit() == eCSSUnit_Calc ||
 +                            v1.GetUnit() == eCSSUnit_Radian ||
 +                            v1.GetUnit() == eCSSUnit_Number,
 +                            "unexpected unit");
 +          NS_ABORT_IF_FALSE(v2.GetUnit() == eCSSUnit_Pixel ||
 +                            v2.GetUnit() == eCSSUnit_Percent ||
++                            v2.GetUnit() == eCSSUnit_Calc ||
 +                            v2.GetUnit() == eCSSUnit_Radian ||
 +                            v2.GetUnit() == eCSSUnit_Number,
 +                            "unexpected unit");
-+          double diff;
-+          if (v1.GetUnit() == eCSSUnit_Percent) {
-+            diff = v2.GetPercentValue() - v1.GetPercentValue();
++          if (v1.GetUnit() == eCSSUnit_Pixel ||
++              v1.GetUnit() == eCSSUnit_Percent ||
++              v1.GetUnit() == eCSSUnit_Calc) {
++            NS_ABORT_IF_FALSE(v2.GetUnit() == eCSSUnit_Pixel ||
++                              v2.GetUnit() == eCSSUnit_Percent ||
++                              v2.GetUnit() == eCSSUnit_Calc,
++                              "unit mismatch");
++            CalcValue c1 = ExtractCalcValue(v1),
++                      c2 = ExtractCalcValue(v2);
++            double diff = c1.mLength - c2.mLength;
++            squareDistance += diff * diff;
++            diff = c1.mPercent - c2.mPercent;
++            squareDistance += diff * diff;
 +          } else {
-+            diff = v2.GetFloatValue() - v1.GetFloatValue();
++            NS_ABORT_IF_FALSE(v1.GetUnit() == v2.GetUnit(), "unit mismatch");
++            double diff = v2.GetFloatValue() - v1.GetFloatValue();
++            squareDistance += diff * diff;
 +          }
-+          squareDistance += diff * diff;
 +        }
        }
 -      diff = nsPresContext::AppUnitsToFloatCSSPixels(
@@ -117,7 +128,73 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        const nsCSSValuePairList *list1 = aStartValue.GetCSSValuePairListValue();
        const nsCSSValuePairList *list2 = aEndValue.GetCSSValuePairListValue();
        double squareDistance = 0.0;
-@@ -1103,33 +1125,33 @@ AddTransformMatrix(const nsStyleTransfor
+@@ -702,46 +735,16 @@ AddCSSValuePercent(double aCoeff1, const
+                    nsCSSValue &aResult)
+ {
+   NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Percent, "unexpected unit");
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Percent, "unexpected unit");
+   aResult.SetPercentValue(aCoeff1 * aValue1.GetPercentValue() +
+                           aCoeff2 * aValue2.GetPercentValue());
+ }
+ 
+-// Add two non-canonical-form calc values (eUnit_Transform) to make
+-// another non-canonical-form calc value.
+-static void
+-AddCSSValueNoncanonicalCalc(double aCoeff1, const nsCSSValue &aValue1,
+-                            double aCoeff2, const nsCSSValue &aValue2,
+-                            nsCSSValue &aResult)
+-{
+-  NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Percent ||
+-                    aValue1.GetUnit() == eCSSUnit_Pixel ||
+-                    aValue1.IsCalcUnit(), "unexpected unit");
+-  NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Percent ||
+-                    aValue2.GetUnit() == eCSSUnit_Pixel ||
+-                    aValue2.IsCalcUnit(), "unexpected unit");
+-  nsRefPtr<nsCSSValue::Array> a1 = nsCSSValue::Array::Create(2),
+-                              a2 = nsCSSValue::Array::Create(2),
+-                              atop = nsCSSValue::Array::Create(2),
+-                              acalc = nsCSSValue::Array::Create(1);
+-  // Don't nest the eCSSUnit_Calc in our input inside any expressions.
+-  a1->Item(0).SetFloatValue(aCoeff1, eCSSUnit_Number);
+-  a1->Item(1) = aValue1.GetUnit() == eCSSUnit_Calc
+-                  ? aValue1.GetArrayValue()->Item(0) : aValue1;
+-  a2->Item(0).SetFloatValue(aCoeff2, eCSSUnit_Number);
+-  a2->Item(1) = aValue2.GetUnit() == eCSSUnit_Calc
+-                  ? aValue2.GetArrayValue()->Item(0) : aValue2;
+-  atop->Item(0).SetArrayValue(a1, eCSSUnit_Calc_Times_L);
+-  atop->Item(1).SetArrayValue(a2, eCSSUnit_Calc_Times_L);
+-  acalc->Item(0).SetArrayValue(atop, eCSSUnit_Calc_Plus);
+-  aResult.SetArrayValue(acalc, eCSSUnit_Calc);
+-}
+-
+ // Add two canonical-form calc values (eUnit_Calc) to make another
+ // canonical-form calc value.
+ static void
+ AddCSSValueCanonicalCalc(double aCoeff1, const nsCSSValue &aValue1,
+                          double aCoeff2, const nsCSSValue &aValue2,
+                          nsCSSValue &aResult)
+ {
+   CalcValue v1 = ExtractCalcValue(aValue1);
+@@ -836,17 +839,17 @@ AddTransformTranslate(const nsCSSValue &
+                     "unexpected unit");
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Percent ||
+                     aValue2.GetUnit() == eCSSUnit_Pixel ||
+                     aValue2.IsCalcUnit(),
+                     "unexpected unit");
+ 
+   if (aValue1.GetUnit() != aValue2.GetUnit() || aValue1.IsCalcUnit()) {
+     // different units; create a calc() expression
+-    AddCSSValueNoncanonicalCalc(aCoeff1, aValue1, aCoeff2, aValue2, aResult);
++    AddCSSValueCanonicalCalc(aCoeff1, aValue1, aCoeff2, aValue2, aResult);
+   } else if (aValue1.GetUnit() == eCSSUnit_Percent) {
+     // both percent
+     AddCSSValuePercent(aCoeff1, aValue1, aCoeff2, aValue2, aResult);
+   } else {
+     // both pixels
+     AddCSSValuePixel(aCoeff1, aValue1, aCoeff2, aValue2, aResult);
+   }
+ }
+@@ -1103,33 +1106,33 @@ AddTransformMatrix(const nsStyleTransfor
    nsCSSValueList **resultTail = getter_Transfers(result);
    nsRefPtr<nsCSSValue::Array> arr;
  
@@ -153,3 +230,41 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
                                aMatrix1.GetCoordYTranslation() * aCoeff1 +
                                aMatrix2.GetCoordYTranslation() * aCoeff2);
    float translateXPercent = aMatrix1.GetWidthRelativeXTranslation() * aCoeff1 +
+@@ -2111,23 +2114,35 @@ StyleCoordToCSSValue(const nsStyleCoord&
+       NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
+       return PR_FALSE;
+   }
+   return PR_TRUE;
+ }
+ 
+ /*
+  * Assign |aOutput = aInput|, except with any non-pixel lengths
+- * replaced with the equivalent in pixels.
++ * replaced with the equivalent in pixels, and any non-canonical calc()
++ * expressions replaced with canonical ones.
+  */
+ static void
+ SubstitutePixelValues(nsStyleContext* aStyleContext,
+                       const nsCSSValue& aInput, nsCSSValue& aOutput)
+ {
+-  if (aInput.UnitHasArrayValue()) {
++  if (aInput.IsCalcUnit()) {
++    PRBool canStoreInRuleTree = PR_TRUE;
++    nsRuleNode::ComputedCalc c =
++      nsRuleNode::SpecifiedCalcToComputedCalc(aInput, aStyleContext,
++                                              aStyleContext->PresContext(),
++                                              canStoreInRuleTree);
++    nsStyleCoord::Calc c2;
++    c2.mLength = c.mLength;
++    c2.mPercent = c.mPercent;
++    c2.mHasPercent = PR_TRUE; // doesn't matter for transform translate
++    SetCalcValue(&c2, aOutput);
++  } else if (aInput.UnitHasArrayValue()) {
+     const nsCSSValue::Array *inputArray = aInput.GetArrayValue();
+     nsRefPtr<nsCSSValue::Array> outputArray =
+       nsCSSValue::Array::Create(inputArray->Count());
+     for (size_t i = 0, i_end = inputArray->Count(); i < i_end; ++i) {
+       SubstitutePixelValues(aStyleContext,
+                             inputArray->Item(i), outputArray->Item(i));
+     }
+     aOutput.SetArrayValue(outputArray, aInput.GetUnit());
