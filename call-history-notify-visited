@@ -1,0 +1,213 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Call History::NotifyVisited whether or not the link is visited.  (Bug 557579)
+
+diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
+--- a/dom/ipc/ContentChild.cpp
++++ b/dom/ipc/ContentChild.cpp
+@@ -405,20 +405,20 @@ ContentChild::RecvNotifyAlertsObserver(c
+             }
+         }
+         ++i;
+     }
+     return true;
+ }
+ 
+ bool
+-ContentChild::RecvNotifyVisited(const IPC::URI& aURI)
++ContentChild::RecvNotifyVisited(const IPC::URI& aURI, const bool& aIsVisited)
+ {
+     nsCOMPtr<nsIURI> newURI(aURI);
+-    History::GetService()->NotifyVisited(newURI);
++    History::GetService()->NotifyVisited(newURI, aIsVisited);
+     return true;
+ }
+ 
+ 
+ bool
+ ContentChild::RecvAsyncMessage(const nsString& aMsg, const nsString& aJSON)
+ {
+   nsRefPtr<nsFrameMessageManager> cpm = nsFrameMessageManager::sChildProcessManager;
+diff --git a/dom/ipc/ContentChild.h b/dom/ipc/ContentChild.h
+--- a/dom/ipc/ContentChild.h
++++ b/dom/ipc/ContentChild.h
+@@ -95,17 +95,18 @@ public:
+     virtual bool DeallocPExternalHelperApp(PExternalHelperAppChild *aService);
+ 
+     virtual bool RecvRegisterChrome(const nsTArray<ChromePackage>& packages,
+                                     const nsTArray<ResourceMapping>& resources,
+                                     const nsTArray<OverrideMapping>& overrides);
+ 
+     virtual bool RecvSetOffline(const PRBool& offline);
+ 
+-    virtual bool RecvNotifyVisited(const IPC::URI& aURI);
++    virtual bool RecvNotifyVisited(const IPC::URI& aURI,
++                                   const bool& aIsVisited);
+     // auto remove when alertfinished is received.
+     nsresult AddRemoteAlertObserver(const nsString& aData, nsIObserver* aObserver);
+ 
+     virtual bool RecvPreferenceUpdate(const nsCString& aDomain);
+     
+     virtual bool RecvNotifyAlertsObserver(const nsCString& aType, const nsString& aData);
+ 
+     virtual bool RecvAsyncMessage(const nsString& aMsg, const nsString& aJSON);
+diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
+--- a/dom/ipc/PContent.ipdl
++++ b/dom/ipc/PContent.ipdl
+@@ -69,17 +69,17 @@ child:
+ 
+     PTestShell();
+ 
+     RegisterChrome(ChromePackage[] packages, ResourceMapping[] resources,
+                    OverrideMapping[] overrides);
+ 
+     async SetOffline(PRBool offline);
+ 
+-    async NotifyVisited(URI uri);
++    async NotifyVisited(URI uri, bool aIsVisited);
+ 
+     PreferenceUpdate(nsCString pref);
+ 
+     NotifyAlertsObserver(nsCString topic, nsString data);
+ 
+     GeolocationUpdate(GeoPosition somewhere);
+ 
+     // nsIPermissionManager messages
+diff --git a/toolkit/components/places/src/History.cpp b/toolkit/components/places/src/History.cpp
+--- a/toolkit/components/places/src/History.cpp
++++ b/toolkit/components/places/src/History.cpp
+@@ -212,19 +212,17 @@ public:
+   }
+ 
+   NS_IMETHOD HandleCompletion(PRUint16 aReason)
+   {
+     if (aReason != mozIStorageStatementCallback::REASON_FINISHED) {
+       return NS_OK;
+     }
+ 
+-    if (mIsVisited) {
+-      History::GetService()->NotifyVisited(mURI);
+-    }
++    History::GetService()->NotifyVisited(mURI, mIsVisited);
+ 
+     // Notify any observers about that we have resolved the visited state of
+     // this URI.
+     nsCOMPtr<nsIObserverService> observerService =
+       mozilla::services::GetObserverService();
+     if (observerService) {
+       nsAutoString status;
+       if (mIsVisited) {
+@@ -365,17 +363,17 @@ public:
+ 
+     nsCOMPtr<nsIObserverService> obsService =
+       mozilla::services::GetObserverService();
+     if (obsService) {
+       nsresult rv = obsService->NotifyObservers(mData->uri, URI_VISIT_SAVED, nsnull);
+       NS_WARN_IF_FALSE(NS_SUCCEEDED(rv), "Could not notify observers");
+     }
+ 
+-    History::GetService()->NotifyVisited(mData->uri);
++    History::GetService()->NotifyVisited(mData->uri, true);
+ 
+     return NS_OK;
+   }
+ 
+ protected:
+   nsAutoPtr<VisitURIData> mData;
+ };
+ NS_IMPL_ISUPPORTS1(
+@@ -976,26 +974,26 @@ History::CurrentTaskFinished()
+   NS_ASSERTION(mPendingVisits.PeekFront(), "Tried to finish task not on the queue");
+ 
+   nsCOMPtr<Step> deadTaskWalking =
+     dont_AddRef(static_cast<Step*>(mPendingVisits.PopFront()));
+   StartNextTask();
+ }
+ 
+ void
+-History::NotifyVisited(nsIURI* aURI)
++History::NotifyVisited(nsIURI* aURI, bool aIsVisited)
+ {
+   NS_ASSERTION(aURI, "Ruh-roh!  A NULL URI was passed to us!");
+ 
+ #ifdef MOZ_IPC
+   if (XRE_GetProcessType() == GeckoProcessType_Default) {
+     mozilla::dom::ContentParent* cpp = 
+       mozilla::dom::ContentParent::GetSingleton(PR_FALSE);
+     if (cpp)
+-      (void)cpp->SendNotifyVisited(aURI);
++      (void)cpp->SendNotifyVisited(aURI, aIsVisited);
+   }
+ #endif
+ 
+   // If the hash table has not been initialized, then we have nothing to notify
+   // about.
+   if (!mObservers.IsInitialized()) {
+     return;
+   }
+@@ -1007,17 +1005,20 @@ History::NotifyVisited(nsIURI* aURI)
+     return;
+   }
+ 
+   // Walk through the array, and update each Link node.
+   const ObserverArray& observers = key->array;
+   ObserverArray::index_type len = observers.Length();
+   for (ObserverArray::index_type i = 0; i < len; i++) {
+     Link* link = observers[i];
+-    link->SetLinkState(eLinkState_Visited);
++    // FIXME: Needs to notify link no matter what aIsVisited is!
++    if (aIsVisited) {
++      link->SetLinkState(eLinkState_Visited);
++    }
+     NS_ASSERTION(len == observers.Length(),
+                  "Calling SetLinkState added or removed an observer!");
+   }
+ 
+   // All the registered nodes can now be removed for this URI.
+   mObservers.RemoveEntry(aURI);
+ }
+ 
+diff --git a/toolkit/components/places/src/History.h b/toolkit/components/places/src/History.h
+--- a/toolkit/components/places/src/History.h
++++ b/toolkit/components/places/src/History.h
+@@ -66,17 +66,17 @@ public:
+   History();
+ 
+   /**
+    * Notifies about the visited status of a given URI.
+    *
+    * @param aURI
+    *        The URI to notify about.
+    */
+-  void NotifyVisited(nsIURI *aURI);
++  void NotifyVisited(nsIURI *aURI, bool aIsVisited);
+ 
+   /**
+    * Append a task to the queue for SQL queries that need to happen
+    * atomically.
+    *
+    * @pre aTask is not null
+    *
+    * @param aTask
+diff --git a/toolkit/components/places/src/nsNavHistory.cpp b/toolkit/components/places/src/nsNavHistory.cpp
+--- a/toolkit/components/places/src/nsNavHistory.cpp
++++ b/toolkit/components/places/src/nsNavHistory.cpp
+@@ -2941,17 +2941,17 @@ nsNavHistory::AddVisit(nsIURI* aURI, PRT
+   if (newItem && (aIsRedirect || aTransitionType == TRANSITION_DOWNLOAD)) {
+     nsCOMPtr<nsIObserverService> obsService =
+       do_GetService(NS_OBSERVERSERVICE_CONTRACTID);
+     if (obsService)
+       obsService->NotifyObservers(aURI, NS_LINK_VISITED_EVENT_TOPIC, nsnull);
+   }
+ 
+   // Because we implement IHistory, we always have to notify about the visit.
+-  History::GetService()->NotifyVisited(aURI);
++  History::GetService()->NotifyVisited(aURI, true);
+ 
+   return NS_OK;
+ }
+ 
+ 
+ // nsNavHistory::GetNewQuery
+ 
+ NS_IMETHODIMP
