@@ -2,6 +2,90 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Call History::NotifyVisited whether or not the link is visited.  (Bug 557579)
 
+diff --git a/content/base/src/Link.cpp b/content/base/src/Link.cpp
+--- a/content/base/src/Link.cpp
++++ b/content/base/src/Link.cpp
+@@ -73,40 +73,36 @@ Link::GetLinkState() const
+   NS_ASSERTION(mLinkState != eLinkState_Unknown,
+                "Getting the link state with an unknown value!");
+   return mLinkState;
+ }
+ 
+ void
+ Link::SetLinkState(nsLinkState aState)
+ {
++  NS_ASSERTION(aState == eLinkState_Visited || aState == eLinkState_Unvisited,
++               "unexpected link state");
+   NS_ASSERTION(mRegistered,
+                "Setting the link state of an unregistered Link!");
+-  NS_ASSERTION(mLinkState != aState,
+-               "Setting state to the currently set state!");
+-
+-  // Remember our old link state for when we notify.
+-  PRInt32 oldLinkState = LinkState();
+ 
+   // Set our current state as appropriate.
+   mLinkState = aState;
+ 
+-  // Per IHistory interface documentation, we are no longer registered.
+-  mRegistered = false;
++  if (aState == eLinkState_Visited) {
++    // Per IHistory interface documentation, we are no longer registered.
++    mRegistered = false;
++  }
+ 
+   // Notify the document that our visited state has changed.
+   nsIContent *content = Content();
+   nsIDocument *doc = content->GetCurrentDoc();
+   NS_ASSERTION(doc, "Registered but we have no document?!");
+-  PRInt32 newLinkState = LinkState();
+-  NS_ASSERTION(newLinkState == NS_EVENT_STATE_VISITED ||
+-               newLinkState == NS_EVENT_STATE_UNVISITED,
+-               "Unexpected state obtained from LinkState()!");
+   mozAutoDocUpdate update(doc, UPDATE_CONTENT_STATE, PR_TRUE);
+-  doc->ContentStatesChanged(content, nsnull, oldLinkState ^ newLinkState);
++  doc->ContentStatesChanged(content, nsnull,
++                            NS_EVENT_STATE_VISITED | NS_EVENT_STATE_UNVISITED);
+ }
+ 
+ PRInt32
+ Link::LinkState() const
+ {
+   // We are a constant method, but we are just lazily doing things and have to
+   // track that state.  Cast away that constness!
+   Link *self = const_cast<Link *>(this);
+diff --git a/docshell/base/IHistory.h b/docshell/base/IHistory.h
+--- a/docshell/base/IHistory.h
++++ b/docshell/base/IHistory.h
+@@ -56,21 +56,23 @@ namespace mozilla {
+ 
+ class IHistory : public nsISupports
+ {
+ public:
+     NS_DECLARE_STATIC_IID_ACCESSOR(IHISTORY_IID)
+ 
+     /**
+      * Registers the Link for notifications about the visited-ness of aURI.
+-     * Consumers should assume that the URI is unvisited after calling this, and
+-     * they will be notified if that state (unvisited) changes by having
+-     * SetLinkState called on themselves.  This function is guaranteed to run to
+-     * completion before aLink is notified.  After the node is notified, it will
+-     * be unregistered.
++     * They will be notified once soon after calling this function that the
++     * link is either visited or unvisited.  Then, at some future point, if
++     * the link becomes visited, they will be notified again.  This
++     * function is guaranteed to run to completion before aLink is
++     * notified.  After the node is notified that it is *visited*, it will
++     * be unregistered, but if it is notified that it is *unvisited* it
++     * will remain registered.
+      *
+      * @note SetLinkState must not call RegisterVisitedCallback or
+      *       UnregisterVisitedCallback.
+      *
+      * @pre aURI must not be null.
+      * @pre aLink may be null only in the MOZ_IPC parent process.
+      *
+      * @param aURI
 diff --git a/dom/ipc/ContentChild.cpp b/dom/ipc/ContentChild.cpp
 --- a/dom/ipc/ContentChild.cpp
 +++ b/dom/ipc/ContentChild.cpp
@@ -145,7 +229,7 @@ diff --git a/toolkit/components/places/src/History.cpp b/toolkit/components/plac
    if (!mObservers.IsInitialized()) {
      return;
    }
-@@ -1007,17 +1005,20 @@ History::NotifyVisited(nsIURI* aURI)
+@@ -1007,23 +1005,25 @@ History::NotifyVisited(nsIURI* aURI)
      return;
    }
  
@@ -155,18 +239,25 @@ diff --git a/toolkit/components/places/src/History.cpp b/toolkit/components/plac
    for (ObserverArray::index_type i = 0; i < len; i++) {
      Link* link = observers[i];
 -    link->SetLinkState(eLinkState_Visited);
-+    // FIXME: Needs to notify link no matter what aIsVisited is!
-+    if (aIsVisited) {
-+      link->SetLinkState(eLinkState_Visited);
-+    }
++    link->SetLinkState(aIsVisited ? eLinkState_Visited : eLinkState_Unvisited);
      NS_ASSERTION(len == observers.Length(),
                   "Calling SetLinkState added or removed an observer!");
    }
  
-   // All the registered nodes can now be removed for this URI.
-   mObservers.RemoveEntry(aURI);
+-  // All the registered nodes can now be removed for this URI.
+-  mObservers.RemoveEntry(aURI);
++  if (aIsVisited) {
++    // All the registered nodes can now be removed for this URI.
++    mObservers.RemoveEntry(aURI);
++  }
  }
  
+ /* static */
+ History*
+ History::GetService()
+ {
+   if (gService) {
+     return gService;
 diff --git a/toolkit/components/places/src/History.h b/toolkit/components/places/src/History.h
 --- a/toolkit/components/places/src/History.h
 +++ b/toolkit/components/places/src/History.h
