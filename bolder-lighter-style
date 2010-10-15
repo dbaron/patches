@@ -1,0 +1,398 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make 'bolder' and 'lighter' values of 'font-weight' be computed in the style system, per recent edits to CSS 2.1.
+
+diff --git a/gfx/thebes/gfxDWriteFonts.cpp b/gfx/thebes/gfxDWriteFonts.cpp
+--- a/gfx/thebes/gfxDWriteFonts.cpp
++++ b/gfx/thebes/gfxDWriteFonts.cpp
+@@ -85,18 +85,16 @@ gfxDWriteFont::gfxDWriteFont(gfxFontEntr
+     nsresult rv;
+     DWRITE_FONT_SIMULATIONS sims = DWRITE_FONT_SIMULATIONS_NONE;
+     if ((GetStyle()->style & (FONT_STYLE_ITALIC | FONT_STYLE_OBLIQUE)) &&
+         !fe->IsItalic()) {
+             // For this we always use the font_matrix for uniformity. Not the
+             // DWrite simulation.
+             mNeedsOblique = PR_TRUE;
+     }
+-    PRInt8 baseWeight, weightDistance;
+-    GetStyle()->ComputeWeightAndOffset(&baseWeight, &weightDistance);
+     if (aNeedsBold) {
+         sims |= DWRITE_FONT_SIMULATIONS_BOLD;
+     }
+ 
+     rv = fe->CreateFontFace(getter_AddRefs(mFontFace), sims);
+ 
+     if (NS_FAILED(rv)) {
+         mIsValid = PR_FALSE;
+diff --git a/gfx/thebes/gfxFont.cpp b/gfx/thebes/gfxFont.cpp
+--- a/gfx/thebes/gfxFont.cpp
++++ b/gfx/thebes/gfxFont.cpp
+@@ -307,22 +307,18 @@ gfxFontFamily::FindFontForStyle(const gf
+ {
+     if (!mHasStyles)
+         FindStyleVariations(); // collect faces for the family, if not already done
+ 
+     NS_ASSERTION(mAvailableFonts.Length() > 0, "font family with no faces!");
+ 
+     aNeedsSyntheticBold = PR_FALSE;
+ 
+-    PRInt8 baseWeight, weightDistance;
+-    aFontStyle.ComputeWeightAndOffset(&baseWeight, &weightDistance);
++    PRInt8 baseWeight = aFontStyle.ComputeWeight();
+     PRBool wantBold = baseWeight >= 6;
+-    if ((wantBold && weightDistance < 0) || (!wantBold && weightDistance > 0)) {
+-        wantBold = !wantBold;
+-    }
+ 
+     // If the family has only one face, we simply return it; no further checking needed
+     if (mAvailableFonts.Length() == 1) {
+         gfxFontEntry *fe = mAvailableFonts[0];
+         aNeedsSyntheticBold = wantBold && !fe->IsBold();
+         return fe;
+     }
+ 
+@@ -417,57 +413,21 @@ gfxFontFamily::FindFontForStyle(const gf
+             direction = -direction;
+         }
+     }
+ 
+     NS_ASSERTION(matchBaseWeight != 0, 
+                  "weight mapping should always find at least one font in a family");
+ 
+     gfxFontEntry *matchFE = weightList[matchBaseWeight];
+-    const PRInt8 absDistance = abs(weightDistance);
+-    PRInt8 wghtSteps;
+-
+-    if (weightDistance != 0) {
+-        direction = (weightDistance > 0) ? 1 : -1;
+-        PRInt8 j;
+-
+-        // Synthetic bolding occurs when font itself is not a bold-face and
+-        // either the absolute weight is at least 600 or the relative weight
+-        // (e.g. 402) implies a darker face than the ones available.
+-        // note: this means that (1) lighter styles *never* synthetic bold and
+-        // (2) synthetic bolding always occurs at the first bolder step beyond
+-        // available faces, no matter how light the boldest face
+-
+-        // Account for synthetic bold in lighter case
+-        // if lighter is applied with an inherited bold weight,
+-        // and no actual bold faces exist, synthetic bold is used
+-        // so the matched weight above is actually one step down already
+-
+-        wghtSteps = 1; // account for initial mapped weight
+-
+-        if (weightDistance < 0 && baseWeight > 5 && matchBaseWeight < 6) {
+-            wghtSteps++; // if no faces [600, 900] then synthetic bold at 700
+-        }
+-
+-        for (j = matchBaseWeight + direction;
+-             j < 10 && j > 0 && wghtSteps <= absDistance;
+-             j += direction) {
+-            if (weightList[j]) {
+-                matchFE = weightList[j];
+-                wghtSteps++;
+-            }
+-        }
+-    }
+ 
+     NS_ASSERTION(matchFE,
+                  "weight mapping should always find at least one font in a family");
+ 
+-    if (!matchFE->IsBold() &&
+-        ((weightDistance == 0 && baseWeight >= 6) ||
+-         (weightDistance > 0 && wghtSteps <= absDistance)))
++    if (!matchFE->IsBold() && baseWeight >= 6)
+     {
+         aNeedsSyntheticBold = PR_TRUE;
+     }
+ 
+     PR_LOG(gFontSelection, PR_LOG_DEBUG,
+            ("(FindFontForStyle) name: %s, sty: %02x, wt: %d, sz: %.1f -> %s\n", 
+             NS_ConvertUTF16toUTF8(mName).get(),
+             aFontStyle.style, aFontStyle.weight, aFontStyle.size,
+@@ -623,22 +583,17 @@ gfxFontFamily::FindFontForChar(FontSearc
+             
+             // italics
+             if (fe->IsItalic() && 
+                     (style->style & (FONT_STYLE_ITALIC | FONT_STYLE_OBLIQUE)) != 0) {
+                 rank += 5;
+             }
+             
+             // weight
+-            PRInt8 baseWeight, weightDistance;
+-            style->ComputeWeightAndOffset(&baseWeight, &weightDistance);
+-
+-            // xxx - not entirely correct, the one unit of weight distance reflects 
+-            // the "next bolder/lighter face"
+-            PRInt32 targetWeight = (baseWeight * 100) + (weightDistance * 100);
++            PRInt32 targetWeight = style->ComputeWeight() * 100;
+ 
+             PRInt32 entryWeight = fe->Weight();
+             if (entryWeight == targetWeight) {
+                 rank += 5;
+             } else {
+                 PRUint32 diffWeight = abs(entryWeight - targetWeight);
+                 if (diffWeight <= 100)  // favor faces close in weight
+                     rank += 2;
+@@ -2725,31 +2680,27 @@ gfxFontStyle::gfxFontStyle(const gfxFont
+     featureSettings(nsnull)
+ {
+     if (aStyle.featureSettings) {
+         featureSettings = new nsTArray<gfxFontFeature>;
+         featureSettings->AppendElements(*aStyle.featureSettings);
+     }
+ }
+ 
+-void
+-gfxFontStyle::ComputeWeightAndOffset(PRInt8 *outBaseWeight, PRInt8 *outOffset) const
++PRInt8
++gfxFontStyle::ComputeWeight() const
+ {
+     PRInt8 baseWeight = (weight + 50) / 100;
+-    PRInt8 offset = weight - baseWeight * 100;
+ 
+     if (baseWeight < 0)
+         baseWeight = 0;
+     if (baseWeight > 9)
+         baseWeight = 9;
+ 
+-    if (outBaseWeight)
+-        *outBaseWeight = baseWeight;
+-    if (outOffset)
+-        *outOffset = offset;
++    return baseWeight;
+ }
+ 
+ PRBool
+ gfxTextRun::GlyphRunIterator::NextRun()  {
+     if (mNextIndex >= mTextRun->mGlyphRuns.Length())
+         return PR_FALSE;
+     mGlyphRun = &mTextRun->mGlyphRuns[mNextIndex];
+     if (mGlyphRun->mCharacterOffset >= mEndOffset)
+diff --git a/gfx/thebes/gfxFont.h b/gfx/thebes/gfxFont.h
+--- a/gfx/thebes/gfxFont.h
++++ b/gfx/thebes/gfxFont.h
+@@ -132,21 +132,17 @@ struct THEBES_API gfxFontStyle {
+ 
+     // Say that this font is used for print or print preview.
+     PRPackedBool printerFont : 1;
+ 
+     // True if the character set quirks (for treatment of "Symbol",
+     // "Wingdings", etc.) should be applied.
+     PRPackedBool familyNameQuirks : 1;
+ 
+-    // The weight of the font.  100, 200, ... 900 are the weights, and
+-    // single integer offsets request the next bolder/lighter font
+-    // available.  For example, for a font available in weights 200,
+-    // 400, 700, and 900, a weight of 898 should lead to the weight 400
+-    // font being used, since it is two weights lighter than 900.
++    // The weight of the font: 100, 200, ... 900.
+     PRUint16 weight;
+ 
+     // The stretch of the font (the sum of various NS_FONT_STRETCH_*
+     // constants; see gfxFontConstants.h).
+     PRInt16 stretch;
+ 
+     // The logical size of the font, in pixels
+     gfxFloat size;
+@@ -186,18 +182,17 @@ struct THEBES_API gfxFontStyle {
+     }
+ 
+     PLDHashNumber Hash() const {
+         return ((style + (systemFont << 7) + (familyNameQuirks << 8) +
+             (weight << 9)) + PRUint32(size*1000) + PRUint32(sizeAdjust*1000)) ^
+             nsISupportsHashKey::HashKey(language);
+     }
+ 
+-    void ComputeWeightAndOffset(PRInt8 *outBaseWeight,
+-                                PRInt8 *outOffset) const;
++    PRInt8 ComputeWeight() const;
+ 
+     PRBool Equals(const gfxFontStyle& other) const {
+         return (size == other.size) &&
+             (style == other.style) &&
+             (systemFont == other.systemFont) &&
+             (printerFont == other.printerFont) &&
+             (familyNameQuirks == other.familyNameQuirks) &&
+             (weight == other.weight) &&
+diff --git a/gfx/thebes/gfxFontConstants.h b/gfx/thebes/gfxFontConstants.h
+--- a/gfx/thebes/gfxFontConstants.h
++++ b/gfx/thebes/gfxFontConstants.h
+@@ -45,18 +45,16 @@
+  */
+ 
+ #define NS_FONT_STYLE_NORMAL            0
+ #define NS_FONT_STYLE_ITALIC            1
+ #define NS_FONT_STYLE_OBLIQUE           2
+ 
+ #define NS_FONT_WEIGHT_NORMAL           400
+ #define NS_FONT_WEIGHT_BOLD             700
+-#define NS_FONT_WEIGHT_BOLDER           1
+-#define NS_FONT_WEIGHT_LIGHTER          (-1)
+ 
+ #define NS_FONT_STRETCH_ULTRA_CONDENSED (-4)
+ #define NS_FONT_STRETCH_EXTRA_CONDENSED (-3)
+ #define NS_FONT_STRETCH_CONDENSED       (-2)
+ #define NS_FONT_STRETCH_SEMI_CONDENSED  (-1)
+ #define NS_FONT_STRETCH_NORMAL          0
+ #define NS_FONT_STRETCH_SEMI_EXPANDED   1
+ #define NS_FONT_STRETCH_EXPANDED        2
+diff --git a/gfx/thebes/gfxFontconfigUtils.cpp b/gfx/thebes/gfxFontconfigUtils.cpp
+--- a/gfx/thebes/gfxFontconfigUtils.cpp
++++ b/gfx/thebes/gfxFontconfigUtils.cpp
+@@ -184,44 +184,22 @@ GuessFcWeight(const gfxFontStyle& aFontS
+     /*
+      * weights come in two parts crammed into one
+      * integer -- the "base" weight is weight / 100,
+      * the rest of the value is the "offset" from that
+      * weight -- the number of steps to move to adjust
+      * the weight in the list of supported font weights,
+      * this value can be negative or positive.
+      */
+-    PRInt8 weight;
+-    PRInt8 offset;
+-    aFontStyle.ComputeWeightAndOffset(&weight, &offset);
++    PRInt8 weight = aFontStyle.ComputeWeight();
+ 
+-    // ComputeWeightAndOffset trimmed the range of weights for us
++    // ComputeWeight trimmed the range of weights for us
+     NS_ASSERTION(weight >= 0 && weight <= 10,
+                  "base weight out of range");
+ 
+-    // Most font families do not support every weight.  The tables here are
+-    // chosen such that a normal (4) base weight and an offset of +1 will
+-    // guess bold.
+-
+-    // Mapping from weight to a guess of the nearest available lighter weight
+-    static const int lighterGuess[11] =
+-        { 0, 0, 1, 1, 2, 3, 4, 4, 6, 7, 8 };
+-    // Mapping from weight to a guess of the nearest available bolder weight
+-    static const int bolderGuess[11] =
+-        { 2, 3, 4, 6, 7, 7, 8, 9, 10, 10, 10 };
+-
+-    while (offset < 0) {
+-        weight = lighterGuess[weight];
+-        offset++;
+-    }
+-    while (offset > 0) {
+-        weight = bolderGuess[weight];
+-        offset--;
+-    }
+-
+     return gfxFontconfigUtils::FcWeightForBaseWeight(weight);
+ }
+ 
+ static void
+ AddString(FcPattern *aPattern, const char *object, const char *aString)
+ {
+     FcPatternAddString(aPattern, object,
+                        gfxFontconfigUtils::ToFcChar8(aString));
+diff --git a/gfx/thebes/gfxOS2Fonts.cpp b/gfx/thebes/gfxOS2Fonts.cpp
+--- a/gfx/thebes/gfxOS2Fonts.cpp
++++ b/gfx/thebes/gfxOS2Fonts.cpp
+@@ -341,33 +341,29 @@ cairo_font_face_t *gfxOS2Font::CairoFont
+ #endif
+         FcPattern *fcPattern = FcPatternCreate();
+ 
+         // add (family) name to pattern
+         // convert name because FC stores it in UTF8 while we have it in UTF16
+         FcPatternAddString(fcPattern, FC_FAMILY,
+                            (FcChar8 *)NS_ConvertUTF16toUTF8(GetName()).get());
+ 
+-        // adjust font weight using the offset
+         // The requirements outlined in gfxFont.h are difficult to meet without
+         // having a table of available font weights, so we map the gfxFont
+         // weight to possible FontConfig weights.
+-        PRInt8 weight, offset;
+-        GetStyle()->ComputeWeightAndOffset(&weight, &offset);
++        PRInt8 weight = GetStyle()->ComputeWeight();
+         // gfxFont weight   FC weight
+         //    400              80
+         //    700             200
+         PRInt16 fcW = 40 * weight - 80; // match gfxFont weight to base FC weight
+         // find the correct weight in the list
+         PRInt8 i = 0;
+         while (i < nFcWeight && fcWeight[i] < fcW) {
+             i++;
+         }
+-        // add the offset, but observe the available number of weights
+-        i += offset;
+         if (i < 0) {
+             i = 0;
+         } else if (i >= nFcWeight) {
+             i = nFcWeight - 1;
+         }
+         fcW = fcWeight[i];
+ 
+         // add weight to pattern
+diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
+--- a/layout/base/nsStyleConsts.h
++++ b/layout/base/nsStyleConsts.h
+@@ -417,18 +417,18 @@ static inline mozilla::css::Side operato
+ // We should eventually stop using the NS_STYLE_* variants here.
+ #define NS_STYLE_FONT_VARIANT_NORMAL            NS_FONT_VARIANT_NORMAL
+ #define NS_STYLE_FONT_VARIANT_SMALL_CAPS        NS_FONT_VARIANT_SMALL_CAPS
+ 
+ // See nsStyleFont
+ // We should eventually stop using the NS_STYLE_* variants here.
+ #define NS_STYLE_FONT_WEIGHT_NORMAL             NS_FONT_WEIGHT_NORMAL
+ #define NS_STYLE_FONT_WEIGHT_BOLD               NS_FONT_WEIGHT_BOLD
+-#define NS_STYLE_FONT_WEIGHT_BOLDER             NS_FONT_WEIGHT_BOLDER
+-#define NS_STYLE_FONT_WEIGHT_LIGHTER            NS_FONT_WEIGHT_LIGHTER
++#define NS_STYLE_FONT_WEIGHT_BOLDER             (-1)
++#define NS_STYLE_FONT_WEIGHT_LIGHTER            (-2)
+ 
+ // See nsStyleFont
+ #define NS_STYLE_FONT_SIZE_XXSMALL              0
+ #define NS_STYLE_FONT_SIZE_XSMALL               1
+ #define NS_STYLE_FONT_SIZE_SMALL                2
+ #define NS_STYLE_FONT_SIZE_MEDIUM               3
+ #define NS_STYLE_FONT_SIZE_LARGE                4
+ #define NS_STYLE_FONT_SIZE_XLARGE               5
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -3000,21 +3000,40 @@ nsRuleNode::SetFont(nsPresContext* aPres
+   // special handling for enum
+   if (eCSSUnit_Enumerated == aFontData.mWeight.GetUnit()) {
+     PRInt32 value = aFontData.mWeight.GetIntValue();
+     switch (value) {
+       case NS_STYLE_FONT_WEIGHT_NORMAL:
+       case NS_STYLE_FONT_WEIGHT_BOLD:
+         aFont->mFont.weight = value;
+         break;
+-      case NS_STYLE_FONT_WEIGHT_BOLDER:
+-      case NS_STYLE_FONT_WEIGHT_LIGHTER:
++      case NS_STYLE_FONT_WEIGHT_BOLDER: {
+         aCanStoreInRuleTree = PR_FALSE;
+-        aFont->mFont.weight = nsStyleUtil::ConstrainFontWeight(aParentFont->mFont.weight + value);
++        PRInt32 inheritedValue = aParentFont->mFont.weight;
++        if (inheritedValue <= 300) {
++          aFont->mFont.weight = 400;
++        } else if (inheritedValue <= 500) {
++          aFont->mFont.weight = 700;
++        } else {
++          aFont->mFont.weight = 900;
++        }
+         break;
++      }
++      case NS_STYLE_FONT_WEIGHT_LIGHTER: {
++        aCanStoreInRuleTree = PR_FALSE;
++        PRInt32 inheritedValue = aParentFont->mFont.weight;
++        if (inheritedValue < 600) {
++          aFont->mFont.weight = 100;
++        } else if (inheritedValue < 800) {
++          aFont->mFont.weight = 400;
++        } else {
++          aFont->mFont.weight = 700;
++        }
++        break;
++      }
+     }
+   } else
+     SetDiscrete(aFontData.mWeight, aFont->mFont.weight, aCanStoreInRuleTree,
+                 SETDSC_INTEGER | SETDSC_SYSTEM_FONT,
+                 aParentFont->mFont.weight,
+                 defaultVariableFont->weight,
+                 0, 0, 0, systemFont.weight);
+ 
