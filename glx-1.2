@@ -5,7 +5,7 @@ Allow use of GLX 1.2 when setting up GL for WebGL.
 diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderGLX.cpp
 --- a/gfx/thebes/GLContextProviderGLX.cpp
 +++ b/gfx/thebes/GLContextProviderGLX.cpp
-@@ -82,36 +82,38 @@ GLXLibrary::EnsureInitialized()
+@@ -82,36 +82,39 @@ GLXLibrary::EnsureInitialized()
  
      LibrarySymbolLoader::SymLoadStruct symbols[] = {
          { (PRFuncPtr*) &xDeleteContext, { "glXDestroyContext", NULL } },
@@ -20,6 +20,7 @@ diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderG
 +        { (PRFuncPtr*) &xGetClientString, { "glXGetClientString", NULL } },
 +        { (PRFuncPtr*) &xCreateContext, { "glXCreateContext", NULL } },
 +        { (PRFuncPtr*) &xGetCurrentContext, { "glXGetCurrentContext", NULL } },
++        { (PRFuncPtr*) &xGetConfig, { "glXGetConfig", NULL } },
 +        { (PRFuncPtr*) &xCreateGLXPixmap, { "glXCreateGLXPixmap", NULL } },
 +        { (PRFuncPtr*) &xDestroyGLXPixmap, { "glXDestroyGLXPixmap", NULL } },
 +        { NULL, { NULL } }
@@ -55,7 +56,7 @@ diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderG
                                                        GLX_VERSION);
      const char *clientVersionStr = xGetClientString(DefaultXDisplay(),
                                                      GLX_VERSION);
-@@ -131,18 +133,22 @@ GLXLibrary::EnsureInitialized()
+@@ -131,18 +134,22 @@ GLXLibrary::EnsureInitialized()
          strlen(clientVersionStr) >= 3 &&
          clientVersionStr[1] == '.')
      {
@@ -79,7 +80,32 @@ diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderG
      mInitialized = PR_TRUE;
      return PR_TRUE;
  }
-@@ -427,16 +433,21 @@ AreCompatibleVisuals(XVisualInfo *one, X
+@@ -166,18 +173,22 @@ public:
+                     GLXDrawable drawable,
+                     GLXFBConfig cfg,
+                     XVisualInfo *vinfo,
+                     GLContextGLX *shareContext,
+                     PRBool deleteDrawable,
+                     gfxXlibSurface *pixmap = nsnull)
+     {
+         int db = 0, err;
+-        err = sGLXLibrary.xGetFBConfigAttrib(display, cfg,
+-                                             GLX_DOUBLEBUFFER, &db);
++        if (gGLXVersion >= 0x0103) {
++            err = sGLXLibrary.xGetFBConfigAttrib(display, cfg,
++                                                 GLX_DOUBLEBUFFER, &db);
++        } else {
++            err = sGLXLibrary.xGetConfig(display, vinfo, GLX_DOUBLEBUFFER, &db);
++        }
+         if (GLX_BAD_ATTRIBUTE != err) {
+ #ifdef DEBUG
+             printf("[GLX] FBConfig is %sdouble-buffered\n", db ? "" : "not ");
+ #endif
+         }
+ 
+         ctxErrorOccurred = false;
+         int (*oldHandler)(Display *, XErrorEvent *);
+@@ -427,16 +438,21 @@ AreCompatibleVisuals(XVisualInfo *one, X
  
  already_AddRefed<GLContext>
  GLContextProviderGLX::CreateForWindow(nsIWidget *aWidget)
@@ -101,29 +127,143 @@ diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderG
      // is a relatively safe intermediate step.
  
      Display *display = (Display*)aWidget->GetNativeData(NS_NATIVE_DISPLAY); 
-@@ -534,16 +545,21 @@ static already_AddRefed<GLContextGLX>
- CreateOffscreenPixmapContext(const gfxIntSize& aSize,
-                              const ContextFormat& aFormat,
-                              PRBool aShare)
- {
-     if (!sGLXLibrary.EnsureInitialized()) {
+@@ -548,82 +564,98 @@ CreateOffscreenPixmapContext(const gfxIn
+         GLX_X_RENDERABLE, True,
+         GLX_RED_SIZE, 1,
+         GLX_GREEN_SIZE, 1,
+         GLX_BLUE_SIZE, 1,
+         GLX_ALPHA_SIZE, 0,
+         GLX_DEPTH_SIZE, 0,
+         0
+     };
+-    int numConfigs = 0;
++
++    ScopedXFree<XVisualInfo> vinfo;
+ 
+     ScopedXFree<GLXFBConfig> cfgs;
+-    cfgs = sGLXLibrary.xChooseFBConfig(display,
+-                                       xscreen,
+-                                       attribs,
+-                                       &numConfigs);
+-    if (!cfgs) {
+-        return nsnull;
+-    }
++    GLXFBConfig chosenConfig;
++    if (gGLXVersion >= 0x0103) {
++        int numConfigs = 0;
+ 
+-    NS_ASSERTION(numConfigs > 0,
+-                 "glXChooseFBConfig() failed to match our requested format and violated its spec (!)");
+-
+-    ScopedXFree<XVisualInfo> vinfo;
+-    int chosenIndex;
+-
+-    for (int i = 0; i < numConfigs; ++i) {
+-        int dtype, visid;
+-
+-        if (sGLXLibrary.xGetFBConfigAttrib(display, cfgs[i], GLX_DRAWABLE_TYPE, &dtype) != Success
+-            || !(dtype & GLX_PIXMAP_BIT))
+-        {
+-            continue;
+-        }
+-        if (sGLXLibrary.xGetFBConfigAttrib(display, cfgs[i], GLX_VISUAL_ID, &visid) != Success
+-            || visid == 0)
+-        {
+-            continue;
++        cfgs = sGLXLibrary.xChooseFBConfig(display,
++                                           xscreen,
++                                           attribs,
++                                           &numConfigs);
++        if (!cfgs) {
++            return nsnull;
+         }
+ 
+-        vinfo = sGLXLibrary.xGetVisualFromFBConfig(display, cfgs[i]);
++        NS_ASSERTION(numConfigs > 0,
++                     "glXChooseFBConfig() failed to match our requested format and violated its spec (!)");
+ 
+-        if (vinfo) {
+-            chosenIndex = i;
+-            break;
++        for (int i = 0; i < numConfigs; ++i) {
++            int dtype, visid;
++
++            if (sGLXLibrary.xGetFBConfigAttrib(display, cfgs[i], GLX_DRAWABLE_TYPE, &dtype) != Success
++                || !(dtype & GLX_PIXMAP_BIT))
++            {
++                continue;
++            }
++            if (sGLXLibrary.xGetFBConfigAttrib(display, cfgs[i], GLX_VISUAL_ID, &visid) != Success
++                || visid == 0)
++            {
++                continue;
++            }
++
++            vinfo = sGLXLibrary.xGetVisualFromFBConfig(display, cfgs[i]);
++
++            if (vinfo) {
++                chosenConfig = cfgs[i];
++                break;
++            }
+         }
++    } else {
++        vinfo = sGLXLibrary.xChooseVisual(display, xscreen, attribs);
++
++        // Leave chosenConfig uninitialized;
++        // GLContextGLX::CreateGLContext will also check gGLXVersion and
++        // thus won't use it.
+     }
+ 
+     if (!vinfo) {
+-        NS_WARNING("glXChooseFBConfig() didn't give us any configs with visuals!");
++        NS_WARNING("glXChooseFBConfig()/glXChooseVisual() didn't give us any configs with visuals!");
          return nsnull;
      }
  
-+    if (gGLXVersion < 0x0103) {
-+        // FIXME: WRITE ME!
-+        return nsnull;
-+    }
-+
-     Display *display = DefaultXDisplay();
-     int xscreen = DefaultScreen(display);
+     nsRefPtr<gfxXlibSurface> xsurface = gfxXlibSurface::Create(DefaultScreenOfDisplay(display),
+                                                                vinfo->visual,
+                                                                gfxIntSize(16, 16));
+     if (xsurface->CairoStatus() != 0) {
+         return nsnull;
+     }
  
-     int attribs[] = {
-         GLX_DOUBLEBUFFER, False,
-         GLX_DRAWABLE_TYPE, GLX_PIXMAP_BIT,
-         GLX_X_RENDERABLE, True,
-         GLX_RED_SIZE, 1,
-@@ -656,16 +672,21 @@ GLContextProviderGLX::CreateOffscreen(co
+-   
+-    GLXPixmap glxpixmap = sGLXLibrary.xCreatePixmap(display,
+-                                                    cfgs[chosenIndex],
+-                                                    xsurface->XDrawable(),
+-                                                    NULL);
++    GLXPixmap glxpixmap;
++    if (gGLXVersion >= 0x0103) {
++        glxpixmap = sGLXLibrary.xCreatePixmap(display,
++                                              chosenConfig,
++                                              xsurface->XDrawable(),
++                                              NULL);
++    } else {
++        // FIXME: We're assuming xsurface's drawable is a Pixmap!
++        glxpixmap = sGLXLibrary.xCreateGLXPixmap(display,
++                                                 vinfo,
++                                                 static_cast<Pixmap>(xsurface->XDrawable()));
++    }
+     if (glxpixmap == 0) {
+         return nsnull;
+     }
+ 
+     GLContextGLX *shareContext = aShare ? GetGlobalContextGLX() : nsnull;
+ 
+     nsRefPtr<GLContextGLX> glContext = GLContextGLX::CreateGLContext(aFormat,
+                                                                      display,
+                                                                      glxpixmap,
+-                                                                     cfgs[chosenIndex],
++                                                                     chosenConfig,
+                                                                      vinfo,
+                                                                      shareContext,
+                                                                      PR_TRUE,
+                                                                      xsurface);
+ 
+     return glContext.forget();
+ }
+ 
+@@ -656,16 +688,21 @@ GLContextProviderGLX::CreateOffscreen(co
  
  already_AddRefed<GLContext>
  GLContextProviderGLX::CreateForNativePixmapSurface(gfxASurface *aSurface)
