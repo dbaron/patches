@@ -1,0 +1,144 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Animate skew in angle space rather than tangent space for interop and to avoid issues with infinite tangents.  (Bug 606722)
+
+diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
+--- a/layout/style/nsStyleAnimation.cpp
++++ b/layout/style/nsStyleAnimation.cpp
+@@ -618,25 +618,17 @@ nsStyleAnimation::ComputeDistance(nsCSSP
+             CalcValue c1 = ExtractCalcValue(v1),
+                       c2 = ExtractCalcValue(v2);
+             double diff = c1.mLength - c2.mLength;
+             squareDistance += diff * diff;
+             diff = c1.mPercent - c2.mPercent;
+             squareDistance += diff * diff;
+           } else {
+             NS_ABORT_IF_FALSE(v1.GetUnit() == v2.GetUnit(), "unit mismatch");
+-            double diff;
+-            if (tfunc == eCSSKeyword_skewx ||
+-                tfunc == eCSSKeyword_skewy ||
+-                tfunc == eCSSKeyword_skew) {
+-              NS_ABORT_IF_FALSE(v1.GetUnit() == eCSSUnit_Radian, "unexpected unit");
+-              diff = tan(v2.GetFloatValue()) - tan(v1.GetFloatValue());
+-            } else {
+-              diff = v2.GetFloatValue() - v1.GetFloatValue();
+-            }
++            double diff = v2.GetFloatValue() - v1.GetFloatValue();
+             squareDistance += diff * diff;
+           }
+         }
+       }
+       NS_ABORT_IF_FALSE(!list1 && !list2,
+                         "list lengths should match after AddWeighted");
+ 
+       aDistance = sqrt(squareDistance);
+@@ -876,31 +868,16 @@ AddTransformScale(const nsCSSValue &aVal
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Number, "unexpected unit");
+ 
+   float v1 = aValue1.GetFloatValue() - 1.0f,
+         v2 = aValue2.GetFloatValue() - 1.0f;
+   float result = v1 * aCoeff1 + v2 * aCoeff2;
+   aResult.SetFloatValue(result + 1.0f, eCSSUnit_Number);
+ }
+ 
+-// FIXME: The spec still says skew should animate in angle space,
+-// although I think we at least sort of agreed that it should animate
+-// in tangent space.  So here I animate in in tangent space.
+-// Animating in angle space would mean just using AddCSSValueAngle.
+-static void
+-AddTransformSkew(const nsCSSValue &aValue1, double aCoeff1,
+-                 const nsCSSValue &aValue2, double aCoeff2,
+-                 nsCSSValue &aResult)
+-{
+-  aResult.SetFloatValue(atan(aCoeff1 * tan(aValue1.GetAngleValueInRadians()) +
+-                             aCoeff2 * tan(aValue2.GetAngleValueInRadians())),
+-                        eCSSUnit_Radian);
+-}
+-
+-
+ static already_AddRefed<nsCSSValue::Array>
+ AppendTransformFunction(nsCSSKeyword aTransformFunction,
+                         nsCSSValueList**& aListTail)
+ {
+   PRUint32 nargs;
+   if (aTransformFunction == eCSSKeyword_matrix) {
+     nargs = 6;
+   } else if (aTransformFunction == eCSSKeyword_translate ||
+@@ -1151,20 +1128,17 @@ AddTransformMatrix(const nsStyleTransfor
+ 
+   float rotate1, XYshear1, scaleX1, scaleY1;
+   DecomposeMatrix(aMatrix1, rotate1, XYshear1, scaleX1, scaleY1);
+   float rotate2, XYshear2, scaleX2, scaleY2;
+   DecomposeMatrix(aMatrix2, rotate2, XYshear2, scaleX2, scaleY2);
+ 
+   float rotate = rotate1 * aCoeff1 + rotate2 * aCoeff2;
+ 
+-  // FIXME: The spec still says skew should animate in angle space,
+-  // although I think we at least sort of agreed that it should animate
+-  // in tangent space.  So here I animate in in tangent space.
+-  float skewX = atanf(XYshear1 * aCoeff1 + XYshear2 * aCoeff2);
++  float skewX = atanf(XYshear1) * aCoeff1 + atanf(XYshear2) * aCoeff2;
+ 
+   // Handle scale, and the two matrix components where identity is 1, by
+   // subtracting 1, multiplying by the coefficients, and then adding 1
+   // back.  This gets the right AddWeighted behavior and gets us the
+   // interpolation-against-identity behavior for free.
+   float scaleX =
+     ((scaleX1 - 1.0f) * aCoeff1 + (scaleX2 - 1.0f) * aCoeff2) + 1.0f;
+   float scaleY =
+@@ -1275,47 +1249,44 @@ AddTransformLists(const nsCSSValueList* 
+         NS_ABORT_IF_FALSE(a1->Count() == 2, "unexpected count");
+         NS_ABORT_IF_FALSE(a2->Count() == 2, "unexpected count");
+ 
+         AddTransformScale(a1->Item(1), aCoeff1, a2->Item(1), aCoeff2,
+                           arr->Item(1));
+ 
+         break;
+       }
++      // It would probably be nicer to animate skew in tangent space
++      // rather than angle space.  However, it's easy to specify
++      // skews with infinite tangents, and behavior changes pretty
++      // drastically when crossing such skews (since the direction of
++      // animation flips), so interop is probably more important here.
+       case eCSSKeyword_skew: {
+         NS_ABORT_IF_FALSE(a1->Count() == 2 || a1->Count() == 3,
+                           "unexpected count");
+         NS_ABORT_IF_FALSE(a2->Count() == 2 || a2->Count() == 3,
+                           "unexpected count");
+ 
+         nsCSSValue zero(0.0f, eCSSUnit_Radian);
+         // Add Y component of skew.
+-        AddTransformSkew(a1->Count() == 3 ? a1->Item(2) : zero,
++        AddCSSValueAngle(a1->Count() == 3 ? a1->Item(2) : zero,
+                          aCoeff1,
+                          a2->Count() == 3 ? a2->Item(2) : zero,
+                          aCoeff2,
+                          arr->Item(2));
+ 
+         // Add X component of skew (which can be merged with case below
+         // in non-DEBUG).
+-        AddTransformSkew(a1->Item(1), aCoeff1, a2->Item(1), aCoeff2,
++        AddCSSValueAngle(a1->Item(1), aCoeff1, a2->Item(1), aCoeff2,
+                          arr->Item(1));
+ 
+         break;
+       }
+       case eCSSKeyword_skewx:
+-      case eCSSKeyword_skewy: {
+-        NS_ABORT_IF_FALSE(a1->Count() == 2, "unexpected count");
+-        NS_ABORT_IF_FALSE(a2->Count() == 2, "unexpected count");
+-
+-        AddTransformSkew(a1->Item(1), aCoeff1, a2->Item(1), aCoeff2,
+-                         arr->Item(1));
+-
+-        break;
+-      }
++      case eCSSKeyword_skewy:
+       case eCSSKeyword_rotate: {
+         NS_ABORT_IF_FALSE(a1->Count() == 2, "unexpected count");
+         NS_ABORT_IF_FALSE(a2->Count() == 2, "unexpected count");
+ 
+         AddCSSValueAngle(a1->Item(1), aCoeff1, a2->Item(1), aCoeff2,
+                          arr->Item(1));
+ 
+         break;
