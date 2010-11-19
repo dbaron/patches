@@ -1,0 +1,89 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Don't propagate text-decoration in quirks-mode across inline-block, inline-table, and HTML table elements.  Also, prepare quirks-mode text-decoration propagation code for use in standards mode (for bug 403524).  (Bug 572713)
+
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4151,30 +4151,39 @@ FillClippedRect(gfxContext* aCtx, nsPres
+ nsTextFrame::TextDecorations
+ nsTextFrame::GetTextDecorations(nsPresContext* aPresContext)
+ {
+   TextDecorations decorations;
+ 
+   // Quirks mode text decoration are rendered by children; see bug 1777
+   // In non-quirks mode, nsHTMLContainer::Paint and nsBlockFrame::Paint
+   // does the painting of text decorations.
+-  if (eCompatibility_NavQuirks != aPresContext->CompatibilityMode())
++  // FIXME Bug 403524: We'd like to unify standards-mode and quirks-mode
++  // text-decoration drawing, using what's currently the quirks mode
++  // codepath.  But for now this code is only used for quirks mode.
++  const nsCompatibility compatMode = aPresContext->CompatibilityMode();
++  if (compatMode != eCompatibility_NavQuirks)
+     return decorations;
+ 
+   PRBool useOverride = PR_FALSE;
+   nscolor overrideColor;
+ 
+   // A mask of all possible decorations.
+   PRUint8 decorMask = NS_STYLE_TEXT_DECORATION_UNDERLINE | 
+                       NS_STYLE_TEXT_DECORATION_OVERLINE |
+                       NS_STYLE_TEXT_DECORATION_LINE_THROUGH;
+ 
+-  for (nsStyleContext* context = GetStyleContext();
+-       decorMask && context && context->HasTextDecorations();
+-       context = context->GetParent()) {
++  PRBool isChild; // ignored
++  for (nsIFrame* f = this; decorMask && f;
++       NS_SUCCEEDED(f->GetParentStyleContextFrame(aPresContext, &f, &isChild))
++         || (f = nsnull)) {
++    nsStyleContext* context = f->GetStyleContext();
++    if (!context->HasTextDecorations()) {
++      break;
++    }
+     const nsStyleTextReset* styleText = context->GetStyleTextReset();
+     if (!useOverride && 
+         (NS_STYLE_TEXT_DECORATION_OVERRIDE_ALL & styleText->mTextDecoration)) {
+       // This handles the <a href="blah.html"><font color="green">La 
+       // la la</font></a> case. The link underline should be green.
+       useOverride = PR_TRUE;
+       overrideColor = context->GetVisitedDependentColor(eCSSProperty_color);
+     }
+@@ -4194,16 +4203,37 @@ nsTextFrame::GetTextDecorations(nsPresCo
+         decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_OVERLINE;
+       }
+       if (NS_STYLE_TEXT_DECORATION_LINE_THROUGH & useDecorations) {
+         decorations.mStrikeColor = useOverride ? overrideColor : color;
+         decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_THROUGH;
+         decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_THROUGH;
+       }
+     }
++
++    // In all modes, if we're on an inline-block or inline-table (or
++    // inline-stack, inline-box, inline-grid), we're done.
++    const nsStyleDisplay *disp = context->GetStyleDisplay();
++    if (disp->mDisplay != NS_STYLE_DISPLAY_INLINE &&
++        disp->IsInlineOutside()) {
++      break;
++    }
++
++    if (compatMode == eCompatibility_NavQuirks) {
++      // In quirks mode, if we're on an HTML table element, we're done.
++      if (f->GetContent()->IsHTML(nsGkAtoms::table)) {
++        break;
++      }
++    } else {
++      // In standards/almost-standards mode, if we're on an
++      // absolutely-positioned element or a floating element, we're done.
++      if (disp->IsFloating() || disp->IsAbsolutelyPositioned()) {
++        break;
++      }
++    }
+   }
+ 
+   return decorations;
+ }
+ 
+ void
+ nsTextFrame::UnionTextDecorationOverflow(nsPresContext* aPresContext,
+                                          PropertyProvider& aProvider,
