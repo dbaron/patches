@@ -1,0 +1,171 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Reuse existing nsImageLoader in the common case to work around an imagelib bug.  (Bug 552538)
+
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1318,67 +1318,91 @@ nsPresContext::SetFullZoom(float aZoom)
+   mSupressResizeReflow = PR_FALSE;
+ 
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ }
+ 
+ void
+ nsPresContext::SetImageLoaders(nsIFrame* aTargetFrame,
+                                ImageLoadType aType,
+-                               nsImageLoader* aImageLoaders)
++                               request_array &aImages,
++                               PRUint32 aActions)
+ {
+-  NS_ASSERTION(mShell || !aImageLoaders,
++  NS_ASSERTION(mShell || aImages.IsEmpty(),
+                "Shouldn't add new image loader after the shell is gone");
+ 
+   nsRefPtr<nsImageLoader> oldLoaders;
+   mImageLoaders[aType].Get(aTargetFrame, getter_AddRefs(oldLoaders));
+ 
+-  if (aImageLoaders) {
+-    mImageLoaders[aType].Put(aTargetFrame, aImageLoaders);
++  if (!aImages.IsEmpty()) {
++    // If we have a single image, and the URL is the same as what we
++    // used to have, just leave the existing image loader.  This is
++    // useful as a workaround for a bug in imagelib in most cases.  See
++    // bug 552538.
++    if (aImages.Length() == 1 && oldLoaders && !oldLoaders->GetNextLoader()) {
++      nsCOMPtr<nsIURI> oldURI, newURI;
++      oldLoaders->GetRequest()->GetURI(getter_AddRefs(oldURI));
++      aImages[0]->GetURI(getter_AddRefs(newURI));
++      PRBool eq;
++      if (NS_SUCCEEDED(oldURI->Equals(newURI, &eq)) && eq) {
++        return;
++      }
++    }
++
++    // Build a new linked list of image loaders.
++    nsRefPtr<nsImageLoader> newLoaders;
++    for (request_array::size_type i = 0, iEnd = aImages.Length();
++         i < iEnd; ++i) {
++      newLoaders =
++        nsImageLoader::Create(aTargetFrame, aImages[i], aActions, newLoaders);
++    }
++
++    mImageLoaders[aType].Put(aTargetFrame, newLoaders);
+   } else if (oldLoaders) {
+     mImageLoaders[aType].Remove(aTargetFrame);
+   }
+ 
+   if (oldLoaders)
+     oldLoaders->Destroy();
+ }
+ 
+ void
+ nsPresContext::SetupBackgroundImageLoaders(nsIFrame* aFrame,
+                                      const nsStyleBackground* aStyleBackground)
+ {
+-  nsRefPtr<nsImageLoader> loaders;
++  nsAutoTArray<imgIRequest*,1> images;
+   NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, aStyleBackground) {
+     if (aStyleBackground->mLayers[i].mImage.GetType() == eStyleImageType_Image) {
+-      PRUint32 actions = nsImageLoader::ACTION_REDRAW_ON_DECODE;
+-      imgIRequest *image = aStyleBackground->mLayers[i].mImage.GetImageData();
+-      loaders = nsImageLoader::Create(aFrame, image, actions, loaders);
++      images.AppendElement(aStyleBackground->mLayers[i].mImage.GetImageData());
+     }
+   }
+-  SetImageLoaders(aFrame, BACKGROUND_IMAGE, loaders);
++  PRUint32 actions = nsImageLoader::ACTION_REDRAW_ON_DECODE;
++  SetImageLoaders(aFrame, BACKGROUND_IMAGE, images, actions);
+ }
+ 
+ void
+ nsPresContext::SetupBorderImageLoaders(nsIFrame* aFrame,
+                                        const nsStyleBorder* aStyleBorder)
+ {
++  NS_ASSERTION(aStyleBorder->GetBorderImage(),
++               "caller is expected to check there is a border-image");
+   PRUint32 actions = nsImageLoader::ACTION_REDRAW_ON_LOAD;
+   if (aStyleBorder->ImageBorderDiffers())
+     actions |= nsImageLoader::ACTION_REFLOW_ON_LOAD;
+-  nsRefPtr<nsImageLoader> loader =
+-    nsImageLoader::Create(aFrame, aStyleBorder->GetBorderImage(),
+-                          actions, nsnull);
+-  SetImageLoaders(aFrame, BORDER_IMAGE, loader);
++  nsAutoTArray<imgIRequest*,1> images;
++  images.AppendElement(aStyleBorder->GetBorderImage());
++  SetImageLoaders(aFrame, BORDER_IMAGE, images, actions);
+ }
+ 
+ void
+ nsPresContext::StopImagesFor(nsIFrame* aTargetFrame)
+ {
++  nsTArray<imgIRequest*> images;
+   for (PRUint32 i = 0; i < IMAGE_LOAD_TYPE_COUNT; ++i)
+-    SetImageLoaders(aTargetFrame, ImageLoadType(i), nsnull);
++    SetImageLoaders(aTargetFrame, ImageLoadType(i), images, 0);
+ }
+ 
+ void
+ nsPresContext::SetContainer(nsISupports* aHandler)
+ {
+   mContainer = do_GetWeakReference(aHandler);
+   InvalidateIsChromeCache();
+   if (mContainer) {
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -411,24 +411,25 @@ public:
+    */
+   enum ImageLoadType {
+     BACKGROUND_IMAGE,
+     BORDER_IMAGE,
+     IMAGE_LOAD_TYPE_COUNT
+   };
+ 
+   /**
+-   * Set the list of image loaders that track invalidation for a
+-   * specific frame and type of image.  This list will replace any
+-   * previous list for that frame and image type (and null will remove
+-   * any previous list).
++   * Construct and set the list of image loaders that track invalidation
++   * for a specific frame and type of image.  This list will replace any
++   * previous list for that frame and image type.
+    */
++  typedef nsTArray<imgIRequest*> request_array;
+   NS_HIDDEN_(void) SetImageLoaders(nsIFrame* aTargetFrame,
+                                    ImageLoadType aType,
+-                                   nsImageLoader* aImageLoaders);
++                                   request_array &aImages,
++                                   PRUint32 aActions);
+ 
+   /**
+    * Make an appropriate SetImageLoaders call (including potentially
+    * with null aImageLoaders) given that aFrame draws its background
+    * based on aStyleBackground.
+    */
+   NS_HIDDEN_(void) SetupBackgroundImageLoaders(nsIFrame* aFrame,
+                                                const nsStyleBackground*
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -521,18 +521,19 @@ nsFrame::DidSetStyleContext(nsStyleConte
+     // when we paint, although we could miss a notification in that
+     // interval.)
+     const nsStyleBackground *oldBG = aOldStyleContext->GetStyleBackground();
+     const nsStyleBackground *newBG = GetStyleBackground();
+     NS_FOR_VISIBLE_BACKGROUND_LAYERS_BACK_TO_FRONT(i, oldBG) {
+       if (i >= newBG->mImageCount ||
+           oldBG->mLayers[i].mImage != newBG->mLayers[i].mImage) {
+         // stop the image loading for the frame, the image has changed
++        nsTArray<imgIRequest*> images;
+         PresContext()->SetImageLoaders(this,
+-          nsPresContext::BACKGROUND_IMAGE, nsnull);
++          nsPresContext::BACKGROUND_IMAGE, images, 0);
+         break;
+       }
+     }
+ 
+     // If we detect a change on margin, padding or border, we store the old
+     // values on the frame itself between now and reflow, so if someone
+     // calls GetUsed(Margin|Border|Padding)() before the next reflow, we
+     // can give an accurate answer.
