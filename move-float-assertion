@@ -1,0 +1,162 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Move assertion about continuations of floats so that it is valid. (Bug 595740)
+
+When we do multiple reflow passes inside a container with page or column
+breaks, we might hit this assertion for legitimate reasons.  In
+particular, if a reflow places the first-in-flow of a float in a later
+continuation of its containing block than it was in before, then during
+reflow we push the continuations of the float back through the
+continuations of the containing block, and in intermediate states of
+this process (such as when this assertion fires), we have two
+continuations of the same float within the same parent.
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -3785,16 +3785,35 @@ nsLayoutUtils::GetEditableRootContentByC
+   nsresult rv = domHTMLDoc->GetBody(getter_AddRefs(body));
+   nsCOMPtr<nsIContent> content = do_QueryInterface(body);
+   if (NS_SUCCEEDED(rv) && content && content->IsEditable()) {
+     return content;
+   }
+   return nsnull;
+ }
+ 
++#ifdef DEBUG
++/* static */ void
++nsLayoutUtils::AssertNoDuplicateContinuations(nsIFrame* aContainer,
++                                              const nsFrameList& aFrameList)
++{
++  for (nsIFrame* f = aFrameList.FirstChild(); f ; f = f->GetNextSibling()) {
++    // Check only later continuations of f; we deal with checking the
++    // earlier continuations when we hit those earlier continuations in
++    // the frame list.
++    for (nsIFrame *c = f; (c = c->GetNextInFlow());) {
++      NS_ASSERTION(c->GetParent() != aContainer ||
++                   !aFrameList.ContainsFrame(c),
++                   "Two continuations of the same frame in the same "
++                   "frame list");
++    }
++  }
++}
++#endif
++
+ nsSetAttrRunnable::nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
+                                      const nsAString& aValue)
+   : mContent(aContent),
+     mAttrName(aAttrName),
+     mValue(aValue)
+ {
+   NS_ASSERTION(aContent && aAttrName, "Missing stuff, prepare to crash");
+ }
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1258,16 +1258,27 @@ public:
+    * Returns true if the passed in prescontext needs the dark grey background
+    * that goes behind the page of a print preview presentation.
+    */
+   static PRBool NeedsPrintPreviewBackground(nsPresContext* aPresContext) {
+     return aPresContext->IsRootPaginatedDocument() &&
+       (aPresContext->Type() == nsPresContext::eContext_PrintPreview ||
+        aPresContext->Type() == nsPresContext::eContext_PageLayout);
+   }
++
++#ifdef DEBUG
++  /**
++   * Assert that there are no duplicate continuations of the same frame
++   * within aFrameList.  Optimize the tests by assuming that all frames
++   * in aFrameList have parent aContainer.
++   */
++  static void
++  AssertNoDuplicateContinuations(nsIFrame* aContainer,
++                                 const nsFrameList& aFrameList);
++#endif
+ };
+ 
+ class nsSetAttrRunnable : public nsRunnable
+ {
+ public:
+   nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
+                     const nsAString& aValue);
+   nsSetAttrRunnable(nsIContent* aContent, nsIAtom* aAttrName,
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1213,16 +1213,23 @@ nsBlockFrame::Reflow(nsPresContext*     
+   // don't waste time translating the coordinate system back on a dead
+   // float manager.
+   if (needFloatManager)
+     state.mFloatManager = nsnull;
+ 
+   aStatus = state.mReflowStatus;
+ 
+ #ifdef DEBUG
++  // Between when we drain pushed floats and when we complete reflow,
++  // we're allowed to have multiple continuations of the same float on
++  // our floats list, since a first-in-flow might get pushed to a later
++  // continuation of its containing block.  But it's not permitted
++  // outside that time.
++  nsLayoutUtils::AssertNoDuplicateContinuations(this, mFloats);
++
+   if (gNoisyReflow) {
+     IndentBy(stdout, gNoiseIndent);
+     ListTag(stdout);
+     printf(": status=%x (%scomplete) metrics=%d,%d carriedMargin=%d",
+            aStatus, NS_FRAME_IS_COMPLETE(aStatus) ? "" : "not ",
+            aMetrics.width, aMetrics.height,
+            aMetrics.mCarriedOutBottomMargin.get());
+     if (HasOverflowAreas()) {
+@@ -4584,16 +4591,25 @@ nsBlockFrame::DrainOverflowLines(nsBlock
+   }
+ 
+   return PR_TRUE;
+ }
+ 
+ void
+ nsBlockFrame::DrainPushedFloats(nsBlockReflowState& aState)
+ {
++#ifdef DEBUG
++  // Between when we drain pushed floats and when we complete reflow,
++  // we're allowed to have multiple continuations of the same float on
++  // our floats list, since a first-in-flow might get pushed to a later
++  // continuation of its containing block.  But it's not permitted
++  // outside that time.
++  nsLayoutUtils::AssertNoDuplicateContinuations(this, mFloats);
++#endif
++
+   // If we're getting reflowed multiple times without our
+   // next-continuation being reflowed, we might need to pull back floats
+   // that we just put in the list to be pushed to our next-in-flow.
+   // But we can't pull any next-in-flows of floats on our own float list.
+   nsFrameList *ourPushedFloats = GetPushedFloats();
+   if (ourPushedFloats) {
+     for (nsIFrame *f = ourPushedFloats->LastChild(), *next; f; f = next) {
+       next = f->GetPrevSibling();
+@@ -4620,25 +4636,16 @@ nsBlockFrame::DrainPushedFloats(nsBlockR
+     nsFrameList *list = prevBlock->RemovePushedFloats();
+     if (list) {
+       if (list->NotEmpty()) {
+         mFloats.InsertFrames(this, nsnull, *list);
+       }
+       delete list;
+     }
+   }
+-
+-#ifdef DEBUG
+-  for (nsIFrame* f = mFloats.FirstChild(); f ; f = f->GetNextSibling()) {
+-    for (nsIFrame* c = f->GetFirstInFlow(); c ; c = c->GetNextInFlow()) {
+-      NS_ASSERTION(c == f || c->GetParent() != this || !mFloats.ContainsFrame(c),
+-                   "Two floats with same parent in same floats list, expect weird errors.");
+-    }
+-  }
+-#endif
+ }
+ 
+ nsLineList*
+ nsBlockFrame::GetOverflowLines() const
+ {
+   if (!(GetStateBits() & NS_BLOCK_HAS_OVERFLOW_LINES)) {
+     return nsnull;
+   }
