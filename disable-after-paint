@@ -1,0 +1,143 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+By default, disable MozAfterPaint for content.  (Bug 608030)
+
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -224,16 +224,17 @@ nsPresContext::nsPresContext(nsIDocument
+   mUseDocumentFonts = PR_TRUE;
+ 
+   // the minimum font-size is unconstrained by default
+ 
+   mLinkColor = NS_RGB(0x00, 0x00, 0xEE);
+   mActiveLinkColor = NS_RGB(0xEE, 0x00, 0x00);
+   mVisitedLinkColor = NS_RGB(0x55, 0x1A, 0x8B);
+   mUnderlineLinks = PR_TRUE;
++  mSendAfterPaintToContent = PR_FALSE;
+ 
+   mFocusTextColor = mDefaultColor;
+   mFocusBackgroundColor = mBackgroundColor;
+   mFocusRingWidth = 1;
+ 
+   if (aType == eContext_Galley) {
+     mMedium = nsGkAtoms::screen;
+   } else {
+@@ -302,16 +303,19 @@ nsPresContext::~nsPresContext()
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("image.animation_mode",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+ #ifdef IBMBIDI
+   nsContentUtils::UnregisterPrefCallback("bidi.", PrefChangedCallback, this);
+ #endif // IBMBIDI
++  nsContentUtils::UnregisterPrefCallback("dom.send_after_paint_to_content",
++                                         nsPresContext::PrefChangedCallback,
++                                         this);
+   nsContentUtils::UnregisterPrefCallback("gfx.font_rendering.",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("layout.css.dpi",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("layout.css.devPixelsPerPx",
+                                          nsPresContext::PrefChangedCallback,
+@@ -648,16 +652,20 @@ nsPresContext::GetUserPreferences()
+ 
+ 
+   mAutoQualityMinFontSizePixelsPref =
+     nsContentUtils::GetIntPref("browser.display.auto_quality_min_font_size");
+ 
+   // * document colors
+   GetDocumentColorPreferences();
+ 
++  mSendAfterPaintToContent =
++    nsContentUtils::GetBoolPref("dom.send_after_paint_to_content",
++                                mSendAfterPaintToContent);
++
+   // * link colors
+   mUnderlineLinks =
+     nsContentUtils::GetBoolPref("browser.underline_anchors", mUnderlineLinks);
+ 
+   nsAdoptingCString colorStr =
+     nsContentUtils::GetCharPref("browser.anchor_color");
+ 
+   if (!colorStr.IsEmpty()) {
+@@ -955,16 +963,19 @@ nsPresContext::Init(nsIDeviceContext* aD
+                                        this);
+   nsContentUtils::RegisterPrefCallback("image.animation_mode",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+ #ifdef IBMBIDI
+   nsContentUtils::RegisterPrefCallback("bidi.", PrefChangedCallback,
+                                        this);
+ #endif
++  nsContentUtils::RegisterPrefCallback("dom.send_after_paint_to_content",
++                                       nsPresContext::PrefChangedCallback,
++                                       this);
+   nsContentUtils::RegisterPrefCallback("gfx.font_rendering.", PrefChangedCallback,
+                                        this);
+   nsContentUtils::RegisterPrefCallback("layout.css.dpi",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+   nsContentUtils::RegisterPrefCallback("layout.css.devPixelsPerPx",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+@@ -2083,23 +2094,30 @@ nsPresContext::FireDOMPaintEvent()
+ {
+   nsPIDOMWindow* ourWindow = mDocument->GetWindow();
+   if (!ourWindow)
+     return;
+ 
+   nsCOMPtr<nsIDOMEventTarget> dispatchTarget = do_QueryInterface(ourWindow);
+   nsCOMPtr<nsIDOMEventTarget> eventTarget = dispatchTarget;
+   if (!IsChrome()) {
+-    PRBool isCrossDocOnly = PR_TRUE;
+-    for (PRUint32 i = 0; i < mInvalidateRequests.mRequests.Length(); ++i) {
+-      if (!(mInvalidateRequests.mRequests[i].mFlags & nsIFrame::INVALIDATE_CROSS_DOC)) {
+-        isCrossDocOnly = PR_FALSE;
++    PRBool notifyContent = mSendAfterPaintToContent;
++
++    if (notifyContent) {
++      notifyContent = PR_FALSE;
++      // If the pref is set, we still don't post events when they're
++      // entirely cross-doc.
++      for (PRUint32 i = 0; i < mInvalidateRequests.mRequests.Length(); ++i) {
++        if (!(mInvalidateRequests.mRequests[i].mFlags &
++              nsIFrame::INVALIDATE_CROSS_DOC)) {
++          notifyContent = PR_TRUE;
++        }
+       }
+     }
+-    if (isCrossDocOnly) {
++    if (notifyContent) {
+       // Don't tell the window about this event, it should not know that
+       // something happened in a subdocument. Tell only the chrome event handler.
+       // (Events sent to the window get propagated to the chrome event handler
+       // automatically.)
+       dispatchTarget = do_QueryInterface(ourWindow->GetParentTarget());
+       if (!dispatchTarget) {
+         return;
+       }
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -1125,16 +1125,17 @@ protected:
+ 
+   mozilla::TimeStamp    mReflowStartTime;
+ 
+   unsigned              mHasPendingInterrupt : 1;
+   unsigned              mInterruptsEnabled : 1;
+   unsigned              mUseDocumentFonts : 1;
+   unsigned              mUseDocumentColors : 1;
+   unsigned              mUnderlineLinks : 1;
++  unsigned              mSendAfterPaintToContent : 1;
+   unsigned              mUseFocusColors : 1;
+   unsigned              mFocusRingOnAnything : 1;
+   unsigned              mFocusRingStyle : 1;
+   unsigned              mDrawImageBackground : 1;
+   unsigned              mDrawColorBackground : 1;
+   unsigned              mNeverAnimate : 1;
+   unsigned              mIsRenderingOnlySelection : 1;
+   unsigned              mPaginated : 1;
