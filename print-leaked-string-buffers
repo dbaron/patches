@@ -1,0 +1,161 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Debugging patch to print out contents of leaked string buffers.
+
+diff --git a/xpcom/string/src/nsSubstring.cpp b/xpcom/string/src/nsSubstring.cpp
+--- a/xpcom/string/src/nsSubstring.cpp
++++ b/xpcom/string/src/nsSubstring.cpp
+@@ -48,27 +48,45 @@
+ #include "nsSubstring.h"
+ #include "nsString.h"
+ #include "nsStringBuffer.h"
+ #include "nsDependentString.h"
+ #include "nsMemory.h"
+ #include "pratom.h"
+ #include "prprf.h"
+ #include "nsStaticAtom.h"
++#include "nsHashSet.h"
+ 
+ // ---------------------------------------------------------------------------
+ 
+ static PRUnichar gNullChar = 0;
+ 
+ char*      nsCharTraits<char>     ::sEmptyBuffer = (char*) &gNullChar;
+ PRUnichar* nsCharTraits<PRUnichar>::sEmptyBuffer =         &gNullChar;
+ 
+ // ---------------------------------------------------------------------------
+ 
+ #ifdef ENABLE_STRING_STATS
++
++static PLDHashOperator
++PrintLeakedString(nsPtrHashKey<nsStringBuffer> aKey, void* userArg)
++{
++  nsStringBuffer *buffer = aKey.GetKey();
++  PRUint32 size = buffer->StorageSize();
++  const char *data = static_cast<char*>(buffer->Data());
++  printf("Leaked string buffer %p, storage size %u:\n", buffer, size);
++  for (PRUint32 i = 0; i < size; ++i) {
++    printf("  string[%u] = 0x%02X", i, unsigned(data[i]));
++    if (' ' <= data[i] && data[i] <= '~') {
++      printf(" (%c)", data[i]);
++    }
++    printf("\n");
++  }
++}
++
+ class nsStringStats
+   {
+     public:
+       nsStringStats()
+         : mAllocCount(0), mReallocCount(0), mFreeCount(0), mShareCount(0) {}
+ 
+       ~nsStringStats()
+         {
+@@ -81,31 +99,33 @@ class nsStringStats
+           printf("nsStringStats\n");
+           printf(" => mAllocCount:     % 10d\n", mAllocCount);
+           printf(" => mReallocCount:   % 10d\n", mReallocCount);
+           printf(" => mFreeCount:      % 10d", mFreeCount);
+           if (mAllocCount > mFreeCount)
+             printf("  --  LEAKED %d !!!\n", mAllocCount - mFreeCount);
+           else
+             printf("\n");
++          mLiveStringBuffers.EnumerateRead(PrintLeakedString, nsnull);
+           printf(" => mShareCount:     % 10d\n", mShareCount);
+           printf(" => mAdoptCount:     % 10d\n", mAdoptCount);
+           printf(" => mAdoptFreeCount: % 10d", mAdoptFreeCount);
+           if (mAdoptCount > mAdoptFreeCount)
+             printf("  --  LEAKED %d !!!\n", mAdoptCount - mAdoptFreeCount);
+           else
+             printf("\n");
+         }
+ 
+       PRInt32 mAllocCount;
+       PRInt32 mReallocCount;
+       PRInt32 mFreeCount;
+       PRInt32 mShareCount;
+       PRInt32 mAdoptCount;
+       PRInt32 mAdoptFreeCount;
++      nsHashSetMT< nsPtrHashKey<nsStringBuffer> > mLiveStringBuffers;
+   };
+ static nsStringStats gStringStats;
+ #define STRING_STAT_INCREMENT(_s) PR_AtomicIncrement(&gStringStats.m ## _s ## Count)
+ #else
+ #define STRING_STAT_INCREMENT(_s)
+ #endif
+ 
+ // ---------------------------------------------------------------------------
+@@ -185,16 +205,19 @@ nsStringBuffer::AddRef()
+ void
+ nsStringBuffer::Release()
+   {
+     PRInt32 count = PR_AtomicDecrement(&mRefCount);
+     NS_LOG_RELEASE(this, count, "nsStringBuffer");
+     if (count == 0)
+       {
+         STRING_STAT_INCREMENT(Free);
++#ifdef ENABLE_STRING_STATS
++        gStringStats.mLiveStringBuffers.Remove(this);
++#endif
+         free(this); // we were allocated with |malloc|
+       }
+   }
+ 
+   /**
+    * Alloc returns a pointer to a new string header with set capacity.
+    */
+ nsStringBuffer*
+@@ -205,16 +228,19 @@ nsStringBuffer::Alloc(size_t size)
+                  sizeof(nsStringBuffer) + size > size,
+                  "mStorageSize will truncate");
+ 
+     nsStringBuffer *hdr =
+         (nsStringBuffer *) malloc(sizeof(nsStringBuffer) + size);
+     if (hdr)
+       {
+         STRING_STAT_INCREMENT(Alloc);
++#ifdef ENABLE_STRING_STATS
++        gStringStats.mLiveStringBuffers.Add(hdr);
++#endif
+ 
+         hdr->mRefCount = 1;
+         hdr->mStorageSize = size;
+         NS_LOG_ADDREF(hdr, 1, "nsStringBuffer", sizeof(*hdr));
+       }
+     return hdr;
+   }
+ 
+@@ -231,23 +257,28 @@ nsStringBuffer::Realloc(nsStringBuffer* 
+     // no point in trying to save ourselves if we hit this assertion
+     NS_ASSERTION(!hdr->IsReadonly(), "|Realloc| attempted on readonly string");
+ 
+     // Treat this as a release and addref for refcounting purposes, since we
+     // just asserted that the refcount is 1.  If we don't do that, refcount
+     // logging will claim we've leaked all sorts of stuff.
+     NS_LOG_RELEASE(hdr, 0, "nsStringBuffer");
+     
+-    hdr = (nsStringBuffer*) realloc(hdr, sizeof(nsStringBuffer) + size);
+-    if (hdr) {
+-      NS_LOG_ADDREF(hdr, 1, "nsStringBuffer", sizeof(*hdr));
+-      hdr->mStorageSize = size;
++    nsStringBuffer* new_hdr =
++      (nsStringBuffer*) realloc(hdr, sizeof(nsStringBuffer) + size);
++    if (new_hdr) {
++      NS_LOG_ADDREF(new_hdr, 1, "nsStringBuffer", sizeof(*new_hdr));
++      new_hdr->mStorageSize = size;
++#ifdef ENABLE_STRING_STATS
++      gStringStats.mLiveStringBuffers.Remove(hdr);
++      gStringStats.mLiveStringBuffers.Add(new_hdr);
++#endif
+     }
+ 
+-    return hdr;
++    return new_hdr;
+   }
+ 
+ nsStringBuffer*
+ nsStringBuffer::FromString(const nsAString& str)
+   {
+     const nsAStringAccessor* accessor =
+         static_cast<const nsAStringAccessor*>(&str);
+ 
