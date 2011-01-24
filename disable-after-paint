@@ -1,0 +1,359 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+By default, disable MozAfterPaint for content.  (Bug 608030)  r=roc  a=blocking2.0:betaN+
+
+diff --git a/build/automation.py.in b/build/automation.py.in
+--- a/build/automation.py.in
++++ b/build/automation.py.in
+@@ -334,16 +334,17 @@ class Automation(object):
+     part = """\
+ user_pref("browser.console.showInPanel", true);
+ user_pref("browser.dom.window.dump.enabled", true);
+ user_pref("dom.allow_scripts_to_close_windows", true);
+ user_pref("dom.disable_open_during_load", false);
+ user_pref("dom.max_script_run_time", 0); // no slow script dialogs
+ user_pref("dom.max_chrome_script_run_time", 0);
+ user_pref("dom.popup_maximum", -1);
++user_pref("dom.send_after_paint_to_content", true);
+ user_pref("dom.successive_dialog_time_limit", 0);
+ user_pref("signed.applets.codebase_principal_support", true);
+ user_pref("security.warn_submit_insecure", false);
+ user_pref("browser.shell.checkDefaultBrowser", false);
+ user_pref("shell.checkDefaultClient", false);
+ user_pref("browser.warnOnQuit", false);
+ user_pref("accessibility.typeaheadfind.autostart", false);
+ user_pref("javascript.options.showInConsole", true);
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -224,16 +224,17 @@ nsPresContext::nsPresContext(nsIDocument
+   mUseDocumentFonts = PR_TRUE;
+ 
+   // the minimum font-size is unconstrained by default
+ 
+   mLinkColor = NS_RGB(0x00, 0x00, 0xEE);
+   mActiveLinkColor = NS_RGB(0xEE, 0x00, 0x00);
+   mVisitedLinkColor = NS_RGB(0x55, 0x1A, 0x8B);
+   mUnderlineLinks = PR_TRUE;
++  mSendAfterPaintToContent = PR_FALSE;
+ 
+   mFocusTextColor = mDefaultColor;
+   mFocusBackgroundColor = mBackgroundColor;
+   mFocusRingWidth = 1;
+ 
+   if (aType == eContext_Galley) {
+     mMedium = nsGkAtoms::screen;
+   } else {
+@@ -298,16 +299,19 @@ nsPresContext::~nsPresContext()
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("image.animation_mode",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+ #ifdef IBMBIDI
+   nsContentUtils::UnregisterPrefCallback("bidi.", PrefChangedCallback, this);
+ #endif // IBMBIDI
++  nsContentUtils::UnregisterPrefCallback("dom.send_after_paint_to_content",
++                                         nsPresContext::PrefChangedCallback,
++                                         this);
+   nsContentUtils::UnregisterPrefCallback("gfx.font_rendering.",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("layout.css.dpi",
+                                          nsPresContext::PrefChangedCallback,
+                                          this);
+   nsContentUtils::UnregisterPrefCallback("layout.css.devPixelsPerPx",
+                                          nsPresContext::PrefChangedCallback,
+@@ -644,16 +648,20 @@ nsPresContext::GetUserPreferences()
+ 
+ 
+   mAutoQualityMinFontSizePixelsPref =
+     nsContentUtils::GetIntPref("browser.display.auto_quality_min_font_size");
+ 
+   // * document colors
+   GetDocumentColorPreferences();
+ 
++  mSendAfterPaintToContent =
++    nsContentUtils::GetBoolPref("dom.send_after_paint_to_content",
++                                mSendAfterPaintToContent);
++
+   // * link colors
+   mUnderlineLinks =
+     nsContentUtils::GetBoolPref("browser.underline_anchors", mUnderlineLinks);
+ 
+   nsAdoptingCString colorStr =
+     nsContentUtils::GetCharPref("browser.anchor_color");
+ 
+   if (!colorStr.IsEmpty()) {
+@@ -951,16 +959,19 @@ nsPresContext::Init(nsIDeviceContext* aD
+                                        this);
+   nsContentUtils::RegisterPrefCallback("image.animation_mode",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+ #ifdef IBMBIDI
+   nsContentUtils::RegisterPrefCallback("bidi.", PrefChangedCallback,
+                                        this);
+ #endif
++  nsContentUtils::RegisterPrefCallback("dom.send_after_paint_to_content",
++                                       nsPresContext::PrefChangedCallback,
++                                       this);
+   nsContentUtils::RegisterPrefCallback("gfx.font_rendering.", PrefChangedCallback,
+                                        this);
+   nsContentUtils::RegisterPrefCallback("layout.css.dpi",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+   nsContentUtils::RegisterPrefCallback("layout.css.devPixelsPerPx",
+                                        nsPresContext::PrefChangedCallback,
+                                        this);
+@@ -2087,23 +2098,30 @@ nsPresContext::FireDOMPaintEvent()
+ {
+   nsPIDOMWindow* ourWindow = mDocument->GetWindow();
+   if (!ourWindow)
+     return;
+ 
+   nsCOMPtr<nsIDOMEventTarget> dispatchTarget = do_QueryInterface(ourWindow);
+   nsCOMPtr<nsIDOMEventTarget> eventTarget = dispatchTarget;
+   if (!IsChrome()) {
+-    PRBool isCrossDocOnly = PR_TRUE;
+-    for (PRUint32 i = 0; i < mInvalidateRequests.mRequests.Length(); ++i) {
+-      if (!(mInvalidateRequests.mRequests[i].mFlags & nsIFrame::INVALIDATE_CROSS_DOC)) {
+-        isCrossDocOnly = PR_FALSE;
++    PRBool notifyContent = mSendAfterPaintToContent;
++
++    if (notifyContent) {
++      // If the pref is set, we still don't post events when they're
++      // entirely cross-doc.
++      notifyContent = PR_FALSE;
++      for (PRUint32 i = 0; i < mInvalidateRequests.mRequests.Length(); ++i) {
++        if (!(mInvalidateRequests.mRequests[i].mFlags &
++              nsIFrame::INVALIDATE_CROSS_DOC)) {
++          notifyContent = PR_TRUE;
++        }
+       }
+     }
+-    if (isCrossDocOnly) {
++    if (!notifyContent) {
+       // Don't tell the window about this event, it should not know that
+       // something happened in a subdocument. Tell only the chrome event handler.
+       // (Events sent to the window get propagated to the chrome event handler
+       // automatically.)
+       dispatchTarget = do_QueryInterface(ourWindow->GetParentTarget());
+       if (!dispatchTarget) {
+         return;
+       }
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -1116,16 +1116,17 @@ protected:
+ 
+   mozilla::TimeStamp    mReflowStartTime;
+ 
+   unsigned              mHasPendingInterrupt : 1;
+   unsigned              mInterruptsEnabled : 1;
+   unsigned              mUseDocumentFonts : 1;
+   unsigned              mUseDocumentColors : 1;
+   unsigned              mUnderlineLinks : 1;
++  unsigned              mSendAfterPaintToContent : 1;
+   unsigned              mUseFocusColors : 1;
+   unsigned              mFocusRingOnAnything : 1;
+   unsigned              mFocusRingStyle : 1;
+   unsigned              mDrawImageBackground : 1;
+   unsigned              mDrawColorBackground : 1;
+   unsigned              mNeverAnimate : 1;
+   unsigned              mIsRenderingOnlySelection : 1;
+   unsigned              mPaginated : 1;
+diff --git a/layout/base/tests/Makefile.in b/layout/base/tests/Makefile.in
+--- a/layout/base/tests/Makefile.in
++++ b/layout/base/tests/Makefile.in
+@@ -61,16 +61,17 @@ include $(topsrcdir)/config/rules.mk
+ 
+ DEFINES += -D_IMPL_NS_LAYOUT
+ 
+ _TEST_FILES =	\
+ 		border_radius_hit_testing_iframe.html \
+ 		bug369950-subframe.xml \
+ 		bug495648.rdf \
+ 		decoration_line_rendering.js \
++		test_after_paint_pref.html \
+ 		test_border_radius_hit_testing.html \
+ 		test_bug66619.html \
+ 		test_bug114649.html \
+ 		$(warning test_bug369950.html disabled due to random orange; see bug 492575) \
+ 		test_bug370436.html \
+ 		test_bug386575.xhtml \
+ 		test_bug388019.html \
+ 		test_bug394057.html \
+diff --git a/layout/base/tests/test_after_paint_pref.html b/layout/base/tests/test_after_paint_pref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/base/tests/test_after_paint_pref.html
+@@ -0,0 +1,126 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++https://bugzilla.mozilla.org/show_bug.cgi?id=608030
++-->
++<head>
++  <title>Test for MozAfterPaint pref Bug 608030</title>
++  <script type="application/javascript" src="/MochiKit/packed.js"></script>
++  <script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
++</head>
++<body>
++<a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=608030">Mozilla Bug 608030</a>
++<div id="display" style="width: 10em; height: 5em; background-color: red"></div>
++<pre id="test">
++<script type="application/javascript">
++
++/** Test for Bug 608030 **/
++
++netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
++var prefService = Components.classes["@mozilla.org/preferences-service;1"].
++                    getService(Components.interfaces.nsIPrefService);
++var domBranch = prefService.getBranch("dom.");
++
++function get_pref()
++{
++    netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
++    return domBranch.getBoolPref("send_after_paint_to_content");
++}
++
++function set_pref(val)
++{
++    netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
++    domBranch.setBoolPref("send_after_paint_to_content", val);
++}
++
++SimpleTest.waitForExplicitFinish();
++
++window.addEventListener("load", step0, false);
++
++is(get_pref(), true, "pref defaults to true in mochitest harness");
++
++function print_rect(rect) {
++  return "(top=" + rect.top + ",left=" + rect.left + ",width=" + rect.width + ",height=" + rect.height + ")";
++}
++
++function print_event(event) {
++  var res = "boundingClientRect=" + print_rect(event.boundingClientRect);
++  var rects = event.clientRects;
++  for (var i = 0; i < rects.length; ++i) {
++    res += " clientRects[" + i + "]=" + print_rect(rects[i]);
++  }
++  return res;
++}
++
++function step0(event) {
++  // Wait until we get the MozAfterPaint following the load event
++  // before starting.
++  window.addEventListener("MozAfterPaint", step1, false);
++}
++
++var start;
++var div = document.getElementById("display");
++
++function step1(event)
++{
++  //ok(true, "step1 event: " + print_event(event));
++  window.removeEventListener("MozAfterPaint", step1, false);
++
++  start = Date.now();
++
++  window.addEventListener("MozAfterPaint", step2, false);
++
++  div.style.backgroundColor = "blue";
++}
++
++function step2(event)
++{
++  //ok(true, "step2 event: " + print_event(event));
++  window.removeEventListener("MozAfterPaint", step2, false);
++
++  var end = Date.now();
++  var timeout = 3 * Math.max(end - start, 300);
++
++  ok(true, "got MozAfterPaint (timeout for next step is " + timeout + "ms)");
++
++  // Set the pref for our second test
++  set_pref(false);
++
++  // When there was previously another page in our window, we seem to
++  // get duplicate events, simultaneously, so we need to register our
++  // next listener after a zero timeout.
++  setTimeout(step3, 0, timeout);
++}
++function step3(timeout) {
++
++  window.addEventListener("MozAfterPaint", failstep, false);
++
++  div.style.backgroundColor = "fuchsia";
++
++  setTimeout(step4, timeout);
++}
++
++function failstep(event)
++{
++  //ok(true, "failstep event: " + print_event(event));
++  ok(false, "got MozAfterPaint when we should not have");
++}
++
++function step4()
++{
++  window.removeEventListener("MozAfterPaint", failstep, false);
++
++  ok(true, "got final step"); // If we didn't get the failure in failstep,
++                              // then we passed.
++
++  // Set the pref back in its initial state.
++  set_pref(true);
++
++  SimpleTest.finish();
++}
++
++</script>
++</pre>
++</body>
++</html>
+diff --git a/layout/tools/reftest/reftest-cmdline.js b/layout/tools/reftest/reftest-cmdline.js
+--- a/layout/tools/reftest/reftest-cmdline.js
++++ b/layout/tools/reftest/reftest-cmdline.js
+@@ -102,16 +102,17 @@ RefTestCmdLineHandler.prototype =
+      * before we load a window.
+      */
+     var prefs = Components.classes["@mozilla.org/preferences-service;1"].
+                 getService(Components.interfaces.nsIPrefService);
+     var branch = prefs.getDefaultBranch("");
+     branch.setBoolPref("gfx.color_management.force_srgb", true);
+     branch.setBoolPref("browser.dom.window.dump.enabled", true);
+     branch.setIntPref("ui.caretBlinkTime", -1);
++    branch.setBoolPref("dom.send_after_paint_to_content", true);
+     // no slow script dialogs
+     branch.setIntPref("dom.max_script_run_time", 0);
+     branch.setIntPref("dom.max_chrome_script_run_time", 0);
+ 
+     var wwatch = Components.classes["@mozilla.org/embedcomp/window-watcher;1"]
+                            .getService(nsIWindowWatcher);
+     wwatch.openWindow(null, "chrome://reftest/content/reftest.xul", "_blank",
+                       "chrome,dialog=no,all", args);
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -565,16 +565,18 @@ pref("dom.allow_scripts_to_close_windows
+ pref("dom.disable_open_during_load",                false);
+ pref("dom.popup_maximum",                           20);
+ pref("dom.popup_allowed_events", "change click dblclick mouseup reset submit");
+ pref("dom.disable_open_click_delay", 1000);
+ 
+ pref("dom.storage.enabled", true);
+ pref("dom.storage.default_quota",      5120);
+ 
++pref("dom.send_after_paint_to_content", false);
++
+ // Timeout clamp in ms for timeouts we clamp
+ pref("dom.min_timeout_value", 10);
+ 
+ // Parsing perf prefs. For now just mimic what the old code did.
+ #ifndef XP_WIN
+ pref("content.sink.pending_event_mode", 0);
+ #endif
+ 
