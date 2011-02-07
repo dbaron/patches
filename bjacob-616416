@@ -1,0 +1,143 @@
+From: Benoit Jacob <bjacob@mozilla.com>
+
+(Bug 616416)
+
+diff --git a/gfx/src/X11Util.cpp b/gfx/src/X11Util.cpp
+--- a/gfx/src/X11Util.cpp
++++ b/gfx/src/X11Util.cpp
+@@ -41,21 +41,23 @@
+ 
+ namespace mozilla {
+ 
+ ScopedXErrorHandler::ErrorEvent* ScopedXErrorHandler::sXErrorPtr;
+ 
+ int
+ ScopedXErrorHandler::ErrorHandler(Display *, XErrorEvent *ev)
+ {
+-    sXErrorPtr->mError = *ev;
++    // only record the error if no error was previously recorded.
++    // this means that in case of multiple errors, it's the first error that we report.
++    if (!sXErrorPtr->mError.error_code)
++      sXErrorPtr->mError = *ev;
+     return 0;
+ }
+ 
+-
+ ScopedXErrorHandler::ScopedXErrorHandler()
+ {
+     // let sXErrorPtr point to this object's mXError object, but don't reset this mXError object!
+     // think of the case of nested ScopedXErrorHandler's.
+     mOldXErrorPtr = sXErrorPtr;
+     sXErrorPtr = &mXError;
+     mOldErrorHandler = XSetErrorHandler(ErrorHandler);
+ }
+diff --git a/gfx/src/X11Util.h b/gfx/src/X11Util.h
+--- a/gfx/src/X11Util.h
++++ b/gfx/src/X11Util.h
+@@ -153,19 +153,21 @@ public:
+ 
+     static int
+     ErrorHandler(Display *, XErrorEvent *ev);
+ 
+     ScopedXErrorHandler();
+ 
+     ~ScopedXErrorHandler();
+ 
+-    /** \returns true if a X error occurred since the last time this method was called on this ScopedXErrorHandler object.
++    /** \returns true if a X error occurred since the last time this method was called on this ScopedXErrorHandler object,
++     *           or since the creation of this ScopedXErrorHandler object if this method was never called on it.
+      *
+-     * \param ev this optional parameter, if set, will be filled with the XErrorEvent object
++     * \param ev this optional parameter, if set, will be filled with the XErrorEvent object. If multiple errors occurred,
++     *           the first one will be returned.
+      */
+     bool SyncAndGetError(Display *dpy, XErrorEvent *ev = nsnull);
+ };
+ 
+ 
+ } // namespace mozilla
+ 
+ #endif  // mozilla_X11Util_h
+diff --git a/gfx/thebes/GLContextProviderGLX.cpp b/gfx/thebes/GLContextProviderGLX.cpp
+--- a/gfx/thebes/GLContextProviderGLX.cpp
++++ b/gfx/thebes/GLContextProviderGLX.cpp
+@@ -249,60 +249,53 @@ public:
+         if (GLX_BAD_ATTRIBUTE != err) {
+ #ifdef DEBUG
+             printf("[GLX] FBConfig is %sdouble-buffered\n", db ? "" : "not ");
+ #endif
+         }
+ 
+         GLXContext context;
+         nsRefPtr<GLContextGLX> glContext;
+-        bool error = false;
++        bool error;
+ 
+         ScopedXErrorHandler xErrorHandler;
+ 
+ TRY_AGAIN_NO_SHARING:
+ 
++        error = false;
++
+         context = sGLXLibrary.xCreateNewContext(display,
+                                                 cfg,
+                                                 GLX_RGBA_TYPE,
+                                                 shareContext ? shareContext->mContext : NULL,
+                                                 True);
+ 
+-        if (context) {
++        error |= !context || xErrorHandler.SyncAndGetError(display);
++
++        if (!error) {
+             glContext = new GLContextGLX(format,
+-                                        shareContext,
+-                                        display,
+-                                        drawable,
+-                                        context,
+-                                        deleteDrawable,
+-                                        db,
+-                                        pixmap);
+-            if (!glContext->Init())
+-                error = true;
+-        } else {
+-            error = true;
++                                         shareContext,
++                                         display,
++                                         drawable,
++                                         context,
++                                         deleteDrawable,
++                                         db,
++                                         pixmap);
++            error |= !glContext->Init() || xErrorHandler.SyncAndGetError(display);
+         }
+ 
+-        if (shareContext) {
+-            if (error || xErrorHandler.SyncAndGetError(display)) {
++        if (error) {
++            if (shareContext) {
+                 shareContext = nsnull;
+                 goto TRY_AGAIN_NO_SHARING;
+             }
+-        }
+ 
+-        // at this point, if shareContext != null, we know there's no error.
+-        // it's important to minimize the number of XSyncs for startup performance.
+-        if (!shareContext) {
+-            if (error || // earlier recorded error
+-                xErrorHandler.SyncAndGetError(display))
+-            {
+-                NS_WARNING("Failed to create GLXContext!");
+-                glContext = nsnull; // note: this must be done while the graceful X error handler is set,
+-                                    // because glxMakeCurrent can give a GLXBadDrawable error
+-            }
++            NS_WARNING("Failed to create GLXContext!");
++            glContext = nsnull; // note: this must be done while the graceful X error handler is set,
++                                // because glxMakeCurrent can give a GLXBadDrawable error
+         }
+ 
+         return glContext.forget();
+     }
+ 
+     ~GLContextGLX()
+     {
+         MarkDestroyed();
