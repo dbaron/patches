@@ -1,0 +1,157 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Include the close parenthesis in the URL token and make quoted URLs produce URL tokens rather than string tokens.  (Bug 604179)
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -1318,18 +1318,17 @@ CSSParserImpl::GetURLInParens(nsString& 
+   NS_ASSERTION(!mHavePushBack, "mustn't have pushback at this point");
+   if (! mScanner.NextURL(mToken)) {
+     // EOF
+     return PR_FALSE;
+   }
+ 
+   aURL = mToken.mIdent;
+ 
+-  if ((eCSSToken_String != mToken.mType && eCSSToken_URL != mToken.mType) ||
+-      !ExpectSymbol(')', PR_TRUE)) {
++  if (eCSSToken_URL != mToken.mType) {
+     // in the failure case, we do not have to match parentheses, since
+     // this is now an invalid URL token.
+     SkipUntil(')');
+     return PR_FALSE;
+   }
+ 
+   return PR_TRUE;
+ }
+diff --git a/layout/style/nsCSSScanner.cpp b/layout/style/nsCSSScanner.cpp
+--- a/layout/style/nsCSSScanner.cpp
++++ b/layout/style/nsCSSScanner.cpp
+@@ -190,24 +190,35 @@ void
+ nsCSSToken::AppendToString(nsString& aBuffer)
+ {
+   switch (mType) {
+     case eCSSToken_AtKeyword:
+       aBuffer.Append(PRUnichar('@')); // fall through intentional
+     case eCSSToken_Ident:
+     case eCSSToken_WhiteSpace:
+     case eCSSToken_Function:
+-    case eCSSToken_URL:
+-    case eCSSToken_Bad_URL:
+     case eCSSToken_HTMLComment:
+     case eCSSToken_URange:
+       aBuffer.Append(mIdent);
+       if (mType == eCSSToken_Function)
+         aBuffer.Append(PRUnichar('('));
+       break;
++    case eCSSToken_URL:
++    case eCSSToken_Bad_URL:
++      if (mSymbol != PRUnichar(0)) {
++        aBuffer.Append(mSymbol);
++      }
++      aBuffer.Append(mIdent);
++      if (mSymbol != PRUnichar(0)) {
++        aBuffer.Append(mSymbol);
++      }
++      if (mType == eCSSToken_URL) {
++        aBuffer.Append(PRUnichar('('));
++      }
++      break;
+     case eCSSToken_Number:
+       if (mIntegerValid) {
+         aBuffer.AppendInt(mInteger, 10);
+       }
+       else {
+         aBuffer.AppendFloat(mNumber);
+       }
+       break;
+@@ -901,54 +912,56 @@ nsCSSScanner::NextURL(nsCSSToken& aToken
+       return PR_FALSE;
+     }
+ 
+     NS_ABORT_IF_FALSE(mToken.mType == eCSSToken_String ||
+                       mToken.mType == eCSSToken_Bad_String,
+                       "unexpected token type");
+     if (NS_LIKELY(mToken.mType == eCSSToken_String)) {
+       EatWhiteSpace();
++      if (LookAhead(')')) {
++        mToken.mType = eCSSToken_URL;
++      } else {
++        mToken.mType = eCSSToken_Bad_URL;
++      }
++    } else {
++      mToken.mType = eCSSToken_Bad_URL;
+     }
+     return PR_TRUE;
+   }
+ 
+   // Process a url lexical token. A CSS1 url token can contain
+   // characters beyond identifier characters (e.g. '/', ':', etc.)
+   // Because of this the normal rules for tokenizing the input don't
+   // apply very well. To simplify the parser and relax some of the
+   // requirements on the scanner we parse url's here. If we find a
+   // malformed URL then we emit a token of type "Bad_URL" so that
+   // the CSS1 parser can ignore the invalid input.  The parser must
+   // treat a Bad_URL token like a Function token, and process
+   // tokens until a matching parenthesis.
+ 
+   aToken.mType = eCSSToken_Bad_URL;
++  aToken.mSymbol = PRUnichar(0);
+   nsString& ident = aToken.mIdent;
+   ident.SetLength(0);
+ 
+   Pushback(ch);
+ 
+   // start of a non-quoted url (which may be empty)
+   PRBool ok = PR_TRUE;
+   for (;;) {
+     ch = Read();
+     if (ch < 0) break;
+     if (ch == CSS_ESCAPE) {
+       ParseAndAppendEscape(ident);
+     } else if (IsWhitespace(ch)) {
+       // Whitespace is allowed at the end of the URL
+       EatWhiteSpace();
+-      if (LookAhead(')')) {
+-        Pushback(')');  // leave the closing symbol
+-        // done!
+-        break;
+-      }
+-      // Whitespace is followed by something other than a
+-      // ")". This is an invalid url spec.
+-      ok = PR_FALSE;
++      // Consume the close paren if we have it; if not we're an invalid URL.
++      ok = LookAhead(')');
+       break;
+     } else if (ch == '"' || ch == '\'' || ch == '(' || ch < PRUnichar(' ')) {
+       // This is an invalid URL spec
+       ok = PR_FALSE;
+       Pushback(ch); // push it back so the parser can match tokens and
+                     // then closing parenthesis
+       break;
+     } else if (ch == ')') {
+diff --git a/layout/style/nsCSSScanner.h b/layout/style/nsCSSScanner.h
+--- a/layout/style/nsCSSScanner.h
++++ b/layout/style/nsCSSScanner.h
+@@ -85,18 +85,18 @@ enum nsCSSTokenType {
+   eCSSToken_ID,             // mIdent
+   // Just like eCSSToken_ID, except the part following the '#' is not
+   // a valid CSS identifier (eg. starts with a digit, is the empty
+   // string, etc).
+   eCSSToken_Ref,            // mIdent
+ 
+   eCSSToken_Function,       // mIdent
+ 
+-  eCSSToken_URL,            // mIdent
+-  eCSSToken_Bad_URL,        // doesn't matter
++  eCSSToken_URL,            // mIdent + mSymbol
++  eCSSToken_Bad_URL,        // mIdent + mSymbol
+ 
+   eCSSToken_HTMLComment,    // "<!--" or "-->"
+ 
+   eCSSToken_Includes,       // "~="
+   eCSSToken_Dashmatch,      // "|="
+   eCSSToken_Beginsmatch,    // "^="
+   eCSSToken_Endsmatch,      // "$="
+   eCSSToken_Containsmatch,  // "*="
