@@ -268,10 +268,75 @@ new file mode 100644
 +  void                     deleteRule(in DOMString key);
 +  nsIDOMMozCSSKeyframeRule findRule(in DOMString key);
 +};
+diff --git a/layout/style/StyleRule.h b/layout/style/StyleRule.h
+--- a/layout/style/StyleRule.h
++++ b/layout/style/StyleRule.h
+@@ -297,22 +297,22 @@ namespace mozilla {
+ namespace css {
+ 
+ class Declaration;
+ class ImportantRule;
+ class DOMCSSStyleRule;
+ 
+ class NS_FINAL_CLASS StyleRule : public nsCSSRule,
+                                  public nsICSSRule {
+- public:
++public:
+   StyleRule(nsCSSSelectorList* aSelector,
+             Declaration *aDeclaration);
++  // used by |Clone|
++  StyleRule(const StyleRule& aCopy);
+ private:
+-  // for |Clone|
+-  StyleRule(const StyleRule& aCopy);
+   // for |DeclarationChanged|
+   StyleRule(StyleRule& aCopy,
+             Declaration *aDeclaration);
+ public:
+   NS_DECLARE_STATIC_IID_ACCESSOR(NS_CSS_STYLE_RULE_IMPL_CID)
+ 
+   NS_DECL_ISUPPORTS
+ 
+@@ -373,16 +373,17 @@ private:
+   // This is not supported and not implemented!
+   StyleRule& operator=(const StyleRule& aCopy);
+ 
+ private:
+   ~StyleRule();
+ 
+ private:
+   nsCSSSelectorList*      mSelector; // null for style attribute
++                                     // or keyframe rule
+   Declaration*            mDeclaration;
+   ImportantRule*          mImportantRule; // initialized by RuleMatched
+   DOMCSSStyleRule*        mDOMRule;
+   // Keep the same type so that MSVC packs them.
+   PRUint32                mLineNumber : 31;
+   PRUint32                mWasMatched : 1;
+ };
+ 
 diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
 --- a/layout/style/nsCSSRules.cpp
 +++ b/layout/style/nsCSSRules.cpp
-@@ -1785,8 +1785,240 @@ void
+@@ -61,16 +61,17 @@
+ #include "nsIDocument.h"
+ #include "nsPresContext.h"
+ 
+ #include "nsContentUtils.h"
+ #include "nsStyleConsts.h"
+ #include "nsDOMError.h"
+ #include "nsStyleUtil.h"
+ #include "mozilla/css/Declaration.h"
++#include "mozilla/css/StyleRule.h"
+ #include "nsPrintfCString.h"
+ 
+ namespace css = mozilla::css;
+ 
+ #define IMPL_STYLE_RULE_INHERIT(_class, super) \
+ /* virtual */ already_AddRefed<nsIStyleSheet> _class::GetStyleSheet() const { return super::GetStyleSheet(); }  \
+ /* virtual */ void _class::SetStyleSheet(nsCSSStyleSheet* aSheet) { super::SetStyleSheet(aSheet); }  \
+ /* virtual */ void _class::SetParentRule(nsICSSGroupRule* aRule) { super::SetParentRule(aRule); }  \
+@@ -1785,8 +1786,326 @@ void
  nsCSSFontFaceRule::GetDesc(nsCSSFontDesc aDescID, nsCSSValue & aValue)
  {
    NS_PRECONDITION(aDescID > eCSSFontDesc_UNKNOWN &&
@@ -282,8 +347,92 @@ diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
  }
 +
 +// -------------------------------------------
++// nsCSSKeyframeStyleDeclaration
++//
++
++nsCSSKeyframeStyleDeclaration::nsCSSKeyframeStyleDeclaration(nsCSSKeyframeRule *aRule)
++  : mRule(aRule)
++{
++}
++
++nsCSSKeyframeStyleDeclaration::~nsCSSKeyframeStyleDeclaration()
++{
++  NS_ASSERTION(!mRule, "DropReference not called.");
++}
++
++NS_IMPL_ADDREF(nsCSSKeyframeStyleDeclaration)
++NS_IMPL_RELEASE(nsCSSKeyframeStyleDeclaration)
++
++css::Declaration*
++nsCSSKeyframeStyleDeclaration::GetCSSDeclaration(PRBool aAllocate)
++{
++  if (mRule) {
++    return mRule->StyleRule()->GetDeclaration();
++  } else {
++    return nsnull;
++  }
++}
++
++/*
++ * This is a utility function.  It will only fail if it can't get a
++ * parser.  This means it can return NS_OK without aURI or aCSSLoader
++ * being initialized.
++ */
++nsresult
++nsCSSKeyframeStyleDeclaration::GetCSSParsingEnvironment(nsIURI** aSheetURI,
++                                                nsIURI** aBaseURI,
++                                                nsIPrincipal** aSheetPrincipal,
++                                                css::Loader** aCSSLoader)
++{
++  return GetCSSParsingEnvironmentForRule(mRule, aSheetURI, aBaseURI,
++                                         aSheetPrincipal, aCSSLoader);
++}
++
++NS_IMETHODIMP
++nsCSSKeyframeStyleDeclaration::GetParentRule(nsIDOMCSSRule **aParent)
++{
++  NS_ENSURE_ARG_POINTER(aParent);
++
++  NS_IF_ADDREF(*aParent = mRule);
++  return NS_OK;
++}
++
++nsresult
++nsCSSKeyframeStyleDeclaration::SetCSSDeclaration(css::Declaration* aDecl)
++{
++  // FIXME: WRITE ME
++  return NS_OK;
++}
++
++nsIDocument*
++nsCSSKeyframeStyleDeclaration::DocToUpdate()
++{
++  return nsnull;
++}
++
++// -------------------------------------------
 +// nsCSSKeyframeRule
 +//
++
++nsCSSKeyframeRule::nsCSSKeyframeRule()
++{
++  // FIXME: make a useful default
++}
++
++nsCSSKeyframeRule::nsCSSKeyframeRule(const nsCSSKeyframeRule& aCopy)
++  // copy everything except our reference count and mStyleDeclaration
++  : nsCSSRule(aCopy)
++  , mKeys(aCopy.mKeys)
++  , mStyleRule(new mozilla::css::StyleRule(*aCopy.mStyleRule))
++{
++}
++
++nsCSSKeyframeRule::~nsCSSKeyframeRule()
++{
++  if (mStyleDeclaration) {
++    mStyleDeclaration->DropReference();
++  }
++}
 +
 +/* virtual */ already_AddRefed<nsICSSRule>
 +nsCSSKeyframeRule::Clone() const
@@ -380,8 +529,10 @@ diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
 +NS_IMETHODIMP
 +nsCSSKeyframeRule::GetStyle(nsIDOMCSSStyleDeclaration** aStyle)
 +{
-+  // FIXME: WRITE ME
-+  *aStyle = nsnull;
++  if (!mStyleDeclaration) {
++    mStyleDeclaration = new nsCSSKeyframeStyleDeclaration(this);
++  }
++  NS_ADDREF(*aStyle = mStyleDeclaration);
 +  return NS_OK;
 +}
 +
@@ -515,7 +666,7 @@ diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
 diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
 --- a/layout/style/nsCSSRules.h
 +++ b/layout/style/nsCSSRules.h
-@@ -43,16 +43,18 @@
+@@ -43,20 +43,30 @@
  #ifndef nsCSSRules_h_
  #define nsCSSRules_h_
  
@@ -530,11 +681,23 @@ diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
  #include "nsAutoPtr.h"
  #include "nsCSSProperty.h"
  #include "nsCSSValue.h"
++#include "nsTArray.h"
++#include "nsDOMCSSDeclaration.h"
++
++namespace mozilla {
++namespace css {
++class StyleRule;
++}
++}
  
  class CSSGroupRuleRuleListImpl;
  class nsMediaList;
  template<class T> struct already_AddRefed;
-@@ -311,9 +313,77 @@ nsCSSFontFaceStyleDecl::ContainingRule()
+ 
+ #define DECL_STYLE_RULE_INHERIT_NO_DOMRULE  \
+ virtual already_AddRefed<nsIStyleSheet> GetStyleSheet() const; \
+ virtual void SetStyleSheet(nsCSSStyleSheet* aSheet); \
+@@ -311,9 +321,116 @@ nsCSSFontFaceStyleDecl::ContainingRule()
  
  inline const nsCSSFontFaceRule*
  nsCSSFontFaceStyleDecl::ContainingRule() const
@@ -543,18 +706,50 @@ diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
      (reinterpret_cast<const char*>(this) - offsetof(nsCSSFontFaceRule, mDecl));
  }
  
++class nsCSSKeyframeRule;
++
++class NS_FINAL_CLASS nsCSSKeyframeStyleDeclaration
++                         : public nsDOMCSSDeclaration
++{
++public:
++  nsCSSKeyframeStyleDeclaration(nsCSSKeyframeRule *aRule);
++  virtual ~nsCSSKeyframeStyleDeclaration();
++
++  NS_IMETHOD GetParentRule(nsIDOMCSSRule **aParent);
++  void DropReference() { mRule = nsnull; }
++  virtual mozilla::css::Declaration* GetCSSDeclaration(PRBool aAllocate);
++  virtual nsresult SetCSSDeclaration(mozilla::css::Declaration* aDecl);
++  virtual nsresult GetCSSParsingEnvironment(nsIURI** aSheetURI,
++                                            nsIURI** aBaseURI,
++                                            nsIPrincipal** aSheetPrincipal,
++                                            mozilla::css::Loader** aCSSLoader);
++  virtual nsIDocument* DocToUpdate();
++
++  NS_IMETHOD_(nsrefcnt) AddRef();
++  NS_IMETHOD_(nsrefcnt) Release();
++
++  virtual nsINode *GetParentObject()
++  {
++    return nsnull;
++  }
++
++protected:
++  nsAutoRefCnt mRefCnt;
++  NS_DECL_OWNINGTHREAD
++
++  // This reference is not reference-counted. The rule object tells us
++  // when it's about to go away.
++  nsCSSKeyframeRule *mRule;
++};
++
 +class NS_FINAL_CLASS nsCSSKeyframeRule : public nsCSSRule,
 +                                         public nsICSSRule,
 +                                         public nsIDOMMozCSSKeyframeRule
 +{
 +public:
-+  nsCSSKeyframeRule() {}
-+
-+  nsCSSKeyframeRule(const nsCSSKeyframeRule& aCopy)
-+    // copy everything except our reference count
-+    : nsCSSRule(aCopy) {
-+    // FIXME: more here
-+  }
++  nsCSSKeyframeRule();
++  nsCSSKeyframeRule(const nsCSSKeyframeRule& aCopy);
++  ~nsCSSKeyframeRule();
 +
 +  NS_DECL_ISUPPORTS
 +
@@ -575,6 +770,13 @@ diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
 +  // nsIDOMMozCSSKeyframeRule interface
 +  NS_DECL_NSIDOMMOZCSSKEYFRAMERULE
 +
++  mozilla::css::StyleRule* StyleRule()       { return mStyleRule; }
++
++private:
++  nsAutoTArray<float, 1>                     mKeys;
++  nsRefPtr<mozilla::css::StyleRule>          mStyleRule;
++  // lazily created when needed:
++  nsRefPtr<nsCSSKeyframeStyleDeclaration>    mStyleDeclaration;
 +};
 +
 +class NS_FINAL_CLASS nsCSSKeyframesRule : public nsCSSRule,
