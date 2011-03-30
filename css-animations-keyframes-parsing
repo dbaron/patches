@@ -2,10 +2,49 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Implement parsing of @keyframes rules.  (Bug 435442)
 
+diff --git a/dom/locales/en-US/chrome/layout/css.properties b/dom/locales/en-US/chrome/layout/css.properties
+--- a/dom/locales/en-US/chrome/layout/css.properties
++++ b/dom/locales/en-US/chrome/layout/css.properties
+@@ -57,19 +57,23 @@ PEImportNotURI=Expected URI in @import r
+ PEImportBadURI=Invalid URI in @import rule: '%1$S'.
+ PEImportUnexpected=Found unexpected '%1$S' within @import.
+ PEGroupRuleEOF=end of @media or @-moz-document rule
+ PEMozDocRuleBadFunc=Expected url(), url-prefix(), or domain() in @-moz-document rule but found '%1$S'.
+ PEMozDocRuleNotURI=Expected URI in @-moz-document rule but found '%1$S'.
+ PEAtNSPrefixEOF=namespace prefix in @namespace rule
+ PEAtNSURIEOF=namespace URI in @namespace rule
+ PEAtNSUnexpected=Unexpected token within @namespace: '%1$S'.
++PEKeyframeNameEOF=name of @keyframes rule.
++PEKeyframeBadName=Expected identifier for name of @keyframes rule.
++PEKeyframeBrace=Expected opening { of @keyframes rule.
+ PESkipDeclBraceEOF=closing } of declaration block
+ PESkipRSBraceEOF=closing } of invalid rule set
+ PEBadSelectorRSIgnored=Ruleset ignored due to bad selector.
++PEBadSelectorKeyframeRuleIgnored=Keyframe rule ignored due to bad selector.
+ PESelectorListExtraEOF=',' or '{'
+ PESelectorListExtra=Expected ',' or '{' but found '%1$S'.
+ PESelectorGroupNoSelector=Selector expected.
+ PESelectorGroupExtraCombinator=Dangling combinator.
+ PEClassSelEOF=class name
+ PEClassSelNotIdent=Expected identifier for class selector but found '%1$S'.
+ PETypeSelEOF=element type
+ PETypeSelNotType=Expected element name or '*' but found '%1$S'.
+@@ -135,9 +139,9 @@ PEUnknownFontDesc=Unknown descriptor '%1
+ PEMQExpectedExpressionStart=Expected '(' to start media query expression but found '%1$S'.
+ PEMQExpressionEOF=contents of media query expression
+ PEMQExpectedFeatureName=Expected media feature name but found '%1$S'.
+ PEMQExpectedFeatureNameEnd=Expected ':' or ')' after media feature name but found '%1$S'.
+ PEMQNoMinMaxWithoutValue=Media features with min- or max- must have a value.
+ PEMQExpectedFeatureValue=Found invalid value for media feature.
+ PEBadFontBlockStart=Expected '{' to begin @font-face rule but found '%1$S'.
+ PEBadFontBlockEnd=Expected '}' to end @font-face rule but found '%1$S'.
+-PEAnonBoxNotAlone=Did not expect anonymous box.
+\ No newline at end of file
++PEAnonBoxNotAlone=Did not expect anonymous box.
 diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 --- a/layout/style/nsCSSParser.cpp
 +++ b/layout/style/nsCSSParser.cpp
-@@ -353,16 +353,17 @@ protected:
+@@ -353,16 +353,19 @@ protected:
                          void* aProcessData);
  
    PRBool ParseFontFaceRule(RuleAppendFunc aAppendFunc, void* aProcessData);
@@ -15,6 +54,8 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
  
    PRBool ParsePageRule(RuleAppendFunc aAppendFunc, void* aProcessData);
 +  PRBool ParseKeyframesRule(RuleAppendFunc aAppendFunc, void* aProcessData);
++  void ParseKeyframeRule(nsCSSKeyframesRule* aParentRule);
++  PRBool ParseKeyframeSelectorList(nsCSSKeyframeRule* aRule);
  
    enum nsSelectorParsingStatus {
      // we have parsed a selector and we saw a token that cannot be
@@ -23,7 +64,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      // we should continue parsing the selector:
      eSelectorParsingStatus_Continue,
      // we saw an unexpected token or token value,
-@@ -1525,16 +1526,20 @@ CSSParserImpl::ParseAtRule(RuleAppendFun
+@@ -1525,16 +1528,20 @@ CSSParserImpl::ParseAtRule(RuleAppendFun
    } else if (mToken.mIdent.LowerCaseEqualsLiteral("font-face")) {
      parseFunc = &CSSParserImpl::ParseFontFaceRule;
      newSection = eCSSSection_General;
@@ -44,7 +85,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      // Skip over unsupported at rule, don't advance section
      return SkipAtRule(PR_FALSE);
    }
-@@ -2264,16 +2269,23 @@ CSSParserImpl::ParseFontDescriptor(nsCSS
+@@ -2264,16 +2271,73 @@ CSSParserImpl::ParseFontDescriptor(nsCSS
  
  PRBool
  CSSParserImpl::ParsePageRule(RuleAppendFunc aAppendFunc, void* aData)
@@ -56,7 +97,57 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +PRBool
 +CSSParserImpl::ParseKeyframesRule(RuleAppendFunc aAppendFunc, void* aData)
 +{
-+  // FIXME: Implement me!
++  if (!GetToken(PR_TRUE)) {
++    REPORT_UNEXPECTED_EOF(PEKeyframeNameEOF);
++    return PR_FALSE;
++  }
++
++  if (mToken.mType != eCSSToken_Ident) {
++    REPORT_UNEXPECTED_TOKEN(PEKeyframeBadName);
++    UngetToken();
++    return PR_FALSE;
++  }
++
++  if (!ExpectSymbol('{', PR_TRUE)) {
++    REPORT_UNEXPECTED_TOKEN(PEKeyframeBrace);
++    return PR_FALSE;
++  }
++
++  nsRefPtr<nsCSSKeyframesRule> rule = new nsCSSKeyframesRule(mToken.mIdent);
++
++  while (!ExpectSymbol('}', PR_TRUE)) {
++    ParseKeyframeRule(rule);
++  }
++
++  (*aAppendFunc)(rule, aData);
++  return PR_TRUE;
++}
++
++void
++CSSParserImpl::ParseKeyframeRule(nsCSSKeyframesRule* aParentRule)
++{
++  nsRefPtr<nsCSSKeyframeRule> rule = new nsCSSKeyframeRule();
++  if (!ParseKeyframeSelectorList(rule)) {
++    REPORT_UNEXPECTED(PEBadSelectorKeyframeRuleIgnored);
++    OUTPUT_ERROR();
++    SkipRuleSet(PR_TRUE);
++    return;
++  }
++
++  // Next parse the declaration block
++  nsAutoPtr<css::Declaration> declaration(ParseDeclarationBlock(PR_TRUE));
++  if (!declaration) {
++    return;
++  }
++
++  rule->SetDeclaration(declaration.forget());
++  aParentRule->AppendRule(rule);
++}
++
++PRBool
++CSSParserImpl::ParseKeyframeSelectorList(nsCSSKeyframeRule* aRule)
++{
++  // FIXME: WRITE ME
 +  return PR_FALSE;
 +}
 +
@@ -68,3 +159,21 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    stack.AppendElement(aStopSymbol);
    for (;;) {
      if (!GetToken(PR_TRUE)) {
+@@ -2443,17 +2507,16 @@ CSSParserImpl::ParseRuleSet(RuleAppendFu
+     return PR_FALSE;
+   }
+   NS_ASSERTION(nsnull != slist, "null selector list");
+   CLEAR_ERROR();
+ 
+   // Next parse the declaration block
+   css::Declaration* declaration = ParseDeclarationBlock(PR_TRUE);
+   if (nsnull == declaration) {
+-    // XXX skip something here
+     delete slist;
+     return PR_FALSE;
+   }
+ 
+ #if 0
+   slist->Dump();
+   fputs("{\n", stdout);
+   declaration->List();
