@@ -1,0 +1,403 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement animation of css3-animations.  (Bug 435442)
+
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -90,16 +90,17 @@
+ #include "nsIEventListenerManager.h"
+ #include "nsStyleStructInlines.h"
+ #include "nsIAppShell.h"
+ #include "prenv.h"
+ #include "nsIPrivateDOMEvent.h"
+ #include "nsIDOMEventTarget.h"
+ #include "nsObjectFrame.h"
+ #include "nsTransitionManager.h"
++#include "nsAnimationManager.h"
+ #include "mozilla/dom/Element.h"
+ #include "nsIFrameMessageManager.h"
+ 
+ #ifdef MOZ_SMIL
+ #include "nsSMILAnimationController.h"
+ #endif // MOZ_SMIL
+ 
+ #ifdef IBMBIDI
+@@ -892,16 +893,20 @@ nsPresContext::Init(nsIDeviceContext* aD
+     return NS_ERROR_OUT_OF_MEMORY;
+ 
+   NS_ADDREF(mEventManager);
+ 
+   mTransitionManager = new nsTransitionManager(this);
+   if (!mTransitionManager)
+     return NS_ERROR_OUT_OF_MEMORY;
+ 
++  mAnimationManager = new nsAnimationManager(this);
++  if (!mAnimationManager)
++    return NS_ERROR_OUT_OF_MEMORY;
++
+   if (mDocument->GetDisplayDocument()) {
+     NS_ASSERTION(mDocument->GetDisplayDocument()->GetShell() &&
+                  mDocument->GetDisplayDocument()->GetShell()->GetPresContext(),
+                  "Why are we being initialized?");
+     mRefreshDriver = mDocument->GetDisplayDocument()->GetShell()->
+       GetPresContext()->RefreshDriver();
+   } else {
+     nsIDocument* parent = mDocument->GetParentDocument();
+@@ -1054,16 +1059,20 @@ nsPresContext::SetShell(nsIPresShell* aS
+       mImageLoaders[i].Enumerate(destroy_loads, nsnull);
+       mImageLoaders[i].Clear();
+     }
+ 
+     if (mTransitionManager) {
+       mTransitionManager->Disconnect();
+       mTransitionManager = nsnull;
+     }
++    if (mAnimationManager) {
++      mAnimationManager->Disconnect();
++      mAnimationManager = nsnull;
++    }
+   }
+ }
+ 
+ void
+ nsPresContext::UpdateCharSet(const nsAFlatCString& aCharSet)
+ {
+   if (mLangService) {
+     NS_IF_RELEASE(mLanguage);
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -97,16 +97,17 @@ class nsIAtom;
+ struct nsStyleBackground;
+ struct nsStyleBorder;
+ class nsIRunnable;
+ class gfxUserFontSet;
+ class nsUserFontSet;
+ struct nsFontFaceRuleContainer;
+ class nsObjectFrame;
+ class nsTransitionManager;
++class nsAnimationManager;
+ class nsRefreshDriver;
+ class imgIContainer;
+ 
+ #ifdef MOZ_REFLOW_PERF
+ class nsIRenderingContext;
+ #endif
+ 
+ enum nsWidgetType {
+@@ -233,16 +234,17 @@ public:
+ 
+ #ifdef _IMPL_NS_LAYOUT
+   nsStyleSet* StyleSet() { return GetPresShell()->StyleSet(); }
+ 
+   nsFrameManager* FrameManager()
+     { return GetPresShell()->FrameManager(); } 
+ 
+   nsTransitionManager* TransitionManager() { return mTransitionManager; }
++  nsAnimationManager* AnimationManager() { return mAnimationManager; }
+ 
+   nsRefreshDriver* RefreshDriver() { return mRefreshDriver; }
+ #endif
+ 
+   /**
+    * Rebuilds all style data by throwing out the old rule tree and
+    * building a new one, and additionally applying aExtraHint (which
+    * must not contain nsChangeHint_ReconstructFrame) to the root frame.
+@@ -1058,16 +1060,17 @@ protected:
+                                         // better safe than sorry.
+                                         // Cannot reintroduce cycles
+                                         // since there is no dependency
+                                         // from gfx back to layout.
+   nsIEventStateManager* mEventManager;  // [STRONG]
+   nsILookAndFeel*       mLookAndFeel;   // [STRONG]
+   nsRefPtr<nsRefreshDriver> mRefreshDriver;
+   nsRefPtr<nsTransitionManager> mTransitionManager;
++  nsRefPtr<nsAnimationManager> mAnimationManager;
+   nsIAtom*              mMedium;        // initialized by subclass ctors;
+                                         // weak pointer to static atom
+ 
+   nsILinkHandler*       mLinkHandler;   // [WEAK]
+ 
+   // Formerly mLangGroup; moving from charset-oriented langGroup to
+   // maintaining actual language settings everywhere (see bug 524107).
+   // This may in fact hold a langGroup such as x-western rather than
+diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
+--- a/layout/style/Makefile.in
++++ b/layout/style/Makefile.in
+@@ -107,16 +107,17 @@ EXPORTS_mozilla/css = \
+ 
+ CPPSRCS		= \
+ 		AnimationCommon.cpp \
+ 		nsCSSAnonBoxes.cpp \
+ 		nsCSSDataBlock.cpp \
+ 		Declaration.cpp \
+ 		nsCSSKeywords.cpp \
+ 		Loader.cpp \
++		nsAnimationManager.cpp \
+ 		nsCSSParser.cpp \
+ 		nsCSSProps.cpp \
+ 		nsCSSPseudoClasses.cpp \
+ 		nsCSSPseudoElements.cpp \
+ 		nsCSSRuleProcessor.cpp \
+ 		nsCSSRules.cpp \
+ 		nsCSSScanner.cpp \
+ 		nsCSSStyleSheet.cpp \
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsAnimationManager.cpp
+@@ -0,0 +1,39 @@
++/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsAnimationManager, an implementation of part
++ * of css3-animations.
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2011
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++#include "nsAnimationManager.h"
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+new file mode 100644
+--- /dev/null
++++ b/layout/style/nsAnimationManager.h
+@@ -0,0 +1,52 @@
++/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is nsAnimationManager, an implementation of part
++ * of css3-animations.
++ *
++ * The Initial Developer of the Original Code is the Mozilla Foundation.
++ * Portions created by the Initial Developer are Copyright (C) 2011
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *   L. David Baron <dbaron@dbaron.org>, Mozilla Corporation (original author)
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++#ifndef nsAnimationManager_h_
++#define nsAnimationManager_h_
++
++#include "AnimationCommon.h"
++
++class nsAnimationManager : public mozilla::css::CommonAnimationManager
++{
++public:
++  nsAnimationManager(nsPresContext *aPresContext)
++    : mozilla::css::CommonAnimationManager(aPresContext)
++  {
++  }
++};
++
++#endif /* !defined(nsAnimationManager_h_) */
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -54,16 +54,17 @@
+ #include "nsCSSAnonBoxes.h"
+ #include "nsCSSPseudoElements.h"
+ #include "nsCSSRuleProcessor.h"
+ #include "nsIContent.h"
+ #include "nsIFrame.h"
+ #include "nsContentUtils.h"
+ #include "nsRuleProcessorData.h"
+ #include "nsTransitionManager.h"
++#include "nsAnimationManager.h"
+ #include "nsIEventStateManager.h"
+ #include "mozilla/dom/Element.h"
+ 
+ using namespace mozilla::dom;
+ 
+ NS_IMPL_ISUPPORTS1(nsEmptyStyleRule, nsIStyleRule)
+ 
+ /* virtual */ void
+@@ -111,16 +112,17 @@ nsStyleSet::Init(nsPresContext *aPresCon
+   }
+ 
+   mRuleTree = nsRuleNode::CreateRootNode(aPresContext);
+   if (!mRuleTree) {
+     mDefaultStyleData.Destroy(0, aPresContext);
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
++  GatherRuleProcessors(eAnimationSheet);
+   GatherRuleProcessors(eTransitionSheet);
+ 
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsStyleSet::BeginReconstruct()
+ {
+@@ -191,16 +193,23 @@ nsStyleSet::GatherRuleProcessors(sheetTy
+ {
+   mRuleProcessors[aType] = nsnull;
+   if (mAuthorStyleDisabled && (aType == eDocSheet || 
+                                aType == ePresHintSheet ||
+                                aType == eStyleAttrSheet)) {
+     //don't regather if this level is disabled
+     return NS_OK;
+   }
++  if (aType == eAnimationSheet) {
++    // We have no sheet for the animations level; just a rule
++    // processor.  (XXX: We should probably do this for the other
++    // non-CSS levels too!)
++    mRuleProcessors[aType] = PresContext()->AnimationManager();
++    return NS_OK;
++  }
+   if (aType == eTransitionSheet) {
+     // We have no sheet for the transitions level; just a rule
+     // processor.  (XXX: We should probably do this for the other
+     // non-CSS levels too!)
+     mRuleProcessors[aType] = PresContext()->TransitionManager();
+     return NS_OK;
+   }
+   if (mSheets[aType].Count()) {
+@@ -675,16 +684,18 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   else {
+     AssertNoImportantRules(lastAgentRN, mRuleTree);
+   }
+ #endif
+ 
+ #ifdef DEBUG
+   nsRuleNode *lastImportantRN = aRuleWalker->CurrentNode();
+ #endif
++  aRuleWalker->SetLevel(eAnimationSheet, PR_FALSE, PR_FALSE);
++  (*aCollectorFunc)(mRuleProcessors[eAnimationSheet], aData);
+   aRuleWalker->SetLevel(eTransitionSheet, PR_FALSE, PR_FALSE);
+   (*aCollectorFunc)(mRuleProcessors[eTransitionSheet], aData);
+ #ifdef DEBUG
+   AssertNoCSSRules(aRuleWalker->CurrentNode(), lastImportantRN);
+   AssertNoImportantRules(aRuleWalker->CurrentNode(), lastImportantRN);
+ #endif
+ 
+ }
+@@ -717,16 +728,17 @@ nsStyleSet::WalkRuleProcessors(nsIStyleR
+   }
+   if (!skipUserStyles && !cutOffInheritance &&
+       mRuleProcessors[eDocSheet]) // NOTE: different
+     (*aFunc)(mRuleProcessors[eDocSheet], aData);
+   if (mRuleProcessors[eStyleAttrSheet])
+     (*aFunc)(mRuleProcessors[eStyleAttrSheet], aData);
+   if (mRuleProcessors[eOverrideSheet])
+     (*aFunc)(mRuleProcessors[eOverrideSheet], aData);
++  (*aFunc)(mRuleProcessors[eAnimationSheet], aData);
+   (*aFunc)(mRuleProcessors[eTransitionSheet], aData);
+ }
+ 
+ PRBool nsStyleSet::BuildDefaultStyleData(nsPresContext* aPresContext)
+ {
+   NS_ASSERTION(!mDefaultStyleData.mResetData &&
+                !mDefaultStyleData.mInheritedData,
+                "leaking default style data");
+@@ -1185,16 +1197,17 @@ nsStyleSet::ReparentStyleContext(nsStyle
+   nsCSSPseudoElements::Type pseudoType = aStyleContext->GetPseudoType();
+   nsRuleNode* ruleNode = aStyleContext->GetRuleNode();
+ 
+   // Skip transition rules as needed just like
+   // nsTransitionManager::WalkTransitionRule would.
+   PRBool skipTransitionRules = PresContext()->IsProcessingRestyles() &&
+     !PresContext()->IsProcessingAnimationStyleChange();
+   if (skipTransitionRules) {
++    // FIXME do something here for animations?
+     // Make sure that we're not using transition rules for our new style
+     // context.  If we need them, an animation restyle will provide.
+     ruleNode =
+       SkipTransitionRules(ruleNode, aElement,
+                           pseudoType !=
+                             nsCSSPseudoElements::ePseudo_NotPseudoElement);
+   }
+ 
+@@ -1203,16 +1216,17 @@ nsStyleSet::ReparentStyleContext(nsStyle
+   // Reparenting a style context just changes where we inherit from,
+   // not what rules we match or what our DOM looks like.  In
+   // particular, it doesn't change whether this is a style context for
+   // a link.
+   if (visitedContext) {
+      visitedRuleNode = visitedContext->GetRuleNode();
+      // Again, skip transition rules as needed
+      if (skipTransitionRules) {
++      // FIXME do something here for animations?
+        visitedRuleNode =
+          SkipTransitionRules(visitedRuleNode, aElement,
+                              pseudoType !=
+                                nsCSSPseudoElements::ePseudo_NotPseudoElement);
+      }
+   }
+ 
+   return GetContext(aNewParentContext, ruleNode, visitedRuleNode,
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -228,16 +228,17 @@ class nsStyleSet
+   // highest (for non-!important rules).
+   enum sheetType {
+     eAgentSheet, // CSS
+     eUserSheet, // CSS
+     ePresHintSheet,
+     eDocSheet, // CSS
+     eStyleAttrSheet,
+     eOverrideSheet, // CSS
++    eAnimationSheet,
+     eTransitionSheet,
+     eSheetTypeCount
+     // be sure to keep the number of bits in |mDirty| below and in
+     // NS_RULE_NODE_LEVEL_MASK updated when changing the number of sheet
+     // types
+   };
+ 
+   // APIs to manipulate the style sheet lists.  The sheets in each
