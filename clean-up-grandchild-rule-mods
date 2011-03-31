@@ -1,0 +1,198 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Clean up handling of CSSOM modifications to rules that are non-child descendants of a sheet.  (Bug 577974)
+
+This fixes handling of a number of cases:
+ 1. Modifications to a style rule inside a group rule now trigger
+    GetRuleCascades.
+ 2. A sheet that has been (potentially) modified is reliably marked as
+    such, and thus never cloned.
+
+diff --git a/layout/style/Loader.cpp b/layout/style/Loader.cpp
+--- a/layout/style/Loader.cpp
++++ b/layout/style/Loader.cpp
+@@ -1689,18 +1689,16 @@ Loader::DoSheetComplete(SheetLoadData* a
+       mLoadingDatas.Remove(&key);
+       aLoadData->mIsLoading = PR_FALSE;
+     }
+   }
+   
+   // Go through and deal with the whole linked list.
+   SheetLoadData* data = aLoadData;
+   while (data) {
+-
+-    data->mSheet->SetModified(PR_FALSE); // it's clean
+     data->mSheet->SetComplete();
+     if (data->mMustNotify && (data->mObserver || !mObservers.IsEmpty())) {
+       // Don't notify here so we don't trigger script.  Remember the
+       // info we need to notify, then do it later when it's safe.
+       aDatasToNotify.AppendElement(data);
+ 
+       // On append failure, just press on.  We'll fail to notify the observer,
+       // but not much we can do about that....
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -654,19 +654,17 @@ GroupRule::List(FILE* out, PRInt32 aInde
+ 
+ void
+ GroupRule::AppendStyleRule(nsICSSRule* aRule)
+ {
+   mRules.AppendObject(aRule);
+   aRule->SetStyleSheet(mSheet);
+   aRule->SetParentRule(this);
+   if (mSheet) {
+-    // XXXldb Shouldn't we be using |WillDirty| and |DidDirty| (and
+-    // shouldn't |SetModified| be removed?
+-    mSheet->SetModified(PR_TRUE);
++    mSheet->SetModifiedByChildRule();
+   }
+ }
+ 
+ nsresult
+ GroupRule::GetStyleRuleAt(PRInt32 aIndex, nsICSSRule*& aRule) const
+ {
+   if (aIndex < 0 || aIndex >= mRules.Count()) {
+     aRule = nsnull;
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -92,26 +92,23 @@ public:
+   virtual nsIDOMCSSRule* GetItemAt(PRUint32 aIndex, nsresult* aResult);
+ 
+   void DropReference() { mStyleSheet = nsnull; }
+ 
+ protected:
+   virtual ~CSSRuleListImpl();
+ 
+   nsCSSStyleSheet*  mStyleSheet;
+-public:
+-  PRBool              mRulesAccessed;
+ };
+ 
+ CSSRuleListImpl::CSSRuleListImpl(nsCSSStyleSheet *aStyleSheet)
+ {
+   // Not reference counted to avoid circular references.
+   // The style sheet will tell us when its going away.
+   mStyleSheet = aStyleSheet;
+-  mRulesAccessed = PR_FALSE;
+ }
+ 
+ CSSRuleListImpl::~CSSRuleListImpl()
+ {
+ }
+ 
+ DOMCI_DATA(CSSRuleList, CSSRuleListImpl)
+ 
+@@ -150,17 +147,16 @@ CSSRuleListImpl::GetItemAt(PRUint32 aInd
+   if (mStyleSheet) {
+     // ensure rules have correct parent
+     if (mStyleSheet->EnsureUniqueInner() !=
+           nsCSSStyleSheet::eUniqueInner_CloneFailed) {
+       nsCOMPtr<nsICSSRule> rule;
+ 
+       result = mStyleSheet->GetStyleRuleAt(aIndex, *getter_AddRefs(rule));
+       if (rule) {
+-        mRulesAccessed = PR_TRUE; // signal to never share rules again
+         return rule->GetDOMRuleWeak(aResult);
+       }
+       if (result == NS_ERROR_ILLEGAL_VALUE) {
+         result = NS_OK; // per spec: "Return Value ... null if ... not a valid index."
+       }
+     }
+   }
+ 
+@@ -1017,25 +1013,24 @@ nsCSSStyleSheet::nsCSSStyleSheet(const n
+                                  nsIDOMNode* aOwningNodeToUse)
+   : mTitle(aCopy.mTitle),
+     mParent(aParentToUse),
+     mOwnerRule(aOwnerRuleToUse),
+     mRuleCollection(nsnull), // re-created lazily
+     mDocument(aDocumentToUse),
+     mOwningNode(aOwningNodeToUse),
+     mDisabled(aCopy.mDisabled),
+-    mDirty(PR_FALSE),
++    mDirty(aCopy.mDirty),
+     mInner(aCopy.mInner),
+     mRuleProcessors(nsnull)
+ {
+ 
+   mInner->AddSheet(this);
+ 
+-  if (aCopy.mRuleCollection && 
+-      aCopy.mRuleCollection->mRulesAccessed) {  // CSSOM's been there, force full copy now
++  if (mDirty) { // CSSOM's been there, force full copy now
+     NS_ASSERTION(mInner->mComplete, "Why have rules been accessed on an incomplete sheet?");
+     // FIXME: handle failure?
+     EnsureUniqueInner();
+   }
+ 
+   if (aCopy.mMedia) {
+     // XXX This is wrong; we should be keeping @import rules and
+     // sheets in sync!
+@@ -1439,16 +1434,18 @@ nsCSSStyleSheet::EnsureUniqueInner()
+   }
+   nsCSSStyleSheetInner* clone = mInner->CloneFor(this);
+   if (!clone) {
+     return eUniqueInner_CloneFailed;
+   }
+   mInner->RemoveSheet(this);
+   mInner = clone;
+ 
++  mDirty = PR_TRUE;
++
+   // otherwise the rule processor has pointers to the old rules
+   ClearRuleCascades();
+ 
+   return eUniqueInner_ClonedInner;
+ }
+ 
+ PRBool
+ nsCSSStyleSheet::AppendAllChildSheets(nsTArray<nsCSSStyleSheet*>& aArray)
+@@ -1559,18 +1556,18 @@ nsCSSStyleSheet::WillDirty()
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+   return NS_OK;
+ }
+ 
+ void
+ nsCSSStyleSheet::DidDirty()
+ {
++  NS_ABORT_IF_FALSE(mDirty, "caller must have called WillDirty()");
+   ClearRuleCascades();
+-  mDirty = PR_TRUE;
+ }
+ 
+ nsresult
+ nsCSSStyleSheet::SubjectSubsumesInnerPrincipal() const
+ {
+   // Get the security manager and do the subsumes check
+   nsIScriptSecurityManager *securityManager =
+     nsContentUtils::GetSecurityManager();
+diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
+--- a/layout/style/nsCSSStyleSheet.h
++++ b/layout/style/nsCSSStyleSheet.h
+@@ -205,17 +205,22 @@ public:
+   nsXMLNameSpaceMap* GetNameSpaceMap() const { return mInner->mNameSpaceMap; }
+ 
+   already_AddRefed<nsCSSStyleSheet> Clone(nsCSSStyleSheet* aCloneParent,
+                                           mozilla::css::ImportRule* aCloneOwnerRule,
+                                           nsIDocument* aCloneDocument,
+                                           nsIDOMNode* aCloneOwningNode) const;
+ 
+   PRBool IsModified() const { return mDirty; }
+-  void SetModified(PRBool aModified) { mDirty = aModified; }
++
++  void SetModifiedByChildRule() {
++    NS_ASSERTION(mDirty,
++                 "sheet must be marked dirty before handing out child rules");
++    DidDirty();
++  }
+ 
+   nsresult AddRuleProcessor(nsCSSRuleProcessor* aProcessor);
+   nsresult DropRuleProcessor(nsCSSRuleProcessor* aProcessor);
+ 
+   /**
+    * Like the DOM insertRule() method, but doesn't do any security checks
+    */
+   nsresult InsertRuleInternal(const nsAString& aRule,
