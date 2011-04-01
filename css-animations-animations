@@ -250,7 +250,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,434 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -297,6 +297,7 @@ new file mode 100644
 +#include "mozilla/TimeStamp.h"
 +#include "nsStyleAnimation.h"
 +#include "nsSMILKeySpline.h"
++#include <math.h>
 +
 +using namespace mozilla;
 +
@@ -310,7 +311,7 @@ new file mode 100644
 +{
 +  TimeDuration mSegmentDuration;
 +  nsSMILKeySpline mTimingFunction;
-+  nsTArray<AnimationSegmentProperty> mProperties;
++  nsTArray<AnimationSegmentProperty, nsTArrayInfallibleAllocator> mProperties;
 +};
 +
 +/**
@@ -329,7 +330,7 @@ new file mode 100644
 +  TimeStamp mPauseStart;
 +  TimeDuration mIterationDuration;
 +
-+  nsTArray<AnimationSegment> mSegments;
++  nsTArray<AnimationSegment, nsTArrayInfallibleAllocator> mSegments;
 +};
 +
 +/**
@@ -355,7 +356,7 @@ new file mode 100644
 +  // The refresh time associated with mStyleRule.
 +  TimeStamp mStyleRuleRefreshTime;
 +
-+  nsTArray<ElementAnimation> mAnimations;
++  nsTArray<ElementAnimation, nsTArrayInfallibleAllocator> mAnimations;
 +};
 +
 +static void
@@ -478,10 +479,11 @@ new file mode 100644
 +    }
 +
 +    // build the animations list
-+    nsTArray<ElementAnimation> newAnimations;
-+    //BuildAnimations(newAnimations, aStyleContext);
++    nsTArray<ElementAnimation, nsTArrayInfallibleAllocator> newAnimations;
++    BuildAnimations(aStyleContext, newAnimations);
 +
-+    // If the full list of names matches, copy over the start times.
++    // If the full list of names matches, copy over the start times and
++    // (if still paused) pause starts.
 +    // FIXME (spec): the spec is very unclear about when to preserve
 +    // animation data under changes.  Should test and improve spec and
 +    // code.
@@ -490,6 +492,125 @@ new file mode 100644
 +  }
 +
 +  return GetAnimationRule(aElement, aStyleContext->GetPseudoType());
++}
++
++class PercentageHashKey : public PLDHashEntryHdr
++{
++public:
++  typedef const float& KeyType;
++  typedef const float* KeyTypePointer;
++
++  PercentageHashKey(KeyTypePointer aKey) : mValue(*aKey) { }
++  PercentageHashKey(const PercentageHashKey& toCopy) : mValue(toCopy.mValue) { }
++  ~PercentageHashKey() { }
++
++  KeyType GetKey() const { return mValue; }
++  PRBool KeyEquals(KeyTypePointer aKey) const { return *aKey == mValue; }
++
++  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
++  static PLDHashNumber HashKey(KeyTypePointer aKey) {
++    PR_STATIC_ASSERT(sizeof(PLDHashNumber) == sizeof(PRUint32));
++    PR_STATIC_ASSERT(PLDHashNumber(-1) > PLDHashNumber(0));
++    return PLDHashNumber(fmodf(*aKey, 1.0f) * PR_UINT32_MAX);
++  }
++  enum { ALLOW_MEMMOVE = PR_TRUE };
++
++private:
++  const float mValue;
++};
++
++struct KeyframeData {
++  float mKey;
++  nsCSSKeyframeRule *mRule;
++};
++
++typedef nsTArray<KeyframeData, nsTArrayInfallibleAllocator> KeyframeDataArray;
++
++static PLDHashOperator
++AppendKeyframeData(const float &aKey, nsCSSKeyframeRule *aRule, void *aData)
++{
++  KeyframeDataArray *array = static_cast<KeyframeDataArray*>(aData);
++  KeyframeData *data = array->AppendElement();
++  data->mKey = aKey;
++  data->mRule = aRule;
++  return PL_DHASH_NEXT;
++}
++
++struct KeyframeDataComparator {
++  PRBool Equals(const KeyframeData& A, const KeyframeData& B) const {
++    return A.mKey == B.mKey;
++  }
++  PRBool LessThan(const KeyframeData& A, const KeyframeData& B) const {
++    return A.mKey < B.mKey;
++  }
++};
++
++void
++nsAnimationManager::BuildAnimations(nsStyleContext* aStyleContext,
++                                    nsTArray<ElementAnimation, nsTArrayInfallibleAllocator>& aAnimations)
++{
++  NS_ABORT_IF_FALSE(aAnimations.IsEmpty(), "expect empty array");
++
++  const nsStyleDisplay *disp = aStyleContext->GetStyleDisplay();
++  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
++  for (PRUint32 i = 0, i_end = disp->mAnimations.Length(); i != i_end; ++i) {
++    const nsAnimation& aSrc = disp->mAnimations[i];
++    ElementAnimation& aDest = *aAnimations.AppendElement();
++
++    aDest.mName = aSrc.GetName();
++    aDest.mIterationCount = aSrc.GetIterationCount();
++    aDest.mDirection = aSrc.GetDirection();
++    aDest.mFillMode = aSrc.GetFillMode();
++    aDest.mPlayState = aSrc.GetPlayState();
++
++    aDest.mStartTime = now;
++    if (aDest.mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_RUNNING) {
++      aDest.mPauseStart = TimeStamp();
++    } else {
++      NS_ABORT_IF_FALSE(aDest.mPlayState ==
++                          NS_STYLE_ANIMATION_PLAY_STATE_PAUSED,
++                        "unexpected play state");
++      aDest.mPauseStart = now;
++    }
++
++    aDest.mIterationDuration = TimeDuration::FromMilliseconds(aSrc.GetDuration());
++
++    nsCSSKeyframesRule *rule = KeyframesRuleFor(aDest.mName);
++    if (!rule) {
++      // no segments
++      continue;
++    }
++
++    // Build the set of unique keyframes in the @keyframes rule.  Per
++    // css3-animations, later keyframes with the same key replace
++    // earlier ones (no cascading).
++    nsDataHashtable<PercentageHashKey, nsCSSKeyframeRule*> keyframes;
++    for (PRUint32 j = 0, j_end = rule->StyleRuleCount(); j != j_end; ++j) {
++      nsCOMPtr<nsICSSRule> cssRule;
++      rule->GetStyleRuleAt(j, *getter_AddRefs(cssRule));
++      NS_ABORT_IF_FALSE(cssRule, "must have rule");
++      NS_ABORT_IF_FALSE(cssRule->GetType() == nsICSSRule::KEYFRAME_RULE,
++                        "must be keyframe rule");
++      nsCSSKeyframeRule *kfRule =
++        static_cast<nsCSSKeyframeRule*>(cssRule.get());
++
++      const nsTArray<float> &keys = kfRule->GetKeys();
++      for (PRUint32 k = 0, k_end = keys.Length(); k != k_end; ++k) {
++        float key = keys[k];
++        keyframes.Put(key, kfRule);
++      }
++    }
++
++    KeyframeDataArray sortedKeyframes;
++    keyframes.EnumerateRead(AppendKeyframeData, &sortedKeyframes);
++    sortedKeyframes.Sort(KeyframeDataComparator());
++
++    for (PRUint32 j = 0, j_end = sortedKeyframes.Length(); j != j_end; ++j) {
++      AnimationSegment &segment = *aDest.mSegments.AppendElement();
++
++      // FIXME: write me
++    }
++  }
 +}
 +
 +nsIStyleRule*
@@ -568,7 +689,7 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsAnimationManager.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,103 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -615,7 +736,8 @@ new file mode 100644
 +#include "nsTHashtable.h"
 +
 +class nsCSSKeyframesRule;
-+class ElementAnimations;
++struct ElementAnimation;
++struct ElementAnimations;
 +
 +class nsAnimationManager : public mozilla::css::CommonAnimationManager
 +{
@@ -659,6 +781,8 @@ new file mode 100644
 +  ElementAnimations* GetElementAnimations(mozilla::dom::Element *aElement,
 +                                          nsCSSPseudoElements::Type aPseudoType,
 +                                          PRBool aCreateIfNeeded);
++  void BuildAnimations(nsStyleContext* aStyleContext,
++                       nsTArray<ElementAnimation, nsTArrayInfallibleAllocator>& aAnimations);
 +  nsIStyleRule* GetAnimationRule(mozilla::dom::Element* aElement,
 +                                 nsCSSPseudoElements::Type aPseudoType);
 +
