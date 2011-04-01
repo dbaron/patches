@@ -399,7 +399,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      // we should continue parsing the selector:
      eSelectorParsingStatus_Continue,
      // we saw an unexpected token or token value,
-@@ -1295,16 +1303,42 @@ CSSParserImpl::ParseSelectorString(const
+@@ -1295,16 +1303,44 @@ CSSParserImpl::ParseSelectorString(const
  
    NS_ASSERTION(!*aSelectorList, "Shouldn't have list!");
    if (prefixErr)
@@ -420,7 +420,9 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +
 +  AssertInitialState();
 +
-+  bool success = !!ParseKeyframeSelectorList(aSelectorList);
++  bool success = ParseKeyframeSelectorList(aSelectorList) &&
++                 // must consume entire input string
++                 !GetToken(PR_TRUE);
 +
 +  OUTPUT_ERROR();
 +  ReleaseScanner();
@@ -442,7 +444,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    for (;;) {
      if (!mHavePushBack) {
        if (!mScanner.Next(mToken)) {
-@@ -1525,16 +1559,20 @@ CSSParserImpl::ParseAtRule(RuleAppendFun
+@@ -1525,16 +1561,20 @@ CSSParserImpl::ParseAtRule(RuleAppendFun
    } else if (mToken.mIdent.LowerCaseEqualsLiteral("font-face")) {
      parseFunc = &CSSParserImpl::ParseFontFaceRule;
      newSection = eCSSSection_General;
@@ -463,7 +465,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
      // Skip over unsupported at rule, don't advance section
      return SkipAtRule(PR_FALSE);
    }
-@@ -2250,16 +2288,105 @@ CSSParserImpl::ParseFontDescriptor(nsCSS
+@@ -2250,16 +2290,110 @@ CSSParserImpl::ParseFontDescriptor(nsCSS
  
  PRBool
  CSSParserImpl::ParsePageRule(RuleAppendFunc aAppendFunc, void* aData)
@@ -505,25 +507,28 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +void
 +CSSParserImpl::ParseKeyframeRule(nsCSSKeyframesRule* aParentRule)
 +{
-+  nsTArray<float> selectorList;
-+  if (!ParseKeyframeSelectorList(selectorList)) {
-+    REPORT_UNEXPECTED(PEBadSelectorKeyframeRuleIgnored);
-+    OUTPUT_ERROR();
-+    SkipRuleSet(PR_TRUE);
++  do {
++    nsTArray<float> selectorList;
++    if (!ParseKeyframeSelectorList(selectorList)) {
++      break;
++    }
++
++    nsAutoPtr<css::Declaration> declaration(ParseDeclarationBlock(PR_TRUE));
++    if (!declaration) {
++      break;
++    }
++
++    // Takes ownership of declaration, and steals contents of selectorList.
++    nsRefPtr<nsCSSKeyframeRule> rule =
++      new nsCSSKeyframeRule(selectorList, declaration);
++
++    aParentRule->AppendStyleRule(rule);
 +    return;
-+  }
++  } while (false);
 +
-+  // Next parse the declaration block
-+  nsAutoPtr<css::Declaration> declaration(ParseDeclarationBlock(PR_TRUE));
-+  if (!declaration) {
-+    return;
-+  }
-+
-+  // Takes ownership of declaration, and steals contents of selectorList.
-+  nsRefPtr<nsCSSKeyframeRule> rule =
-+    new nsCSSKeyframeRule(selectorList, declaration);
-+
-+  aParentRule->AppendStyleRule(rule);
++  REPORT_UNEXPECTED(PEBadSelectorKeyframeRuleIgnored);
++  OUTPUT_ERROR();
++  SkipRuleSet(PR_TRUE);
 +}
 +
 +PRBool
@@ -551,7 +556,9 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
 +        // fall through
 +      default:
 +        UngetToken();
-+        return !first;
++        // If we're first, we got an empty list.  If we're not first, we
++        // have a trailing comma.
++        return PR_FALSE;
 +    }
 +    aSelectorList.AppendElement(value);
 +    first = false;
@@ -569,7 +576,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    stack.AppendElement(aStopSymbol);
    for (;;) {
      if (!GetToken(PR_TRUE)) {
-@@ -2429,17 +2556,16 @@ CSSParserImpl::ParseRuleSet(RuleAppendFu
+@@ -2429,17 +2563,16 @@ CSSParserImpl::ParseRuleSet(RuleAppendFu
      return PR_FALSE;
    }
    NS_ASSERTION(nsnull != slist, "null selector list");
@@ -587,7 +594,7 @@ diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
    slist->Dump();
    fputs("{\n", stdout);
    declaration->List();
-@@ -8612,8 +8738,19 @@ nsresult
+@@ -8612,8 +8745,19 @@ nsresult
  nsCSSParser::ParseSelectorString(const nsSubstring&  aSelectorString,
                                   nsIURI*             aURI,
                                   PRUint32            aLineNumber,
@@ -1283,7 +1290,7 @@ diff --git a/layout/style/test/test_keyframes_rules.html b/layout/style/test/tes
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/test/test_keyframes_rules.html
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,94 @@
 +<!DOCTYPE HTML>
 +<html>
 +<!--
@@ -1300,6 +1307,22 @@ new file mode 100644
 +    from {
 +      margin-left: 0
 +    }
++
++    /*
++     * These rules should get dropped due to syntax errors.  The script
++     * below tests that the 25% rule following them is at cssRules[1].
++     */
++    from, { margin-left: 0 }
++    from , { margin-left: 0 }
++    , from { margin-left: 0 }
++    ,from { margin-left: 0 }
++    from from { margin-left: 0 }
++    from, 1 { margin-left: 0 }
++    1 { margin-left: 0 }
++    1, from { margin-left: 0 }
++    from, 1.0 { margin-left: 0 }
++    1.0 { margin-left: 0 }
++    1.0, from { margin-left: 0 }
 +
 +    25% {
 +      margin-left: 25px;
@@ -1346,6 +1369,17 @@ new file mode 100644
 +is(bounce.cssRules[3].keyText, "100%", "keyframe rule keyText");
 +is(bounce.cssRules[0].style.marginLeft, "0pt", "keyframe rule style");
 +is(bounce.cssRules[1].style.marginLeft, "25px", "keyframe rule style");
++
++bounce.cssRules[1].keyText = "from, 1"; // syntax error
++bounce.cssRules[1].keyText = "from, x"; // syntax error
++bounce.cssRules[1].keyText = "x"; // syntax error
++is(bounce.cssRules[1].keyText, "25%", "keyframe rule keyText parsing");
++bounce.cssRules[1].keyText = "from, 10%";
++is(bounce.cssRules[1].keyText, "0%, 10%", "keyframe rule keyText parsing");
++bounce.cssRules[1].keyText = "from, 0%";
++is(bounce.cssRules[1].keyText, "0%, 0%", "keyframe rule keyText parsing");
++bounce.cssRules[1].keyText = "from, from, from";
++is(bounce.cssRules[1].keyText, "0%, 0%, 0%", "keyframe rule keyText parsing");
 +
 +</script>
 +</pre>
