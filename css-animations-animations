@@ -111,6 +111,24 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  {
    if (mLangService) {
      NS_IF_RELEASE(mLanguage);
+@@ -1613,16 +1622,17 @@ void
+ nsPresContext::RebuildAllStyleData(nsChangeHint aExtraHint)
+ {
+   if (!mShell) {
+     // We must have been torn down. Nothing to do here.
+     return;
+   }
+ 
+   RebuildUserFontSet();
++  AnimationManager()->KeyframesListIsDirty();
+ 
+   mShell->FrameConstructor()->RebuildAllStyleData(aExtraHint);
+ }
+ 
+ void
+ nsPresContext::PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint)
+ {
+   if (!mShell) {
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
@@ -168,6 +186,45 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    // Formerly mLangGroup; moving from charset-oriented langGroup to
    // maintaining actual language settings everywhere (see bug 524107).
    // This may in fact hold a langGroup such as x-western rather than
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -61,16 +61,17 @@
+ #include "nsIContent.h"
+ #include "mozilla/dom/Element.h"
+ #include "nsIDocument.h"
+ #include "nsIDOMXULDocument.h"
+ #include "nsStubDocumentObserver.h"
+ #include "nsStyleSet.h"
+ #include "nsCSSStyleSheet.h" // XXX for UA sheet loading hack, can this go away please?
+ #include "nsIDOMCSSStyleSheet.h"  // for Pref-related rule management (bugs 22963,20760,31816)
++#include "nsAnimationManager.h"
+ #include "nsINameSpaceManager.h"  // for Pref-related rule management (bugs 22963,20760,31816)
+ #include "nsIServiceManager.h"
+ #include "nsFrame.h"
+ #include "nsIViewManager.h"
+ #include "nsCRT.h"
+ #include "nsCRTGlue.h"
+ #include "prlog.h"
+ #include "prmem.h"
+@@ -5108,16 +5109,17 @@ nsIPresShell::ReconstructStyleDataIntern
+ 
+   if (mIsDestroying) {
+     // We don't want to mess with restyles at this point
+     return;
+   }
+ 
+   if (mPresContext) {
+     mPresContext->RebuildUserFontSet();
++    mPresContext->AnimationManager()->KeyframesListIsDirty();
+   }
+ 
+   Element* root = mDocument->GetRootElement();
+   if (!mDidInitialReflow) {
+     // Nothing to do here, since we have no frames yet
+     return;
+   }
+ 
 diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
 --- a/layout/style/Makefile.in
 +++ b/layout/style/Makefile.in
@@ -193,7 +250,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,164 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -235,6 +292,8 @@ new file mode 100644
 +#include "nsAnimationManager.h"
 +#include "nsPresContext.h"
 +#include "nsRuleProcessorData.h"
++#include "nsStyleSet.h"
++#include "nsCSSRules.h"
 +
 +/* virtual */ void
 +nsAnimationManager::RulesMatching(ElementRuleProcessorData* aData)
@@ -334,11 +393,33 @@ new file mode 100644
 +
 +  // FIXME: implement.
 +}
++
++nsCSSKeyframesRule*
++nsAnimationManager::KeyframesRuleFor(const nsSubstring& aName)
++{
++  if (mKeyframesListIsDirty) {
++    mKeyframesListIsDirty = false;
++
++    nsTArray<nsCSSKeyframesRule*> rules;
++    mPresContext->StyleSet()->AppendKeyframesRules(mPresContext, rules);
++
++    mKeyframesRules.Clear();
++    for (PRUint32 i = 0, i_end = rules.Length(); i != i_end; ++i) {
++      nsCSSKeyframesRule *rule = rules[i];
++      mKeyframesRules.Put(rule->GetName(), rule);
++    }
++
++    // FIXME: Mark all element data as needing recalculation.
++  }
++
++  return mKeyframesRules.Get(aName);
++}
++
 diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsAnimationManager.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,96 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -382,12 +463,16 @@ new file mode 100644
 +#include "AnimationCommon.h"
 +#include "nsCSSPseudoElements.h"
 +#include "nsStyleContext.h"
++#include "nsTHashtable.h"
++
++class nsCSSKeyframesRule;
 +
 +class nsAnimationManager : public mozilla::css::CommonAnimationManager
 +{
 +public:
 +  nsAnimationManager(nsPresContext *aPresContext)
-+    : mozilla::css::CommonAnimationManager(aPresContext)
++    : mozilla::css::CommonAnimationManager(aPresContext),
++      mKeyframesListIsDirty(true)
 +  {
 +  }
 +
@@ -416,9 +501,18 @@ new file mode 100644
 +  nsIStyleRule* CheckAnimationRule(nsStyleContext* aStyleContext,
 +                                   mozilla::dom::Element* aElement);
 +
++  void KeyframesListIsDirty() {
++    mKeyframesListIsDirty = PR_TRUE;
++  }
++
 +private:
 +  nsIStyleRule* GetAnimationRule(mozilla::dom::Element* aElement,
 +                                 nsCSSPseudoElements::Type aPseudoType);
++
++  nsCSSKeyframesRule* KeyframesRuleFor(const nsSubstring& aName);
++
++  bool mKeyframesListIsDirty;
++  nsDataHashtable<nsStringHashKey, nsCSSKeyframesRule*> mKeyframesRules;
 +};
 +
 +#endif /* !defined(nsAnimationManager_h_) */
