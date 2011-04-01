@@ -250,7 +250,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,313 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -325,9 +325,8 @@ new file mode 100644
 +  PRUint8 mFillMode;
 +  PRUint8 mPlayState;
 +
-+  PRUint32 mIteration;
-+  PRUint32 mCurrentSegment;
 +  TimeStamp mStartTime; // with delay taken into account
++  TimeStamp mPauseStart;
 +  TimeDuration mIterationDuration;
 +
 +  nsTArray<AnimationSegment> mSegments;
@@ -341,19 +340,11 @@ new file mode 100644
 +  ElementAnimations(dom::Element *aElement, nsIAtom *aElementProperty,
 +                     nsAnimationManager *aAnimationManager)
 +    : CommonElementAnimationData(aElement, aElementProperty,
-+                                 aAnimationManager),
-+      mRecomputeSegments(true)
++                                 aAnimationManager)
 +  {
 +  }
 +
 +  void EnsureStyleRuleFor(TimeStamp aRefreshTime);
-+
-+  // Because of a change in computed style or style rules, notify that
-+  // the element not only needs a new style rule, but needs to recompute
-+  // the bases between which that style rule is interpolating.
-+  void InvalidateSegments() {
-+    mRecomputeSegments = true;
-+  }
 +
 +  // This style rule contains the style data for currently animating
 +  // values.  It only matches when styling with animation.  When we
@@ -364,7 +355,7 @@ new file mode 100644
 +  // The refresh time associated with mStyleRule.
 +  TimeStamp mStyleRuleRefreshTime;
 +
-+  bool mRecomputeSegments;
++  nsTArray<ElementAnimation> mAnimations;
 +};
 +
 +static void
@@ -471,17 +462,31 @@ new file mode 100644
 +nsAnimationManager::CheckAnimationRule(nsStyleContext* aStyleContext,
 +                                       mozilla::dom::Element* aElement)
 +{
-+  const nsStyleDisplay *disp = aStyleContext->GetStyleDisplay();
-+  ElementAnimations *ea =
-+    GetElementAnimations(aElement, aStyleContext->GetPseudoType(), PR_FALSE);
-+  if (!ea &&
-+      disp->mAnimations.Length() == 1 &&
-+      disp->mAnimations[0].GetName().IsEmpty()) {
-+    return nsnull;
-+  }
-+
 +  if (!mPresContext->IsProcessingAnimationStyleChange()) {
-+  // FIXME: Deal with the possibility of the names being different.
++    // Everything that causes our animation data to change triggers a
++    // style change, which in turn triggers a non-animation restyle.
++    // Likewise, when we initially construct frames, we're not in a
++    // style change, but also not in an animation restyle.
++
++    const nsStyleDisplay *disp = aStyleContext->GetStyleDisplay();
++    ElementAnimations *ea =
++      GetElementAnimations(aElement, aStyleContext->GetPseudoType(), PR_FALSE);
++    if (!ea &&
++        disp->mAnimations.Length() == 1 &&
++        disp->mAnimations[0].GetName().IsEmpty()) {
++      return nsnull;
++    }
++
++    // build the animations list
++    nsTArray<ElementAnimation> newAnimations;
++    //BuildAnimations(newAnimations, aStyleContext);
++
++    // If the full list of names matches, copy over the start times.
++    // FIXME (spec): the spec is very unclear about when to preserve
++    // animation data under changes.  Should test and improve spec and
++    // code.
++
++    // FIXME: implement
 +  }
 +
 +  return GetAnimationRule(aElement, aStyleContext->GetPseudoType());
@@ -497,13 +502,26 @@ new file mode 100644
 +    aPseudoType == nsCSSPseudoElements::ePseudo_after,
 +    "forbidden pseudo type");
 +
-+  if (PR_CLIST_IS_EMPTY(&mElementData)) {
++  ElementAnimations *ea =
++    GetElementAnimations(aElement, aPseudoType, PR_FALSE);
++  if (!ea) {
++    return nsnull;
++  }
++
++  if (mPresContext->IsProcessingRestyles() &&
++      !mPresContext->IsProcessingAnimationStyleChange()) {
++    // During the non-animation part of processing restyles, we don't
++    // add the animation rule.
++
++    nsRestyleHint hint =
++      (aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement)
++        ? eRestyle_Self : eRestyle_Subtree;
++    mPresContext->PresShell()->RestyleForAnimation(aElement, hint);
++
 +    return nsnull;
 +  }
 +
 +  // FIXME: implement
-+
-+  // FIXME: Mark it as dirty if we get a non-animation restyle.
 +
 +  return nsnull;
 +}
@@ -540,14 +558,6 @@ new file mode 100644
 +    for (PRUint32 i = 0, i_end = rules.Length(); i != i_end; ++i) {
 +      nsCSSKeyframesRule *rule = rules[i];
 +      mKeyframesRules.Put(rule->GetName(), rule);
-+    }
-+
-+    // Since keyframes rules have changed, we need to invalidate all
-+    // current animations.
-+    for (PRCList *l = PR_LIST_HEAD(&mElementData); l != &mElementData;
-+         l = PR_NEXT_LINK(l)) {
-+      ElementAnimations *ea = static_cast<ElementAnimations*>(l);
-+      ea->InvalidateSegments();
 +    }
 +  }
 +
