@@ -74,7 +74,7 @@ diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsI
     * to the given value. That is, when set to kDontAnimMode, all images
     * will stop animating. The attribute's value must be one of the
     * animationMode values from imgIContainer.
-@@ -820,16 +820,30 @@ interface nsIDOMWindowUtils : nsISupport
+@@ -820,16 +820,31 @@ interface nsIDOMWindowUtils : nsISupport
    nsIDOMWindow getOuterWindowWithId(in unsigned long long aOuterWindowID);
  
    [noscript] void RenderDocument(in nsConstRect aRect,
@@ -88,7 +88,8 @@ diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsI
 +   * three things:
 +   *  (1) It marks the refresh driver for this presentation so that it
 +   *      no longer refreshes on its own, but is instead driven entirely
-+   *      by the caller.
++   *      by the caller (except for the refresh that happens when a
++   *      document comes out of the bfcache).
 +   *  (2) It advances the refresh driver's current refresh time by the
 +   *      argument given.  Negative advances are permitted.
 +   *  (3) It does a refresh (i.e., notifies refresh observers) at that
@@ -108,7 +109,38 @@ diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsI
 diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
 --- a/layout/base/nsRefreshDriver.cpp
 +++ b/layout/base/nsRefreshDriver.cpp
-@@ -111,16 +111,24 @@ nsRefreshDriver::nsRefreshDriver(nsPresC
+@@ -49,16 +49,17 @@
+ #include "nsCSSFrameConstructor.h"
+ #include "nsIDocument.h"
+ #include "nsGUIEvent.h"
+ #include "nsEventDispatcher.h"
+ #include "jsapi.h"
+ #include "nsContentUtils.h"
+ 
+ using mozilla::TimeStamp;
++using mozilla::TimeDuration;
+ 
+ #define DEFAULT_FRAME_RATE 60
+ #define DEFAULT_THROTTLED_FRAME_RATE 1
+ 
+ static PRBool sPrecisePref;
+ 
+ /* static */ void
+ nsRefreshDriver::InitializeStatics()
+@@ -99,28 +100,40 @@ nsRefreshDriver::GetRefreshTimerType() c
+   }
+   return nsITimer::TYPE_REPEATING_SLACK;
+ }
+ 
+ nsRefreshDriver::nsRefreshDriver(nsPresContext *aPresContext)
+   : mPresContext(aPresContext),
+     mFrozen(false),
+     mThrottled(false),
++    mTestControllingRefreshes(false),
+     mTimerIsPrecise(false),
+     mLastTimerInterval(0)
+ {
+ }
  
  nsRefreshDriver::~nsRefreshDriver()
  {
@@ -122,7 +154,10 @@ diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
 +void
 +nsRefreshDriver::AdvanceTimeAndRefresh(PRInt64 aMilliseconds)
 +{
-+  // FIXME: WRITE ME
++  mTestControllingRefreshes = true;
++  mMostRecentRefreshEpochTime += aMilliseconds * 1000;
++  mMostRecentRefresh += TimeDuration::FromMilliseconds(aMilliseconds);
++  Notify(nsnull);
 +}
 +
  TimeStamp
@@ -133,6 +168,55 @@ diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
    return mMostRecentRefresh;
  }
  
+@@ -206,16 +219,20 @@ nsRefreshDriver::ObserverCount() const
+   sum += mBeforePaintTargets.Length();
+   sum += mAnimationFrameListenerDocs.Length();
+   return sum;
+ }
+ 
+ void
+ nsRefreshDriver::UpdateMostRecentRefresh()
+ {
++  if (mTestControllingRefreshes) {
++    return;
++  }
++
+   // Call JS_Now first, since that can have nonzero latency in some rare cases.
+   mMostRecentRefreshEpochTime = JS_Now();
+   mMostRecentRefresh = TimeStamp::Now();
+ }
+ 
+ nsRefreshDriver::ObserverArray&
+ nsRefreshDriver::ArrayFor(mozFlushType aFlushType)
+ {
+@@ -238,21 +255,26 @@ nsRefreshDriver::ArrayFor(mozFlushType a
+ 
+ NS_IMPL_ISUPPORTS1(nsRefreshDriver, nsITimerCallback)
+ 
+ /*
+  * nsITimerCallback implementation
+  */
+ 
+ NS_IMETHODIMP
+-nsRefreshDriver::Notify(nsITimer * /* unused */)
++nsRefreshDriver::Notify(nsITimer *aTimer)
+ {
+   NS_PRECONDITION(!mFrozen, "Why are we notified while frozen?");
+   NS_PRECONDITION(mPresContext, "Why are we notified after disconnection?");
+ 
++  if (mTestControllingRefreshes && aTimer) {
++    // Ignore real refreshes from our timer (but honor the others).
++    return NS_OK;
++  }
++
+   UpdateMostRecentRefresh();
+ 
+   nsCOMPtr<nsIPresShell> presShell = mPresContext->GetPresShell();
+   if (!presShell || ObserverCount() == 0) {
+     // Things are being destroyed, or we no longer have any observers.
+     // We don't want to stop the timer when observers are initially
+     // removed, because sometimes observers can be added and removed
+     // often depending on what other things are going on and in that
 diff --git a/layout/base/nsRefreshDriver.h b/layout/base/nsRefreshDriver.h
 --- a/layout/base/nsRefreshDriver.h
 +++ b/layout/base/nsRefreshDriver.h
@@ -159,3 +243,21 @@ diff --git a/layout/base/nsRefreshDriver.h b/layout/base/nsRefreshDriver.h
     */
    mozilla::TimeStamp MostRecentRefresh() const;
    /**
+@@ -232,16 +238,17 @@ private:
+   PRInt64 mMostRecentRefreshEpochTime;   // same thing as mMostRecentRefresh,
+                                          // but in microseconds since the epoch.
+ 
+   nsPresContext *mPresContext; // weak; pres context passed in constructor
+                                // and unset in Disconnect
+ 
+   bool mFrozen;
+   bool mThrottled;
++  bool mTestControllingRefreshes;
+   /* If mTimer is non-null, this boolean indicates whether the timer is
+      a precise timer.  If mTimer is null, this boolean's value can be
+      anything.  */
+   bool mTimerIsPrecise;
+ 
+   // separate arrays for each flush type we support
+   ObserverArray mObservers[3];
+   nsAutoTArray<nsIPresShell*, 16> mStyleFlushObservers;
