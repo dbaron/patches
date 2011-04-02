@@ -6,7 +6,7 @@ diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/AnimationCommon.cpp
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,220 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -193,13 +193,45 @@ new file mode 100644
 +}
 +#endif
 +
++void
++ComputedTimingFunction::Init(const nsTimingFunction &aFunction)
++{
++  mType = aFunction.mType;
++  if (mType == nsTimingFunction::Function) {
++    mTimingFunction.Init(aFunction.mFunc.mX1, aFunction.mFunc.mY1,
++                         aFunction.mFunc.mX2, aFunction.mFunc.mY2);
++  } else {
++    mSteps = aFunction.mSteps;
++  }
++}
++
++double
++ComputedTimingFunction::GetValue(double aPortion) const
++{
++  switch (mType) {
++    case nsTimingFunction::Function:
++      return mTimingFunction.GetSplineValue(aPortion);
++    case nsTimingFunction::StepStart:
++      // There are diagrams in the spec that seem to suggest this check
++      // (but not that for step-end) should be >=.  However, we rely on
++      // rounding negative values up to zero, so we can't do that.  And
++      // it's not clear the spec really meant it.
++      return (aPortion > 0.0) ? 1.0 : 0.0;
++    default:
++      NS_ABORT_IF_FALSE(PR_FALSE, "bad type");
++      // fall through
++    case nsTimingFunction::StepEnd:
++      return (aPortion < 1.0) ? 0.0 : 1.0;
++  }
++}
++
 +}
 +}
 diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/AnimationCommon.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,181 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -248,6 +280,8 @@ new file mode 100644
 +#include "nsStyleAnimation.h"
 +#include "nsCSSProperty.h"
 +#include "mozilla/dom/Element.h"
++#include "nsSMILKeySpline.h"
++#include "nsStyleStruct.h"
 +
 +class nsPresContext;
 +
@@ -333,6 +367,17 @@ new file mode 100644
 +  nsTArray<PropertyValuePair> mPropertyValuePairs;
 +};
 +
++class ComputedTimingFunction {
++public:
++  typedef nsTimingFunction::Type Type;
++  void Init(const nsTimingFunction &aFunction);
++  double GetValue(double aPortion) const;
++private:
++  Type mType;
++  nsSMILKeySpline mTimingFunction;
++  PRUint32 mSteps;
++};
++
 +struct CommonElementAnimationData : public PRCList
 +{
 +  CommonElementAnimationData(dom::Element *aElement, nsIAtom *aElementProperty,
@@ -392,7 +437,19 @@ diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -55,16 +55,17 @@
+@@ -43,85 +43,42 @@
+ #include "nsStyleContext.h"
+ #include "nsCSSProps.h"
+ #include "mozilla/TimeStamp.h"
+ #include "nsRefreshDriver.h"
+ #include "nsRuleProcessorData.h"
+ #include "nsIStyleRule.h"
+ #include "nsRuleWalker.h"
+ #include "nsRuleData.h"
+-#include "nsSMILKeySpline.h"
+ #include "gfxColor.h"
+ #include "nsCSSPropertySet.h"
+ #include "nsStyleAnimation.h"
  #include "nsEventDispatcher.h"
  #include "nsGUIEvent.h"
  #include "mozilla/dom/Element.h"
@@ -407,16 +464,74 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
   * Per-Element data                                                          *
   *****************************************************************************/
  
+-class ComputedTimingFunction {
+-public:
+-  typedef nsTimingFunction::Type Type;
+-  void Init(const nsTimingFunction &aFunction);
+-  double GetValue(double aPortion) const;
+-private:
+-  Type mType;
+-  nsSMILKeySpline mTimingFunction;
+-  PRUint32 mSteps;
+-};
+-
+-void
+-ComputedTimingFunction::Init(const nsTimingFunction &aFunction)
+-{
+-  mType = aFunction.mType;
+-  if (mType == nsTimingFunction::Function) {
+-    mTimingFunction.Init(aFunction.mFunc.mX1, aFunction.mFunc.mY1,
+-                         aFunction.mFunc.mX2, aFunction.mFunc.mY2);
+-  } else {
+-    mSteps = aFunction.mSteps;
+-  }
+-}
+-
+-double
+-ComputedTimingFunction::GetValue(double aPortion) const
+-{
+-  switch (mType) {
+-    case nsTimingFunction::Function:
+-      return mTimingFunction.GetSplineValue(aPortion);
+-    case nsTimingFunction::StepStart:
+-      // There are diagrams in the spec that seem to suggest this check
+-      // (but not that for step-end) should be >=.  However, we rely on
+-      // rounding negative values up to zero, so we can't do that.  And
+-      // it's not clear the spec really meant it.
+-      return (aPortion > 0.0) ? 1.0 : 0.0;
+-    default:
+-      NS_ABORT_IF_FALSE(PR_FALSE, "bad type");
+-      // fall through
+-    case nsTimingFunction::StepEnd:
+-      return (aPortion < 1.0) ? 0.0 : 1.0;
+-  }
+-}
+-
  struct ElementPropertyTransition
  {
    nsCSSProperty mProperty;
-@@ -132,119 +133,57 @@ ElementPropertyTransition::ValuePortionF
+   nsStyleAnimation::Value mStartValue, mEndValue;
+   TimeStamp mStartTime; // actual start plus transition delay
+ 
+   // data from the relevant nsTransition
+   TimeDuration mDuration;
+-  ComputedTimingFunction mTimingFunction;
++  css::ComputedTimingFunction mTimingFunction;
+ 
+   // This is the start value to be used for a check for whether a
+   // transition is being reversed.  Normally the same as mStartValue,
+   // except when this transition started as the reversal of another
+   // in-progress transition.  Needed so we can handle two reverses in a
+   // row.
+   nsStyleAnimation::Value mStartForReversingTest;
+   // Likewise, the portion (in value space) of the "full" reversed
+@@ -175,119 +132,57 @@ ElementPropertyTransition::ValuePortionF
        timePortion = 0.0; // use start value during transition-delay
      if (timePortion > 1.0)
        timePortion = 1.0; // we might be behind on flushing
    }
  
-   return mTimingFunction.GetSplineValue(timePortion);
+   return mTimingFunction.GetValue(timePortion);
  }
  
 -/**
@@ -535,7 +650,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
        if (pt.IsRemovedSentinel()) {
          continue;
        }
-@@ -261,107 +200,20 @@ ElementTransitions::EnsureStyleRuleFor(T
+@@ -304,107 +199,20 @@ ElementTransitions::EnsureStyleRuleFor(T
          nsStyleAnimation::Interpolate(pt.mProperty,
                                        pt.mStartValue, pt.mEndValue,
                                        valuePortion, *val);
@@ -643,7 +758,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
    NS_PRECONDITION(aOldStyleContext->GetPseudo() ==
                        aNewStyleContext->GetPseudo(),
                    "pseudo type mismatch");
-@@ -502,18 +354,18 @@ nsTransitionManager::StyleContextChanged
+@@ -545,18 +353,18 @@ nsTransitionManager::StyleContextChanged
      do {
        --i;
        ElementPropertyTransition &pt = pts[i];
@@ -664,7 +779,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
  
      if (pts.IsEmpty()) {
        et->Destroy();
-@@ -538,17 +390,17 @@ nsTransitionManager::StyleContextChanged
+@@ -581,17 +389,17 @@ nsTransitionManager::StyleContextChanged
    // restyle that caused this transition using a "covering" rule that
    // covers up any changes on which we started transitions, so that
    // descendants don't start their own transitions.  (In the case of
@@ -683,7 +798,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
    nsTArray<ElementPropertyTransition> &pts = et->mPropertyTransitions;
    for (PRUint32 i = 0, i_end = pts.Length(); i < i_end; ++i) {
      ElementPropertyTransition &pt = pts[i];
-@@ -584,18 +436,20 @@ nsTransitionManager::ConsiderStartingTra
+@@ -627,18 +435,20 @@ nsTransitionManager::ConsiderStartingTra
  
    if (nsCSSProps::kAnimTypeTable[aProperty] == eStyleAnimType_None) {
      return;
@@ -706,7 +821,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
      // CanInterpolate method, but it seems fine for now.)
      nsStyleAnimation::Interpolate(aProperty, pt.mStartValue, pt.mEndValue,
                                    0.5, dummyValue);
-@@ -744,17 +598,17 @@ nsTransitionManager::ConsiderStartingTra
+@@ -787,17 +597,17 @@ nsTransitionManager::ConsiderStartingTra
    aWhichStarted->AddProperty(aProperty);
  }
  
@@ -725,7 +840,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
    if (aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement) {
      propName = nsGkAtoms::transitionsProperty;
    } else if (aPseudoType == nsCSSPseudoElements::ePseudo_before) {
-@@ -779,40 +633,22 @@ nsTransitionManager::GetElementTransitio
+@@ -822,40 +632,22 @@ nsTransitionManager::GetElementTransitio
      nsresult rv = aElement->SetProperty(propName, et,
                                          ElementTransitionsPropertyDtor, nsnull);
      if (NS_FAILED(rv)) {
@@ -767,7 +882,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
  nsTransitionManager::WalkTransitionRule(RuleProcessorData* aData,
                                          nsCSSPseudoElements::Type aPseudoType)
  {
-@@ -874,40 +710,16 @@ nsTransitionManager::RulesMatching(AnonB
+@@ -917,40 +709,16 @@ nsTransitionManager::RulesMatching(AnonB
  
  #ifdef MOZ_XUL
  /* virtual */ void
@@ -808,7 +923,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
                        TimeDuration aDuration)
      : mElement(aElement),
        mEvent(PR_TRUE, NS_TRANSITION_END,
-@@ -932,27 +744,27 @@ nsTransitionManager::WillRefresh(mozilla
+@@ -975,27 +743,27 @@ nsTransitionManager::WillRefresh(mozilla
    NS_ABORT_IF_FALSE(mPresContext,
                      "refresh driver should not notify additional observers "
                      "after pres context has been destroyed");
@@ -839,7 +954,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
                          "nsGenericElement::UnbindFromTree should have "
                          "destroyed the element transitions object");
  
-@@ -1006,29 +818,19 @@ nsTransitionManager::WillRefresh(mozilla
+@@ -1049,29 +817,19 @@ nsTransitionManager::WillRefresh(mozilla
          et->Destroy();
          // |et| is now a dangling pointer!
          et = nsnull;

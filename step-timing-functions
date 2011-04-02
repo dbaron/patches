@@ -1,0 +1,745 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement step-start, step-end, and steps() timing functions.  (Bug 435442, patch 0)
+
+diff --git a/layout/base/nsStyleConsts.h b/layout/base/nsStyleConsts.h
+--- a/layout/base/nsStyleConsts.h
++++ b/layout/base/nsStyleConsts.h
+@@ -642,16 +642,18 @@ static inline mozilla::css::Side operato
+ #define NS_STYLE_TEXT_TRANSFORM_UPPERCASE       3
+ 
+ // See nsStyleDisplay
+ #define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE         0
+ #define NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR       1
+ #define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN      2
+ #define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT     3
+ #define NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT  4
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START   5
++#define NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END     6
+ 
+ // See nsStyleText
+ // Note: these values pickup after the text-align values because there
+ // are a few html cases where an object can have both types of
+ // alignment applied with a single attribute
+ #define NS_STYLE_VERTICAL_ALIGN_BASELINE             11
+ #define NS_STYLE_VERTICAL_ALIGN_SUB                  12
+ #define NS_STYLE_VERTICAL_ALIGN_SUPER                13
+diff --git a/layout/style/nsCSSKeywordList.h b/layout/style/nsCSSKeywordList.h
+--- a/layout/style/nsCSSKeywordList.h
++++ b/layout/style/nsCSSKeywordList.h
+@@ -432,16 +432,18 @@ CSS_KEY(small-caption, small_caption)
+ CSS_KEY(smaller, smaller)
+ CSS_KEY(soft, soft)
+ CSS_KEY(solid, solid)
+ CSS_KEY(spell-out, spell_out)
+ CSS_KEY(square, square)
+ CSS_KEY(start, start)
+ CSS_KEY(static, static)
+ CSS_KEY(status-bar, status_bar)
++CSS_KEY(step-end, step_end)
++CSS_KEY(step-start, step_start)
+ CSS_KEY(stretch, stretch)
+ CSS_KEY(stretch-to-fit, stretch_to_fit)
+ CSS_KEY(stroke, stroke)
+ CSS_KEY(sub, sub)
+ CSS_KEY(super, super)
+ CSS_KEY(sw-resize, sw_resize)
+ CSS_KEY(table, table)
+ CSS_KEY(table-caption, table_caption)
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -108,17 +108,17 @@ namespace css = mozilla::css;
+ #define VARIANT_ATTR            0x001000  //
+ #define VARIANT_IDENTIFIER      0x002000  // D
+ #define VARIANT_AUTO            0x010000  // A
+ #define VARIANT_INHERIT         0x020000  // H eCSSUnit_Initial, eCSSUnit_Inherit
+ #define VARIANT_NONE            0x040000  // O
+ #define VARIANT_NORMAL          0x080000  // M
+ #define VARIANT_SYSFONT         0x100000  // eCSSUnit_System_Font
+ #define VARIANT_GRADIENT        0x200000  // eCSSUnit_Gradient
+-#define VARIANT_CUBIC_BEZIER    0x400000  // CSS transition timing function
++#define VARIANT_TIMING_FUNCTION 0x400000  // cubic-bezier() and steps()
+ #define VARIANT_ALL             0x800000  //
+ #define VARIANT_IMAGE_RECT    0x01000000  // eCSSUnit_Function
+ // This is an extra bit that says that a VARIANT_ANGLE allows unitless zero:
+ #define VARIANT_ZERO_ANGLE    0x02000000  // unitless zero for angles
+ #define VARIANT_CALC          0x04000000  // eCSSUnit_Calc
+ #define VARIANT_ELEMENT       0x08000000  // eCSSUnit_Element
+ 
+ // Common combinations of variants
+@@ -149,17 +149,16 @@ namespace css = mozilla::css;
+ #define VARIANT_HUK  (VARIANT_HK | VARIANT_URL)
+ #define VARIANT_HUO  (VARIANT_INHERIT | VARIANT_URL | VARIANT_NONE)
+ #define VARIANT_AHUO (VARIANT_AUTO | VARIANT_HUO)
+ #define VARIANT_HPN  (VARIANT_INHERIT | VARIANT_PERCENT | VARIANT_NUMBER)
+ #define VARIANT_HN   (VARIANT_INHERIT | VARIANT_NUMBER)
+ #define VARIANT_HON  (VARIANT_HN | VARIANT_NONE)
+ #define VARIANT_HOS  (VARIANT_INHERIT | VARIANT_NONE | VARIANT_STRING)
+ #define VARIANT_LPN  (VARIANT_LP | VARIANT_NUMBER)
+-#define VARIANT_TIMING_FUNCTION (VARIANT_KEYWORD | VARIANT_CUBIC_BEZIER)
+ #define VARIANT_UK   (VARIANT_URL | VARIANT_KEYWORD)
+ #define VARIANT_UO   (VARIANT_URL | VARIANT_NONE)
+ #define VARIANT_ANGLE_OR_ZERO (VARIANT_ANGLE | VARIANT_ZERO_ANGLE)
+ #define VARIANT_TRANSFORM_LPCALC (VARIANT_LP | VARIANT_CALC)
+ #define VARIANT_IMAGE (VARIANT_URL | VARIANT_NONE | VARIANT_GRADIENT | \
+                        VARIANT_IMAGE_RECT | VARIANT_ELEMENT)
+ 
+ // This lives here because it depends on the above macros.
+@@ -512,16 +511,17 @@ protected:
+   PRBool ParseShadowItem(nsCSSValue& aValue, PRBool aIsBoxShadow);
+   PRBool ParseShadowList(nsCSSProperty aProperty);
+   PRBool ParseTransitionProperty();
+   PRBool ParseTransition();
+   PRBool ParseTransitionTimingFunctionValues(nsCSSValue& aValue);
+   PRBool ParseTransitionTimingFunctionValueComponent(float& aComponent,
+                                                      char aStop,
+                                                      PRBool aCheckRange);
++  PRBool ParseTransitionStepTimingFunctionValues(nsCSSValue& aValue);
+ 
+ #ifdef MOZ_SVG
+   PRBool ParsePaint(nsCSSProperty aPropID);
+   PRBool ParseDasharray();
+   PRBool ParseMarker();
+ #endif
+ 
+   // Reused utility parsing routines
+@@ -4222,17 +4222,17 @@ CSSParserImpl::TranslateDimension(nsCSSV
+   VARIANT_ATTR | \
+   VARIANT_IDENTIFIER | \
+   VARIANT_AUTO | \
+   VARIANT_INHERIT | \
+   VARIANT_NONE | \
+   VARIANT_NORMAL | \
+   VARIANT_SYSFONT | \
+   VARIANT_GRADIENT | \
+-  VARIANT_CUBIC_BEZIER | \
++  VARIANT_TIMING_FUNCTION | \
+   VARIANT_ALL | \
+   VARIANT_CALC
+ 
+ // Note that callers passing VARIANT_CALC in aVariantMask will get
+ // full-range parsing inside the calc() expression, and the code that
+ // computes the calc will be required to clamp the resulting value to an
+ // appropriate range.
+ PRBool
+@@ -4494,25 +4494,32 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+       (eCSSToken_Function == tk->mType) &&
+       tk->mIdent.LowerCaseEqualsLiteral("attr")) {
+     if (!ParseAttr(aValue)) {
+       SkipUntil(')');
+       return PR_FALSE;
+     }
+     return PR_TRUE;
+   }
+-  if (((aVariantMask & VARIANT_CUBIC_BEZIER) != 0) &&
++  if (((aVariantMask & VARIANT_TIMING_FUNCTION) != 0) &&
+       (eCSSToken_Function == tk->mType)) {
+-     if (tk->mIdent.LowerCaseEqualsLiteral("cubic-bezier")) {
++    if (tk->mIdent.LowerCaseEqualsLiteral("cubic-bezier")) {
+       if (!ParseTransitionTimingFunctionValues(aValue)) {
+         SkipUntil(')');
+         return PR_FALSE;
+       }
+       return PR_TRUE;
+     }
++    if (tk->mIdent.LowerCaseEqualsLiteral("steps")) {
++      if (!ParseTransitionStepTimingFunctionValues(aValue)) {
++        SkipUntil(')');
++        return PR_FALSE;
++      }
++      return PR_TRUE;
++    }
+   }
+   if ((aVariantMask & VARIANT_CALC) &&
+       (eCSSToken_Function == tk->mType) &&
+       tk->mIdent.LowerCaseEqualsLiteral("-moz-calc")) {
+     // calc() currently allows only lengths and percents inside it.
+     return ParseCalc(aValue, aVariantMask & VARIANT_LP);
+   }
+ 
+@@ -7963,16 +7970,54 @@ CSSParserImpl::ParseTransitionTimingFunc
+     aComponent = num;
+     if (ExpectSymbol(aStop, PR_TRUE)) {
+       return PR_TRUE;
+     }
+   }
+   return PR_FALSE;
+ }
+ 
++PRBool
++CSSParserImpl::ParseTransitionStepTimingFunctionValues(nsCSSValue& aValue)
++{
++  NS_ASSERTION(!mHavePushBack &&
++               mToken.mType == eCSSToken_Function &&
++               mToken.mIdent.LowerCaseEqualsLiteral("steps"),
++               "unexpected initial state");
++
++  nsRefPtr<nsCSSValue::Array> val = nsCSSValue::Array::Create(2);
++
++  if (!ParsePositiveNonZeroVariant(val->Item(0), VARIANT_INTEGER, nsnull)) {
++    return PR_FALSE;
++  }
++
++  PRInt32 type = NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END;
++  if (ExpectSymbol(',', PR_TRUE)) {
++    if (!GetToken(PR_TRUE)) {
++      return PR_FALSE;
++    }
++    type = -1;
++    if (mToken.mType == eCSSToken_Ident) {
++      if (mToken.mIdent.LowerCaseEqualsLiteral("start")) {
++        type = NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START;
++      } else if (mToken.mIdent.LowerCaseEqualsLiteral("end")) {
++        type = NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END;
++      }
++    }
++    if (type == -1) {
++      UngetToken();
++      return PR_FALSE;
++    }
++  }
++  val->Item(2).SetIntValue(type, eCSSUnit_Enumerated);
++
++  aValue.SetArrayValue(val, eCSSUnit_Steps);
++  return PR_TRUE;
++}
++
+ static nsCSSValueList*
+ AppendValueToList(nsCSSValue& aContainer,
+                   nsCSSValueList* aTail,
+                   const nsCSSValue& aValue)
+ {
+   nsCSSValueList* entry;
+   if (aContainer.GetUnit() == eCSSUnit_Null) {
+     NS_ABORT_IF_FALSE(!aTail, "should not have an entry");
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -2283,17 +2283,17 @@ CSS_PROP_DISPLAY(
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_None)
+ CSS_PROP_DISPLAY(
+     -moz-transition-timing-function,
+     transition_timing_function,
+     CSS_PROP_DOMPROP_PREFIXED(TransitionTimingFunction),
+     CSS_PROPERTY_PARSE_VALUE_LIST |
+         CSS_PROPERTY_VALUE_LIST_USES_COMMAS,
+-    VARIANT_TIMING_FUNCTION, // used by list parsing
++    VARIANT_KEYWORD | VARIANT_TIMING_FUNCTION, // used by list parsing
+     kTransitionTimingFunctionKTable,
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_None)
+ CSS_PROP_TEXTRESET(
+     unicode-bidi,
+     unicode_bidi,
+     UnicodeBidi,
+     CSS_PROPERTY_PARSE_VALUE,
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -1257,16 +1257,18 @@ const PRInt32 nsCSSProps::kTextTransform
+ };
+ 
+ const PRInt32 nsCSSProps::kTransitionTimingFunctionKTable[] = {
+   eCSSKeyword_ease, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE,
+   eCSSKeyword_linear, NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR,
+   eCSSKeyword_ease_in, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN,
+   eCSSKeyword_ease_out, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT,
+   eCSSKeyword_ease_in_out, NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT,
++  eCSSKeyword_step_start, NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START,
++  eCSSKeyword_step_end, NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END,
+   eCSSKeyword_UNKNOWN,-1
+ };
+ 
+ const PRInt32 nsCSSProps::kUnicodeBidiKTable[] = {
+   eCSSKeyword_normal, NS_STYLE_UNICODE_BIDI_NORMAL,
+   eCSSKeyword_embed, NS_STYLE_UNICODE_BIDI_EMBED,
+   eCSSKeyword_bidi_override, NS_STYLE_UNICODE_BIDI_OVERRIDE,
+   eCSSKeyword_UNKNOWN,-1
+diff --git a/layout/style/nsCSSValue.cpp b/layout/style/nsCSSValue.cpp
+--- a/layout/style/nsCSSValue.cpp
++++ b/layout/style/nsCSSValue.cpp
+@@ -686,27 +686,43 @@ nsCSSValue::AppendToString(nsCSSProperty
+       nsStyleUtil::AppendEscapedCSSString(buffer, aResult);
+     } else if (unit == eCSSUnit_Families) {
+       // XXX We really need to do *some* escaping.
+       aResult.Append(buffer);
+     } else {
+       nsStyleUtil::AppendEscapedCSSIdent(buffer, aResult);
+     }
+   }
+-  else if (eCSSUnit_Array <= unit && unit <= eCSSUnit_Cubic_Bezier) {
++  else if (eCSSUnit_Array <= unit && unit <= eCSSUnit_Steps) {
+     switch (unit) {
+       case eCSSUnit_Counter:  aResult.AppendLiteral("counter(");  break;
+       case eCSSUnit_Counters: aResult.AppendLiteral("counters("); break;
+       case eCSSUnit_Cubic_Bezier: aResult.AppendLiteral("cubic-bezier("); break;
++      case eCSSUnit_Steps: aResult.AppendLiteral("steps("); break;
+       default: break;
+     }
+ 
+     nsCSSValue::Array *array = GetArrayValue();
+     PRBool mark = PR_FALSE;
+     for (size_t i = 0, i_end = array->Count(); i < i_end; ++i) {
++      if (unit == eCSSUnit_Steps && i == 1) {
++        NS_ABORT_IF_FALSE(array->Item(i).GetUnit() == eCSSUnit_Enumerated &&
++                          (array->Item(i).GetIntValue() ==
++                            NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START ||
++                           array->Item(i).GetIntValue() ==
++                            NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END),
++                          "unexpected value");
++        if (array->Item(i).GetIntValue() ==
++              NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START) {
++          aResult.AppendLiteral("start");
++        } else {
++          aResult.AppendLiteral("end");
++        }
++        continue;
++      }
+       if (aProperty == eCSSProperty_border_image && i >= 5) {
+         if (array->Item(i).GetUnit() == eCSSUnit_Null) {
+           continue;
+         }
+         if (i == 5) {
+           aResult.AppendLiteral(" /");
+         }
+       }
+@@ -976,16 +992,17 @@ nsCSSValue::AppendToString(nsCSSProperty
+     case eCSSUnit_Ident:        break;
+     case eCSSUnit_Families:     break;
+     case eCSSUnit_URL:          break;
+     case eCSSUnit_Image:        break;
+     case eCSSUnit_Element:      break;
+     case eCSSUnit_Array:        break;
+     case eCSSUnit_Attr:
+     case eCSSUnit_Cubic_Bezier:
++    case eCSSUnit_Steps:
+     case eCSSUnit_Counter:
+     case eCSSUnit_Counters:     aResult.Append(PRUnichar(')'));    break;
+     case eCSSUnit_Local_Font:   break;
+     case eCSSUnit_Font_Format:  break;
+     case eCSSUnit_Function:     break;
+     case eCSSUnit_Calc:         break;
+     case eCSSUnit_Calc_Plus:    break;
+     case eCSSUnit_Calc_Minus:   break;
+diff --git a/layout/style/nsCSSValue.h b/layout/style/nsCSSValue.h
+--- a/layout/style/nsCSSValue.h
++++ b/layout/style/nsCSSValue.h
+@@ -110,36 +110,37 @@ enum nsCSSUnit {
+   eCSSUnit_Local_Font   = 15,     // (PRUnichar*) a local font name
+   eCSSUnit_Font_Format  = 16,     // (PRUnichar*) a font format name
+   eCSSUnit_Element      = 17,     // (PRUnichar*) an element id
+ 
+   eCSSUnit_Array        = 20,     // (nsCSSValue::Array*) a list of values
+   eCSSUnit_Counter      = 21,     // (nsCSSValue::Array*) a counter(string,[string]) value
+   eCSSUnit_Counters     = 22,     // (nsCSSValue::Array*) a counters(string,string[,string]) value
+   eCSSUnit_Cubic_Bezier = 23,     // (nsCSSValue::Array*) a list of float values
+-  eCSSUnit_Function     = 24,     // (nsCSSValue::Array*) a function with
++  eCSSUnit_Steps        = 24,     // (nsCSSValue::Array*) a list of (integer, enumerated)
++  eCSSUnit_Function     = 25,     // (nsCSSValue::Array*) a function with
+                                   //  parameters.  First elem of array is name,
+                                   //  the rest of the values are arguments.
+ 
+   // The top level of a calc() expression is eCSSUnit_Calc.  All
+   // remaining eCSSUnit_Calc_* units only occur inside these toplevel
+   // calc values.
+ 
+   // eCSSUnit_Calc has an array with exactly 1 element.  eCSSUnit_Calc
+   // exists so we can distinguish calc(2em) from 2em as specified values
+   // (but we drop this distinction for nsStyleCoord when we store
+   // computed values).
+-  eCSSUnit_Calc         = 25,     // (nsCSSValue::Array*) calc() value
++  eCSSUnit_Calc         = 30,     // (nsCSSValue::Array*) calc() value
+   // Plus, Minus, Times_* and Divided have arrays with exactly 2
+   // elements.  a + b + c + d is grouped as ((a + b) + c) + d
+-  eCSSUnit_Calc_Plus    = 26,     // (nsCSSValue::Array*) + node within calc()
+-  eCSSUnit_Calc_Minus   = 27,     // (nsCSSValue::Array*) - within calc
+-  eCSSUnit_Calc_Times_L = 28,     // (nsCSSValue::Array*) num * val within calc
+-  eCSSUnit_Calc_Times_R = 29,     // (nsCSSValue::Array*) val * num within calc
+-  eCSSUnit_Calc_Divided = 30,     // (nsCSSValue::Array*) / within calc
++  eCSSUnit_Calc_Plus    = 31,     // (nsCSSValue::Array*) + node within calc()
++  eCSSUnit_Calc_Minus   = 32,     // (nsCSSValue::Array*) - within calc
++  eCSSUnit_Calc_Times_L = 33,     // (nsCSSValue::Array*) num * val within calc
++  eCSSUnit_Calc_Times_R = 34,     // (nsCSSValue::Array*) val * num within calc
++  eCSSUnit_Calc_Divided = 35,     // (nsCSSValue::Array*) / within calc
+ 
+   eCSSUnit_URL          = 40,     // (nsCSSValue::URL*) value
+   eCSSUnit_Image        = 41,     // (nsCSSValue::Image*) value
+   eCSSUnit_Gradient     = 42,     // (nsCSSValueGradient*) value
+ 
+   eCSSUnit_Pair         = 50,     // (nsCSSValuePair*) pair of values
+   eCSSUnit_Rect         = 51,     // (nsCSSRect*) rectangle (four values)
+   eCSSUnit_List         = 52,     // (nsCSSValueList*) list of values
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -3877,37 +3877,57 @@ nsComputedDOMStyle::DoGetTransitionPrope
+     }
+     else
+       property->SetString(nsCSSProps::GetStringValue(cssprop));
+   } while (++i < display->mTransitionPropertyCount);
+ 
+   return valueList;
+ }
+ 
++void
++nsComputedDOMStyle::AppendTimingFunction(nsDOMCSSValueList *aValueList,
++                                         const nsTimingFunction& aTimingFunction)
++{
++  nsROCSSPrimitiveValue* timingFunction = GetROCSSPrimitiveValue();
++  aValueList->AppendCSSValue(timingFunction);
++
++  if (aTimingFunction.mType == nsTimingFunction::Function) {
++    // set the value from the cubic-bezier control points
++    // (We could try to regenerate the keywords if we want.)
++    timingFunction->SetString(
++      nsPrintfCString(64, "cubic-bezier(%f, %f, %f, %f)",
++                          aTimingFunction.mFunc.mX1,
++                          aTimingFunction.mFunc.mY1,
++                          aTimingFunction.mFunc.mX2,
++                          aTimingFunction.mFunc.mY2));
++  } else {
++    nsString tmp;
++    tmp.AppendLiteral("steps(");
++    tmp.AppendInt(aTimingFunction.mSteps);
++    if (aTimingFunction.mType == nsTimingFunction::StepStart) {
++      tmp.AppendLiteral(", start)");
++    } else {
++      tmp.AppendLiteral(", end)");
++    }
++  }
++}
++
+ nsIDOMCSSValue*
+ nsComputedDOMStyle::DoGetTransitionTimingFunction()
+ {
+   const nsStyleDisplay* display = GetStyleDisplay();
+ 
+   nsDOMCSSValueList *valueList = GetROCSSValueList(PR_TRUE);
+ 
+   NS_ABORT_IF_FALSE(display->mTransitionTimingFunctionCount > 0,
+                     "first item must be explicit");
+   PRUint32 i = 0;
+   do {
+-    const nsTransition *transition = &display->mTransitions[i];
+-    nsROCSSPrimitiveValue* timingFunction = GetROCSSPrimitiveValue();
+-    valueList->AppendCSSValue(timingFunction);
+-
+-    // set the value from the cubic-bezier control points
+-    // (We could try to regenerate the keywords if we want.)
+-    const nsTimingFunction& tf = transition->GetTimingFunction();
+-    timingFunction->SetString(
+-      nsPrintfCString(64, "cubic-bezier(%f, %f, %f, %f)",
+-                          tf.mX1, tf.mY1, tf.mX2, tf.mY2));
++    AppendTimingFunction(valueList,
++                         display->mTransitions[i].GetTimingFunction());
+   } while (++i < display->mTransitionTimingFunctionCount);
+ 
+   return valueList;
+ }
+ 
+ #define COMPUTED_STYLE_MAP_ENTRY(_prop, _method)              \
+   { eCSSProperty_##_prop, &nsComputedDOMStyle::DoGet##_method, PR_FALSE }
+ #define COMPUTED_STYLE_MAP_ENTRY_LAYOUT(_prop, _method)       \
+diff --git a/layout/style/nsComputedDOMStyle.h b/layout/style/nsComputedDOMStyle.h
+--- a/layout/style/nsComputedDOMStyle.h
++++ b/layout/style/nsComputedDOMStyle.h
+@@ -163,16 +163,18 @@ private:
+                                     PRUint32 nsStyleBackground::* aCount,
+                                     const PRInt32 aTable[]);
+ 
+   void GetCSSGradientString(const nsStyleGradient* aGradient,
+                             nsAString& aString);
+   void GetImageRectString(nsIURI* aURI,
+                           const nsStyleSides& aCropRect,
+                           nsString& aString);
++  void AppendTimingFunction(nsDOMCSSValueList *aValueList,
++                            const nsTimingFunction& aTimingFunction);
+ 
+   /* Properties queryable as CSSValues.
+    * To avoid a name conflict with nsIDOM*CSS2Properties, these are all
+    * DoGetXXX instead of GetXXX.
+    */
+ 
+   nsIDOMCSSValue* DoGetAppearance();
+ 
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1916,36 +1916,50 @@ nsStyleBackground::Layer::operator==(con
+          mImage == aOther.mImage;
+ }
+ 
+ // --------------------
+ // nsStyleDisplay
+ //
+ void nsTimingFunction::AssignFromKeyword(PRInt32 aTimingFunctionType)
+ {
++  switch (aTimingFunctionType) {
++    case NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_START:
++      mType = StepStart;
++      mSteps = 1;
++      return;
++    case NS_STYLE_TRANSITION_TIMING_FUNCTION_STEP_END:
++      mType = StepEnd;
++      mSteps = 1;
++      return;
++    default:
++      mType = Function;
++      break;
++  }
++
+   PR_STATIC_ASSERT(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE == 0);
+   PR_STATIC_ASSERT(NS_STYLE_TRANSITION_TIMING_FUNCTION_LINEAR == 1);
+   PR_STATIC_ASSERT(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN == 2);
+   PR_STATIC_ASSERT(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_OUT == 3);
+   PR_STATIC_ASSERT(NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE_IN_OUT == 4);
+ 
+   static const float timingFunctionValues[5][4] = {
+     { 0.25, 0.10, 0.25, 1.00 }, // ease
+     { 0.00, 0.00, 1.00, 1.00 }, // linear
+     { 0.42, 0.00, 1.00, 1.00 }, // ease-in
+     { 0.00, 0.00, 0.58, 1.00 }, // ease-out
+     { 0.42, 0.00, 0.58, 1.00 }  // ease-in-out
+   };
+ 
+   NS_ABORT_IF_FALSE(0 <= aTimingFunctionType && aTimingFunctionType < 5,
+                     "keyword out of range");
+-  mX1 = timingFunctionValues[aTimingFunctionType][0];
+-  mY1 = timingFunctionValues[aTimingFunctionType][1];
+-  mX2 = timingFunctionValues[aTimingFunctionType][2];
+-  mY2 = timingFunctionValues[aTimingFunctionType][3];
++  mFunc.mX1 = timingFunctionValues[aTimingFunctionType][0];
++  mFunc.mY1 = timingFunctionValues[aTimingFunctionType][1];
++  mFunc.mX2 = timingFunctionValues[aTimingFunctionType][2];
++  mFunc.mY2 = timingFunctionValues[aTimingFunctionType][3];
+ }
+ 
+ nsTransition::nsTransition(const nsTransition& aCopy)
+   : mTimingFunction(aCopy.mTimingFunction)
+   , mDuration(aCopy.mDuration)
+   , mDelay(aCopy.mDelay)
+   , mProperty(aCopy.mProperty)
+   , mUnknownProperty(aCopy.mUnknownProperty)
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -1304,43 +1304,66 @@ struct nsStyleVisibility {
+ 
+   PRBool IsVisibleOrCollapsed() const {
+     return ((mVisible == NS_STYLE_VISIBILITY_VISIBLE) ||
+             (mVisible == NS_STYLE_VISIBILITY_COLLAPSE));
+   }
+ };
+ 
+ struct nsTimingFunction {
++  enum Type { Function, StepStart, StepEnd };
++
+   explicit nsTimingFunction(PRInt32 aTimingFunctionType
+                               = NS_STYLE_TRANSITION_TIMING_FUNCTION_EASE)
+   {
+     AssignFromKeyword(aTimingFunctionType);
+   }
+ 
+   nsTimingFunction(float x1, float y1, float x2, float y2)
+-    : mX1(x1)
+-    , mY1(y1)
+-    , mX2(x2)
+-    , mY2(y2)
+-  {}
+-
+-  float mX1;
+-  float mY1;
+-  float mX2;
+-  float mY2;
+-
+-  PRBool operator==(const nsTimingFunction& aOther) const
++    : mType(Function)
+   {
+-    return !(*this != aOther);
++    mFunc.mX1 = x1;
++    mFunc.mY1 = y1;
++    mFunc.mX2 = x2;
++    mFunc.mY2 = y2;
+   }
+ 
+-  PRBool operator!=(const nsTimingFunction& aOther) const
++  nsTimingFunction(Type aType, PRUint32 aSteps)
++    : mType(aType)
+   {
+-    return mX1 != aOther.mX1 || mY1 != aOther.mY1 ||
+-           mX2 != aOther.mX2 || mY2 != aOther.mY2;
++    NS_ABORT_IF_FALSE(mType == StepStart || mType == StepEnd, "wrong type");
++    mSteps = aSteps;
++  }
++
++  Type mType;
++  union {
++    struct {
++      float mX1;
++      float mY1;
++      float mX2;
++      float mY2;
++    } mFunc;
++    PRUint32 mSteps;
++  };
++
++  bool operator==(const nsTimingFunction& aOther) const
++  {
++    if (mType != aOther.mType) {
++      return false;
++    }
++    if (mType == Function) {
++      return mFunc.mX1 == aOther.mFunc.mX1 && mFunc.mY1 == aOther.mFunc.mY1 &&
++             mFunc.mX2 == aOther.mFunc.mX2 && mFunc.mY2 == aOther.mFunc.mY2;
++    }
++    return mSteps == aOther.mSteps;
++  }
++
++  bool operator!=(const nsTimingFunction& aOther) const
++  {
++    return !(*this == aOther);
+   }
+ 
+ private:
+   void AssignFromKeyword(PRInt32 aTimingFunctionType);
+ };
+ 
+ struct nsTransition {
+   nsTransition() { /* leaves uninitialized; see also SetInitialValues */ }
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -60,25 +60,68 @@ using mozilla::TimeStamp;
+ using mozilla::TimeDuration;
+ 
+ namespace dom = mozilla::dom;
+ 
+ /*****************************************************************************
+  * Per-Element data                                                          *
+  *****************************************************************************/
+ 
++class ComputedTimingFunction {
++public:
++  typedef nsTimingFunction::Type Type;
++  void Init(const nsTimingFunction &aFunction);
++  double GetValue(double aPortion) const;
++private:
++  Type mType;
++  nsSMILKeySpline mTimingFunction;
++  PRUint32 mSteps;
++};
++
++void
++ComputedTimingFunction::Init(const nsTimingFunction &aFunction)
++{
++  mType = aFunction.mType;
++  if (mType == nsTimingFunction::Function) {
++    mTimingFunction.Init(aFunction.mFunc.mX1, aFunction.mFunc.mY1,
++                         aFunction.mFunc.mX2, aFunction.mFunc.mY2);
++  } else {
++    mSteps = aFunction.mSteps;
++  }
++}
++
++double
++ComputedTimingFunction::GetValue(double aPortion) const
++{
++  switch (mType) {
++    case nsTimingFunction::Function:
++      return mTimingFunction.GetSplineValue(aPortion);
++    case nsTimingFunction::StepStart:
++      // There are diagrams in the spec that seem to suggest this check
++      // (but not that for step-end) should be >=.  However, we rely on
++      // rounding negative values up to zero, so we can't do that.  And
++      // it's not clear the spec really meant it.
++      return (aPortion > 0.0) ? 1.0 : 0.0;
++    default:
++      NS_ABORT_IF_FALSE(PR_FALSE, "bad type");
++      // fall through
++    case nsTimingFunction::StepEnd:
++      return (aPortion < 1.0) ? 0.0 : 1.0;
++  }
++}
++
+ struct ElementPropertyTransition
+ {
+   nsCSSProperty mProperty;
+   nsStyleAnimation::Value mStartValue, mEndValue;
+   TimeStamp mStartTime; // actual start plus transition delay
+ 
+   // data from the relevant nsTransition
+   TimeDuration mDuration;
+-  nsSMILKeySpline mTimingFunction;
++  ComputedTimingFunction mTimingFunction;
+ 
+   // This is the start value to be used for a check for whether a
+   // transition is being reversed.  Normally the same as mStartValue,
+   // except when this transition started as the reversal of another
+   // in-progress transition.  Needed so we can handle two reverses in a
+   // row.
+   nsStyleAnimation::Value mStartForReversingTest;
+   // Likewise, the portion (in value space) of the "full" reversed
+@@ -129,17 +172,17 @@ ElementPropertyTransition::ValuePortionF
+   } else {
+     timePortion = (aRefreshTime - mStartTime).ToSeconds() / duration;
+     if (timePortion < 0.0)
+       timePortion = 0.0; // use start value during transition-delay
+     if (timePortion > 1.0)
+       timePortion = 1.0; // we might be behind on flushing
+   }
+ 
+-  return mTimingFunction.GetSplineValue(timePortion);
++  return mTimingFunction.GetValue(timePortion);
+ }
+ 
+ /**
+  * A style rule that maps property-nsStyleAnimation::Value pairs.
+  */
+ class AnimValuesStyleRule : public nsIStyleRule
+ {
+ public:
+@@ -699,17 +742,17 @@ nsTransitionManager::ConsiderStartingTra
+       pt.mStartForReversingTest = oldPT.mEndValue;
+       pt.mReversePortion = valuePortion;
+     }
+   }
+ 
+   pt.mProperty = aProperty;
+   pt.mStartTime = mostRecentRefresh + TimeDuration::FromMilliseconds(delay);
+   pt.mDuration = TimeDuration::FromMilliseconds(duration);
+-  pt.mTimingFunction.Init(tf.mX1, tf.mY1, tf.mX2, tf.mY2);
++  pt.mTimingFunction.Init(tf);
+ 
+   if (!aElementTransitions) {
+     aElementTransitions =
+       GetElementTransitions(aElement, aNewStyleContext->GetPseudoType(),
+                             PR_TRUE);
+     if (!aElementTransitions) {
+       NS_WARNING("allocating ElementTransitions failed");
+       return;
+diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
+--- a/layout/style/test/property_database.js
++++ b/layout/style/test/property_database.js
+@@ -2636,18 +2636,18 @@ var gCSSProperties = {
+ 		other_values: [ "none", "left", "top", "color", "width, height, opacity", "foobar", "auto", "\\32width", "-width", "-\\32width", "\\32 0width", "-\\32 0width", "\\2width", "-\\2width" ],
+ 		invalid_values: [ "none, none", "all, all", "color, none", "none, color", "all, color", "color, all", "inherit, color", "color, inherit", "initial, color", "color, initial", "none, color", "color, none", "all, color", "color, all" ]
+ 	},
+ 	"-moz-transition-timing-function": {
+ 		domProp: "MozTransitionTimingFunction",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "ease", "cubic-bezier(0.25, 0.1, 0.25, 1.0)" ],
+-		other_values: [ "linear", "ease-in", "ease-out", "ease-in-out", "linear, ease-in, cubic-bezier(0.1, 0.2, 0.8, 0.9)", "cubic-bezier(0.5, 0.5, 0.5, 0.5)", "cubic-bezier(0.25, 1.5, 0.75, -0.5)" ],
+-		invalid_values: [ "none", "auto", "cubic-bezier(0.25, 0.1, 0.25)", "cubic-bezier(0.25, 0.1, 0.25, 0.25, 1.0)", "cubic-bezier(-0.5, 0.5, 0.5, 0.5)", "cubic-bezier(1.5, 0.5, 0.5, 0.5)", "cubic-bezier(0.5, 0.5, -0.5, 0.5)", "cubic-bezier(0.5, 0.5, 1.5, 0.5)" ]
++		other_values: [ "linear", "ease-in", "ease-out", "ease-in-out", "linear, ease-in, cubic-bezier(0.1, 0.2, 0.8, 0.9)", "cubic-bezier(0.5, 0.5, 0.5, 0.5)", "cubic-bezier(0.25, 1.5, 0.75, -0.5)", "step-start", "step-end", "steps(1)", "steps(2, start)", "steps(386)", "steps(3, end)" ],
++		invalid_values: [ "none", "auto", "cubic-bezier(0.25, 0.1, 0.25)", "cubic-bezier(0.25, 0.1, 0.25, 0.25, 1.0)", "cubic-bezier(-0.5, 0.5, 0.5, 0.5)", "cubic-bezier(1.5, 0.5, 0.5, 0.5)", "cubic-bezier(0.5, 0.5, -0.5, 0.5)", "cubic-bezier(0.5, 0.5, 1.5, 0.5)", "steps(2, step-end)", "steps(0)", "steps(-2)", "steps(0, step-end, 1)" ]
+ 	},
+ 	"unicode-bidi": {
+ 		domProp: "unicodeBidi",
+ 		inherited: false,
+ 		type: CSS_TYPE_LONGHAND,
+ 		initial_values: [ "normal" ],
+ 		other_values: [ "embed", "bidi-override" ],
+ 		invalid_values: [ "auto", "none" ]
