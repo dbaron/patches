@@ -24,12 +24,45 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
    nsCSSProperty mProperty;
    nsStyleAnimation::Value mFromValue, mToValue;
  };
-@@ -87,30 +89,54 @@ struct ElementAnimation
+@@ -61,16 +63,21 @@ struct AnimationSegment
+ };
+ 
+ /**
+  * Data about one animation (i.e., one of the values of
+  * 'animation-name') animation running on an element.
+  */
+ struct ElementAnimation
+ {
++  ElementAnimation()
++    : mLastNotification(LAST_NOTIFICATION_NONE)
++  {
++  }
++
+   nsString mName; // empty string for 'none'
+   float mIterationCount; // NS_IEEEPositiveInfinity() means infinite
+   PRUint8 mDirection;
+   PRUint8 mFillMode;
+   PRUint8 mPlayState;
+ 
+   bool FillsForwards() const {
+     return mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BOTH ||
+@@ -84,38 +91,72 @@ struct ElementAnimation
+   bool IsPaused() const {
+     return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED;
+   }
  
    TimeStamp mStartTime; // with delay taken into account
    TimeStamp mPauseStart;
    TimeDuration mIterationDuration;
  
++  enum {
++    LAST_NOTIFICATION_NONE = PRUint32(-1),
++    LAST_NOTIFICATION_END = PRUint32(-2)
++  };
++  // One of the above constants, or an integer for the iteration
++  // whose start we last notified on.
++  PRUint32 mLastNotification;
++
    InfallibleTArray<AnimationSegment> mSegments;
  };
  
@@ -38,9 +71,9 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 +  nsAnimationEvent mEvent;
 +
 +  AnimationEventInfo(dom::Element *aElement, const nsString& aAnimationName,
-+                     PRUint32 aMessage, TimeDuration aDuration)
++                     PRUint32 aMessage, TimeDuration aElapsedTime)
 +    : mElement(aElement),
-+      mEvent(PR_TRUE, aMessage, aAnimationName, aDuration.ToSeconds())
++      mEvent(PR_TRUE, aMessage, aAnimationName, aElapsedTime.ToSeconds())
 +  {
 +  }
 +
@@ -72,15 +105,25 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 -  void EnsureStyleRuleFor(TimeStamp aRefreshTime);
 +  void EnsureStyleRuleFor(TimeStamp aRefreshTime,
 +                          EventArray &aEventsToDispatch);
++
++  bool IsForElement() const { // rather than for a pseudo-element
++    return mElementProperty == nsGkAtoms::animationsProperty;
++  }
  
    void PostRestyleForAnimation(nsPresContext *aPresContext) {
-     nsRestyleHint hint =
-       (mElementProperty == nsGkAtoms::animationsProperty)
-         ? eRestyle_Self : eRestyle_Subtree;
+-    nsRestyleHint hint =
+-      (mElementProperty == nsGkAtoms::animationsProperty)
+-        ? eRestyle_Self : eRestyle_Subtree;
++    nsRestyleHint hint = IsForElement() ? eRestyle_Self : eRestyle_Subtree;
      aPresContext->PresShell()->RestyleForAnimation(mElement, hint);
    }
  
-@@ -139,17 +165,18 @@ ElementAnimationsPropertyDtor(void      
+   // This style rule contains the style data for currently animating
+   // values.  It only matches when styling with animation.  When we
+   // style without animation, we need to not use it so that we can
+   // detect any new changes; if necessary we restyle immediately
+   // afterwards with animation.
+@@ -139,17 +180,18 @@ ElementAnimationsPropertyDtor(void      
                                void           *aPropertyValue,
                                void           *aData)
  {
@@ -100,7 +143,27 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
    }
  
    mNeedsRefreshes = false;
-@@ -183,16 +210,17 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+@@ -162,17 +204,17 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+ 
+     // FIXME(spec): assume that properties in higher animations override
+     // those in lower ones (and that our |HasProperty| check in
+     // |BuildSegment| matches the definition of when they should do so.
+     // Therefore, we iterate from last animation to first.
+     nsCSSPropertySet properties;
+ 
+     for (PRUint32 i = mAnimations.Length(); i-- != 0; ) {
+-      const ElementAnimation &anim = mAnimations[i];
++      ElementAnimation &anim = mAnimations[i];
+ 
+       if (anim.mSegments.Length() == 0 ||
+           anim.mIterationDuration.ToMilliseconds() <= 0.0) {
+         // No animation data.
+         continue;
+       }
+ 
+       TimeDuration currentTimeDuration;
+@@ -182,32 +224,45 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+       } else {
          currentTimeDuration = aRefreshTime - anim.mStartTime;
        }
  
@@ -108,8 +171,18 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
        // iterations we've completed up to the current position.
        double currentIterationCount =
          currentTimeDuration / anim.mIterationDuration;
++      bool dispatchStartOrIteration = false;
        if (currentIterationCount > double(anim.mIterationCount)) {
-+        // FIXME: Add END events to aEventsToDispatch.
++        // Dispatch 'animationend' when needed.
++        if (IsForElement() && 
++            anim.mLastNotification !=
++              ElementAnimation::LAST_NOTIFICATION_END) {
++          anim.mLastNotification = ElementAnimation::LAST_NOTIFICATION_END;
++          AnimationEventInfo ei(mElement, anim.mName, NS_ANIMATION_END,
++                                currentTimeDuration);
++          aEventsToDispatch.AppendElement(ei);
++        }
++
          if (!anim.FillsForwards()) {
            // No animation data.
            continue;
@@ -118,7 +191,24 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
        } else {
          if (!anim.IsPaused()) {
            mNeedsRefreshes = true;
-@@ -218,16 +246,24 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+         }
+         if (currentIterationCount < 0.0) {
+           if (!anim.FillsBackwards()) {
+             // No animation data.
+             continue;
+           }
+           currentIterationCount = 0.0;
++        } else {
++          dispatchStartOrIteration = !anim.IsPaused();
+         }
+       }
+ 
+       // Set |positionInIteration| to the position from 0% to 100% along
+       // the keyframes.
+       NS_ABORT_IF_FALSE(currentIterationCount >= 0.0, "must be positive");
+       PRUint32 whichIteration = int(currentIterationCount);
+       if (whichIteration == anim.mIterationCount) {
+@@ -218,16 +273,34 @@ ElementAnimations::EnsureStyleRuleFor(Ti
        }
        double positionInIteration =
          currentIterationCount - double(whichIteration);
@@ -127,13 +217,23 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
          positionInIteration = 1.0 - positionInIteration;
        }
  
-+      // FIXME: Add START and ITERATION events to aEventsToDispatch.
-+      // (Be careful that we can be here when FillsBackwards() before
-+      // starting the animation.)
-+      // Note that when somebody changes the animation-duration
-+      // dynamically, this will fire an extra iteration event
-+      // immediately in many cases.  It's not clear to me if that's the
-+      // right thing to do.
++      // Dispatch 'animationstart' or 'animationiteration' when needed.
++      if (IsForElement() && dispatchStartOrIteration &&
++          whichIteration != anim.mLastNotification) {
++        // Notify 'animationstart' even if a negative delay puts us
++        // past the first iteration.
++        // Note that when somebody changes the animation-duration
++        // dynamically, this will fire an extra iteration event
++        // immediately in many cases.  It's not clear to me if that's the
++        // right thing to do.
++        PRUint32 message =
++          anim.mLastNotification == ElementAnimation::LAST_NOTIFICATION_NONE
++            ? NS_ANIMATION_START : NS_ANIMATION_ITERATION;
++        anim.mLastNotification = whichIteration;
++        AnimationEventInfo ei(mElement, anim.mName, message,
++                              currentTimeDuration);
++        aEventsToDispatch.AppendElement(ei);
++      }
 +
        NS_ABORT_IF_FALSE(0.0 <= positionInIteration &&
                            positionInIteration <= 1.0,
@@ -143,7 +243,25 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
                          "incorrect first from key");
        NS_ABORT_IF_FALSE(anim.mSegments[anim.mSegments.Length() - 1].mToKey
                            == 1.0,
-@@ -465,17 +501,19 @@ nsAnimationManager::CheckAnimationRule(n
+@@ -445,16 +518,17 @@ nsAnimationManager::CheckAnimationRule(n
+               break;
+             }
+           }
+           if (!oldAnim) {
+             continue;
+           }
+ 
+           newAnim->mStartTime = oldAnim->mStartTime;
++          newAnim->mLastNotification = oldAnim->mLastNotification;
+ 
+           if (oldAnim->IsPaused()) {
+             if (newAnim->IsPaused()) {
+               // Copy pause start just like start time.
+               newAnim->mPauseStart = oldAnim->mPauseStart;
+             } else {
+               // Handle change in pause state by adjusting start
+               // time to unpause.
+@@ -465,17 +539,19 @@ nsAnimationManager::CheckAnimationRule(n
        }
      } else {
        ea = GetElementAnimations(aElement, aStyleContext->GetPseudoType(),
@@ -164,7 +282,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
  class PercentageHashKey : public PLDHashEntryHdr
  {
  public:
-@@ -775,25 +813,42 @@ nsAnimationManager::WillRefresh(mozilla:
+@@ -775,25 +851,42 @@ nsAnimationManager::WillRefresh(mozilla:
      // triggering refreshes.
      RemoveAllElementData();
      return;
