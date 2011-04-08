@@ -1,0 +1,223 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Fire animation events at the correct times.  (Bug 435442, patch 13)
+
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -39,16 +39,18 @@
+ #include "nsAnimationManager.h"
+ #include "nsPresContext.h"
+ #include "nsRuleProcessorData.h"
+ #include "nsStyleSet.h"
+ #include "nsCSSRules.h"
+ #include "mozilla/TimeStamp.h"
+ #include "nsStyleAnimation.h"
+ #include "nsSMILKeySpline.h"
++#include "nsGUIEvent.h"
++#include "nsEventDispatcher.h"
+ 
+ using namespace mozilla;
+ 
+ struct AnimationSegmentProperty
+ {
+   nsCSSProperty mProperty;
+   nsStyleAnimation::Value mFromValue, mToValue;
+ };
+@@ -87,30 +89,54 @@ struct ElementAnimation
+ 
+   TimeStamp mStartTime; // with delay taken into account
+   TimeStamp mPauseStart;
+   TimeDuration mIterationDuration;
+ 
+   InfallibleTArray<AnimationSegment> mSegments;
+ };
+ 
++struct AnimationEventInfo {
++  nsCOMPtr<dom::Element> mElement;
++  nsAnimationEvent mEvent;
++
++  AnimationEventInfo(dom::Element *aElement, const nsString& aAnimationName,
++                     PRUint32 aMessage, TimeDuration aDuration)
++    : mElement(aElement),
++      mEvent(PR_TRUE, aMessage, aAnimationName, aDuration.ToSeconds())
++  {
++  }
++
++  // nsAnimationEvent doesn't support copy-construction, so we need
++  // to ourselves in order to work with nsTArray
++  AnimationEventInfo(const AnimationEventInfo &aOther)
++    : mElement(aOther.mElement),
++      mEvent(PR_TRUE, aOther.mEvent.message,
++             aOther.mEvent.animationName, aOther.mEvent.elapsedTime)
++  {
++  }
++};
++
++typedef nsAnimationManager::EventArray EventArray;
++
+ /**
+  * Data about all of the animations running on an element.
+  */
+ struct ElementAnimations : public mozilla::css::CommonElementAnimationData
+ {
+   ElementAnimations(dom::Element *aElement, nsIAtom *aElementProperty,
+                      nsAnimationManager *aAnimationManager)
+     : CommonElementAnimationData(aElement, aElementProperty,
+                                  aAnimationManager),
+       mNeedsRefreshes(true)
+   {
+   }
+ 
+-  void EnsureStyleRuleFor(TimeStamp aRefreshTime);
++  void EnsureStyleRuleFor(TimeStamp aRefreshTime,
++                          EventArray &aEventsToDispatch);
+ 
+   void PostRestyleForAnimation(nsPresContext *aPresContext) {
+     nsRestyleHint hint =
+       (mElementProperty == nsGkAtoms::animationsProperty)
+         ? eRestyle_Self : eRestyle_Subtree;
+     aPresContext->PresShell()->RestyleForAnimation(mElement, hint);
+   }
+ 
+@@ -139,17 +165,18 @@ ElementAnimationsPropertyDtor(void      
+                               void           *aPropertyValue,
+                               void           *aData)
+ {
+   ElementAnimations *ea = static_cast<ElementAnimations*>(aPropertyValue);
+   delete ea;
+ }
+ 
+ void
+-ElementAnimations::EnsureStyleRuleFor(TimeStamp aRefreshTime)
++ElementAnimations::EnsureStyleRuleFor(TimeStamp aRefreshTime,
++                                      EventArray& aEventsToDispatch)
+ {
+   if (!mNeedsRefreshes) {
+     // All of our animations are paused or completed.
+     mStyleRuleRefreshTime = aRefreshTime;
+     return;
+   }
+ 
+   mNeedsRefreshes = false;
+@@ -465,17 +492,19 @@ nsAnimationManager::CheckAnimationRule(n
+       }
+     } else {
+       ea = GetElementAnimations(aElement, aStyleContext->GetPseudoType(),
+                                 PR_TRUE);
+     }
+     ea->mAnimations.SwapElements(newAnimations);
+     ea->mNeedsRefreshes = true;
+ 
+-    ea->EnsureStyleRuleFor(refreshTime);
++    EventArray eventsToDispatch;
++    ea->EnsureStyleRuleFor(refreshTime, eventsToDispatch);
++    // FIXME: Dispatch!  (WHEN?)
+   }
+ 
+   return GetAnimationRule(aElement, aStyleContext->GetPseudoType());
+ }
+ 
+ class PercentageHashKey : public PLDHashEntryHdr
+ {
+ public:
+@@ -775,25 +804,42 @@ nsAnimationManager::WillRefresh(mozilla:
+     // triggering refreshes.
+     RemoveAllElementData();
+     return;
+   }
+ 
+   // FIXME: check that there's at least one style rule that's not
+   // in its "done" state, and if there isn't, remove ourselves from
+   // the refresh driver (but leave the animations!).
++  EventArray eventsToDispatch;
+   for (PRCList *l = PR_LIST_HEAD(&mElementData); l != &mElementData;
+        l = PR_NEXT_LINK(l)) {
+     ElementAnimations *ea = static_cast<ElementAnimations*>(l);
+     nsRefPtr<css::AnimValuesStyleRule> oldStyleRule = ea->mStyleRule;
+-    ea->EnsureStyleRuleFor(mPresContext->RefreshDriver()->MostRecentRefresh());
++    ea->EnsureStyleRuleFor(mPresContext->RefreshDriver()->MostRecentRefresh(),
++                           eventsToDispatch);
+     if (oldStyleRule != ea->mStyleRule) {
+       ea->PostRestyleForAnimation(mPresContext);
+     }
+   }
++
++  DispatchEvents(eventsToDispatch);
++}
++
++void
++nsAnimationManager::DispatchEvents(EventArray& aEvents)
++{
++  for (PRUint32 i = 0, i_end = aEvents.Length(); i < i_end; ++i) {
++    AnimationEventInfo &info = aEvents[i];
++    nsEventDispatcher::Dispatch(info.mElement, mPresContext, &info.mEvent);
++
++    if (!mPresContext) {
++      break;
++    }
++  }
+ }
+ 
+ nsCSSKeyframesRule*
+ nsAnimationManager::KeyframesRuleFor(const nsSubstring& aName)
+ {
+   if (mKeyframesListIsDirty) {
+     mKeyframesListIsDirty = false;
+ 
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -42,16 +42,17 @@
+ #include "nsCSSPseudoElements.h"
+ #include "nsStyleContext.h"
+ #include "nsTHashtable.h"
+ 
+ class nsCSSKeyframesRule;
+ struct AnimationSegment;
+ struct ElementAnimation;
+ struct ElementAnimations;
++struct AnimationEventInfo;
+ 
+ namespace mozilla {
+ namespace css {
+ class Declaration;
+ }
+ }
+ 
+ class nsAnimationManager : public mozilla::css::CommonAnimationManager
+@@ -88,31 +89,34 @@ public:
+    */
+   nsIStyleRule* CheckAnimationRule(nsStyleContext* aStyleContext,
+                                    mozilla::dom::Element* aElement);
+ 
+   void KeyframesListIsDirty() {
+     mKeyframesListIsDirty = PR_TRUE;
+   }
+ 
++  typedef InfallibleTArray<AnimationEventInfo> EventArray;
++
+ private:
+   ElementAnimations* GetElementAnimations(mozilla::dom::Element *aElement,
+                                           nsCSSPseudoElements::Type aPseudoType,
+                                           PRBool aCreateIfNeeded);
+   void BuildAnimations(nsStyleContext* aStyleContext,
+                        InfallibleTArray<ElementAnimation>& aAnimations);
+   void BuildSegment(nsTArray<AnimationSegment,
+                              nsTArrayInfallibleAllocator>& aSegments,
+                     const nsAnimation& aAnimation,
+                     float aFromKey, nsStyleContext* aFromContext,
+                     mozilla::css::Declaration* aFromDeclaration,
+                     float aToKey, nsStyleContext* aToContext,
+                     mozilla::css::Declaration* aToDeclaration);
+   nsIStyleRule* GetAnimationRule(mozilla::dom::Element* aElement,
+                                  nsCSSPseudoElements::Type aPseudoType);
++  void DispatchEvents(EventArray& aEvents);
+ 
+   nsCSSKeyframesRule* KeyframesRuleFor(const nsSubstring& aName);
+ 
+   bool mKeyframesListIsDirty;
+   nsDataHashtable<nsStringHashKey, nsCSSKeyframesRule*> mKeyframesRules;
+ };
+ 
+ #endif /* !defined(nsAnimationManager_h_) */
