@@ -1,0 +1,233 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Fix css3-animations handling of properties that are not present in all keyframes to match WebKit and generally be more sensible.  (This inverts the relationship between segments and properties in the animation data structures.)  (Bug 649400)
+
+diff --git a/layout/style/Declaration.h b/layout/style/Declaration.h
+--- a/layout/style/Declaration.h
++++ b/layout/style/Declaration.h
+@@ -246,20 +246,22 @@ private:
+   static void AppendImportanceToString(PRBool aIsImportant, nsAString& aString);
+   // return whether there was a value in |aValue| (i.e., it had a non-null unit)
+   PRBool AppendValueToString(nsCSSProperty aProperty, nsAString& aResult) const;
+   // Helper for ToString with strange semantics regarding aValue.
+   void AppendPropertyAndValueToString(nsCSSProperty aProperty,
+                                       nsAutoString& aValue,
+                                       nsAString& aResult) const;
+ 
++public:
+   nsCSSProperty OrderValueAt(PRUint32 aValue) const {
+     return nsCSSProperty(mOrder.ElementAt(aValue));
+   }
+ 
++private:
+   nsAutoTArray<PRUint8, 8> mOrder;
+ 
+   // never null, except while expanded, or before the first call to
+   // InitializeEmpty or CompressFrom.
+   nsAutoPtr<nsCSSCompressedDataBlock> mData;
+ 
+   // may be null
+   nsAutoPtr<nsCSSCompressedDataBlock> mImportantData;
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -42,27 +42,27 @@
+ #include "nsStyleSet.h"
+ #include "nsCSSRules.h"
+ #include "nsStyleAnimation.h"
+ #include "nsSMILKeySpline.h"
+ #include "nsEventDispatcher.h"
+ 
+ using namespace mozilla;
+ 
+-struct AnimationSegmentProperty
++struct AnimationPropertySegment
++{
++  float mFromKey, mToKey;
++  nsStyleAnimation::Value mFromValue, mToValue;
++  css::ComputedTimingFunction mTimingFunction;
++};
++
++struct AnimationProperty
+ {
+   nsCSSProperty mProperty;
+-  nsStyleAnimation::Value mFromValue, mToValue;
+-};
+-
+-struct AnimationSegment
+-{
+-  float mFromKey, mToKey;
+-  css::ComputedTimingFunction mTimingFunction;
+-  InfallibleTArray<AnimationSegmentProperty> mProperties;
++  InfallibleTArray<AnimationPropertySegment> mSegments;
+ };
+ 
+ /**
+  * Data about one animation (i.e., one of the values of
+  * 'animation-name') running on an element.
+  */
+ struct ElementAnimation
+ {
+@@ -97,17 +97,17 @@ struct ElementAnimation
+   enum {
+     LAST_NOTIFICATION_NONE = PRUint32(-1),
+     LAST_NOTIFICATION_END = PRUint32(-2)
+   };
+   // One of the above constants, or an integer for the iteration
+   // whose start we last notified on.
+   PRUint32 mLastNotification;
+ 
+-  InfallibleTArray<AnimationSegment> mSegments;
++  InfallibleTArray<AnimationProperty> mProperties;
+ };
+ 
+ typedef nsAnimationManager::EventArray EventArray;
+ typedef nsAnimationManager::AnimationEventInfo AnimationEventInfo;
+ 
+ /**
+  * Data about all of the animations running on an element.
+  */
+@@ -176,25 +176,24 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+ 
+   // mStyleRule may be null and valid, if we have no style to apply.
+   if (mStyleRuleRefreshTime.IsNull() ||
+       mStyleRuleRefreshTime != aRefreshTime) {
+     mStyleRuleRefreshTime = aRefreshTime;
+     mStyleRule = nsnull;
+ 
+     // FIXME(spec): assume that properties in higher animations override
+-    // those in lower ones (and that our |HasProperty| check in
+-    // |BuildSegment| matches the definition of when they should do so.
++    // those in lower ones.
+     // Therefore, we iterate from last animation to first.
+     nsCSSPropertySet properties;
+ 
+     for (PRUint32 i = mAnimations.Length(); i-- != 0; ) {
+       ElementAnimation &anim = mAnimations[i];
+ 
+-      if (anim.mSegments.Length() == 0 ||
++      if (anim.mProperties.Length() == 0 ||
+           anim.mIterationDuration.ToMilliseconds() <= 0.0) {
+         // No animation data.
+         continue;
+       }
+ 
+       TimeDuration currentTimeDuration;
+       if (anim.IsPaused()) {
+         // FIXME: avoid recalculating every time
+@@ -279,55 +278,55 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+                         "position should be in [0-1]");
+ 
+       NS_ABORT_IF_FALSE(anim.mSegments[0].mFromKey == 0.0,
+                         "incorrect first from key");
+       NS_ABORT_IF_FALSE(anim.mSegments[anim.mSegments.Length() - 1].mToKey
+                           == 1.0,
+                         "incorrect last to key");
+ 
+-      // FIXME: Maybe cache the current segment?
+-      const AnimationSegment *segment = anim.mSegments.Elements();
+-      while (segment->mToKey < positionInIteration) {
+-        NS_ABORT_IF_FALSE(segment->mFromKey < segment->mToKey,
+-                          "incorrect keys");
+-        ++segment;
+-        NS_ABORT_IF_FALSE(segment->mFromKey == (segment-1)->mToKey,
+-                          "incorrect keys");
+-      }
+-      NS_ABORT_IF_FALSE(segment->mFromKey < segment->mToKey,
+-                        "incorrect keys");
+-      NS_ABORT_IF_FALSE(segment - anim.mSegments.Elements() <
+-                          anim.mSegments.Length(),
+-                        "ran off end");
++      for (PRUint32 j = 0, j_end = anim.mProperties.Length(); j !+ j_end; ++j)
++      {
++        const AnimationProperty &prop = anim.mProperties[j];
+ 
+-      if (segment->mProperties.IsEmpty()) {
+-        // No animation data.
+-        continue;
+-      }
+-
+-      if (!mStyleRule) {
+-        // Allocate the style rule now that we know we have animation data.
+-        mStyleRule = new css::AnimValuesStyleRule();
+-      }
+-
+-      double positionInSegment = (positionInIteration - segment->mFromKey) /
+-                                 (segment->mToKey - segment->mFromKey);
+-      double valuePosition =
+-        segment->mTimingFunction.GetValue(positionInSegment);
+-
+-      for (PRUint32 j = 0, j_end = segment->mProperties.Length();
+-           j != j_end; ++j) {
+-        const AnimationSegmentProperty &prop = segment->mProperties[j];
+         if (properties.HasProperty(prop.mProperty)) {
+           // A later animation already set this property.
+           continue;
+         }
+         properties.AddProperty(prop.mProperty);
+ 
++        NS_ABORT_IF_FALSE(prop.mSegments.Length() > 0,
++                          "property should not be in animations if it "
++                          "has no segments");
++
++        // FIXME: Maybe cache the current segment?
++        const AnimationSegment *segment = prop.mSegments.Elements();
++        while (segment->mToKey < positionInIteration) {
++          NS_ABORT_IF_FALSE(segment->mFromKey < segment->mToKey,
++                            "incorrect keys");
++          ++segment;
++          NS_ABORT_IF_FALSE(segment->mFromKey == (segment-1)->mToKey,
++                            "incorrect keys");
++        }
++        NS_ABORT_IF_FALSE(segment->mFromKey < segment->mToKey,
++                          "incorrect keys");
++        NS_ABORT_IF_FALSE(segment - prop.mSegments.Elements() <
++                            anim.mSegments.Length(),
++                          "ran off end");
++
++        if (!mStyleRule) {
++          // Allocate the style rule now that we know we have animation data.
++          mStyleRule = new css::AnimValuesStyleRule();
++        }
++
++        double positionInSegment = (positionInIteration - segment->mFromKey) /
++                                   (segment->mToKey - segment->mFromKey);
++        double valuePosition =
++          segment->mTimingFunction.GetValue(positionInSegment);
++
+         nsStyleAnimation::Value *val =
+           mStyleRule->AddEmptyValue(prop.mProperty);
+ 
+ #ifdef DEBUG
+         PRBool result =
+ #endif
+           nsStyleAnimation::Interpolate(prop.mProperty,
+                                         prop.mFromValue, prop.mToValue,
+@@ -687,16 +686,27 @@ nsAnimationManager::BuildAnimations(nsSt
+     keyframes.EnumerateRead(AppendKeyframeData, &sortedKeyframes);
+     sortedKeyframes.Sort(KeyframeDataComparator());
+ 
+     if (sortedKeyframes.Length() == 0) {
+       // no segments
+       continue;
+     }
+ 
++    // In the first loop through the keyframes rules, record the
++    // properties that are present in any of them.
++    nsCSSPropertySet properties;
++
++    for (XXX) {
++      css::Declaration *decl = kfRule->Declaration();
++      for (PRUint32 k = 0, k_end = decl->Count(); k != k_end; ++k) {
++        properties.AddProperty(decl->OrderValueAt(k));
++      }
++    }
++
+     KeyframeData fromKeyframe = sortedKeyframes[0];
+     nsRefPtr<nsStyleContext> fromContext =
+       resolvedStyles.Get(mPresContext, aStyleContext,
+                          fromKeyframe.mRule);
+ 
+     // If there's no rule for 0%, there's implicitly an empty rule.
+     if (fromKeyframe.mKey != 0.0f) {
+       BuildSegment(aDest.mSegments, aSrc,
