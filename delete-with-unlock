@@ -1,0 +1,70 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Don't hold nsProxyObjectManager's lock while calling delete on an nsProxyEventObject.  (Bug 650674)
+
+diff --git a/xpcom/proxy/src/nsProxyEvent.cpp b/xpcom/proxy/src/nsProxyEvent.cpp
+--- a/xpcom/proxy/src/nsProxyEvent.cpp
++++ b/xpcom/proxy/src/nsProxyEvent.cpp
+@@ -422,33 +422,35 @@ nsProxyObject::QueryInterface(REFNSIID a
+     MutexAutoLock lock(pom->GetLock());
+     return LockedFind(aIID, aResult);
+ }
+ 
+ nsresult
+ nsProxyObject::LockedFind(REFNSIID aIID, void **aResult)
+ {
+     // This method is only called when the global lock is held.
+-    // XXX assert this
++#ifdef DEBUG
++    nsProxyObjectManager::GetInstance()->GetLock().AssertCurrentThreadOwns();
++#endif
+ 
+     nsProxyEventObject *peo;
+ 
+     for (peo = mFirst; peo; peo = peo->mNext) {
+         if (peo->GetClass()->GetProxiedIID().Equals(aIID)) {
+             *aResult = static_cast<nsISupports*>(peo->mXPTCStub);
+             peo->LockedAddRef();
+             return NS_OK;
+         }
+     }
+ 
+     nsProxyEventObject *newpeo;
+ 
+     // Both GetClass and QueryInterface call out to XPCOM, so we unlock for them
++    nsProxyObjectManager* pom = nsProxyObjectManager::GetInstance();
+     {
+-        nsProxyObjectManager* pom = nsProxyObjectManager::GetInstance();
+         MutexAutoUnlock unlock(pom->GetLock());
+ 
+         nsProxyEventClass *pec;
+         nsresult rv = pom->GetClass(aIID, &pec);
+         if (NS_FAILED(rv))
+             return rv;
+ 
+         nsISomeInterface* newInterface;
+@@ -468,17 +470,23 @@ nsProxyObject::LockedFind(REFNSIID aIID,
+             return rv;
+         }
+     }
+ 
+     // Now that we're locked again, check for races by repeating the
+     // linked-list check.
+     for (peo = mFirst; peo; peo = peo->mNext) {
+         if (peo->GetClass()->GetProxiedIID().Equals(aIID)) {
+-            delete newpeo;
++            {
++                // Deleting an nsProxyEventObject can call Release on an
++                // nsProxyObject, which can only happen when not holding
++                // the lock.
++                MutexAutoUnlock unlock(pom->GetLock());
++                delete newpeo;
++            }
+             *aResult = static_cast<nsISupports*>(peo->mXPTCStub);
+             peo->LockedAddRef();
+             return NS_OK;
+         }
+     }
+ 
+     newpeo->mNext = mFirst;
+     mFirst = newpeo;
