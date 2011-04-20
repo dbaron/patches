@@ -103,7 +103,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
  #include "nsIBaseWindow.h"
  #include "nsAccelerometer.h"
  #include "nsIContent.h"
-@@ -3919,16 +3920,45 @@ nsGlobalWindow::GetMozAnimationStartTime
+@@ -3919,16 +3920,42 @@ nsGlobalWindow::GetMozAnimationStartTime
    }
  
    // If all else fails, just be compatible with Date.now()
@@ -133,10 +133,7 @@ diff --git a/dom/base/nsGlobalWindow.cpp b/dom/base/nsGlobalWindow.cpp
 +  if (!presContext)
 +    return NS_OK;
 +
-+  nsRefPtr<nsDOMMediaQueryList> result =
-+    new nsDOMMediaQueryList(presContext, aMediaQueryList);
-+  result.forget(aResult);
-+
++  presContext->MatchMedia(aMediaQueryList, aResult);
 +  return NS_OK;
 +}
 +
@@ -279,6 +276,168 @@ diff --git a/dom/interfaces/base/nsIDOMWindowInternal.idl b/dom/interfaces/base/
    DOMString createObjectURL(in nsIDOMBlob blob);
    void revokeObjectURL(in DOMString URL);
  };
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -95,16 +95,17 @@
+ #include "nsObjectFrame.h"
+ #include "nsTransitionManager.h"
+ #ifdef MOZ_CSS_ANIMATIONS
+ #include "nsAnimationManager.h"
+ #endif
+ #include "mozilla/dom/Element.h"
+ #include "nsIFrameMessageManager.h"
+ #include "FrameLayerBuilder.h"
++#include "nsDOMMediaQueryList.h"
+ 
+ #ifdef MOZ_SMIL
+ #include "nsSMILAnimationController.h"
+ #endif // MOZ_SMIL
+ 
+ #ifdef IBMBIDI
+ #include "nsBidiPresUtils.h"
+ #endif // IBMBIDI
+@@ -249,23 +250,28 @@ nsPresContext::nsPresContext(nsIDocument
+     mNeverAnimate = PR_TRUE;
+   } else {
+     mImageAnimationMode = imgIContainer::kNormalAnimMode;
+     mNeverAnimate = PR_FALSE;
+   }
+   NS_ASSERTION(mDocument, "Null document");
+   mUserFontSet = nsnull;
+   mUserFontSetDirty = PR_TRUE;
++
++  PR_INIT_CLIST(&mDOMMediaQueryLists);
+ }
+ 
+ nsPresContext::~nsPresContext()
+ {
+   NS_PRECONDITION(!mShell, "Presshell forgot to clear our mShell pointer");
+   SetShell(nsnull);
+ 
++  NS_ABORT_IF_FALSE(PR_CLIST_IS_EMPTY(&mDOMMediaQueryLists),
++                    "must not have media query lists left");
++
+   // Disconnect the refresh driver *after* the transition manager, which
+   // needs it.
+   if (mRefreshDriver && mRefreshDriver->PresContext() == this) {
+     mRefreshDriver->Disconnect();
+   }
+ 
+   if (mEventManager) {
+     // unclear if these are needed, but can't hurt
+@@ -1638,16 +1644,18 @@ void
+ nsPresContext::MediaFeatureValuesChanged(PRBool aCallerWillRebuildStyleData)
+ {
+   mPendingMediaFeatureValuesChanged = PR_FALSE;
+   if (mShell &&
+       mShell->StyleSet()->MediumFeaturesChanged(this) &&
+       !aCallerWillRebuildStyleData) {
+     RebuildAllStyleData(nsChangeHint(0));
+   }
++
++  // FIXME: Notify mDOMMediaQueryLists!  (Is this an ok time?)
+ }
+ 
+ void
+ nsPresContext::PostMediaFeatureValuesChangedEvent()
+ {
+   if (!mPendingMediaFeatureValuesChanged) {
+     nsCOMPtr<nsIRunnable> ev =
+       NS_NewRunnableMethod(this, &nsPresContext::HandleMediaFeatureValuesChangedEvent);
+@@ -1663,16 +1671,28 @@ nsPresContext::HandleMediaFeatureValuesC
+   // Null-check mShell in case the shell has been destroyed (and the
+   // event is the only thing holding the pres context alive).
+   if (mPendingMediaFeatureValuesChanged && mShell) {
+     MediaFeatureValuesChanged(PR_FALSE);
+   }
+ }
+ 
+ void
++nsPresContext::MatchMedia(const nsAString& aMediaQueryList,
++                          nsIDOMMediaQueryList** aResult)
++{
++  nsRefPtr<nsDOMMediaQueryList> result =
++    new nsDOMMediaQueryList(this, aMediaQueryList);
++
++  PR_INSERT_AFTER(result, &mDOMMediaQueryLists);
++
++  result.forget(aResult);
++}
++
++void
+ nsPresContext::SetPaginatedScrolling(PRBool aPaginated)
+ {
+   if (mType == eContext_PrintPreview || mType == eContext_PageLayout)
+     mCanPaginatedScroll = aPaginated;
+ }
+ 
+ void
+ nsPresContext::SetPrintSettings(nsIPrintSettings *aPrintSettings)
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -68,16 +68,18 @@
+ #include "nsRegion.h"
+ #include "nsTArray.h"
+ #include "nsAutoPtr.h"
+ #include "nsThreadUtils.h"
+ #include "nsContentUtils.h"
+ #include "nsIWidget.h"
+ #include "mozilla/TimeStamp.h"
+ #include "nsIContent.h"
++#include "nsIDOMMediaQueryList.h"
++#include "prclist.h"
+ 
+ class nsImageLoader;
+ #ifdef IBMBIDI
+ class nsBidiPresUtils;
+ #endif // IBMBIDI
+ 
+ struct nsRect;
+ 
+@@ -265,16 +267,22 @@ public:
+   void PostMediaFeatureValuesChangedEvent();
+   NS_HIDDEN_(void) HandleMediaFeatureValuesChangedEvent();
+   void FlushPendingMediaFeatureValuesChanged() {
+     if (mPendingMediaFeatureValuesChanged)
+       MediaFeatureValuesChanged(PR_FALSE);
+   }
+ 
+   /**
++   * Support for window.matchMedia()
++   */
++  void MatchMedia(const nsAString& aMediaQueryList,
++                  nsIDOMMediaQueryList** aResult);
++
++  /**
+    * Access compatibility mode for this context.  This is the same as
+    * our document's compatibility mode.
+    */
+   nsCompatibility CompatibilityMode() const {
+     return Document()->GetCompatibilityMode();
+   }
+   /**
+    * Notify the context that the document's compatibility mode has changed
+@@ -1081,16 +1089,18 @@ protected:
+   // charset rather than explicitly specified as a lang attribute).
+   nsIAtom*              mLanguage;      // [STRONG]
+ 
+   nsRefPtrHashtable<nsVoidPtrHashKey, nsImageLoader>
+                         mImageLoaders[IMAGE_LOAD_TYPE_COUNT];
+ 
+   nsWeakPtr             mContainer;
+ 
++  PRCList               mDOMMediaQueryLists;
++
+   PRInt32               mMinFontSize;   // Min font size, defaults to 0
+   float                 mTextZoom;      // Text zoom, defaults to 1.0
+   float                 mFullZoom;      // Page zoom, defaults to 1.0
+ 
+   PRInt32               mCurAppUnitsPerDevPixel;
+   PRInt32               mAutoQualityMinFontSizePixelsPref;
+ 
+   nsCOMPtr<nsITheme> mTheme;
 diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
 --- a/layout/style/Makefile.in
 +++ b/layout/style/Makefile.in
@@ -321,7 +480,7 @@ diff --git a/layout/style/Makefile.in b/layout/style/Makefile.in
 diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
 --- a/layout/style/nsCSSStyleSheet.cpp
 +++ b/layout/style/nsCSSStyleSheet.cpp
-@@ -580,17 +580,17 @@ nsMediaList::SetText(const nsAString& aM
+@@ -582,17 +582,17 @@ nsMediaList::SetText(const nsAString& aM
  
    PRBool htmlMode = PR_FALSE;
    if (mStyleSheet) {
@@ -337,14 +496,14 @@ diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
  
  PRBool
  nsMediaList::Matches(nsPresContext* aPresContext,
-                      nsMediaQueryResultCacheKey& aKey)
+                      nsMediaQueryResultCacheKey* aKey)
  {
    for (PRInt32 i = 0, i_end = mArray.Length(); i < i_end; ++i) {
 diff --git a/layout/style/nsDOMMediaQueryList.cpp b/layout/style/nsDOMMediaQueryList.cpp
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsDOMMediaQueryList.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,134 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -392,18 +551,21 @@ new file mode 100644
 +nsDOMMediaQueryList::nsDOMMediaQueryList(nsPresContext *aPresContext,
 +                                         const nsAString &aMediaQueryList)
 +  : mPresContext(aPresContext),
-+    mMediaList(new nsMediaList)
++    mMediaList(new nsMediaList),
++    mMatchesValid(PR_FALSE)
 +{
++  PR_INIT_CLIST(this);
++
++  mListeners.Init();
++
 +  nsCSSParser parser;
 +  // FIXME: What should we pass for aHTMLMode?
 +  parser.ParseMediaList(aMediaQueryList, nsnull, 0, mMediaList, PR_FALSE);
-+
-+  // FIXME: register this object and set mMatches
 +}
 +
 +nsDOMMediaQueryList::~nsDOMMediaQueryList()
 +{
-+  // FIXME: unregister this object
++  PR_REMOVE_LINK(this);
 +}
 +
 +DOMCI_DATA(MediaQueryList, nsDOMMediaQueryList)
@@ -427,6 +589,10 @@ new file mode 100644
 +NS_IMETHODIMP
 +nsDOMMediaQueryList::GetMatches(PRBool *aMatches)
 +{
++  if (!mMatchesValid) {
++    RecomputeMatches();
++  }
++
 +  *aMatches = mMatches;
 +  return NS_OK;
 +}
@@ -434,6 +600,13 @@ new file mode 100644
 +NS_IMETHODIMP
 +nsDOMMediaQueryList::AddListener(nsIDOMMediaQueryListListener *aListener)
 +{
++  if (mListeners.Count()) {
++    NS_ABORT_IF_FALSE(mMatchesValid,
++                      "when listeners present, must keep mMatches current");
++  } else {
++    RecomputeMatches();
++  }
++
 +  mListeners.Add(aListener);
 +  return NS_OK;
 +}
@@ -444,11 +617,32 @@ new file mode 100644
 +  mListeners.Remove(aListener);
 +  return NS_OK;
 +}
++
++void
++nsDOMMediaQueryList::RecomputeMatches()
++{
++  mMatches = mMediaList->Matches(mPresContext, nsnull);
++  mMatchesValid = PR_TRUE;
++}
++
++void
++nsDOMMediaQueryList::MediumFeaturesChanged()
++{
++  mMatchesValid = PR_FALSE;
++
++  if (mListeners.Count()) {
++    PRPackedBool oldMatches = mMatches;
++    RecomputeMatches();
++    if (mMatches != oldMatches) {
++      // FIXME: notify listeners!
++    }
++  }
++}
 diff --git a/layout/style/nsDOMMediaQueryList.h b/layout/style/nsDOMMediaQueryList.h
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsDOMMediaQueryList.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,79 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -495,13 +689,17 @@ new file mode 100644
 +#include "nsAutoPtr.h"
 +#include "nsHashSet.h"
 +#include "nsHashKeys.h"
++#include "prclist.h"
 +
 +class nsPresContext;
 +class nsMediaList;
 +
-+class nsDOMMediaQueryList : public nsIDOMMediaQueryList
++class nsDOMMediaQueryList : public nsIDOMMediaQueryList,
++                            public PRCList
 +{
 +public:
++  // The caller who constructs is responsible for calling Evaluate
++  // before calling any other methods.
 +  nsDOMMediaQueryList(nsPresContext *aPresContext,
 +                      const nsAString &aMediaQueryList);
 +private:
@@ -511,12 +709,15 @@ new file mode 100644
 +  NS_DECL_ISUPPORTS
 +  NS_DECL_NSIDOMMEDIAQUERYLIST
 +
-+  // FIXME: Need methods for notifying listeners!
++  void MediumFeaturesChanged();
 +
 +private:
++  void RecomputeMatches();
++
 +  nsRefPtr<nsPresContext> mPresContext;
 +  nsRefPtr<nsMediaList> mMediaList;
-+  PRBool mMatches;
++  PRPackedBool mMatches;
++  PRPackedBool mMatchesValid;
 +  nsHashSet< nsInterfaceHashKey<nsIDOMMediaQueryListListener> > mListeners;
 +};
 +
