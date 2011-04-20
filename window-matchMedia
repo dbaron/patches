@@ -326,7 +326,7 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  
    if (mEventManager) {
      // unclear if these are needed, but can't hurt
-@@ -1638,16 +1644,18 @@ void
+@@ -1638,21 +1644,48 @@ void
  nsPresContext::MediaFeatureValuesChanged(PRBool aCallerWillRebuildStyleData)
  {
    mPendingMediaFeatureValuesChanged = PR_FALSE;
@@ -336,16 +336,46 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
      RebuildAllStyleData(nsChangeHint(0));
    }
 +
-+  // FIXME: Notify mDOMMediaQueryLists!  (Is this an ok time?)
++  // Media query list listeners should be notified from a queued task
++  // (in HTML5 terms), although we also want to notify them on certain
++  // flushes.
++  // Note that we do this after the new style from media queries in
++  // style sheets has been computed.
++  NS_ABORT_IF_FALSE(nsContentUtils::IsSafeToRunScript(),
++                    "media query list listeners can run script");
++
++  if (!PR_CLIST_IS_EMPTY(&mDOMMediaQueryLists)) {
++    nsDOMMediaQueryList::NotifyList notifyList;
++    for (PRCList *l = PR_LIST_HEAD(&mDOMMediaQueryLists);
++         l != &mDOMMediaQueryLists; l = PR_NEXT_LINK(l)) {
++      nsDOMMediaQueryList *mql = static_cast<nsDOMMediaQueryList*>(l);
++      mql->MediumFeaturesChanged(notifyList);
++    }
++
++    for (PRUint32 i = 0, i_end = notifyList.Length(); i != i_end; ++i) {
++      nsDOMMediaQueryList::HandleChangeData &d = notifyList[i];
++      d.listener->HandleChange(d.mql);
++    }
++
++    // NOTE:  When |notifyList| goes out of scope, our destructor could run.
++  }
  }
  
  void
  nsPresContext::PostMediaFeatureValuesChangedEvent()
  {
++  // FIXME: We should probably replace this event with use of
++  // nsRefreshDriver::AddStyleFlushObserver (except the pres shell would
++  // need to track whether it's been added).
    if (!mPendingMediaFeatureValuesChanged) {
      nsCOMPtr<nsIRunnable> ev =
        NS_NewRunnableMethod(this, &nsPresContext::HandleMediaFeatureValuesChangedEvent);
-@@ -1663,16 +1671,29 @@ nsPresContext::HandleMediaFeatureValuesC
+     if (NS_SUCCEEDED(NS_DispatchToCurrentThread(ev))) {
+       mPendingMediaFeatureValuesChanged = PR_TRUE;
+     }
+   }
+ }
+@@ -1663,16 +1696,29 @@ nsPresContext::HandleMediaFeatureValuesC
    // Null-check mShell in case the shell has been destroyed (and the
    // event is the only thing holding the pres context alive).
    if (mPendingMediaFeatureValuesChanged && mShell) {
@@ -521,7 +551,7 @@ diff --git a/layout/style/nsDOMMediaQueryList.cpp b/layout/style/nsDOMMediaQuery
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsDOMMediaQueryList.cpp
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,147 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -651,7 +681,7 @@ new file mode 100644
 +}
 +
 +void
-+nsDOMMediaQueryList::MediumFeaturesChanged(ListenerList &aListenersToNotify)
++nsDOMMediaQueryList::MediumFeaturesChanged(NotifyList &aListenersToNotify)
 +{
 +  mMatchesValid = PR_FALSE;
 +
@@ -659,7 +689,13 @@ new file mode 100644
 +    PRPackedBool oldMatches = mMatches;
 +    RecomputeMatches();
 +    if (mMatches != oldMatches) {
-+      aListenersToNotify.AppendElements(mListeners);
++      for (PRUint32 i = 0, i_end = mListeners.Length(); i != i_end; ++i) {
++        HandleChangeData *d = aListenersToNotify.AppendElement();
++        if (d) {
++          d->mql = this;
++          d->listener = mListeners[i];
++        }
++      }
 +    }
 +  }
 +}
@@ -667,7 +703,7 @@ diff --git a/layout/style/nsDOMMediaQueryList.h b/layout/style/nsDOMMediaQueryLi
 new file mode 100644
 --- /dev/null
 +++ b/layout/style/nsDOMMediaQueryList.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,91 @@
 +/* vim: set shiftwidth=2 tabstop=8 autoindent cindent expandtab: */
 +/* ***** BEGIN LICENSE BLOCK *****
 + * Version: MPL 1.1/GPL 2.0/LGPL 2.1
@@ -737,10 +773,16 @@ new file mode 100644
 +
 +  NS_DECL_NSIDOMMEDIAQUERYLIST
 +
-+  typedef nsTArray< nsCOMPtr<nsIDOMMediaQueryListListener> > ListenerList;
++  struct HandleChangeData {
++    nsRefPtr<nsDOMMediaQueryList> mql;
++    nsCOMPtr<nsIDOMMediaQueryListListener> listener;
++  };
++
++  typedef FallibleTArray< nsCOMPtr<nsIDOMMediaQueryListListener> > ListenerList;
++  typedef FallibleTArray<HandleChangeData> NotifyList;
 +
 +  // Appends listeners that need notification to aListenersToNotify
-+  void MediumFeaturesChanged(ListenerList &aListenersToNotify);
++  void MediumFeaturesChanged(NotifyList &aListenersToNotify);
 +
 +private:
 +  void RecomputeMatches();
