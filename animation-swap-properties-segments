@@ -243,7 +243,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
        ResolveStyleByAddingRules(aParentStyleContext, rules);
      mCache.Put(aKeyframe, resultStrong);
      result = resultStrong;
-@@ -690,102 +690,118 @@ nsAnimationManager::BuildAnimations(nsSt
+@@ -690,103 +690,133 @@ nsAnimationManager::BuildAnimations(nsSt
      keyframes.EnumerateRead(AppendKeyframeData, &sortedKeyframes);
      sortedKeyframes.Sort(KeyframeDataComparator());
  
@@ -301,6 +301,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 -    }
 +      KeyframeData *fromKeyframe = nsnull;
 +      nsRefPtr<nsStyleContext> fromContext;
++      bool interpolated = true;
 +      for (PRUint32 kfIdx = 0, kfEnd = sortedKeyframes.Length();
 +           kfIdx != kfEnd; ++kfIdx) {
 +        KeyframeData &toKeyframe = sortedKeyframes[kfIdx];
@@ -318,23 +319,22 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 +          resolvedStyles.Get(mPresContext, aStyleContext, toKeyframe.mRule);
 +
 +        if (fromKeyframe) {
-+          BuildSegment(propData.mSegments, prop, aSrc,
-+                       fromKeyframe->mKey, fromContext,
-+                       fromKeyframe->mRule->Declaration(),
-+                       toKeyframe.mKey, toContext);
++          interpolated = interpolated &&
++            BuildSegment(propData.mSegments, prop, aSrc,
++                         fromKeyframe->mKey, fromContext,
++                         fromKeyframe->mRule->Declaration(),
++                         toKeyframe.mKey, toContext);
 +        } else {
 +          if (toKeyframe.mKey != 0.0f) {
 +            // There's no data for this property at 0%, so use the
 +            // cascaded value above us.
-+            BuildSegment(propData.mSegments, prop, aSrc,
-+                         0.0f, aStyleContext, nsnull,
-+                         toKeyframe.mKey, toContext);
++            interpolated = interpolated &&
++              BuildSegment(propData.mSegments, prop, aSrc,
++                           0.0f, aStyleContext, nsnull,
++                           toKeyframe.mKey, toContext);
 +          }
 +        }
 +
-+        // FIXME: We should only do this when BuildSegment actually
-+        // builds a segment.  (And if we get no segments, we need
-+        // to not have the property in the list!)
 +        fromContext = toContext;
 +        fromKeyframe = &toKeyframe;
 +      }
@@ -342,17 +342,29 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 +      if (fromKeyframe->mKey != 1.0f) {
 +        // There's no data for this property at 100%, so use the
 +        // cascaded value above us.
-+        BuildSegment(propData.mSegments, prop, aSrc,
-+                     fromKeyframe->mKey, fromContext,
-+                     fromKeyframe->mRule->Declaration(),
-+                     1.0f, aStyleContext);
++        interpolated = interpolated &&
++          BuildSegment(propData.mSegments, prop, aSrc,
++                       fromKeyframe->mKey, fromContext,
++                       fromKeyframe->mRule->Declaration(),
++                       1.0f, aStyleContext);
++      }
++
++      // If we failed to build any segments due to inability to
++      // interpolate, remove the property from the animation.  (It's not
++      // clear if this is the right thing to do -- we could run some of
++      // the segments, but it's really not clear whether we should skip
++      // values (which?) or skip segments, so best to skip the whole
++      // thing for now.)
++      if (!interpolated) {
++        aDest.mProperties.RemoveElementAt(aDest.mProperties.Length() - 1);
 +      }
      }
    }
  }
  
- void
+-void
 -nsAnimationManager::BuildSegment(InfallibleTArray<AnimationSegment>& aSegments,
++bool
 +nsAnimationManager::BuildSegment(InfallibleTArray<AnimationPropertySegment>&
 +                                   aSegments,
 +                                 nsCSSProperty aProperty,
@@ -365,43 +377,37 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
  {
 -  AnimationSegment &segment = *aSegments.AppendElement();
 +  nsStyleAnimation::Value fromValue, toValue, dummyValue;
-+  if (ExtractComputedValueForTransition(aProperty, aFromContext, fromValue) &&
-+      ExtractComputedValueForTransition(aProperty, aToContext, toValue) &&
++  if (!ExtractComputedValueForTransition(aProperty, aFromContext, fromValue) ||
++      !ExtractComputedValueForTransition(aProperty, aToContext, toValue) ||
 +      // Check that we can interpolate between these values
 +      // (If this is ever a performance problem, we could add a
 +      // CanInterpolate method, but it seems fine for now.)
-+      // FIXME: No longer the right thing when we can't interpolate!
-+      nsStyleAnimation::Interpolate(aProperty, fromValue, toValue,
++      !nsStyleAnimation::Interpolate(aProperty, fromValue, toValue,
 +                                    0.5, dummyValue)) {
-+    AnimationPropertySegment &segment = *aSegments.AppendElement();
++    return false;
++  }
  
--  segment.mFromKey = aFromKey;
--  segment.mToKey = aToKey;
--  const nsTimingFunction *tf;
--  if (aFromDeclaration &&
--      aFromDeclaration->HasProperty(eCSSProperty_animation_timing_function)) {
--    tf = &aFromContext->GetStyleDisplay()->mAnimations[0].GetTimingFunction();
--  } else {
--    tf = &aAnimation.GetTimingFunction();
--  }
--  segment.mTimingFunction.Init(*tf);
--
++  AnimationPropertySegment &segment = *aSegments.AppendElement();
++
++  segment.mFromValue = fromValue;
++  segment.mToValue = toValue;
+   segment.mFromKey = aFromKey;
+   segment.mToKey = aToKey;
+   const nsTimingFunction *tf;
+   if (aFromDeclaration &&
+       aFromDeclaration->HasProperty(eCSSProperty_animation_timing_function)) {
+     tf = &aFromContext->GetStyleDisplay()->mAnimations[0].GetTimingFunction();
+   } else {
+     tf = &aAnimation.GetTimingFunction();
+   }
+   segment.mTimingFunction.Init(*tf);
+ 
 -  for (nsCSSProperty prop = nsCSSProperty(0);
 -       prop < eCSSProperty_COUNT_no_shorthands;
 -       prop = nsCSSProperty(prop + 1)) {
 -    if (nsCSSProps::kAnimTypeTable[prop] == eStyleAnimType_None) {
 -      continue;
-+    segment.mFromValue = fromValue;
-+    segment.mToValue = toValue;
-+    segment.mFromKey = aFromKey;
-+    segment.mToKey = aToKey;
-+    const nsTimingFunction *tf;
-+    if (aFromDeclaration &&
-+        aFromDeclaration->HasProperty(eCSSProperty_animation_timing_function)) {
-+      tf = &aFromContext->GetStyleDisplay()->mAnimations[0].GetTimingFunction();
-+    } else {
-+      tf = &aAnimation.GetTimingFunction();
-     }
+-    }
 -
 -    if (!(aFromDeclaration && aFromDeclaration->HasProperty(prop)) &&
 -        !(aToDeclaration && aToDeclaration->HasProperty(prop))) {
@@ -422,8 +428,8 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 -      p.mFromValue = fromValue;
 -      p.mToValue = toValue;
 -    }
-+    segment.mTimingFunction.Init(*tf);
-   }
+-  }
++  return true;
  }
  
  nsIStyleRule*
@@ -431,6 +437,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
                                       nsCSSPseudoElements::Type aPseudoType)
  {
    NS_ABORT_IF_FALSE(
+     aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement ||
 diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
 --- a/layout/style/nsAnimationManager.h
 +++ b/layout/style/nsAnimationManager.h
@@ -464,7 +471,7 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
                         InfallibleTArray<ElementAnimation>& aAnimations);
 -  void BuildSegment(InfallibleTArray<AnimationSegment>& aSegments,
 -                    const nsAnimation& aAnimation,
-+  void BuildSegment(InfallibleTArray<AnimationPropertySegment>& aSegments,
++  bool BuildSegment(InfallibleTArray<AnimationPropertySegment>& aSegments,
 +                    nsCSSProperty aProperty, const nsAnimation& aAnimation,
                      float aFromKey, nsStyleContext* aFromContext,
                      mozilla::css::Declaration* aFromDeclaration,
