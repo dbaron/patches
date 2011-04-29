@@ -1,0 +1,193 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Audit for places in style rule code that need to check for a null sheet.  (Bug 634373)
+
+diff --git a/layout/style/StyleRule.cpp b/layout/style/StyleRule.cpp
+--- a/layout/style/StyleRule.cpp
++++ b/layout/style/StyleRule.cpp
+@@ -1373,20 +1373,23 @@ StyleRule::DeclarationChanged(Declaratio
+   StyleRule* clone = new StyleRule(*this, aDecl);
+   if (!clone) {
+     return nsnull;
+   }
+ 
+   NS_ADDREF(clone); // for return
+ 
+   if (aHandleContainer) {
+-    NS_ASSERTION(mSheet, "rule must be in a sheet");
+     if (mParentRule) {
+-      mSheet->ReplaceRuleInGroup(mParentRule, this, clone);
+-    } else {
++      if (mSheet) {
++        mSheet->ReplaceRuleInGroup(mParentRule, this, clone);
++      } else {
++        mParentRule->ReplaceStyleRule(this, clone);
++      }
++    } else if (mSheet) {
+       mSheet->ReplaceStyleRule(this, clone);
+     }
+   }
+ 
+   return clone;
+ }
+ 
+ /* virtual */ void
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -530,41 +530,42 @@ GroupRule::GroupRule()
+ static PRBool
+ SetParentRuleReference(nsICSSRule* aRule, void* aParentRule)
+ {
+   GroupRule* parentRule = static_cast<GroupRule*>(aParentRule);
+   aRule->SetParentRule(parentRule);
+   return PR_TRUE;
+ }
+ 
++static PRBool
++SetStyleSheetReference(nsICSSRule* aRule, void* aSheet)
++{
++  nsCSSStyleSheet* sheet = (nsCSSStyleSheet*)aSheet;
++  aRule->SetStyleSheet(sheet);
++  return PR_TRUE;
++}
++
+ GroupRule::GroupRule(const GroupRule& aCopy)
+   : Rule(aCopy)
+ {
+   const_cast<GroupRule&>(aCopy).mRules.EnumerateForwards(CloneRuleInto, &mRules);
+   mRules.EnumerateForwards(SetParentRuleReference, this);
+ }
+ 
+ GroupRule::~GroupRule()
+ {
+   mRules.EnumerateForwards(SetParentRuleReference, nsnull);
++  mRules.EnumerateForwards(SetStyleSheetReference, nsnull);
+   if (mRuleCollection) {
+     mRuleCollection->DropReference();
+   }
+ }
+ 
+ IMPL_STYLE_RULE_INHERIT_MAP_RULE_INFO_INTO(GroupRule, Rule)
+ 
+-static PRBool
+-SetStyleSheetReference(nsICSSRule* aRule, void* aSheet)
+-{
+-  nsCSSStyleSheet* sheet = (nsCSSStyleSheet*)aSheet;
+-  aRule->SetStyleSheet(sheet);
+-  return PR_TRUE;
+-}
+-
+ /* virtual */ void
+ GroupRule::SetStyleSheet(nsCSSStyleSheet* aSheet)
+ {
+   mRules.EnumerateForwards(SetStyleSheetReference, aSheet);
+   Rule::SetStyleSheet(aSheet);
+ }
+ 
+ #ifdef DEBUG
+@@ -1911,17 +1912,19 @@ nsCSSKeyframeRule::SetKeyText(const nsAS
+   nsTArray<float> newSelectors;
+   // FIXME: pass filename and line number
+   if (parser.ParseKeyframeSelectorString(aKeyText, nsnull, 0, newSelectors)) {
+     newSelectors.SwapElements(mKeys);
+   } else {
+     // for now, we don't do anything if the parse fails
+   }
+ 
+-  mSheet->SetModifiedByChildRule();
++  if (mSheet) {
++    mSheet->SetModifiedByChildRule();
++  }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSKeyframeRule::GetStyle(nsIDOMCSSStyleDeclaration** aStyle)
+ {
+   if (!mDOMDeclaration) {
+@@ -1931,17 +1934,19 @@ nsCSSKeyframeRule::GetStyle(nsIDOMCSSSty
+   return NS_OK;
+ }
+ 
+ void
+ nsCSSKeyframeRule::ChangeDeclaration(mozilla::css::Declaration* aDeclaration)
+ {
+   mDeclaration = aDeclaration;
+ 
+-  mSheet->SetModifiedByChildRule();
++  if (mSheet) {
++    mSheet->SetModifiedByChildRule();
++  }
+ }
+ 
+ // -------------------------------------------
+ // nsCSSKeyframesRule
+ //
+ 
+ nsCSSKeyframesRule::nsCSSKeyframesRule(const nsCSSKeyframesRule& aCopy)
+   // copy everything except our reference count.  GroupRule's copy
+@@ -2046,17 +2051,19 @@ nsCSSKeyframesRule::GetName(nsAString& a
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSKeyframesRule::SetName(const nsAString& aName)
+ {
+   mName = aName;
+ 
+-  mSheet->SetModifiedByChildRule();
++  if (mSheet) {
++    mSheet->SetModifiedByChildRule();
++  }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSKeyframesRule::GetCssRules(nsIDOMCSSRuleList* *aRuleList)
+ {
+   NS_ADDREF(*aRuleList = GroupRule::GetCssRules());
+@@ -2071,17 +2078,19 @@ nsCSSKeyframesRule::InsertRule(const nsA
+   // http://lists.w3.org/Archives/Public/www-style/2011Apr/0034.html
+   nsCSSParser parser;
+ 
+   // FIXME: pass filename and line number
+   nsRefPtr<nsCSSKeyframeRule> rule =
+     parser.ParseKeyframeRule(aRule, nsnull, 0);
+   if (rule) {
+     mRules.AppendObject(rule);
+-    mSheet->SetModifiedByChildRule();
++    if (mSheet) {
++      mSheet->SetModifiedByChildRule();
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ static const PRUint32 RULE_NOT_FOUND = PRUint32(-1);
+ 
+ PRUint32
+@@ -2108,17 +2117,19 @@ nsCSSKeyframesRule::FindRuleIndexForKey(
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSKeyframesRule::DeleteRule(const nsAString& aKey)
+ {
+   PRUint32 index = FindRuleIndexForKey(aKey);
+   if (index != RULE_NOT_FOUND) {
+     mRules.RemoveObjectAt(index);
+-    mSheet->SetModifiedByChildRule();
++    if (mSheet) {
++      mSheet->SetModifiedByChildRule();
++    }
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsCSSKeyframesRule::FindRule(const nsAString& aKey,
+                              nsIDOMMozCSSKeyframeRule** aResult)
+ {
