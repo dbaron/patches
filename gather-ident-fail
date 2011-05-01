@@ -1,0 +1,114 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Handle failure of GatherIdent, which can happen (starting with the next patch) fail when the character sequence is not an identifier.  Additionally, change the tokenization of a hash (#) followed by a non-name character or EOF to tokenize as DELIM (eCSSToken_Symbol) rather than as eCSSToken_Hash or eCSSToken_ID.  (Bug 384672, patch 2)
+
+diff --git a/layout/style/nsCSSScanner.cpp b/layout/style/nsCSSScanner.cpp
+--- a/layout/style/nsCSSScanner.cpp
++++ b/layout/style/nsCSSScanner.cpp
+@@ -1066,16 +1066,20 @@ nsCSSScanner::ParseAndAppendEscape(nsStr
+ }
+ 
+ /**
+  * Gather up the characters in an identifier. The identfier was
+  * started by "aChar" which will be appended to aIdent. The result
+  * will be aIdent with all of the identifier characters appended
+  * until the first non-identifier character is seen. The termination
+  * character is unread for the future re-reading.
++ *
++ * Returns failure when the character sequence does not form an ident at
++ * all, in which case the caller is responsible for pushing back or
++ * otherwise handling aChar.  (This occurs only when aChar is '\'.)
+  */
+ PRBool
+ nsCSSScanner::GatherIdent(PRInt32 aChar, nsString& aIdent)
+ {
+   if (aChar == CSS_ESCAPE) {
+     ParseAndAppendEscape(aIdent, false);
+   }
+   else if (0 < aChar) {
+@@ -1124,31 +1128,37 @@ nsCSSScanner::ParseRef(PRInt32 aChar, ns
+     return PR_FALSE;
+   }
+   if (IsIdent(ch) || ch == CSS_ESCAPE) {
+     // First char after the '#' is a valid ident char (or an escape),
+     // so it makes sense to keep going
+     if (StartsIdent(ch, Peek())) {
+       aToken.mType = eCSSToken_ID;
+     }
+-    return GatherIdent(ch, aToken.mIdent);
++    if (GatherIdent(ch, aToken.mIdent)) {
++      return PR_TRUE;
++    }
+   }
+ 
+   // No ident chars after the '#'.  Just unread |ch| and get out of here.
+   Pushback(ch);
++  aToken.mType = eCSSToken_Symbol;
++  aToken.mSymbol = PRUnichar('#');
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ nsCSSScanner::ParseIdent(PRInt32 aChar, nsCSSToken& aToken)
+ {
+   nsString& ident = aToken.mIdent;
+   ident.SetLength(0);
+   if (!GatherIdent(aChar, ident)) {
+-    return PR_FALSE;
++    aToken.mType = eCSSToken_Symbol;
++    aToken.mSymbol = aChar;
++    return PR_TRUE;
+   }
+ 
+   nsCSSTokenType tokenType = eCSSToken_Ident;
+   // look for functions (ie: "ident(")
+   if (Peek() == PRUnichar('(')) {
+     Read();
+     tokenType = eCSSToken_Function;
+ 
+@@ -1162,17 +1172,21 @@ nsCSSScanner::ParseIdent(PRInt32 aChar, 
+   return PR_TRUE;
+ }
+ 
+ PRBool
+ nsCSSScanner::ParseAtKeyword(PRInt32 aChar, nsCSSToken& aToken)
+ {
+   aToken.mIdent.SetLength(0);
+   aToken.mType = eCSSToken_AtKeyword;
+-  return GatherIdent(0, aToken.mIdent);
++  if (!GatherIdent(0, aToken.mIdent)) {
++    aToken.mType = eCSSToken_Symbol;
++    aToken.mSymbol = PRUnichar('@');
++  }
++  return PR_TRUE;
+ }
+ 
+ PRBool
+ nsCSSScanner::ParseNumber(PRInt32 c, nsCSSToken& aToken)
+ {
+   NS_PRECONDITION(c == '.' || c == '+' || c == '-' || IsDigit(c),
+                   "Why did we get called?");
+   aToken.mHasSign = (c == '+' || c == '-');
+@@ -1282,20 +1296,19 @@ nsCSSScanner::ParseNumber(PRInt32 c, nsC
+   }
+ 
+   nsString& ident = aToken.mIdent;
+   ident.Truncate();
+ 
+   // Look at character that terminated the number
+   if (c >= 0) {
+     if (StartsIdent(c, Peek())) {
+-      if (!GatherIdent(c, ident)) {
+-        return PR_FALSE;
++      if (GatherIdent(c, ident)) {
++        type = eCSSToken_Dimension;
+       }
+-      type = eCSSToken_Dimension;
+     } else if ('%' == c) {
+       type = eCSSToken_Percentage;
+       value = value / 100.0f;
+       aToken.mIntegerValid = PR_FALSE;
+     } else {
+       // Put back character that stopped numeric scan
+       Pushback(c);
+     }
