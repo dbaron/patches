@@ -1,0 +1,182 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Allow ParseAndAppendEscape to fail when the stream does not contain an escape, and make callers handle this failure appropriately.  This changes our behavior when backslash immediately precedes end-of-stream.  (Bug 384672, patch 3)
+
+diff --git a/layout/style/nsCSSScanner.cpp b/layout/style/nsCSSScanner.cpp
+--- a/layout/style/nsCSSScanner.cpp
++++ b/layout/style/nsCSSScanner.cpp
+@@ -966,17 +966,21 @@ nsCSSScanner::NextURL(nsCSSToken& aToken
+   Pushback(ch);
+ 
+   // start of a non-quoted url (which may be empty)
+   PRBool ok = PR_TRUE;
+   for (;;) {
+     ch = Read();
+     if (ch < 0) break;
+     if (ch == CSS_ESCAPE) {
+-      ParseAndAppendEscape(ident, false);
++      if (!ParseAndAppendEscape(ident, false)) {
++        ok = PR_FALSE;
++        Pushback(ch);
++        break;
++      }
+     } else if (IsWhitespace(ch)) {
+       // Whitespace is allowed at the end of the URL
+       EatWhiteSpace();
+       // Consume the close paren if we have it; if not we're an invalid URL.
+       ok = LookAheadOrEOF(')');
+       break;
+     } else if (ch == '"' || ch == '\'' || ch == '(' || ch < PRUnichar(' ')) {
+       // This is an invalid URL spec
+@@ -997,23 +1001,27 @@ nsCSSScanner::NextURL(nsCSSToken& aToken
+   // type to a useful one.
+   if (ok) {
+     aToken.mType = eCSSToken_URL;
+   }
+   return PR_TRUE;
+ }
+ 
+ 
+-void
++/**
++ * Returns whether an escape was succesfully parsed; if it was not,
++ * the backslash needs to be its own symbol token.
++ */
++bool
+ nsCSSScanner::ParseAndAppendEscape(nsString& aOutput, bool aInString)
+ {
+   PRInt32 ch = Peek();
+   if (ch < 0) {
+     aOutput.Append(CSS_ESCAPE);
+-    return;
++    return false;
+   }
+   if (IsHexDigit(ch)) {
+     PRInt32 rv = 0;
+     int i;
+     for (i = 0; i < 6; i++) { // up to six digits
+       ch = Read();
+       if (ch < 0) {
+         // Whoops: error or premature eof
+@@ -1049,38 +1057,41 @@ nsCSSScanner::ParseAndAppendEscape(nsStr
+     if (rv > 0) {
+       AppendUCS4ToUTF16(ENSURE_VALID_CHAR(rv), aOutput);
+     } else {
+       while (i--)
+         aOutput.Append('0');
+       if (IsWhitespace(ch))
+         Pushback(ch);
+     }
+-    return;
++    return true;
+   } 
+   // "Any character except a hexidecimal digit can be escaped to
+   // remove its special meaning by putting a backslash in front"
+   // -- CSS1 spec section 7.1
+   ch = Read();  // Consume the escaped character
+   if ((ch > 0) && (ch != '\n')) {
+     aOutput.Append(ch);
+   }
++
++  return true;
+ }
+ 
+ /**
+  * Gather up the characters in an identifier. The identfier was
+  * started by "aChar" which will be appended to aIdent. The result
+  * will be aIdent with all of the identifier characters appended
+  * until the first non-identifier character is seen. The termination
+  * character is unread for the future re-reading.
+  */
+ PRBool
+ nsCSSScanner::GatherIdent(PRInt32 aChar, nsString& aIdent)
+ {
+   if (aChar == CSS_ESCAPE) {
++    // FIXME
+     ParseAndAppendEscape(aIdent, false);
+   }
+   else if (0 < aChar) {
+     aIdent.Append(aChar);
+   }
+   for (;;) {
+     // If nothing in pushback, first try to get as much as possible in one go
+     if (!mPushbackCount && EnsureData()) {
+@@ -1098,17 +1109,20 @@ nsCSSScanner::GatherIdent(PRInt32 aChar,
+         aIdent.Append(&mReadPointer[mOffset], n - mOffset);
+         mOffset = n;
+       }
+     }
+ 
+     aChar = Read();
+     if (aChar < 0) break;
+     if (aChar == CSS_ESCAPE) {
+-      ParseAndAppendEscape(aIdent, false);
++      if (!ParseAndAppendEscape(aIdent, false)) {
++        Pushback(aChar);
++        break;
++      }
+     } else if (IsIdent(aChar)) {
+       aIdent.Append(PRUnichar(aChar));
+     } else {
+       Pushback(aChar);
+       break;
+     }
+   }
+   return PR_TRUE;
+@@ -1362,17 +1376,31 @@ nsCSSScanner::ParseString(PRInt32 aStop,
+     if (ch == '\n') {
+       aToken.mType = eCSSToken_Bad_String;
+ #ifdef CSS_REPORT_PARSE_ERRORS
+       ReportUnexpectedToken(aToken, "SEUnterminatedString");
+ #endif
+       break;
+     }
+     if (ch == CSS_ESCAPE) {
+-      ParseAndAppendEscape(aToken.mIdent, true);
++      if (!ParseAndAppendEscape(aToken.mIdent, true)) {
++        aToken.mType = eCSSToken_Bad_String;
++        Pushback(ch);
++#ifdef CSS_REPORT_PARSE_ERRORS
++        // For strings, the only case where ParseAndAppendEscape will
++        // return false is when there's a backslash to start an escape
++        // immediately followed by end-of-stream.  In that case, the
++        // correct tokenization is badstring *followed* by a DELIM for
++        // the backslash, but as far as the author is concerned, it
++        // works pretty much the same as an unterminated string, so we
++        // use the same error message.
++        ReportUnexpectedToken(aToken, "SEUnterminatedString");
++#endif
++        break;
++      }
+     } else {
+       aToken.mIdent.Append(ch);
+     }
+   }
+   return PR_TRUE;
+ }
+ 
+ // UNICODE-RANGE tokens match the regular expression
+diff --git a/layout/style/nsCSSScanner.h b/layout/style/nsCSSScanner.h
+--- a/layout/style/nsCSSScanner.h
++++ b/layout/style/nsCSSScanner.h
+@@ -209,18 +209,18 @@ class nsCSSScanner {
+   
+ protected:
+   PRBool EnsureData();
+   PRInt32 Read();
+   PRInt32 Peek();
+   PRBool LookAhead(PRUnichar aChar);
+   PRBool LookAheadOrEOF(PRUnichar aChar); // expect either aChar or EOF
+   void EatWhiteSpace();
+-  
+-  void ParseAndAppendEscape(nsString& aOutput, bool aInString);
++
++  bool ParseAndAppendEscape(nsString& aOutput, bool aInString);
+   PRBool ParseIdent(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseAtKeyword(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseNumber(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseRef(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseString(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool ParseURange(PRInt32 aChar, nsCSSToken& aResult);
+   PRBool SkipCComment();
+ 
