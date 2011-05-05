@@ -5,39 +5,21 @@ Ensure nsStyleAnimation doesn't produce values outside valid ranges.  (Bug 65384
 diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.cpp
 --- a/layout/style/nsStyleAnimation.cpp
 +++ b/layout/style/nsStyleAnimation.cpp
-@@ -792,16 +792,17 @@ AddShadowItems(double aCoeff1, const nsC
-                     "wrong unit");
-   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Array,
-                     "wrong unit");
-   nsCSSValue::Array *array1 = aValue1.GetArrayValue();
-   nsCSSValue::Array *array2 = aValue2.GetArrayValue();
-   nsRefPtr<nsCSSValue::Array> resultArray = nsCSSValue::Array::Create(6);
- 
-   for (size_t i = 0; i < 4; ++i) {
-+    // FIXME: blur radius (item 3) must be nonnegative!
-     AddCSSValuePixel(aCoeff1, array1->Item(i), aCoeff2, array2->Item(i),
-                      resultArray->Item(i));
-   }
- 
-   const nsCSSValue& color1 = array1->Item(4);
-   const nsCSSValue& color2 = array2->Item(4);
-   const nsCSSValue& inset1 = array1->Item(5);
-   const nsCSSValue& inset2 = array2->Item(5);
-@@ -1327,16 +1328,41 @@ AddTransformLists(const nsCSSValueList* 
-     aList1 = aList1->mNext;
-     aList2 = aList2->mNext;
-   } while (aList1);
-   NS_ABORT_IF_FALSE(!aList2, "list length mismatch");
- 
-   return result.forget();
+@@ -712,49 +712,84 @@ inline PRUint8 ClampColor(double aColor)
+ {
+   if (aColor >= MAX_PACKED_COLOR_COMPONENT)
+     return MAX_PACKED_COLOR_COMPONENT;
+   if (aColor <= 0.0)
+     return 0;
+   return NSToIntRound(aColor);
  }
  
 +template <typename T>
 +T
-+RestrictValue(nsCSSProperty aProperty, T aValue)
++RestrictValue(PRUint32 aRestrictions, T aValue)
 +{
 +  T result = aValue;
-+  switch (nsCSSProps::ValueRestrictions(aProperty)) {
++  switch (aRestrictions) {
 +    case 0:
 +      break;
 +    case CSS_PROPERTY_VALUE_NONNEGATIVE:
@@ -57,15 +39,88 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
 +  return result;
 +}
 +
- PRBool
- nsStyleAnimation::AddWeighted(nsCSSProperty aProperty,
-                               double aCoeff1, const Value& aValue1,
-                               double aCoeff2, const Value& aValue2,
-                               Value& aResultValue)
++template <typename T>
++T
++RestrictValue(nsCSSProperty aProperty, T aValue)
++{
++  return RestrictValue(nsCSSProps::ValueRestrictions(aProperty), aValue);
++}
++
+ static inline void
+ AddCSSValuePixel(double aCoeff1, const nsCSSValue &aValue1,
+                  double aCoeff2, const nsCSSValue &aValue2,
+-                 nsCSSValue &aResult)
++                 nsCSSValue &aResult, PRUint32 aValueRestrictions = 0)
  {
-   Unit commonUnit =
-     GetCommonUnit(aProperty, aValue1.GetUnit(), aValue2.GetUnit());
-@@ -1354,16 +1380,21 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+   NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Pixel, "unexpected unit");
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Pixel, "unexpected unit");
+-  aResult.SetFloatValue(aCoeff1 * aValue1.GetFloatValue() +
+-                        aCoeff2 * aValue2.GetFloatValue(),
++  aResult.SetFloatValue(RestrictValue(aValueRestrictions,
++                                      aCoeff1 * aValue1.GetFloatValue() +
++                                      aCoeff2 * aValue2.GetFloatValue()),
+                         eCSSUnit_Pixel);
+ }
+ 
+ static inline void
+ AddCSSValueNumber(double aCoeff1, const nsCSSValue &aValue1,
+                   double aCoeff2, const nsCSSValue &aValue2,
+-                  nsCSSValue &aResult)
++                  nsCSSValue &aResult, PRUint32 aValueRestrictions = 0)
+ {
+   NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Number, "unexpected unit");
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Number, "unexpected unit");
+-  aResult.SetFloatValue(aCoeff1 * aValue1.GetFloatValue() +
+-                        aCoeff2 * aValue2.GetFloatValue(),
++  aResult.SetFloatValue(RestrictValue(aValueRestrictions,
++                                      aCoeff1 * aValue1.GetFloatValue() +
++                                      aCoeff2 * aValue2.GetFloatValue()),
+                         eCSSUnit_Number);
+ }
+ 
+ static inline void
+ AddCSSValuePercent(double aCoeff1, const nsCSSValue &aValue1,
+                    double aCoeff2, const nsCSSValue &aValue2,
+-                   nsCSSValue &aResult)
++                   nsCSSValue &aResult, PRUint32 aValueRestrictions = 0)
+ {
+   NS_ABORT_IF_FALSE(aValue1.GetUnit() == eCSSUnit_Percent, "unexpected unit");
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Percent, "unexpected unit");
+-  aResult.SetPercentValue(aCoeff1 * aValue1.GetPercentValue() +
+-                          aCoeff2 * aValue2.GetPercentValue());
++  aResult.SetPercentValue(RestrictValue(aValueRestrictions,
++                                        aCoeff1 * aValue1.GetPercentValue() +
++                                        aCoeff2 * aValue2.GetPercentValue()));
+ }
+ 
+ // Add two canonical-form calc values (eUnit_Calc) to make another
+ // canonical-form calc value.
+ static void
+ AddCSSValueCanonicalCalc(double aCoeff1, const nsCSSValue &aValue1,
+                          double aCoeff2, const nsCSSValue &aValue2,
+                          nsCSSValue &aResult)
+@@ -793,17 +828,19 @@ AddShadowItems(double aCoeff1, const nsC
+   NS_ABORT_IF_FALSE(aValue2.GetUnit() == eCSSUnit_Array,
+                     "wrong unit");
+   nsCSSValue::Array *array1 = aValue1.GetArrayValue();
+   nsCSSValue::Array *array2 = aValue2.GetArrayValue();
+   nsRefPtr<nsCSSValue::Array> resultArray = nsCSSValue::Array::Create(6);
+ 
+   for (size_t i = 0; i < 4; ++i) {
+     AddCSSValuePixel(aCoeff1, array1->Item(i), aCoeff2, array2->Item(i),
+-                     resultArray->Item(i));
++                     resultArray->Item(i),
++                     // blur radius must be nonnegative
++                     (i == 2) ? CSS_PROPERTY_VALUE_NONNEGATIVE : 0);
+   }
+ 
+   const nsCSSValue& color1 = array1->Item(4);
+   const nsCSSValue& color2 = array2->Item(4);
+   const nsCSSValue& inset1 = array1->Item(5);
+   const nsCSSValue& inset2 = array2->Item(5);
+   if (color1.GetUnit() != color2.GetUnit() ||
+       inset1.GetUnit() != inset2.GetUnit()) {
+@@ -1354,16 +1391,21 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
        return PR_FALSE;
  
      case eUnit_Enumerated:
@@ -87,7 +142,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        }
      case eUnit_Visibility: {
        PRInt32 val1 = aValue1.GetIntValue() == NS_STYLE_VISIBILITY_VISIBLE;
-@@ -1377,36 +1408,43 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+@@ -1377,36 +1419,43 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
      case eUnit_Integer: {
        // http://dev.w3.org/csswg/css3-transitions/#animation-of-property-types-
        // says we should use floor
@@ -137,30 +192,38 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        // FIXME (spec): The CSS transitions spec doesn't say whether
        // colors are premultiplied, but things work better when they are,
        // so use premultiplication.  Spec issue is still open per
-@@ -1477,20 +1515,22 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+@@ -1473,27 +1522,28 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+           unit[0] == eCSSUnit_URL) {
+         return PR_FALSE;
+       }
+ 
        nsAutoPtr<nsCSSValuePair> result(new nsCSSValuePair);
        static nsCSSValue nsCSSValuePair::* const pairValues[2] = {
          &nsCSSValuePair::mXValue, &nsCSSValuePair::mYValue
        };
++      PRUint32 restrictions = nsCSSProps::ValueRestrictions(aProperty);
        for (PRUint32 i = 0; i < 2; ++i) {
          nsCSSValue nsCSSValuePair::*member = pairValues[i];
          switch (unit[i]) {
            case eCSSUnit_Pixel:
-+            // FIXME: value restrictions!
              AddCSSValuePixel(aCoeff1, pair1->*member, aCoeff2, pair2->*member,
-                              result->*member);
+-                             result->*member);
++                             result->*member, restrictions);
              break;
            case eCSSUnit_Percent:
-+            // FIXME: value restrictions!
              AddCSSValuePercent(aCoeff1, pair1->*member,
                                 aCoeff2, pair2->*member,
-                                result->*member);
+-                               result->*member);
++                               result->*member, restrictions);
              break;
            case eCSSUnit_Calc:
              AddCSSValueCanonicalCalc(aCoeff1, pair1->*member,
                                       aCoeff2, pair2->*member,
                                       result->*member);
-@@ -1501,16 +1541,18 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+             break;
+           default:
+             NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
+@@ -1501,16 +1551,18 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
          }
        }
  
@@ -179,7 +242,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
            rect1->mLeft.GetUnit() != rect2->mLeft.GetUnit()) {
          // At least until we have calc()
          return PR_FALSE;
-@@ -1539,16 +1581,17 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+@@ -1539,16 +1591,17 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
              NS_ABORT_IF_FALSE(PR_FALSE, "unexpected unit");
              return PR_FALSE;
          }
@@ -197,7 +260,7 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
        for (const nsCSSValueList *v = list1; v; v = v->mNext) {
          ++len1;
        }
-@@ -1583,18 +1626,20 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+@@ -1583,19 +1636,21 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
          nsCSSValueList *item = new nsCSSValueList;
          if (!item) {
            return PR_FALSE;
@@ -206,11 +269,13 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
          resultTail = &item->mNext;
  
          if (v1.GetUnit() == eCSSUnit_Number) {
-+          // FIXME: nonnegative!
-           AddCSSValueNumber(aCoeff1, v1, aCoeff2, v2, item->mValue);
+-          AddCSSValueNumber(aCoeff1, v1, aCoeff2, v2, item->mValue);
++          AddCSSValueNumber(aCoeff1, v1, aCoeff2, v2, item->mValue,
++                            CSS_PROPERTY_VALUE_NONNEGATIVE);
          } else {
-+          // FIXME: nonnegative!
-           AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, item->mValue);
+-          AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, item->mValue);
++          AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, item->mValue,
++                             CSS_PROPERTY_VALUE_NONNEGATIVE);
          }
  
          list1 = list1->mNext;
@@ -218,7 +283,20 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
            list1 = aValue1.GetCSSValueListValue();
          }
          list2 = list2->mNext;
-@@ -1741,22 +1786,25 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+         if (!list2) {
+@@ -1730,31 +1785,32 @@ nsStyleAnimation::AddWeighted(nsCSSPrope
+         }
+         *resultTail = item;
+         resultTail = &item->mNext;
+ 
+         static nsCSSValue nsCSSValuePairList::* const pairListValues[] = {
+           &nsCSSValuePairList::mXValue,
+           &nsCSSValuePairList::mYValue,
+         };
++        PRUint32 restrictions = nsCSSProps::ValueRestrictions(aProperty);
+         for (PRUint32 i = 0; i < NS_ARRAY_LENGTH(pairListValues); ++i) {
+           const nsCSSValue &v1 = list1->*(pairListValues[i]);
+           const nsCSSValue &v2 = list2->*(pairListValues[i]);
            nsCSSValue &vr = item->*(pairListValues[i]);
            nsCSSUnit unit =
              GetCommonUnit(aProperty, v1.GetUnit(), v2.GetUnit());
@@ -227,20 +305,17 @@ diff --git a/layout/style/nsStyleAnimation.cpp b/layout/style/nsStyleAnimation.c
            }
            switch (unit) {
              case eCSSUnit_Pixel:
-+              // FIXME: value restrictions
-               AddCSSValuePixel(aCoeff1, v1, aCoeff2, v2, vr);
+-              AddCSSValuePixel(aCoeff1, v1, aCoeff2, v2, vr);
++              AddCSSValuePixel(aCoeff1, v1, aCoeff2, v2, vr, restrictions);
                break;
              case eCSSUnit_Percent:
-+              // FIXME: value restrictions
-               AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, vr);
+-              AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, vr);
++              AddCSSValuePercent(aCoeff1, v1, aCoeff2, v2, vr, restrictions);
                break;
              case eCSSUnit_Calc:
-+              // FIXME: value restrictions
                AddCSSValueCanonicalCalc(aCoeff1, v1, aCoeff2, v2, vr);
                break;
              default:
                if (v1 != v2) {
                  return PR_FALSE;
                }
-               vr = v1;
-               break;
