@@ -1,0 +1,146 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Stop animations in the same cases we stop animated images.  (Bug 651506)
+
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -62,37 +62,40 @@ struct AnimationProperty
+ 
+ /**
+  * Data about one animation (i.e., one of the values of
+  * 'animation-name') running on an element.
+  */
+ struct ElementAnimation
+ {
+   ElementAnimation()
+-    : mLastNotification(LAST_NOTIFICATION_NONE)
++    : mForcedPause(false)
++    , mLastNotification(LAST_NOTIFICATION_NONE)
+   {
+   }
+ 
+   nsString mName; // empty string for 'none'
+   float mIterationCount; // NS_IEEEPositiveInfinity() means infinite
+   PRUint8 mDirection;
+   PRUint8 mFillMode;
+   PRUint8 mPlayState;
++  bool mForcedPause;
+ 
+   bool FillsForwards() const {
+     return mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BOTH ||
+            mFillMode == NS_STYLE_ANIMATION_FILL_MODE_FORWARDS;
+   }
+   bool FillsBackwards() const {
+     return mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BOTH ||
+            mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BACKWARDS;
+   }
+ 
+   bool IsPaused() const {
+-    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED;
++    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED ||
++           mForcedPause;
+   }
+ 
+   TimeStamp mStartTime; // with delay taken into account
+   TimeStamp mPauseStart;
+   TimeDuration mIterationDuration;
+ 
+   enum {
+     LAST_NOTIFICATION_NONE = PRUint32(-1),
+@@ -501,16 +504,17 @@ nsAnimationManager::CheckAnimationRule(n
+             }
+           }
+           if (!oldAnim) {
+             continue;
+           }
+ 
+           newAnim->mStartTime = oldAnim->mStartTime;
+           newAnim->mLastNotification = oldAnim->mLastNotification;
++          newAnim->mForcedPause = oldAnim->mForcedPause;
+ 
+           if (oldAnim->IsPaused()) {
+             if (newAnim->IsPaused()) {
+               // Copy pause start just like start time.
+               newAnim->mPauseStart = oldAnim->mPauseStart;
+             } else {
+               // Handle change in pause state by adjusting start
+               // time to unpause.
+@@ -915,8 +919,44 @@ nsAnimationManager::KeyframesRuleFor(con
+       nsCSSKeyframesRule *rule = rules[i];
+       mKeyframesRules.Put(rule->GetName(), rule);
+     }
+   }
+ 
+   return mKeyframesRules.Get(aName);
+ }
+ 
++void
++nsAnimationManager::StopAllAnimations()
++{
++  for (PRCList *l = PR_LIST_HEAD(&mElementData); l != &mElementData;
++       l = PR_NEXT_LINK(l)) {
++    ElementAnimations *ea = static_cast<ElementAnimations*>(l);
++    bool needsRestyle = false;
++    for (PRUint32 animIdx = 0, animEnd = ea->mAnimations.Length();
++         animIdx != animEnd; ++animIdx) {
++      ElementAnimation &anim = ea->mAnimations[animIdx];
++      if (anim.IsPaused()) {
++        continue;
++      }
++      TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
++      if (anim.mIterationCount == NS_IEEEPositiveInfinity()) {
++        // Pause animations with an 'infinite'
++        // animation-iteration-count.  (Should we consider forcing them
++        // to the beginning or end of an iteration?)
++        anim.mForcedPause = true;
++        anim.mPauseStart = now;
++        if (ea->mStyleRuleRefreshTime.IsNull() ||
++            ea->mStyleRuleRefreshTime != now) {
++          needsRestyle = true;
++        }
++      } else {
++        // Push animations that complete, but have not completed yet, to
++        // their completed state by adjusting their start time.
++        // FIXME: WRITE ME
++        // FIXME: set needsRestyle
++      }
++    }
++    if (needsRestyle) {
++      ea->PostRestyleForAnimation(mPresContext);
++    }
++  }
++}
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -124,16 +124,29 @@ public:
+    * Dispatch any pending events.  We accumulate animationend and
+    * animationiteration events only during refresh driver notifications
+    * (and dispatch them at the end of such notifications), but we
+    * accumulate animationstart events at other points when style
+    * contexts are created.
+    */
+   void DispatchEvents();
+ 
++  /**
++   * A hook for user interface (such as the stop button or escape key)
++   * that stops animations.
++   *
++   * This goes through all currently running animations, and:
++   *  + for those with a non-'infinite' animation-iteration-count,
++   *    advances them to their end time by moving their start time
++   *    backwards, and
++   *  + for those with an 'infinite' animation-iteration-count,
++   *    pauses them.
++   */
++  void StopAllAnimations();
++
+ private:
+   ElementAnimations* GetElementAnimations(mozilla::dom::Element *aElement,
+                                           nsCSSPseudoElements::Type aPseudoType,
+                                           PRBool aCreateIfNeeded);
+   void BuildAnimations(nsStyleContext* aStyleContext,
+                        InfallibleTArray<ElementAnimation>& aAnimations);
+   bool BuildSegment(InfallibleTArray<AnimationPropertySegment>& aSegments,
+                     nsCSSProperty aProperty, const nsAnimation& aAnimation,
