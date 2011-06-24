@@ -1,0 +1,731 @@
+From: Vitor Menezes <vmenezes@mozilla.com>
+
+Fix text-decoration positioning in quirks mode and set overflow areas to match.  (Bug 403524)  r=dbaron
+
+Change the quirks mode text-decoration code (soon to be used for all
+modes) to follow CSS 2.1's rules for positioning of decoration lines.
+Decorations are now drawn at a constant vertical position established by
+the element creating the decoration, and more than one of the same type
+(underline, overline, line-through) of decoration are supported on the
+same piece of text.
+
+This means that text-decorations can now significantly overflow a text
+frame, since the vertical-alignment of the element with text-decoration
+may be substantially different from the vertical alignment of the text.
+Set overflow areas for text frames with text decorations in
+nsLineLayout::RelativePositionFrames since it must happen *after*
+vertical alignment is done, and when relative positioning data are
+consistent (nsIFrame::GetRelativeOffset matches the offset that has been
+applied).
+
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -2593,17 +2593,22 @@ nsLineLayout::RelativePositionFrames(Per
+     nsOverflowAreas r;
+     if (pfd->mSpan) {
+       // Compute a new combined area for the child span before
+       // aggregating it into our combined area.
+       RelativePositionFrames(pfd->mSpan, r);
+     } else {
+       r = pfd->mOverflowAreas;
+       if (pfd->GetFlag(PFD_ISTEXTFRAME)) {
+-        if (pfd->GetFlag(PFD_RECOMPUTEOVERFLOW)) {
++        // We need to recompute overflow areas in two cases:
++        // (1) When PFD_RECOMPUTEOVERFLOW is set due to trimming
++        // (2) When there are text decorations, since we can't recompute the
++        //     overflow area until Reflow and VerticalAlignLine have finished
++        if (pfd->GetFlag(PFD_RECOMPUTEOVERFLOW) ||
++            frame->GetStyleContext()->HasTextDecorationLines()) {
+           nsTextFrame* f = static_cast<nsTextFrame*>(frame);
+           r = f->RecomputeOverflow();
+         }
+         frame->FinishAndStoreOverflow(r, frame->GetSize());
+       }
+ 
+       // If we have something that's not an inline but with a complex frame
+       // hierarchy inside that contains views, they need to be
+diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
+--- a/layout/generic/nsTextFrame.h
++++ b/layout/generic/nsTextFrame.h
+@@ -402,19 +402,20 @@ protected:
+   nscoord     mAscent;
+   gfxTextRun* mTextRun;
+ 
+   // The caller of this method must call DestroySelectionDetails() on the
+   // return value, if that return value is not null.  Calling
+   // DestroySelectionDetails() on a null value is still OK, just not necessary.
+   SelectionDetails* GetSelectionDetails();
+   
+-  void UnionTextDecorationOverflow(nsPresContext* aPresContext,
+-                                   PropertyProvider& aProvider,
+-                                   nsRect* aVisualOverflowRect);
++  void UnionAdditionalOverflow(nsPresContext* aPresContext,
++                               PropertyProvider& aProvider,
++                               nsRect* aVisualOverflowRect,
++                               bool aIncludeTextDecorations);
+ 
+   void DrawText(gfxContext* aCtx,
+                 const gfxPoint& aTextBaselinePt,
+                 PRUint32 aOffset,
+                 PRUint32 aLength,
+                 const gfxRect* aDirtyRect,
+                 PropertyProvider* aProvider,
+                 gfxFloat& aAdvanceWidth,
+@@ -425,50 +426,73 @@ protected:
+                       nsCSSShadowItem* aShadowDetails,
+                       PropertyProvider* aProvider,
+                       const nsRect& aDirtyRect,
+                       const gfxPoint& aFramePt,
+                       const gfxPoint& aTextBaselinePt,
+                       gfxContext* aCtx,
+                       const nscolor& aForegroundColor);
+ 
++  struct LineDecoration {
++    nsIFrame* mFrame;
++
++    // This is represents the offset from our baseline to mFrame's baseline;
++    // positive offsets are *above* the baseline and negative offsets below
++    nscoord mBaselineOffset;
++
++    nscolor mColor;
++    PRUint8 mStyle;
++
++    LineDecoration(nsIFrame *const aFrame,
++                   const nscoord aOff,
++                   const nscolor aColor,
++                   const PRUint8 aStyle)
++      : mFrame(aFrame),
++        mBaselineOffset(aOff),
++        mColor(aColor),
++        mStyle(aStyle)
++    {}
++
++    LineDecoration(const LineDecoration& aOther)
++      : mFrame(aOther.mFrame),
++        mBaselineOffset(aOther.mBaselineOffset),
++        mColor(aOther.mColor),
++        mStyle(aOther.mStyle)
++    {}
++
++    bool operator==(const LineDecoration& aOther) const {
++      return mFrame == aOther.mFrame &&
++             mStyle == aOther.mStyle &&
++             mColor == aOther.mColor &&
++             mBaselineOffset == aOther.mBaselineOffset;
++    }
++  };
++
+   struct TextDecorations {
+-    PRUint8 mDecorations;
+-    PRUint8 mOverStyle;
+-    PRUint8 mUnderStyle;
+-    PRUint8 mStrikeStyle;
+-    nscolor mOverColor;
+-    nscolor mUnderColor;
+-    nscolor mStrikeColor;
++    nsAutoTArray<LineDecoration, 1> mOverlines, mUnderlines, mStrikes;
+ 
+-    TextDecorations() :
+-      mDecorations(0), mOverStyle(NS_STYLE_TEXT_DECORATION_STYLE_SOLID),
+-      mUnderStyle(NS_STYLE_TEXT_DECORATION_STYLE_SOLID),
+-      mStrikeStyle(NS_STYLE_TEXT_DECORATION_STYLE_SOLID),
+-      mOverColor(NS_RGB(0, 0, 0)), mUnderColor(NS_RGB(0, 0, 0)),
+-      mStrikeColor(NS_RGB(0, 0, 0))
+-    { }
++    TextDecorations() { }
+ 
+-    PRBool HasDecorationlines() {
++    PRBool HasDecorationLines() const {
+       return HasUnderline() || HasOverline() || HasStrikeout();
+     }
+-    PRBool HasUnderline() {
+-      return (mDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) &&
+-             mUnderStyle != NS_STYLE_TEXT_DECORATION_STYLE_NONE;
++
++    PRBool HasUnderline() const {
++      return !mUnderlines.IsEmpty();
+     }
+-    PRBool HasOverline() {
+-      return (mDecorations & NS_STYLE_TEXT_DECORATION_LINE_OVERLINE) &&
+-             mOverStyle != NS_STYLE_TEXT_DECORATION_STYLE_NONE;
++    PRBool HasOverline() const {
++      return !mOverlines.IsEmpty();
+     }
+-    PRBool HasStrikeout() {
+-      return (mDecorations & NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH) &&
+-             mStrikeStyle != NS_STYLE_TEXT_DECORATION_STYLE_NONE;
++    PRBool HasStrikeout() const {
++      return !mStrikes.IsEmpty();
+     }
+   };
+-  TextDecorations GetTextDecorations(nsPresContext* aPresContext);
++
++  void GetTextDecorations(nsPresContext* aPresContext,
++                          TextDecorations& aDecorations);
+ 
+   // Set non empty rect to aRect, it should be overflow rect or frame rect.
+   // If the result rect is larger than the given rect, this returns PR_TRUE.
+   PRBool CombineSelectionUnderlineRect(nsPresContext* aPresContext,
+                                        nsRect& aRect);
+ 
+   PRBool IsFloatingFirstLetterChild();
+ 
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4295,92 +4295,95 @@ FillClippedRect(gfxContext* aCtx, nsPres
+   aCtx->NewPath();
+   // pixel-snap
+   aCtx->Rectangle(gfxRect(r.X() / app, r.Y() / app,
+                           r.Width() / app, r.Height() / app), PR_TRUE);
+   aCtx->SetColor(gfxRGBA(aColor));
+   aCtx->Fill();
+ }
+ 
+-nsTextFrame::TextDecorations
+-nsTextFrame::GetTextDecorations(nsPresContext* aPresContext)
+-{
+-  TextDecorations decorations;
+-
++void
++nsTextFrame::GetTextDecorations(nsPresContext* aPresContext,
++                                nsTextFrame::TextDecorations& aDecorations)
++{
+   // Quirks mode text decoration are rendered by children; see bug 1777
+   // In non-quirks mode, nsHTMLContainer::Paint and nsBlockFrame::Paint
+   // does the painting of text decorations.
+   // FIXME Bug 403524: We'd like to unify standards-mode and quirks-mode
+   // text-decoration drawing, using what's currently the quirks mode
+   // codepath.  But for now this code is only used for quirks mode.
+   const nsCompatibility compatMode = aPresContext->CompatibilityMode();
+   if (compatMode != eCompatibility_NavQuirks)
+-    return decorations;
++    return;
+ 
+   PRBool useOverride = PR_FALSE;
+   nscolor overrideColor;
+ 
+-  // A mask of all possible decorations.
+-  // FIXME: Per spec, we still need to draw all relevant decorations
+-  // from ancestors, not just the nearest one from each.
+-  PRUint8 decorMask = NS_STYLE_TEXT_DECORATION_LINE_LINES_MASK;
+-
+-  PRBool isChild; // ignored
+-  for (nsIFrame* f = this; decorMask && f;
+-       NS_SUCCEEDED(f->GetParentStyleContextFrame(aPresContext, &f, &isChild))
+-         || (f = nsnull)) {
+-    nsStyleContext* context = f->GetStyleContext();
++  // frameTopOffset represents the offset to f's top from our baseline in our
++  // coordinate space
++  // baselineOffset represents the offset from our baseline to f's baseline or
++  // the nearest block's baseline, in our coordinate space, whichever is closest
++  // during the particular iteration
++  nscoord frameTopOffset = mAscent,
++          baselineOffset = 0;
++
++  bool nearestBlockFound = false;
++
++  for (nsIFrame* f = this; f;
++       f = nsLayoutUtils::GetParentOrPlaceholderFor(
++             aPresContext->FrameManager(), f))
++  {
++    nsStyleContext *const context = f->GetStyleContext();
+     if (!context->HasTextDecorationLines()) {
+       break;
+     }
+-    const nsStyleTextReset* styleText = context->GetStyleTextReset();
+-    if (!useOverride && 
+-        (NS_STYLE_TEXT_DECORATION_LINE_OVERRIDE_ALL &
+-           styleText->mTextDecorationLine)) {
++
++    const nsStyleTextReset *const styleText = context->GetStyleTextReset();
++    const PRUint8 textDecorations = styleText->mTextDecorationLine;
++
++    if (!useOverride &&
++        (NS_STYLE_TEXT_DECORATION_LINE_OVERRIDE_ALL & textDecorations))
++    {
+       // This handles the <a href="blah.html"><font color="green">La 
+       // la la</font></a> case. The link underline should be green.
+       useOverride = PR_TRUE;
+       overrideColor = context->GetVisitedDependentColor(
+                                  eCSSProperty_text_decoration_color);
+     }
+ 
+-    // FIXME: see above (remove this check)
+-    PRUint8 useDecorations = decorMask & styleText->mTextDecorationLine;
+-    if (useDecorations) {// a decoration defined here
+-      nscolor color = context->GetVisitedDependentColor(
+-                                 eCSSProperty_text_decoration_color);
+-
+-      // FIXME: We also need to record the thickness and position
+-      // metrics appropriate to this element (at least in standards
+-      // mode).  This will require adjusting the visual overflow region
+-      // of this frame and maybe its ancestors.  The positions should
+-      // probably be relative to the line's baseline (when text
+-      // decorations are specified on inlines we should look for their
+-      // containing line; otherwise use the element's font); when
+-      // drawing it should always be relative to the line baseline.
+-      // This way we move the decorations for relative positioning.
+-      if (NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE & useDecorations) {
+-        decorations.mUnderColor = useOverride ? overrideColor : color;
+-        decorations.mUnderStyle = styleText->GetDecorationStyle();
+-        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE;
+-        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE;
++    nearestBlockFound = nearestBlockFound || nsLayoutUtils::GetAsBlock(f);
++    if (textDecorations) {
++      const nscolor color = useOverride ? overrideColor
++        : context->GetVisitedDependentColor(eCSSProperty_text_decoration_color);
++
++      // Not updating positions once we hit a parent block is equivalent to
++      // the CSS 2.1 spec that blocks should propagate decorations down to their
++      // children (albeit the style should be preserved)
++      if (!nearestBlockFound) {
++        baselineOffset = frameTopOffset - f->GetBaseline();
+       }
+-      if (NS_STYLE_TEXT_DECORATION_LINE_OVERLINE & useDecorations) {
+-        decorations.mOverColor = useOverride ? overrideColor : color;
+-        decorations.mOverStyle = styleText->GetDecorationStyle();
+-        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_OVERLINE;
+-        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_OVERLINE;
++
++      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) {
++        aDecorations.mUnderlines.AppendElement(
++          nsTextFrame::LineDecoration(f, baselineOffset,
++                                      color, styleText->GetDecorationStyle()));
+       }
+-      if (NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH & useDecorations) {
+-        decorations.mStrikeColor = useOverride ? overrideColor : color;
+-        decorations.mStrikeStyle = styleText->GetDecorationStyle();
+-        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH;
+-        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH;
++      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_OVERLINE) {
++        aDecorations.mOverlines.AppendElement(
++          nsTextFrame::LineDecoration(f, baselineOffset,
++                                      color, styleText->GetDecorationStyle()));
+       }
+-    }
++      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH) {
++        aDecorations.mStrikes.AppendElement(
++          nsTextFrame::LineDecoration(f, baselineOffset,
++                                      color, styleText->GetDecorationStyle()));
++      }
++    }
++
++    frameTopOffset += f->GetRect().Y() - f->GetRelativeOffset().y;
+ 
+     // In all modes, if we're on an inline-block or inline-table (or
+     // inline-stack, inline-box, inline-grid), we're done.
+     const nsStyleDisplay *disp = context->GetStyleDisplay();
+     if (disp->mDisplay != NS_STYLE_DISPLAY_INLINE &&
+         disp->IsInlineOutside()) {
+       break;
+     }
+@@ -4393,100 +4396,183 @@ nsTextFrame::GetTextDecorations(nsPresCo
+     } else {
+       // In standards/almost-standards mode, if we're on an
+       // absolutely-positioned element or a floating element, we're done.
+       if (disp->IsFloating() || disp->IsAbsolutelyPositioned()) {
+         break;
+       }
+     }
+   }
+-
+-  return decorations;
+ }
+ 
+ void
+-nsTextFrame::UnionTextDecorationOverflow(nsPresContext* aPresContext,
+-                                         PropertyProvider& aProvider,
+-                                         nsRect* aVisualOverflowRect)
++nsTextFrame::UnionAdditionalOverflow(nsPresContext* aPresContext,
++                                     PropertyProvider& aProvider,
++                                     nsRect* aVisualOverflowRect,
++                                     bool aIncludeTextDecorations)
+ {
+   // Text-shadow overflows
+   nsRect shadowRect =
+     nsLayoutUtils::GetTextShadowRectsUnion(*aVisualOverflowRect, this);
+   aVisualOverflowRect->UnionRect(*aVisualOverflowRect, shadowRect);
+ 
+   if (IsFloatingFirstLetterChild()) {
+     // The underline/overline drawable area must be contained in the overflow
+     // rect when this is in floating first letter frame at *both* modes.
+     nsFontMetrics* fm = aProvider.GetFontMetrics();
+     nscoord fontAscent = fm->MaxAscent();
+     nscoord fontHeight = fm->MaxHeight();
+     nsRect fontRect(0, mAscent - fontAscent, GetSize().width, fontHeight);
+     aVisualOverflowRect->UnionRect(*aVisualOverflowRect, fontRect);
+   }
+ 
++  if (aIncludeTextDecorations) {
++    // Since CSS 2.1 requires that text-decoration defined on ancestors maintain
++    // style and position, they can be drawn at virtually any y-offset, so
++    // maxima and minima are required to reliably generate the rectangle for
++    // them
++    TextDecorations textDecs;
++    GetTextDecorations(aPresContext, textDecs);
++    if (textDecs.HasDecorationLines()) {
++      const nscoord width = GetSize().width;
++      const gfxFloat appUnitsPerDevUnit = aPresContext->AppUnitsPerDevPixel(),
++                     gfxWidth = width / appUnitsPerDevUnit,
++                     ascent = gfxFloat(mAscent) / appUnitsPerDevUnit;
++      nscoord top(nscoord_MAX), bottom(nscoord_MIN);
++
++      // Below we loop through all text decorations and compute the rectangle
++      // containing all of them, in this frame's coordinate space
++      for (PRUint32 i = 0; i < textDecs.mUnderlines.Length(); ++i) {
++        const LineDecoration& dec = textDecs.mUnderlines[i];
++
++        const gfxFont::Metrics metrics =
++          GetFirstFontMetrics(GetFontGroupForFrame(dec.mFrame));
++
++        const nsRect decorationRect =
++          nsCSSRendering::GetTextDecorationRect(aPresContext,
++            gfxSize(gfxWidth, metrics.underlineSize),
++            ascent, metrics.underlineOffset,
++            NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE, dec.mStyle) +
++          nsPoint(0, -dec.mBaselineOffset);
++
++        top = NS_MIN(decorationRect.y, top);
++        bottom = NS_MAX(decorationRect.YMost(), bottom);
++      }
++      for (PRUint32 i = 0; i < textDecs.mOverlines.Length(); ++i) {
++        const LineDecoration& dec = textDecs.mOverlines[i];
++
++        const gfxFont::Metrics metrics =
++          GetFirstFontMetrics(GetFontGroupForFrame(dec.mFrame));
++
++        const nsRect decorationRect =
++          nsCSSRendering::GetTextDecorationRect(aPresContext,
++            gfxSize(gfxWidth, metrics.underlineSize),
++            ascent, metrics.maxAscent,
++            NS_STYLE_TEXT_DECORATION_LINE_OVERLINE, dec.mStyle) +
++          nsPoint(0, -dec.mBaselineOffset);
++
++        top = NS_MIN(decorationRect.y, top);
++        bottom = NS_MAX(decorationRect.YMost(), bottom);
++      }
++      for (PRUint32 i = 0; i < textDecs.mStrikes.Length(); ++i) {
++        const LineDecoration& dec = textDecs.mStrikes[i];
++
++        const gfxFont::Metrics metrics =
++          GetFirstFontMetrics(GetFontGroupForFrame(dec.mFrame));
++
++        const nsRect decorationRect =
++          nsCSSRendering::GetTextDecorationRect(aPresContext,
++            gfxSize(gfxWidth, metrics.strikeoutSize),
++            ascent, metrics.strikeoutOffset,
++            NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH, dec.mStyle) +
++          nsPoint(0, -dec.mBaselineOffset);
++
++        top = NS_MIN(decorationRect.y, top);
++        bottom = NS_MAX(decorationRect.YMost(), bottom);
++      }
++
++      aVisualOverflowRect->UnionRect(*aVisualOverflowRect,
++                                     nsRect(0, top, width, bottom - top));
++    }
++  }
++
+   // When this frame is not selected, the text-decoration area must be in
+   // frame bounds.
+-  nsRect decorationRect;
+   if (!(GetStateBits() & NS_FRAME_SELECTED_CONTENT) ||
+       !CombineSelectionUnderlineRect(aPresContext, *aVisualOverflowRect))
+     return;
+   AddStateBits(TEXT_SELECTION_UNDERLINE_OVERFLOWED);
+ }
+ 
+ void 
+ nsTextFrame::PaintTextDecorations(gfxContext* aCtx, const gfxRect& aDirtyRect,
+                                   const gfxPoint& aFramePt,
+                                   const gfxPoint& aTextBaselinePt,
+                                   nsTextPaintStyle& aTextPaintStyle,
+                                   PropertyProvider& aProvider,
+                                   const nscolor* aOverrideColor)
+ {
+-  TextDecorations decorations =
+-    GetTextDecorations(aTextPaintStyle.PresContext());
+-  if (!decorations.HasDecorationlines())
++  TextDecorations decorations;
++  GetTextDecorations(aTextPaintStyle.PresContext(), decorations);
++
++  if (!decorations.HasDecorationLines())
+     return;
+ 
+   // Hide text decorations if we're currently hiding @font-face fallback text
+   if (aProvider.GetFontGroup()->ShouldSkipDrawing())
+     return;
+ 
+-  gfxFont* firstFont = aProvider.GetFontGroup()->GetFontAt(0);
+-  if (!firstFont)
+-    return; // OOM
+-  const gfxFont::Metrics& fontMetrics = firstFont->GetMetrics();
+-  gfxFloat app = aTextPaintStyle.PresContext()->AppUnitsPerDevPixel();
++  const gfxFloat app = aTextPaintStyle.PresContext()->AppUnitsPerDevPixel();
+ 
+   // XXX aFramePt is in AppUnits, shouldn't it be nsFloatPoint?
+-  gfxPoint pt(aFramePt.x / app, (aTextBaselinePt.y - mAscent) / app);
++  gfxPoint pt(aFramePt.x / app, 0);
+   gfxSize size(GetRect().width / app, 0);
+-  gfxFloat ascent = gfxFloat(mAscent) / app;
++  const gfxFloat ascent = gfxFloat(mAscent) / app;
++  const nscoord baseline = aTextBaselinePt.y - mAscent;
+ 
+   nscolor lineColor;
+-  if (decorations.HasOverline()) {
+-    lineColor = aOverrideColor ? *aOverrideColor : decorations.mOverColor;
+-    size.height = fontMetrics.underlineSize;
+-    nsCSSRendering::PaintDecorationLine(
+-      aCtx, lineColor, pt, size, ascent, fontMetrics.maxAscent,
+-      NS_STYLE_TEXT_DECORATION_LINE_OVERLINE, decorations.mOverStyle);
+-  }
+-  if (decorations.HasUnderline()) {
+-    lineColor = aOverrideColor ? *aOverrideColor : decorations.mUnderColor;
+-    size.height = fontMetrics.underlineSize;
+-    gfxFloat offset = aProvider.GetFontGroup()->GetUnderlineOffset();
+-    nsCSSRendering::PaintDecorationLine(
+-      aCtx, lineColor, pt, size, ascent, offset,
+-      NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE, decorations.mUnderStyle);
+-  }
+-  if (decorations.HasStrikeout()) {
+-    lineColor = aOverrideColor ? *aOverrideColor : decorations.mStrikeColor;
+-    size.height = fontMetrics.strikeoutSize;
+-    gfxFloat offset = fontMetrics.strikeoutOffset;
+-    nsCSSRendering::PaintDecorationLine(
+-      aCtx, lineColor, pt, size, ascent, offset,
+-      NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH, decorations.mStrikeStyle);
++  for (PRUint32 i = decorations.mUnderlines.Length(); i-- > 0; ) {
++    const LineDecoration& dec = decorations.mUnderlines[i];
++    gfxFontGroup* fontGroup = GetFontGroupForFrame(dec.mFrame);
++    const gfxFont::Metrics metrics = GetFirstFontMetrics(fontGroup);
++
++    size.height = metrics.underlineSize;
++    pt.y = (baseline - dec.mBaselineOffset) / app;
++
++    lineColor = aOverrideColor ? *aOverrideColor : dec.mColor;
++    nsCSSRendering::PaintDecorationLine(aCtx, lineColor, pt, size, ascent,
++      fontGroup->GetUnderlineOffset(), NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE,
++      dec.mStyle);
++  }
++  for (PRUint32 i = decorations.mOverlines.Length(); i-- > 0; ) {
++    const LineDecoration& dec = decorations.mOverlines[i];
++
++    const gfxFont::Metrics metrics =
++      GetFirstFontMetrics(GetFontGroupForFrame(dec.mFrame));
++
++    size.height = metrics.underlineSize;
++    pt.y = (baseline - dec.mBaselineOffset) / app;
++
++    lineColor = aOverrideColor ? *aOverrideColor : dec.mColor;
++    nsCSSRendering::PaintDecorationLine(aCtx, lineColor, pt, size, ascent,
++      metrics.maxAscent, NS_STYLE_TEXT_DECORATION_LINE_OVERLINE, dec.mStyle);
++  }
++  for (PRUint32 i = decorations.mStrikes.Length(); i-- > 0; ) {
++    const LineDecoration& dec = decorations.mStrikes[i];
++
++    const gfxFont::Metrics metrics =
++      GetFirstFontMetrics(GetFontGroupForFrame(dec.mFrame));
++
++    size.height = metrics.strikeoutSize;
++    pt.y = (baseline - dec.mBaselineOffset) / app;
++
++    lineColor = aOverrideColor ? *aOverrideColor : dec.mColor;
++    nsCSSRendering::PaintDecorationLine(aCtx, lineColor, pt, size, ascent,
++      metrics.strikeoutOffset, NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH,
++      dec.mStyle);
+   }
+ }
+ 
+ static gfxFloat
+ ComputeDescentLimitForSelectionUnderline(nsPresContext* aPresContext,
+                                          nsTextFrame* aFrame,
+                                          const gfxFont::Metrics& aFontMetrics)
+ {
+@@ -6984,17 +7070,21 @@ nsTextFrame::ReflowText(nsLineLayout& aL
+ 
+   mAscent = aMetrics.ascent;
+ 
+   // Handle text that runs outside its normal bounds.
+   nsRect boundingBox = RoundOut(textMetrics.mBoundingBox) + nsPoint(0, mAscent);
+   aMetrics.SetOverflowAreasToDesiredBounds();
+   aMetrics.VisualOverflow().UnionRect(aMetrics.VisualOverflow(), boundingBox);
+ 
+-  UnionTextDecorationOverflow(presContext, provider, &aMetrics.VisualOverflow());
++  // When we have text decorations, we don't need to compute their overflow now
++  // because we're guaranteed to do it later
++  // (see nsLineLayout::RelativePositionFrames)
++  UnionAdditionalOverflow(presContext, provider, &aMetrics.VisualOverflow(),
++                          false);
+ 
+   /////////////////////////////////////////////////////////////////////
+   // Clean up, update state
+   /////////////////////////////////////////////////////////////////////
+ 
+   // If all our characters are discarded or collapsed, then trimmable width
+   // from the last textframe should be preserved. Otherwise the trimmable width
+   // from this textframe overrides. (Currently in CSS trimmable width can be
+@@ -7244,17 +7334,17 @@ nsTextFrame::RecomputeOverflow()
+     mTextRun->MeasureText(provider.GetStart().GetSkippedOffset(),
+                           ComputeTransformedLength(provider),
+                           gfxFont::LOOSE_INK_EXTENTS, nsnull,
+                           &provider);
+ 
+   nsRect &vis = result.VisualOverflow();
+   vis.UnionRect(vis, RoundOut(textMetrics.mBoundingBox) + nsPoint(0, mAscent));
+ 
+-  UnionTextDecorationOverflow(PresContext(), provider, &vis);
++  UnionAdditionalOverflow(PresContext(), provider, &vis, true);
+ 
+   return result;
+ }
+ 
+ static PRUnichar TransformChar(const nsStyleText* aStyle, gfxTextRun* aTextRun,
+                                PRUint32 aSkippedOffset, PRUnichar aChar)
+ {
+   if (aChar == '\n') {
+diff --git a/layout/reftests/text-decoration/decoration-css21-ref.html b/layout/reftests/text-decoration/decoration-css21-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text-decoration/decoration-css21-ref.html
+@@ -0,0 +1,28 @@
++<html>
++	<head>
++		<style>
++			body {line-height: 3;}
++			.transparent {color: transparent;}
++			.alllines {text-decoration:line-through overline underline; color: purple;}
++			.highRel {position: relative; top: -4em;}
++			.lowRel {position: relative; top: 4em;}
++			.lowVert {vertical-align: -4em;}
++			.highVert {vertical-align: 4em;}
++		</style>
++	</head>
++	<body>
++		<p>
++			<span style="text-decoration: underline">Underlined <span class="transparent">still underlined</span></span>
++			<span style="text-decoration: underline">Underlined <span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></span>
++		</p>
++		<p>
++			<span class="alllines">
++				Before<span class="transparent">highlow</span>After</span>
++			</span>
++			<span class="highVert transparent">Offset</span><span class="lowVert transparent">text</span>
++		</p>
++		<p>
++			<span class="alllines">Before</span><span class="highRel alllines">high</span><span class="lowRel alllines">low</span><span class="alllines">After</span>
++		</p>
++	</body>
++</html>
+diff --git a/layout/reftests/text-decoration/decoration-css21.html b/layout/reftests/text-decoration/decoration-css21.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text-decoration/decoration-css21.html
+@@ -0,0 +1,30 @@
++<html>
++	<head>
++		<style>
++			body {line-height: 3;}
++			.sup {line-height: 1;}
++			.transparent {color: transparent;}
++			.alllines {text-decoration:line-through overline underline; color: purple;}
++			.highRel {position: relative; top: -4em;}
++			.lowRel {position: relative; top: 4em;}
++			.lowVert {vertical-align: -4em;}
++			.highVert {vertical-align: 4em;}
++		</style>
++	</head>
++	<body>
++		<p>
++			<span style="text-decoration: underline">Underlined <span class="sup transparent">still underlined</span></span>
++			<span style="text-decoration: underline">Underlined <span class="sup">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></span>
++		</p>
++		<p>
++			<span class="alllines">
++				Before<span class="highVert transparent">high</span><span class="lowVert transparent">low</span>After
++			</span>
++		</p>
++		<p>
++			<span class="alllines">
++				Before<span class="highRel">high</span><span class="lowRel">low</span>After</span>
++			</span>
++		</p>
++	</body>
++</html>
+diff --git a/layout/reftests/text-decoration/decoration-style-quirks-ref.html b/layout/reftests/text-decoration/decoration-style-quirks-ref.html
+--- a/layout/reftests/text-decoration/decoration-style-quirks-ref.html
++++ b/layout/reftests/text-decoration/decoration-style-quirks-ref.html
+@@ -15,31 +15,31 @@
+                -moz-text-decoration-style: dashed;">
+     here has inherited decoration lines</span>,
+   and here has no decoration lines.
+ </p>
+ <p>
+   <span style="text-decoration: underline line-through overline;
+                -moz-text-decoration-style: dotted;">
+     Here has dotted decoration lines,
+-  </span><span style="font-size: 2em;
+-                      text-decoration: underline line-through overline;
+-                      -moz-text-decoration-style: wavy;">
++  </span><span style="text-decoration: underline line-through overline;
++					  -moz-text-decoration-style: dotted">
++   <span style="font-size: 2em;
++                text-decoration: underline line-through overline;
++                -moz-text-decoration-style: wavy;">
+     here has wavy decoration
+-    lines</span><span style="text-decoration: underline line-through overline;
++    lines</span></span><span style="text-decoration: underline line-through overline;
+                              -moz-text-decoration-style: dotted;">,
+     and here has dotted decoration lines.</span>
+ </p>
+ <p>
+   <span style="text-decoration: underline line-through overline;
+                -moz-text-decoration-style: double;">
+     Here has double decoration lines,
+-  </span><span style="font-size: 2em;
+-                      text-decoration: underline line-through overline;
+-                      -moz-text-decoration-style: double;">
++  <span style="font-size: 2em;">
+     here is specified as dashed decoration lines but should be
+     ignored</span><span style="text-decoration: underline line-through overline;
+                                -moz-text-decoration-style: double;">,
+     and here has double decoration lines.</span>
+ </p>
+ <p>
+   Here is specified the decoration style as -moz-none.
+ </p>
+diff --git a/layout/reftests/text-decoration/reftest.list b/layout/reftests/text-decoration/reftest.list
+--- a/layout/reftests/text-decoration/reftest.list
++++ b/layout/reftests/text-decoration/reftest.list
+@@ -84,8 +84,9 @@ fails == underline-block-propagation-sta
+ fails-if(Android) fails-if(d2d) == underline-block-propagation-2-standards.html underline-block-propagation-2-standards-ref.html # bug 585684
+ == text-decoration-zorder-1-standards.html text-decoration-zorder-1-ref.html
+ fails == text-decoration-zorder-1-quirks.html text-decoration-zorder-1-ref.html # bug 403524
+ == table-quirk-1.html table-quirk-1-ref.html
+ == table-quirk-2.html table-quirk-2-ref.html
+ == text-decoration-propagation-1-quirks.html text-decoration-propagation-1-quirks-ref.html
+ fails == text-decoration-propagation-1-standards.html text-decoration-propagation-1-standards-ref.html
+ == 641444-1.html 641444-1-ref.html
++== decoration-css21.html decoration-css21-ref.html # bug 403524
+diff --git a/layout/style/ua.css b/layout/style/ua.css
+--- a/layout/style/ua.css
++++ b/layout/style/ua.css
+@@ -127,16 +127,17 @@
+ *|*::-moz-anonymous-block, *|*::-moz-anonymous-positioned-block {
+   /* we currently inherit from the inline that is split */
+   outline: inherit;
+   outline-offset: inherit;
+   clip-path: inherit;
+   filter: inherit;
+   mask: inherit;
+   opacity: inherit;
++  text-decoration: inherit;
+   -moz-box-ordinal-group: inherit !important;
+ }
+ 
+ *|*::-moz-xul-anonymous-block {
+   display: block ! important;
+   position: static ! important;
+   float: none ! important;
+   -moz-box-ordinal-group: inherit !important;
