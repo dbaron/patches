@@ -18,10 +18,69 @@ vertical alignment is done, and when relative positioning data are
 consistent (nsIFrame::GetRelativeOffset matches the offset that has been
 applied).
 
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -891,16 +891,18 @@ public:
+   NS_DECLARE_FRAME_PROPERTY(PreTransformBBoxProperty, DestroyRect)
+ 
+   NS_DECLARE_FRAME_PROPERTY(UsedMarginProperty, DestroyMargin)
+   NS_DECLARE_FRAME_PROPERTY(UsedPaddingProperty, DestroyMargin)
+   NS_DECLARE_FRAME_PROPERTY(UsedBorderProperty, DestroyMargin)
+ 
+   NS_DECLARE_FRAME_PROPERTY(ScrollLayerCount, nsnull)
+ 
++  NS_DECLARE_FRAME_PROPERTY(LineBaselineOffset, nsnull)
++
+   /**
+    * Return the distance between the border edge of the frame and the
+    * margin edge of the frame.  Like GetRect(), returns the dimensions
+    * as of the most recent reflow.
+    *
+    * This doesn't include any margin collapsing that may have occurred.
+    *
+    * It also treats 'auto' margins as zero, and treats any margins that
 diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
 --- a/layout/generic/nsLineLayout.cpp
 +++ b/layout/generic/nsLineLayout.cpp
-@@ -2594,17 +2594,22 @@ nsLineLayout::RelativePositionFrames(Per
+@@ -1475,16 +1475,36 @@ nsLineLayout::VerticalAlignLine()
+   for (PerFrameData* pfd = psd->mFirstFrame; pfd; pfd = pfd->mNext) {
+     if (pfd->mVerticalAlign == VALIGN_OTHER) {
+       pfd->mBounds.y += baselineY;
+       pfd->mFrame->SetRect(pfd->mBounds);
+     }
+   }
+   PlaceTopBottomFrames(psd, -mTopEdge, lineHeight);
+ 
++  // If the frame being reflowed has text decorations, we simulate the
++  // propagation of those decorations to a line-level element by storing the
++  // offset in a frame property on any child frames that are vertically-aligned
++  // somewhere other than the baseline. This property is then used by
++  // nsTextFrame::GetTextDecorations when the same conditions are met.
++  if (rootPFD.mFrame->GetStyleContext()->HasTextDecorationLines()) {
++    for (const PerFrameData* pfd = psd->mFirstFrame; pfd; pfd = pfd->mNext) {
++      const nsIFrame *const f = pfd->mFrame;
++      const nsStyleCoord& vAlign =
++          f->GetStyleContext()->GetStyleTextReset()->mVerticalAlign;
++
++      if (vAlign.GetUnit() != eStyleUnit_Enumerated ||
++          vAlign.GetIntValue() != NS_STYLE_VERTICAL_ALIGN_BASELINE) {
++        const nscoord offset = baselineY - (pfd->mBounds.y);
++        f->Properties().Set(nsIFrame::LineBaselineOffset(),
++                            NS_INT32_TO_PTR(offset));
++      }
++    }
++  }
++
+   // Fill in returned line-box and max-element-width data
+   mLineBox->mBounds.x = psd->mLeftEdge;
+   mLineBox->mBounds.y = mTopEdge;
+   mLineBox->mBounds.width = psd->mX - psd->mLeftEdge;
+   mLineBox->mBounds.height = lineHeight;
+   mFinalLineHeight = lineHeight;
+   mLineBox->SetAscent(baselineY - mTopEdge);
+ #ifdef NOISY_VERTICAL_ALIGN
+@@ -2594,17 +2614,22 @@ nsLineLayout::RelativePositionFrames(Per
      nsOverflowAreas r;
      if (pfd->mSpan) {
        // Compute a new combined area for the child span before
@@ -48,7 +107,8 @@ diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
 diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
 --- a/layout/generic/nsTextFrame.h
 +++ b/layout/generic/nsTextFrame.h
-@@ -435,19 +435,20 @@ protected:
+@@ -434,20 +434,21 @@ protected:
+   PRInt32     mContentLengthHint;
    nscoord     mAscent;
    gfxTextRun* mTextRun;
  
@@ -56,10 +116,11 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
    // return value, if that return value is not null.  Calling
    // DestroySelectionDetails() on a null value is still OK, just not necessary.
    SelectionDetails* GetSelectionDetails();
-   
+-  
 -  void UnionTextDecorationOverflow(nsPresContext* aPresContext,
 -                                   PropertyProvider& aProvider,
 -                                   nsRect* aVisualOverflowRect);
++
 +  void UnionAdditionalOverflow(nsPresContext* aPresContext,
 +                               PropertyProvider& aProvider,
 +                               nsRect* aVisualOverflowRect,
@@ -72,7 +133,7 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
                  const gfxRect* aDirtyRect,
                  PropertyProvider* aProvider,
                  gfxFloat& aAdvanceWidth,
-@@ -460,50 +461,73 @@ protected:
+@@ -460,50 +461,70 @@ protected:
                        const nsRect& aDirtyRect,
                        const gfxPoint& aFramePt,
                        const gfxPoint& aTextBaselinePt,
@@ -115,7 +176,6 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
 +             mBaselineOffset == aOther.mBaselineOffset;
 +    }
 +  };
-+
    struct TextDecorations {
 -    PRUint8 mDecorations;
 -    PRUint8 mOverStyle;
@@ -142,7 +202,6 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
 -    PRBool HasUnderline() {
 -      return (mDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) &&
 -             mUnderStyle != NS_STYLE_TEXT_DECORATION_STYLE_NONE;
-+
 +    PRBool HasUnderline() const {
 +      return !mUnderlines.IsEmpty();
      }
@@ -160,7 +219,6 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
      }
    };
 -  TextDecorations GetTextDecorations(nsPresContext* aPresContext);
-+
 +  void GetTextDecorations(nsPresContext* aPresContext,
 +                          TextDecorations& aDecorations);
  
@@ -174,7 +232,7 @@ diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
 diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
 --- a/layout/generic/nsTextFrameThebes.cpp
 +++ b/layout/generic/nsTextFrameThebes.cpp
-@@ -4255,92 +4255,95 @@ FillClippedRect(gfxContext* aCtx, nsPres
+@@ -4255,90 +4255,107 @@ FillClippedRect(gfxContext* aCtx, nsPres
    aCtx->NewPath();
    // pixel-snap
    aCtx->Rectangle(gfxRect(r.X() / app, r.Y() / app,
@@ -226,10 +284,7 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
 +
 +  bool nearestBlockFound = false;
 +
-+  for (nsIFrame* f = this; f;
-+       f = nsLayoutUtils::GetParentOrPlaceholderFor(
-+             aPresContext->FrameManager(), f))
-+  {
++  for (nsIFrame* f = this, *fParent; f; f = fParent) {
 +    nsStyleContext *const context = f->GetStyleContext();
      if (!context->HasTextDecorationLines()) {
        break;
@@ -272,56 +327,70 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
 -        decorations.mUnderStyle = styleText->GetDecorationStyle();
 -        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE;
 -        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE;
-+    nearestBlockFound = nearestBlockFound || nsLayoutUtils::GetAsBlock(f);
-+    if (textDecorations) {
++    fParent = nsLayoutUtils::GetParentOrPlaceholderFor(
++                aPresContext->FrameManager(), f);
++    const bool firstBlock = !nearestBlockFound &&
++                            nsLayoutUtils::GetAsBlock(fParent);
++
++    // Not updating positions once we hit a parent block is equivalent to
++    // the CSS 2.1 spec that blocks should propagate decorations down to their
++    // children (albeit the style should be preserved)
++    // However, if we're vertically aligned within a block, then we need to
++    // recover the right baseline from the line by querying the FrameProperty
++    // that should be set (see nsLineLayout::VerticalAlignLine).
++    if (firstBlock &&
++        (styleText->mVerticalAlign.GetUnit() != eStyleUnit_Enumerated ||
++         styleText->mVerticalAlign.GetIntValue() !=
++           NS_STYLE_VERTICAL_ALIGN_BASELINE)) {
++      baselineOffset = frameTopOffset -
++        NS_PTR_TO_INT32(f->Properties().Get(nsIFrame::LineBaselineOffset()));
++    }
++    else if (!nearestBlockFound) {
++      baselineOffset = frameTopOffset - f->GetBaseline();
++    }
++
++    nearestBlockFound = nearestBlockFound || firstBlock;
++    frameTopOffset += f->GetRect().Y() - f->GetRelativeOffset().y;
++
++    const PRUint8 style = styleText->GetDecorationStyle();
++    // Accumulate only elements that have decorations with a genuine style
++    if (textDecorations && style != NS_STYLE_TEXT_DECORATION_STYLE_NONE) {
 +      const nscolor color = useOverride ? overrideColor
 +        : context->GetVisitedDependentColor(eCSSProperty_text_decoration_color);
 +
-+      // Not updating positions once we hit a parent block is equivalent to
-+      // the CSS 2.1 spec that blocks should propagate decorations down to their
-+      // children (albeit the style should be preserved)
-+      if (!nearestBlockFound) {
-+        baselineOffset = frameTopOffset - f->GetBaseline();
++      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) {
++        aDecorations.mUnderlines.AppendElement(
++          nsTextFrame::LineDecoration(f, baselineOffset, color,
++                                      style));
        }
 -      if (NS_STYLE_TEXT_DECORATION_LINE_OVERLINE & useDecorations) {
 -        decorations.mOverColor = useOverride ? overrideColor : color;
 -        decorations.mOverStyle = styleText->GetDecorationStyle();
 -        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_OVERLINE;
 -        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_OVERLINE;
-+
-+      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) {
-+        aDecorations.mUnderlines.AppendElement(
-+          nsTextFrame::LineDecoration(f, baselineOffset,
-+                                      color, styleText->GetDecorationStyle()));
++      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_OVERLINE) {
++        aDecorations.mOverlines.AppendElement(
++          nsTextFrame::LineDecoration(f, baselineOffset, color,
++                                      style));
        }
 -      if (NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH & useDecorations) {
 -        decorations.mStrikeColor = useOverride ? overrideColor : color;
 -        decorations.mStrikeStyle = styleText->GetDecorationStyle();
 -        decorMask &= ~NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH;
 -        decorations.mDecorations |= NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH;
-+      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_OVERLINE) {
-+        aDecorations.mOverlines.AppendElement(
-+          nsTextFrame::LineDecoration(f, baselineOffset,
-+                                      color, styleText->GetDecorationStyle()));
-       }
--    }
 +      if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH) {
 +        aDecorations.mStrikes.AppendElement(
-+          nsTextFrame::LineDecoration(f, baselineOffset,
-+                                      color, styleText->GetDecorationStyle()));
-+      }
-+    }
-+
-+    frameTopOffset += f->GetRect().Y() - f->GetRelativeOffset().y;
++          nsTextFrame::LineDecoration(f, baselineOffset, color,
++                                      style));
+       }
+     }
  
      // In all modes, if we're on an inline-block or inline-table (or
      // inline-stack, inline-box, inline-grid), we're done.
      const nsStyleDisplay *disp = context->GetStyleDisplay();
      if (disp->mDisplay != NS_STYLE_DISPLAY_INLINE &&
          disp->IsInlineOutside()) {
-       break;
-     }
-@@ -4353,105 +4356,188 @@ nsTextFrame::GetTextDecorations(nsPresCo
+@@ -4353,105 +4370,184 @@ nsTextFrame::GetTextDecorations(nsPresCo
      } else {
        // In standards/almost-standards mode, if we're on an
        // absolutely-positioned element or a floating element, we're done.
@@ -357,7 +426,7 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
      nsRect fontRect(0, mAscent - fontAscent, GetSize().width, fontHeight);
      aVisualOverflowRect->UnionRect(*aVisualOverflowRect, fontRect);
    }
- 
+-
 +  if (aIncludeTextDecorations) {
 +    // Since CSS 2.1 requires that text-decoration defined on ancestors maintain
 +    // style and position, they can be drawn at virtually any y-offset, so
@@ -371,7 +440,6 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
 +                     gfxWidth = width / appUnitsPerDevUnit,
 +                     ascent = gfxFloat(mAscent) / appUnitsPerDevUnit;
 +      nscoord top(nscoord_MAX), bottom(nscoord_MIN);
-+
 +      // Below we loop through all text decorations and compute the rectangle
 +      // containing all of them, in this frame's coordinate space
 +      for (PRUint32 i = 0; i < textDecs.mUnderlines.Length(); ++i) {
@@ -418,7 +486,6 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
 +            ascent, metrics.strikeoutOffset,
 +            NS_STYLE_TEXT_DECORATION_LINE_LINE_THROUGH, dec.mStyle) +
 +          nsPoint(0, -dec.mBaselineOffset);
-+
 +        top = NS_MIN(decorationRect.y, top);
 +        bottom = NS_MAX(decorationRect.YMost(), bottom);
 +      }
@@ -427,7 +494,6 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
 +                                     nsRect(0, top, width, bottom - top));
 +    }
 +  }
-+
    // When this frame is not selected, the text-decoration area must be in
    // frame bounds.
 -  nsRect decorationRect;
@@ -548,7 +614,7 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
                                           nsTextFrame* aFrame,
                                           const gfxFont::Metrics& aFontMetrics)
  {
-@@ -7089,17 +7175,21 @@ nsTextFrame::ReflowText(nsLineLayout& aL
+@@ -7089,17 +7185,21 @@ nsTextFrame::ReflowText(nsLineLayout& aL
  
    mAscent = aMetrics.ascent;
  
@@ -571,34 +637,84 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
    // If all our characters are discarded or collapsed, then trimmable width
    // from the last textframe should be preserved. Otherwise the trimmable width
    // from this textframe overrides. (Currently in CSS trimmable width can be
-@@ -7347,17 +7437,17 @@ nsTextFrame::RecomputeOverflow()
+@@ -7343,25 +7443,21 @@ nsTextFrame::RecomputeOverflow()
+   PropertyProvider provider(this, iter);
+   provider.InitializeForDisplay(PR_TRUE);
+ 
+   gfxTextRun::Metrics textMetrics =
      mTextRun->MeasureText(provider.GetStart().GetSkippedOffset(),
                            ComputeTransformedLength(provider),
                            gfxFont::LOOSE_INK_EXTENTS, nsnull,
                            &provider);
- 
+-
    nsRect &vis = result.VisualOverflow();
    vis.UnionRect(vis, RoundOut(textMetrics.mBoundingBox) + nsPoint(0, mAscent));
- 
+-
 -  UnionTextDecorationOverflow(PresContext(), provider, &vis);
+-
 +  UnionAdditionalOverflow(PresContext(), provider, &vis, true);
- 
    return result;
  }
- 
+-
  static PRUnichar TransformChar(const nsStyleText* aStyle, gfxTextRun* aTextRun,
                                 PRUint32 aSkippedOffset, PRUnichar aChar)
  {
    if (aChar == '\n') {
+     return aStyle->NewlineIsSignificant() ? aChar : ' ';
+   }
+   switch (aStyle->mTextTransform) {
+   case NS_STYLE_TEXT_TRANSFORM_LOWERCASE:
+diff --git a/layout/reftests/text-decoration/decoration-css21-block-ref.html b/layout/reftests/text-decoration/decoration-css21-block-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text-decoration/decoration-css21-block-ref.html
+@@ -0,0 +1,16 @@
++<html>
++	<head>
++		<style>
++			.high {vertical-align: 5em;}
++			.invisible {color: transparent;}
++		</style>
++	</head>
++	<body>
++		<div>
++			<span style="text-decoration: underline;">
++				underline<span class="invisible">continued<span class="invisible">continued</span></span></span>
++			<span class="invisible high">offset<span class="invisible high">offset</span></span>
++		</div>
++		<span style="text-decoration: underline;">also underlined</span>
++	</body>
++</html>
+\ No newline at end of file
+diff --git a/layout/reftests/text-decoration/decoration-css21-block.html b/layout/reftests/text-decoration/decoration-css21-block.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text-decoration/decoration-css21-block.html
+@@ -0,0 +1,14 @@
++<html>
++	<head>
++		<style>
++			.high {vertical-align: 5em;}
++			.invisible {color: transparent;}
++		</style>
++	</head>
++	<body>
++		<div style="text-decoration: underline;">
++			underline<span class="invisible high">continued<span class="invisible high">continued</span></span><br>
++			also underlined
++		</div>
++	</body>
++</html>
+\ No newline at end of file
 diff --git a/layout/reftests/text-decoration/decoration-css21-ref.html b/layout/reftests/text-decoration/decoration-css21-ref.html
 new file mode 100644
 --- /dev/null
 +++ b/layout/reftests/text-decoration/decoration-css21-ref.html
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,29 @@
 +<html>
 +	<head>
 +		<style>
-+			body {line-height: 3;}
++			.sup {vertical-align: super;}
 +			.transparent {color: transparent;}
 +			.alllines {text-decoration:line-through overline underline; color: purple;}
 +			.highRel {position: relative; top: -4em;}
@@ -611,6 +727,7 @@ new file mode 100644
 +		<p>
 +			<span style="text-decoration: underline">Underlined <span class="transparent">still underlined</span></span>
 +			<span style="text-decoration: underline">Underlined <span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></span>
++			<span class="sup transparent">Offset</span>
 +		</p>
 +		<p>
 +			<span class="alllines">
@@ -627,12 +744,11 @@ diff --git a/layout/reftests/text-decoration/decoration-css21.html b/layout/reft
 new file mode 100644
 --- /dev/null
 +++ b/layout/reftests/text-decoration/decoration-css21.html
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,29 @@
 +<html>
 +	<head>
 +		<style>
-+			body {line-height: 3;}
-+			.sup {line-height: 1; vertical-align: super; }
++			.sup {vertical-align: super;}
 +			.transparent {color: transparent;}
 +			.alllines {text-decoration:line-through overline underline; color: purple;}
 +			.highRel {position: relative; top: -4em;}
@@ -661,7 +777,7 @@ new file mode 100644
 diff --git a/layout/reftests/text-decoration/decoration-style-quirks-ref.html b/layout/reftests/text-decoration/decoration-style-quirks-ref.html
 --- a/layout/reftests/text-decoration/decoration-style-quirks-ref.html
 +++ b/layout/reftests/text-decoration/decoration-style-quirks-ref.html
-@@ -15,31 +15,31 @@
+@@ -15,35 +15,35 @@
                 -moz-text-decoration-style: dashed;">
      here has inherited decoration lines</span>,
    and here has no decoration lines.
@@ -695,15 +811,20 @@ diff --git a/layout/reftests/text-decoration/decoration-style-quirks-ref.html b/
      here is specified as dashed decoration lines but should be
      ignored</span><span style="text-decoration: underline line-through overline;
                                 -moz-text-decoration-style: double;">,
-     and here has double decoration lines.</span>
+-    and here has double decoration lines.</span>
++    and here has double decoration lines.</span></span>
  </p>
  <p>
    Here is specified the decoration style as -moz-none.
  </p>
+ <p style="text-decoration: underline line-through overline;">
+   Here has solid decoration lines even if its style is specified as dotted
+   before text-decoration.
+ </p>
 diff --git a/layout/reftests/text-decoration/reftest.list b/layout/reftests/text-decoration/reftest.list
 --- a/layout/reftests/text-decoration/reftest.list
 +++ b/layout/reftests/text-decoration/reftest.list
-@@ -84,8 +84,9 @@ fails == underline-block-propagation-sta
+@@ -84,8 +84,10 @@ fails == underline-block-propagation-sta
  fails-if(Android) fails-if(d2d) == underline-block-propagation-2-standards.html underline-block-propagation-2-standards-ref.html # bug 585684
  == text-decoration-zorder-1-standards.html text-decoration-zorder-1-ref.html
  fails == text-decoration-zorder-1-quirks.html text-decoration-zorder-1-ref.html # bug 403524
@@ -713,6 +834,7 @@ diff --git a/layout/reftests/text-decoration/reftest.list b/layout/reftests/text
  fails == text-decoration-propagation-1-standards.html text-decoration-propagation-1-standards-ref.html
  == 641444-1.html 641444-1-ref.html
 +== decoration-css21.html decoration-css21-ref.html # bug 403524
++== decoration-css21-block.html decoration-css21-block-ref.html # bug 403524
 diff --git a/layout/style/ua.css b/layout/style/ua.css
 --- a/layout/style/ua.css
 +++ b/layout/style/ua.css
