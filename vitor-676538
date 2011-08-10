@@ -1,0 +1,117 @@
+From: Vitor Menezes <vmenezes@mozilla.com>
+
+Bug 676538: Fix regression that caused text-decorations on inline *child* of block to draw at the offset for the block rather than the inline.  r=dbaron
+
+The FrameProperty representing baseline is set when a block defines
+text-decorations and has vertically-aligned children, but we were
+retrieving it whether the block or the vertically-aligned frame itself
+defined the decorations.  As a result, we "undo" the frame offset to get
+the baseline from the child in that case.
+
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -1490,17 +1490,17 @@ nsLineLayout::VerticalAlignLine()
+   if (rootPFD.mFrame->GetStyleContext()->HasTextDecorationLines()) {
+     for (const PerFrameData* pfd = psd->mFirstFrame; pfd; pfd = pfd->mNext) {
+       const nsIFrame *const f = pfd->mFrame;
+       const nsStyleCoord& vAlign =
+           f->GetStyleContext()->GetStyleTextReset()->mVerticalAlign;
+ 
+       if (vAlign.GetUnit() != eStyleUnit_Enumerated ||
+           vAlign.GetIntValue() != NS_STYLE_VERTICAL_ALIGN_BASELINE) {
+-        const nscoord offset = baselineY - (pfd->mBounds.y);
++        const nscoord offset = baselineY - pfd->mBounds.y;
+         f->Properties().Set(nsIFrame::LineBaselineOffset(),
+                             NS_INT32_TO_PTR(offset));
+       }
+     }
+   }
+ 
+   // Fill in returned line-box and max-element-width data
+   mLineBox->mBounds.x = psd->mLeftEdge;
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4274,17 +4274,22 @@ nsTextFrame::GetTextDecorations(nsPresCo
+   // baselineOffset represents the offset from our baseline to f's baseline or
+   // the nearest block's baseline, in our coordinate space, whichever is closest
+   // during the particular iteration
+   nscoord frameTopOffset = mAscent,
+           baselineOffset = 0;
+ 
+   bool nearestBlockFound = false;
+ 
+-  for (nsIFrame* f = this, *fParent; f; f = fParent) {
++  for (nsIFrame* f = this, *fChild = nsnull;
++       f;
++       fChild = f,
++       f = nsLayoutUtils::GetParentOrPlaceholderFor(
++             aPresContext->FrameManager(), f))
++  {
+     nsStyleContext *const context = f->GetStyleContext();
+     if (!context->HasTextDecorationLines()) {
+       break;
+     }
+ 
+     const nsStyleTextReset *const styleText = context->GetStyleTextReset();
+     const PRUint8 textDecorations = styleText->mTextDecorationLine;
+ 
+@@ -4293,40 +4298,44 @@ nsTextFrame::GetTextDecorations(nsPresCo
+     {
+       // This handles the <a href="blah.html"><font color="green">La 
+       // la la</font></a> case. The link underline should be green.
+       useOverride = PR_TRUE;
+       overrideColor = context->GetVisitedDependentColor(
+                                  eCSSProperty_text_decoration_color);
+     }
+ 
+-    fParent = nsLayoutUtils::GetParentOrPlaceholderFor(
+-                aPresContext->FrameManager(), f);
+-    const bool firstBlock = !nearestBlockFound &&
+-                            nsLayoutUtils::GetAsBlock(fParent);
++    const bool firstBlock = !nearestBlockFound && nsLayoutUtils::GetAsBlock(f);
+ 
+     // Not updating positions once we hit a parent block is equivalent to
+     // the CSS 2.1 spec that blocks should propagate decorations down to their
+     // children (albeit the style should be preserved)
+     // However, if we're vertically aligned within a block, then we need to
+     // recover the right baseline from the line by querying the FrameProperty
+     // that should be set (see nsLineLayout::VerticalAlignLine).
+-    if (firstBlock &&
+-        (styleText->mVerticalAlign.GetUnit() != eStyleUnit_Enumerated ||
+-         styleText->mVerticalAlign.GetIntValue() !=
+-           NS_STYLE_VERTICAL_ALIGN_BASELINE)) {
+-      baselineOffset = frameTopOffset -
+-        NS_PTR_TO_INT32(f->Properties().Get(nsIFrame::LineBaselineOffset()));
++    if (firstBlock) {
++      // At this point, fChild can't be null since TextFrames can't be blocks
++      const nsStyleCoord& vAlign =
++        fChild->GetStyleContext()->GetStyleTextReset()->mVerticalAlign;
++      if (vAlign.GetUnit() != eStyleUnit_Enumerated ||
++          vAlign.GetIntValue() != NS_STYLE_VERTICAL_ALIGN_BASELINE)
++      {
++        // Since offset is the offset in the child's coordinate space, we have
++        // to undo the accumulation to bring the transform out of the block's
++        // coordinate space
++        baselineOffset =
++          frameTopOffset - (fChild->GetRect().y - fChild->GetRelativeOffset().y)
++          - NS_PTR_TO_INT32(
++              fChild->Properties().Get(nsIFrame::LineBaselineOffset()));
++      }
+     }
+     else if (!nearestBlockFound) {
+       baselineOffset = frameTopOffset - f->GetBaseline();
+     }
+ 
+     nearestBlockFound = nearestBlockFound || firstBlock;
+-    frameTopOffset += f->GetRect().Y() - f->GetRelativeOffset().y;
++    frameTopOffset += f->GetRect().y - f->GetRelativeOffset().y;
+ 
+     const PRUint8 style = styleText->GetDecorationStyle();
+     // Accumulate only elements that have decorations with a genuine style
+     if (textDecorations && style != NS_STYLE_TEXT_DECORATION_STYLE_NONE) {
+       const nscolor color = useOverride ? overrideColor
+         : context->GetVisitedDependentColor(eCSSProperty_text_decoration_color);
+ 
+       if (textDecorations & NS_STYLE_TEXT_DECORATION_LINE_UNDERLINE) {
