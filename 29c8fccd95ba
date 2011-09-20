@@ -1,0 +1,462 @@
+
+# HG changeset patch
+# User Brian Hackett <bhackett1024@gmail.com>
+# Date 1316128778 25200
+# Node ID 29c8fccd95bae89d6863e43122209295a9124060
+# Parent  5c131d458c539102dd7a743c1916e04945c66f0b
+[INFER] Add jitcode assertions for type correctness around property accesses, bug 685186.
+
+diff --git a/js/src/methodjit/BaseAssembler.h b/js/src/methodjit/BaseAssembler.h
+--- a/js/src/methodjit/BaseAssembler.h
++++ b/js/src/methodjit/BaseAssembler.h
+@@ -1147,17 +1147,17 @@ static const JSC::MacroAssembler::Regist
+                Registers::maskReg(address.index);
+     }
+ 
+     /*
+      * Generate code testing whether an in memory value at address has a type
+      * in the specified set. Updates mismatches with any failure jumps. Assumes
+      * no data registers are live.
+      */
+-    bool generateTypeCheck(JSContext *cx, Address address,
++    bool generateTypeCheck(JSContext *cx, Address address, RegisterID reg,
+                            types::TypeSet *types, Vector<Jump> *mismatches)
+     {
+         if (types->unknown())
+             return true;
+ 
+         Vector<Jump> matches(cx);
+ 
+         if (types->hasType(types::Type::DoubleType())) {
+@@ -1195,19 +1195,16 @@ static const JSC::MacroAssembler::Regist
+                 return false;
+         } else {
+             count = types->getObjectCount();
+         }
+ 
+         if (count != 0) {
+             if (!mismatches->append(testObject(Assembler::NotEqual, address)))
+                 return false;
+-            Registers tempRegs(Registers::AvailRegs);
+-            RegisterID reg = tempRegs.takeAnyReg().reg();
+-
+             loadPayload(address, reg);
+ 
+             Jump notSingleton = branchTest32(Assembler::Zero,
+                                              Address(reg, offsetof(JSObject, flags)),
+                                              Imm32(JSObject::SINGLETON_TYPE));
+ 
+             for (unsigned i = 0; i < count; i++) {
+                 if (JSObject *object = types->getSingleObject(i)) {
+diff --git a/js/src/methodjit/Compiler.cpp b/js/src/methodjit/Compiler.cpp
+--- a/js/src/methodjit/Compiler.cpp
++++ b/js/src/methodjit/Compiler.cpp
+@@ -2029,16 +2029,19 @@ mjit::Compiler::generateMethod()
+           END_CASE(JSOP_GETELEM)
+ 
+           BEGIN_CASE(JSOP_TOID)
+             jsop_toid();
+           END_CASE(JSOP_TOID)
+ 
+           BEGIN_CASE(JSOP_SETELEM)
+           {
++            typeCheckPopped(0);
++            typeCheckPopped(1);
++            typeCheckPopped(2);
+             jsbytecode *next = &PC[JSOP_SETELEM_LENGTH];
+             bool pop = (JSOp(*next) == JSOP_POP && !analysis->jumpTarget(next));
+             if (!jsop_setelem(pop))
+                 return Compile_Error;
+           }
+           END_CASE(JSOP_SETELEM);
+ 
+           BEGIN_CASE(JSOP_EVAL)
+@@ -2379,28 +2382,23 @@ mjit::Compiler::generateMethod()
+                 return Compile_Retry;
+           END_CASE(JSOP_LOCALDEC)
+ 
+           BEGIN_CASE(JSOP_BINDNAME)
+             jsop_bindname(script->getAtom(fullAtomIndex(PC)), true);
+           END_CASE(JSOP_BINDNAME)
+ 
+           BEGIN_CASE(JSOP_SETPROP)
+-          {
+-            jsbytecode *next = &PC[JSOP_SETPROP_LENGTH];
+-            bool pop = JSOp(*next) == JSOP_POP && !analysis->jumpTarget(next);
+-            if (!jsop_setprop(script->getAtom(fullAtomIndex(PC)), true, pop))
+-                return Compile_Error;
+-          }
+-          END_CASE(JSOP_SETPROP)
+-
+           BEGIN_CASE(JSOP_SETNAME)
+           BEGIN_CASE(JSOP_SETMETHOD)
+           {
+-            jsbytecode *next = &PC[JSOP_SETNAME_LENGTH];
++            typeCheckPopped(0);
++            if (op != JSOP_SETNAME)
++                typeCheckPopped(1);
++            jsbytecode *next = &PC[JSOP_SETPROP_LENGTH];
+             bool pop = JSOp(*next) == JSOP_POP && !analysis->jumpTarget(next);
+             if (!jsop_setprop(script->getAtom(fullAtomIndex(PC)), true, pop))
+                 return Compile_Error;
+           }
+           END_CASE(JSOP_SETNAME)
+ 
+           BEGIN_CASE(JSOP_THROW)
+             prepareStubCall(Uses(1));
+@@ -2788,16 +2786,32 @@ mjit::Compiler::generateMethod()
+             unsigned ndefs = GetDefCount(script, lastPC - script->code);
+             for (unsigned i = 0; i < ndefs; i++) {
+                 FrameEntry *fe = frame.getStack(opinfo->stackDepth - nuses + i);
+                 if (fe) {
+                     /* fe may be NULL for conditionally pushed entries, e.g. JSOP_AND */
+                     frame.extra(fe).types = analysis->pushedTypes(lastPC - script->code, i);
+                 }
+             }
++
++#ifdef DEBUG
++            if ((js_CodeSpec[op].format & JOF_TYPESET) &&
++                js_GetOpcode(cx, script, PC) != JSOP_POP) {
++                FrameEntry *fe = frame.getStack(opinfo->stackDepth - nuses);
++                Jump j = frame.typeCheckEntry(fe, frame.extra(fe).types);
++                stubcc.linkExit(j, Uses(0));
++                stubcc.leave();
++
++                jsbytecode *oldPC = PC;
++                PC = lastPC;
++                OOL_STUBCALL(stubs::TypeCheckPushed, REJOIN_FALLTHROUGH);
++                PC = oldPC;
++                stubcc.rejoin(Changes(0));
++            }
++#endif
+         }
+ 
+         if (script->pcCounters) {
+             size_t length = masm.size() - masm.distanceOf(codeStart);
+             if (countersUpdated || length != 0) {
+                 if (!countersUpdated)
+                     updatePCCounters(lastPC, &codeStart, &countersUpdated);
+ 
+@@ -7597,18 +7611,21 @@ mjit::Compiler::testPushedType(RejoinSta
+     if (types->unknown())
+         return;
+ 
+     Assembler &masm = ool ? stubcc.masm : this->masm;
+ 
+     JS_ASSERT(which <= 0);
+     Address address = (which == 0) ? frame.addressOfTop() : frame.addressOf(frame.peek(which));
+ 
++    Registers tempRegs(Registers::AvailRegs);
++    RegisterID scratch = tempRegs.takeAnyReg().reg();
++
+     Vector<Jump> mismatches(cx);
+-    if (!masm.generateTypeCheck(cx, address, types, &mismatches)) {
++    if (!masm.generateTypeCheck(cx, address, scratch, types, &mismatches)) {
+         oomInVector = true;
+         return;
+     }
+ 
+     Jump j = masm.jump();
+ 
+     for (unsigned i = 0; i < mismatches.length(); i++)
+         mismatches[i].linkTo(masm.label(), &masm);
+@@ -7616,8 +7633,26 @@ mjit::Compiler::testPushedType(RejoinSta
+     masm.move(Imm32(which), Registers::ArgReg1);
+     if (ool)
+         OOL_STUBCALL(stubs::StubTypeHelper, rejoin);
+     else
+         INLINE_STUBCALL(stubs::StubTypeHelper, rejoin);
+ 
+     j.linkTo(masm.label(), &masm);
+ }
++
++#ifdef DEBUG
++void
++mjit::Compiler::typeCheckPopped(int which)
++{
++    if (!cx->typeInferenceEnabled())
++        return;
++
++    FrameEntry *fe = frame.peek(-1 - which);
++    Jump j = frame.typeCheckEntry(fe, analysis->poppedTypes(PC, which));
++    stubcc.linkExit(j, Uses(0));
++    stubcc.leave();
++
++    stubcc.masm.move(Imm32(which), Registers::ArgReg1);
++    OOL_STUBCALL(stubs::TypeCheckPopped, REJOIN_RESUME);
++    stubcc.rejoin(Changes(0));
++}
++#endif /* DEBUG */
+diff --git a/js/src/methodjit/Compiler.h b/js/src/methodjit/Compiler.h
+--- a/js/src/methodjit/Compiler.h
++++ b/js/src/methodjit/Compiler.h
+@@ -553,16 +553,19 @@ class Compiler : public BaseCompiler
+     types::TypeSet *pushedTypeSet(uint32 which);
+     bool monitored(jsbytecode *pc);
+     bool hasTypeBarriers(jsbytecode *pc);
+     bool testSingletonProperty(JSObject *obj, jsid id);
+     bool testSingletonPropertyTypes(FrameEntry *top, jsid id, bool *testObject);
+     CompileStatus addInlineFrame(JSScript *script, uint32 depth, uint32 parent, jsbytecode *parentpc);
+     CompileStatus scanInlineCalls(uint32 index, uint32 depth);
+     CompileStatus checkAnalysis(JSScript *script);
++#ifdef DEBUG
++    void typeCheckPopped(int which);
++#endif
+ 
+     struct BarrierState {
+         MaybeJump jump;
+         RegisterID typeReg;
+         RegisterID dataReg;
+     };
+ 
+     MaybeJump trySingleTypeTest(types::TypeSet *types, RegisterID typeReg);
+diff --git a/js/src/methodjit/FrameState.cpp b/js/src/methodjit/FrameState.cpp
+--- a/js/src/methodjit/FrameState.cpp
++++ b/js/src/methodjit/FrameState.cpp
+@@ -1102,16 +1102,87 @@ FrameState::storeTo(FrameEntry *fe, Addr
+         else
+             fe->type.setRegister(reg);
+     }
+ #endif
+     if (pinAddressReg)
+         unpinReg(address.base);
+ }
+ 
++#ifdef DEBUG
++JSC::MacroAssembler::Jump
++FrameState::typeCheckEntry(const FrameEntry *fe, types::TypeSet *types) const
++{
++    if (fe->isCopy())
++        fe = fe->copyOf();
++
++    Address addr1 = addressOfTop();
++    Address addr2 = Address(JSFrameReg, addr1.offset + sizeof(Value));
++
++    Registers tempRegs(Registers::AvailRegs);
++    RegisterID scratch = tempRegs.takeAnyReg().reg();
++    masm.storePtr(scratch, addr1);
++
++    do {
++        if (fe->isConstant()) {
++            masm.storeValue(fe->getValue(), addr2);
++            break;
++        }
++
++        if (fe->data.inFPRegister()) {
++            masm.storeDouble(fe->data.fpreg(), addr2);
++            break;
++        }
++
++        if (fe->isType(JSVAL_TYPE_DOUBLE)) {
++            JS_ASSERT(fe->data.inMemory());
++            masm.loadDouble(addressOf(fe), Registers::FPConversionTemp);
++            masm.storeDouble(Registers::FPConversionTemp, addr2);
++            break;
++        }
++
++        if (fe->data.inRegister())
++            masm.storePayload(fe->data.reg(), addr2);
++        else
++            JS_ASSERT(fe->data.inMemory());
++
++        if (fe->isTypeKnown())
++            masm.storeTypeTag(ImmType(fe->getKnownType()), addr2);
++        else if (fe->type.inRegister())
++            masm.storeTypeTag(fe->type.reg(), addr2);
++        else
++            JS_ASSERT(fe->type.inMemory());
++
++        if (fe->data.inMemory()) {
++            masm.loadPayload(addressOf(fe), scratch);
++            masm.storePayload(scratch, addr2);
++        }
++        if (fe->type.inMemory()) {
++            masm.loadTypeTag(addressOf(fe), scratch);
++            masm.storeTypeTag(scratch, addr2);
++        }
++    } while (false);
++
++    Vector<Jump> mismatches(cx);
++    masm.generateTypeCheck(cx, addr2, scratch, types, &mismatches);
++
++    masm.loadPtr(addr1, scratch);
++    Jump j = masm.jump();
++
++    for (unsigned i = 0; i < mismatches.length(); i++)
++        mismatches[i].linkTo(masm.label(), &masm);
++    masm.loadPtr(addr1, scratch);
++    Jump mismatch = masm.jump();
++
++    j.linkTo(masm.label(), &masm);
++
++    return mismatch;
++}
++#endif /* DEBUG */
++
+ void
+ FrameState::loadThisForReturn(RegisterID typeReg, RegisterID dataReg, RegisterID tempReg)
+ {
+     return loadForReturn(getThis(), typeReg, dataReg, tempReg);
+ }
+ 
+ void FrameState::loadForReturn(FrameEntry *fe, RegisterID typeReg, RegisterID dataReg, RegisterID tempReg)
+ {
+diff --git a/js/src/methodjit/FrameState.h b/js/src/methodjit/FrameState.h
+--- a/js/src/methodjit/FrameState.h
++++ b/js/src/methodjit/FrameState.h
+@@ -613,19 +613,29 @@ class FrameState
+      */
+     void takeReg(AnyRegisterID reg);
+ 
+     /*
+      * Returns a FrameEntry * for a slot on the operation stack.
+      */
+     inline FrameEntry *peek(int32 depth);
+ 
++#ifdef DEBUG
++    /*
++     * Check that a frame entry matches a type, returning a jump taken on
++     * mismatch. Does not affect register state or sync state of any entries.
++     */
++    Jump typeCheckEntry(const FrameEntry *fe, types::TypeSet *types) const;
++#endif
++
+     /*
+      * Fully stores a FrameEntry at an arbitrary address. popHint specifies
+      * how hard the register allocator should try to keep the FE in registers.
++     * If scratchData and scratchType are specified, the frame entry and
++     * register state will not be modified.
+      */
+     void storeTo(FrameEntry *fe, Address address, bool popHint = false);
+ 
+     /*
+      * Fully stores a FrameEntry into two arbitrary registers. tempReg may be
+      * used as a temporary.
+      */
+     void loadForReturn(FrameEntry *fe, RegisterID typeReg, RegisterID dataReg, RegisterID tempReg);
+diff --git a/js/src/methodjit/MonoIC.cpp b/js/src/methodjit/MonoIC.cpp
+--- a/js/src/methodjit/MonoIC.cpp
++++ b/js/src/methodjit/MonoIC.cpp
+@@ -618,17 +618,17 @@ mjit::NativeStubEpilogue(VMFrame &f, Ass
+         if (!typeReg.isSet()) {
+             /*
+              * Test the result of this native against the known result type set
+              * for the call. We don't assume knowledge about the types that
+              * natives can return, except when generating specialized paths in
+              * FastBuiltins.
+              */
+             types::TypeSet *types = f.script()->analysis()->bytecodeTypes(f.pc());
+-            if (!masm.generateTypeCheck(f.cx, resultAddress, types, &mismatches))
++            if (!masm.generateTypeCheck(f.cx, resultAddress, Registers::ReturnReg, types, &mismatches))
+                 THROWV(false);
+         }
+     }
+ 
+     /*
+      * Can no longer trigger recompilation in this stub, clear the stub
+      * rejoin on the VMFrame.
+      */
+@@ -1334,27 +1334,30 @@ ic::GenerateArgumentCheckStub(VMFrame &f
+     JSScript *script = fun->script();
+ 
+     if (jit->argsCheckPool)
+         jit->resetArgsCheck();
+ 
+     Assembler masm;
+     Vector<Jump> mismatches(f.cx);
+ 
++    Registers tempRegs(Registers::AvailRegs);
++    RegisterID scratch = tempRegs.takeAnyReg().reg();
++
+     if (!f.fp()->isConstructing()) {
+         types::TypeSet *types = types::TypeScript::ThisTypes(script);
+         Address address(JSFrameReg, StackFrame::offsetOfThis(fun));
+-        if (!masm.generateTypeCheck(f.cx, address, types, &mismatches))
++        if (!masm.generateTypeCheck(f.cx, address, scratch, types, &mismatches))
+             return;
+     }
+ 
+     for (unsigned i = 0; i < fun->nargs; i++) {
+         types::TypeSet *types = types::TypeScript::ArgTypes(script, i);
+         Address address(JSFrameReg, StackFrame::offsetOfFormalArg(fun, i));
+-        if (!masm.generateTypeCheck(f.cx, address, types, &mismatches))
++        if (!masm.generateTypeCheck(f.cx, address, scratch, types, &mismatches))
+             return;
+     }
+ 
+     Jump done = masm.jump();
+ 
+     LinkerHelper linker(masm, JSC::METHOD_CODE);
+     JSC::ExecutablePool *ep = linker.init(f.cx);
+     if (!ep)
+diff --git a/js/src/methodjit/StubCalls.cpp b/js/src/methodjit/StubCalls.cpp
+--- a/js/src/methodjit/StubCalls.cpp
++++ b/js/src/methodjit/StubCalls.cpp
+@@ -2453,16 +2453,44 @@ stubs::AssertArgumentTypes(VMFrame &f)
+     }
+ 
+     for (unsigned i = 0; i < fun->nargs; i++) {
+         Type type = GetValueType(f.cx, fp->formalArg(i));
+         if (!TypeScript::ArgTypes(script, i)->hasType(type))
+             TypeFailure(f.cx, "Missing type for arg %d: %s", i, TypeString(type));
+     }
+ }
++
++void JS_FASTCALL
++stubs::TypeCheckPushed(VMFrame &f)
++{
++    TypeScript::CheckBytecode(f.cx, f.script(), f.pc(), f.regs.sp);
++}
++
++void JS_FASTCALL
++stubs::TypeCheckPopped(VMFrame &f, int32 which)
++{
++    JSScript *script = f.script();
++    jsbytecode *pc = f.pc();
++    if (!script->hasAnalysis() || !script->analysis()->ranInference())
++        return;
++
++    AutoEnterTypeInference enter(f.cx);
++
++    const js::Value &val = f.regs.sp[-1 - which];
++    TypeSet *types = script->analysis()->poppedTypes(pc, which);
++    Type type = GetValueType(f.cx, val);
++
++    if (!types->hasType(type)) {
++        /* Display fine-grained debug information first */
++        fprintf(stderr, "Missing type at #%u:%05u popped %u: %s\n", 
++                script->id(), unsigned(pc - script->code), which, TypeString(type));
++        TypeFailure(f.cx, "Missing type popped %u", which);
++    }
++}
+ #endif
+ 
+ /*
+  * These two are never actually called, they just give us a place to rejoin if
+  * there is an invariant failure when initially entering a loop.
+  */
+ void JS_FASTCALL stubs::MissedBoundsCheckEntry(VMFrame &f) {}
+ void JS_FASTCALL stubs::MissedBoundsCheckHead(VMFrame &f) {}
+diff --git a/js/src/methodjit/StubCalls.h b/js/src/methodjit/StubCalls.h
+--- a/js/src/methodjit/StubCalls.h
++++ b/js/src/methodjit/StubCalls.h
+@@ -211,16 +211,18 @@ void JS_FASTCALL TypeBarrierReturn(VMFra
+ void JS_FASTCALL NegZeroHelper(VMFrame &f);
+ 
+ void JS_FASTCALL StubTypeHelper(VMFrame &f, int32 which);
+ 
+ void JS_FASTCALL CheckArgumentTypes(VMFrame &f);
+ 
+ #ifdef DEBUG
+ void JS_FASTCALL AssertArgumentTypes(VMFrame &f);
++void JS_FASTCALL TypeCheckPushed(VMFrame &f);
++void JS_FASTCALL TypeCheckPopped(VMFrame &f, int32 which);
+ #endif
+ 
+ void JS_FASTCALL MissedBoundsCheckEntry(VMFrame &f);
+ void JS_FASTCALL MissedBoundsCheckHead(VMFrame &f);
+ void * JS_FASTCALL InvariantFailure(VMFrame &f, void *repatchCode);
+ 
+ template <bool strict> int32 JS_FASTCALL ConvertToTypedInt(JSContext *cx, Value *vp);
+ void JS_FASTCALL ConvertToTypedFloat(JSContext *cx, Value *vp);
+
