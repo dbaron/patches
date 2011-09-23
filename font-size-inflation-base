@@ -1,0 +1,325 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement computation of font size inflation.  (Bug 627842)
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -121,16 +121,18 @@ namespace css = mozilla::css;
+ #ifdef DEBUG
+ // TODO: remove, see bug 598468.
+ bool nsLayoutUtils::gPreventAssertInCompareTreePosition = false;
+ #endif // DEBUG
+ 
+ typedef gfxPattern::GraphicsFilter GraphicsFilter;
+ typedef FrameMetrics::ViewID ViewID;
+ 
++static PRUint32 sFontSizeInflationRatio;
++
+ static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
+ 
+ typedef nsDataHashtable<nsUint64HashKey, nsIContent*> ContentMap;
+ static ContentMap* sContentMap = NULL;
+ static ContentMap& GetContentMap() {
+   if (!sContentMap) {
+     sContentMap = new ContentMap();
+ #ifdef DEBUG
+@@ -4299,16 +4301,24 @@ nsLayoutUtils::GetFontFacesForText(nsIFr
+   } while (aFollowContinuations &&
+            (curr = static_cast<nsTextFrame*>(curr->GetNextContinuation())));
+ 
+   return NS_OK;
+ }
+ 
+ /* static */
+ void
++nsLayoutUtils::Initialize()
++{
++  mozilla::Preferences::AddUintVarCache(&sFontSizeInflationRatio,
++                                        "font.size.inflation.ratio");
++}
++
++/* static */
++void
+ nsLayoutUtils::Shutdown()
+ {
+   if (sContentMap) {
+     delete sContentMap;
+     sContentMap = NULL;
+   }
+ }
+ 
+@@ -4363,8 +4373,152 @@ NS_IMETHODIMP
+ nsReflowFrameRunnable::Run()
+ {
+   if (mWeakFrame.IsAlive()) {
+     mWeakFrame->PresContext()->PresShell()->
+       FrameNeedsReflow(mWeakFrame, mIntrinsicDirty, mBitToAdd);
+   }
+   return NS_OK;
+ }
++
++static nscoord
++MinimumFontSizeFor(nscoord aContainerWidth)
++{
++  // FIXME: Control with prefs.  (Which of sizes or ratios will need
++  // less adjustment across devices?  With a size preference we'd
++  // compute the ratio below by dividing screen size by the minimum font
++  // size.)
++  if (sFontSizeInflationRatio == 0) {
++    return 0;
++  }
++  return aContainerWidth / sFontSizeInflationRatio;
++}
++
++// NOTE: line heights should be inflated by the same ratio as the font
++// size of the same text; the aStyleFontSize parameter here should
++// always be a font size, and never a line height.
++static float
++FontSizeInflationFor(nscoord aContainerContentWidth, nscoord aStyleFontSize)
++{
++  if (aStyleFontSize <= 0) {
++    // Never scale zero font size.
++    return 1.0;
++  }
++
++  nscoord min = MinimumFontSizeFor(aContainerContentWidth);
++  if (min <= 0) {
++    // No need to scale.
++    return 1.0;
++  }
++
++  // Scale everything from 0-1.5 times min to instead fit in the range
++  // 1-1.5 times min, so that we still show some distinction rather than
++  // just enforcing a minimum.
++  // FIXME: Fiddle with this algorithm; maybe have prefs to control it?
++  float ratio = float(aStyleFontSize) / float(min);
++  if (ratio >= 1.5f) {
++    // If we're already at 1.5 or more times the minimum, don't scale.
++    return 1.0;
++  }
++
++  // To scale 0-1.5 times min to instead be 1-1.5 times min, we want
++  // to the desired multiple of min to be 1 + (ratio/3) (where ratio
++  // is our input's multiple of min).  The scaling needed to produce
++  // that is that divided by |ratio|, or:
++  return (1.0f / ratio) + (1.0f / 3.0f);
++}
++
++static inline bool
++IsContainerForFontSizeInflation(nsIFrame *aFrame)
++{
++  // For now, basically anything other than inline and text frames.
++  // FIXME (maybe): This may be wrong, since we probably want many cases
++  // of nested blocks to apply the same scaling to both even if they
++  // have different widths -- though for many other cases of nested
++  // blocks this is what we want.
++  // FIXME: Should we inflate text in inline form controls to match?
++  return !aFrame->IsFrameOfType(nsIFrame::eLineParticipant);
++}
++
++static bool
++ShouldInflateFontsForContainer(nsIFrame *aFrame)
++{
++  // FIXME: We only want to inflate fonts for text that is in a place
++  // with room to expand.  The question is what the best heuristic for
++  // that is...
++
++  // If any ancestor has a constrained height, we should not expand.
++  return true;
++}
++
++float
++nsLayoutUtils::FontSizeInflationFor(const nsHTMLReflowState *aReflowState)
++{
++#ifdef DEBUG
++  {
++    const nsHTMLReflowState *rs = aReflowState;
++    nsIFrame *f = aReflowState->frame;
++    for (; rs; rs = rs->parentReflowState, f = f->GetParent()) {
++      NS_ABORT_IF_FALSE(rs->frame == f,
++                        "reflow state parentage must match frame parentage");
++    }
++  }
++#endif
++
++  if (sFontSizeInflationRatio == 0 ||
++      aReflowState->frame->PresContext()->IsChrome()) {
++    return 1.0;
++  }
++
++  for (const nsHTMLReflowState *rs = aReflowState; rs;
++       rs = rs->parentReflowState) {
++    if (IsContainerForFontSizeInflation(rs->frame)) {
++      if (!ShouldInflateFontsForContainer(rs->frame)) {
++        return 1.0;
++      }
++
++      NS_ABORT_IF_FALSE(rs->ComputedWidth() != NS_INTRINSICSIZE,
++                        "must have a computed width");
++      return ::FontSizeInflationFor(rs->ComputedWidth(),
++                 aReflowState->frame->GetStyleFont()->mFont.size);
++    }
++  }
++
++  NS_ABORT_IF_FALSE(false, "reflow roots should always be container");
++
++  return 1.0;
++}
++
++float
++nsLayoutUtils::FontSizeInflationFor(nsIFrame *aFrame)
++{
++#ifdef DEBUG
++  // Check that neither this frame nor any of its ancestors are
++  // currently being reflowed.
++  for (nsIFrame *f = aFrame; f; f = f->GetParent()) {
++    NS_ABORT_IF_FALSE(!(f->GetStateBits() & NS_FRAME_IN_REFLOW),
++                      "must call nsHTMLReflowState* version during reflow");
++  }
++  // It's ok if frames are dirty, or even if they've never been
++  // reflowed, since they will be eventually and then we'll get the
++  // right size.
++#endif
++
++  if (sFontSizeInflationRatio == 0 ||
++      aFrame->PresContext()->IsChrome()) {
++    return 1.0;
++  }
++
++  for (nsIFrame *f = aFrame; f; f = f->GetParent()) {
++    if (IsContainerForFontSizeInflation(f)) {
++      if (!ShouldInflateFontsForContainer(f)) {
++        return 1.0;
++      }
++
++      return ::FontSizeInflationFor(f->GetContentRect().width,
++                                    aFrame->GetStyleFont()->mFont.size);
++    }
++  }
++
++  NS_ABORT_IF_FALSE(false, "root should always be container");
++
++  return 1.0;
++}
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1425,16 +1425,25 @@ public:
+                                       PRBool aFollowContinuations,
+                                       nsFontFaceList* aFontFaceList);
+ 
+   /**
+    * Checks if CSS 3D transforms are currently enabled.
+    */
+   static PRBool Are3DTransformsEnabled();
+ 
++  /**
++   * Return the font size inflation *ratio* for a given frame; pass a
++   * reflow state if the frame or any of its ancestors are currently
++   * being reflowed and a frame otherwise.
++   */
++  static float FontSizeInflationFor(const nsHTMLReflowState *aReflowState);
++  static float FontSizeInflationFor(nsIFrame *aFrame);
++
++  static void Initialize();
+   static void Shutdown();
+ 
+ #ifdef DEBUG
+   /**
+    * Assert that there are no duplicate continuations of the same frame
+    * within aFrameList.  Optimize the tests by assuming that all frames
+    * in aFrameList have parent aContainer.
+    */
+diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
+--- a/layout/build/nsLayoutStatics.cpp
++++ b/layout/build/nsLayoutStatics.cpp
+@@ -251,16 +251,17 @@ nsLayoutStatics::Initialize()
+   }
+ 
+ #ifdef MOZ_SYDNEYAUDIO
+   nsAudioStream::InitLibrary();
+ #endif
+ 
+   nsContentSink::InitializeStatics();
+   nsHtml5Module::InitializeStatics();
++  nsLayoutUtils::Initialize();
+   nsIPresShell::InitializeStatics();
+   nsRefreshDriver::InitializeStatics();
+ 
+   nsCORSListenerProxy::Startup();
+ 
+   nsFrameList::Init();
+ 
+   NS_SealStaticAtomTable();
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -1056,16 +1056,18 @@ nsBlockFrame::Reflow(nsPresContext*     
+   nsOverflowAreas fcBounds;
+   nsReflowStatus fcStatus = NS_FRAME_COMPLETE;
+   rv = ReflowPushedFloats(state, fcBounds, fcStatus);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // If we're not dirty (which means we'll mark everything dirty later)
+   // and our width has changed, mark the lines dirty that we need to
+   // mark dirty for a resize reflow.
++  // FIXME: If font size inflation is enabled, we just need to mark
++  // everything dirty.
+   if (reflowState->mFlags.mHResize)
+     PrepareResizeReflow(state);
+ 
+   mState &= ~NS_FRAME_FIRST_REFLOW;
+ 
+   // Now reflow...
+   rv = ReflowDirtyLines(state);
+   NS_ASSERTION(NS_SUCCEEDED(rv), "reflow dirty lines failed");
+diff --git a/mobile/app/mobile.js b/mobile/app/mobile.js
+--- a/mobile/app/mobile.js
++++ b/mobile/app/mobile.js
+@@ -419,16 +419,18 @@ pref("browser.ui.kinetic.polynomialC", 1
+ pref("browser.ui.kinetic.swipeLength", 160);
+ 
+ // zooming
+ pref("browser.ui.zoom.pageFitGranularity", 9); // don't zoom to fit by less than 1/9 (11%)
+ pref("browser.ui.zoom.animationDuration", 200); // ms duration of double-tap zoom animation
+ pref("browser.ui.zoom.reflow", false); // Change text wrapping on double-tap
+ pref("browser.ui.zoom.reflow.fontSize", 720);
+ 
++pref("font.size.inflation.ratio", 30);
++
+ // pinch gesture
+ pref("browser.ui.pinch.maxGrowth", 150);     // max pinch distance growth
+ pref("browser.ui.pinch.maxShrink", 200);     // max pinch distance shrinkage
+ pref("browser.ui.pinch.scalingFactor", 500); // scaling factor for above pinch limits
+ 
+ // Touch radius (area around the touch location to look for target elements),
+ // in 1/240-inch pixels:
+ pref("browser.ui.touch.left", 8);
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -1525,16 +1525,23 @@ pref("font.minimum-size.x-telu", 0);
+ pref("font.minimum-size.x-tibt", 0);
+ pref("font.minimum-size.th", 0);
+ pref("font.minimum-size.tr", 0);
+ pref("font.minimum-size.x-cans", 0);
+ pref("font.minimum-size.x-western", 0);
+ pref("font.minimum-size.x-unicode", 0);
+ pref("font.minimum-size.x-user-def", 0);
+ 
++/*
++ * A value of 0 disables font size inflation.  Nonzero (positive) values
++ * cause the font inflation code to ensure that the font size of the
++ * text is at least 1/N times the width of the container.
++ */
++pref("font.size.inflation.ratio", 0);
++
+ #ifdef XP_WIN
+ 
+ pref("font.name.serif.ar", "Times New Roman");
+ pref("font.name.sans-serif.ar", "Arial");
+ pref("font.name.monospace.ar", "Courier New");
+ pref("font.name.cursive.ar", "Comic Sans MS");
+ 
+ pref("font.name.serif.el", "Times New Roman");
