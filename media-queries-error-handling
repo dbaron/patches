@@ -1,0 +1,259 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Update to rules in current css3-mediaqueries spec for handling malformed media queries:  all of the handling is now at the query level rather than the query list level.
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -334,17 +334,17 @@ protected:
+                       PRBool aInsideBraces = PR_FALSE);
+   PRBool ParseAtRule(RuleAppendFunc aAppendFunc, void* aProcessData);
+   PRBool ParseCharsetRule(RuleAppendFunc aAppendFunc, void* aProcessData);
+   PRBool ParseImportRule(RuleAppendFunc aAppendFunc, void* aProcessData);
+   PRBool ParseURLOrString(nsString& aURL);
+   PRBool GatherMedia(nsMediaList* aMedia,
+                      PRBool aInAtRule);
+   PRBool ParseMediaQuery(PRBool aInAtRule, nsMediaQuery **aQuery,
+-                         PRBool *aParsedSomething, PRBool *aHitStop);
++                         PRBool *aHitStop);
+   PRBool ParseMediaQueryExpression(nsMediaQuery* aQuery);
+   void ProcessImport(const nsString& aURLSpec,
+                      nsMediaList* aMedia,
+                      RuleAppendFunc aAppendFunc,
+                      void* aProcessData);
+   PRBool ParseGroupRule(css::GroupRule* aRule, RuleAppendFunc aAppendFunc,
+                         void* aProcessData);
+   PRBool ParseMediaRule(RuleAppendFunc aAppendFunc, void* aProcessData);
+@@ -1620,21 +1620,19 @@ CSSParserImpl::ParseURLOrString(nsString
+   }
+   UngetToken();
+   return PR_FALSE;
+ }
+ 
+ PRBool
+ CSSParserImpl::ParseMediaQuery(PRBool aInAtRule,
+                                nsMediaQuery **aQuery,
+-                               PRBool *aParsedSomething,
+                                PRBool *aHitStop)
+ {
+   *aQuery = nsnull;
+-  *aParsedSomething = PR_FALSE;
+   *aHitStop = PR_FALSE;
+ 
+   // "If the comma-separated list is the empty list it is assumed to
+   // specify the media query 'all'."  (css3-mediaqueries, section
+   // "Media Queries")
+   if (!GetToken(PR_TRUE)) {
+     *aHitStop = PR_TRUE;
+     // expected termination by EOF
+@@ -1649,19 +1647,18 @@ CSSParserImpl::ParseMediaQuery(PRBool aI
+   if (eCSSToken_Symbol == mToken.mType && aInAtRule &&
+       (mToken.mSymbol == ';' || mToken.mSymbol == '{')) {
+     *aHitStop = PR_TRUE;
+     UngetToken();
+     return PR_TRUE;
+   }
+   UngetToken();
+ 
+-  *aParsedSomething = PR_TRUE;
+-
+-  nsAutoPtr<nsMediaQuery> query(new nsMediaQuery);
++  nsMediaQuery* query = new nsMediaQuery;
++  *aQuery = query;
+   if (!query) {
+     mScanner.SetLowLevelError(NS_ERROR_OUT_OF_MEMORY);
+     return PR_FALSE;
+   }
+ 
+   if (ExpectSymbol('(', PR_TRUE)) {
+     // we got an expression without a media type
+     UngetToken(); // so ParseMediaQueryExpression can handle it
+@@ -1728,52 +1725,51 @@ CSSParserImpl::ParseMediaQuery(PRBool aI
+       UngetToken();
+       return PR_FALSE;
+     }
+     if (!ParseMediaQueryExpression(query)) {
+       OUTPUT_ERROR();
+       query->SetHadUnknownExpression();
+     }
+   }
+-  *aQuery = query.forget();
+   return PR_TRUE;
+ }
+ 
+ // Returns false only when there is a low-level error in the scanner
+ // (out-of-memory).
+ PRBool
+ CSSParserImpl::GatherMedia(nsMediaList* aMedia,
+                            PRBool aInAtRule)
+ {
+   for (;;) {
+     nsAutoPtr<nsMediaQuery> query;
+-    PRBool parsedSomething, hitStop;
++    PRBool hitStop;
+     if (!ParseMediaQuery(aInAtRule, getter_Transfers(query),
+-                         &parsedSomething, &hitStop)) {
++                         &hitStop)) {
+       NS_ASSERTION(!hitStop, "should return true when hit stop");
+       if (NS_FAILED(mScanner.GetLowLevelError())) {
+         return PR_FALSE;
+       }
++      if (query) {
++        query->SetHadUnknownExpression();
++      }
+       if (aInAtRule) {
+         const PRUnichar stopChars[] =
+           { PRUnichar(','), PRUnichar('{'), PRUnichar(';'), PRUnichar(0) };
+         SkipUntilOneOf(stopChars);
+       } else {
+         SkipUntil(',');
+       }
+       // Rely on SkipUntilOneOf leaving mToken around as the last token read.
+       if (mToken.mType == eCSSToken_Symbol && aInAtRule &&
+           (mToken.mSymbol == '{' || mToken.mSymbol == ';')) {
+         UngetToken();
+         hitStop = PR_TRUE;
+       }
+     }
+-    if (parsedSomething) {
+-      aMedia->SetNonEmpty();
+-    }
+     if (query) {
+       nsresult rv = aMedia->AppendQuery(query);
+       if (NS_FAILED(rv)) {
+         mScanner.SetLowLevelError(rv);
+         return PR_FALSE;
+       }
+     }
+     if (hitStop) {
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -537,34 +537,29 @@ NS_INTERFACE_MAP_BEGIN(nsMediaList)
+   NS_DOM_INTERFACE_MAP_ENTRY_CLASSINFO(MediaList)
+ NS_INTERFACE_MAP_END
+ 
+ NS_IMPL_ADDREF(nsMediaList)
+ NS_IMPL_RELEASE(nsMediaList)
+ 
+ 
+ nsMediaList::nsMediaList()
+-  : mIsEmpty(PR_TRUE)
+-  , mStyleSheet(nsnull)
++  : mStyleSheet(nsnull)
+ {
+ }
+ 
+ nsMediaList::~nsMediaList()
+ {
+ }
+ 
+ nsresult
+ nsMediaList::GetText(nsAString& aMediaText)
+ {
+   aMediaText.Truncate();
+ 
+-  if (mArray.Length() == 0 && !mIsEmpty) {
+-    aMediaText.AppendLiteral("not all");
+-  }
+-
+   for (PRInt32 i = 0, i_end = mArray.Length(); i < i_end; ++i) {
+     nsMediaQuery* query = mArray[i];
+     NS_ENSURE_TRUE(query, NS_ERROR_FAILURE);
+ 
+     query->AppendToString(aMediaText);
+ 
+     if (i + 1 < i_end) {
+       aMediaText.AppendLiteral(", ");
+@@ -596,17 +591,17 @@ PRBool
+ nsMediaList::Matches(nsPresContext* aPresContext,
+                      nsMediaQueryResultCacheKey* aKey)
+ {
+   for (PRInt32 i = 0, i_end = mArray.Length(); i < i_end; ++i) {
+     if (mArray[i]->Matches(aPresContext, aKey)) {
+       return PR_TRUE;
+     }
+   }
+-  return mIsEmpty;
++  return mArray.IsEmpty();
+ }
+ 
+ nsresult
+ nsMediaList::SetStyleSheet(nsCSSStyleSheet *aSheet)
+ {
+   NS_ASSERTION(aSheet == mStyleSheet || !aSheet || !mStyleSheet,
+                "multiple style sheets competing for one media list");
+   mStyleSheet = aSheet;
+@@ -619,17 +614,16 @@ nsMediaList::Clone(nsMediaList** aResult
+   nsRefPtr<nsMediaList> result = new nsMediaList();
+   if (!result || !result->mArray.AppendElements(mArray.Length()))
+     return NS_ERROR_OUT_OF_MEMORY;
+   for (PRInt32 i = 0, i_end = mArray.Length(); i < i_end; ++i) {
+     if (!(result->mArray[i] = mArray[i]->Clone())) {
+       return NS_ERROR_OUT_OF_MEMORY;
+     }
+   }
+-  result->mIsEmpty = mIsEmpty;
+   NS_ADDREF(*aResult = result);
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsMediaList::GetMediaText(nsAString& aMediaText)
+ {
+   return GetText(aMediaText);
+diff --git a/layout/style/nsIMediaList.h b/layout/style/nsIMediaList.h
+--- a/layout/style/nsIMediaList.h
++++ b/layout/style/nsIMediaList.h
+@@ -200,28 +200,23 @@ public:
+     aQuery.forget();
+     return NS_OK;
+   }
+ 
+   nsresult Clone(nsMediaList** aResult);
+ 
+   PRInt32 Count() { return mArray.Length(); }
+   nsMediaQuery* MediumAt(PRInt32 aIndex) { return mArray[aIndex]; }
+-  void Clear() { mArray.Clear(); mIsEmpty = PR_TRUE; }
+-  // a media list with no items may not represent the lack of a media
+-  // list; it could represent the empty string or something with parser
+-  // errors, which means that the media list should never match
+-  void SetNonEmpty() { mIsEmpty = PR_FALSE; }
++  void Clear() { mArray.Clear(); }
+ 
+ protected:
+   ~nsMediaList();
+ 
+   nsresult Delete(const nsAString & aOldMedium);
+   nsresult Append(const nsAString & aOldMedium);
+ 
+   nsTArray<nsAutoPtr<nsMediaQuery> > mArray;
+-  PRBool mIsEmpty;
+   // not refcounted; sheet will let us know when it goes away
+   // mStyleSheet is the sheet that needs to be dirtied when this medialist
+   // changes
+   nsCSSStyleSheet*         mStyleSheet;
+ };
+ #endif /* !defined(nsIMediaList_h_) */
+diff --git a/layout/style/test/test_media_queries.html b/layout/style/test/test_media_queries.html
+--- a/layout/style/test/test_media_queries.html
++++ b/layout/style/test/test_media_queries.html
+@@ -74,17 +74,17 @@ function run() {
+   document.getElementsByTagName("head")[0]
+     .appendChild(parse_test_style_element);
+ 
+   function query_is_parseable(q) {
+     parse_test_style_text.data = "@media screen, " + q + " {}";
+     var sheet = parse_test_style_element.sheet; // XXX yikes, not live!
+     if (sheet.cssRules.length == 1 &&
+         sheet.cssRules[0].type == CSSRule.MEDIA_RULE)
+-      return sheet.cssRules[0].media.mediaText != "screen";
++      return sheet.cssRules[0].media.mediaText != "screen, not all";
+     ok(false, "unexpected result testing whether query " + q +
+               " is parseable");
+     return true; // doesn't matter, we already failed
+   }
+ 
+   function query_should_be_parseable(q) {
+     ok(query_is_parseable(q), "query " + q + " should be parseable");
+     test_serialization(q, false, false);
