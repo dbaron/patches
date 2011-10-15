@@ -24,7 +24,7 @@ nsHTMLReflowState.
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
 +++ b/layout/base/nsLayoutUtils.cpp
-@@ -121,16 +121,18 @@ namespace css = mozilla::css;
+@@ -121,16 +121,19 @@ namespace css = mozilla::css;
  #ifdef DEBUG
  // TODO: remove, see bug 598468.
  bool nsLayoutUtils::gPreventAssertInCompareTreePosition = false;
@@ -34,6 +34,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
  typedef FrameMetrics::ViewID ViewID;
  
 +static PRUint32 sFontSizeInflationEmPerLine;
++static PRUint32 sFontSizeInflationEmPerInch;
 +
  static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
  
@@ -43,7 +44,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    if (!sContentMap) {
      sContentMap = new ContentMap();
  #ifdef DEBUG
-@@ -4279,16 +4281,24 @@ nsLayoutUtils::GetFontFacesForText(nsIFr
+@@ -4279,16 +4282,26 @@ nsLayoutUtils::GetFontFacesForText(nsIFr
    } while (aFollowContinuations &&
             (curr = static_cast<nsTextFrame*>(curr->GetNextContinuation())));
  
@@ -56,6 +57,8 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +{
 +  mozilla::Preferences::AddUintVarCache(&sFontSizeInflationEmPerLine,
 +                                        "font.size.inflation.emPerLine");
++  mozilla::Preferences::AddUintVarCache(&sFontSizeInflationEmPerInch,
++                                        "font.size.inflation.emPerInch");
 +}
 +
 +/* static */
@@ -68,7 +71,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    }
  }
  
-@@ -4439,8 +4449,159 @@ NS_IMETHODIMP
+@@ -4439,8 +4452,179 @@ NS_IMETHODIMP
  nsReflowFrameRunnable::Run()
  {
    if (mWeakFrame.IsAlive()) {
@@ -78,31 +81,46 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    return NS_OK;
  }
 +
++/**
++ * Compute the minimum font size inside of a container with the given
++ * width, such that **when the user zooms the container to fill the full
++ * width of the device**, the fonts satisfy our minima.
++ */
 +static nscoord
-+MinimumFontSizeFor(nscoord aContainerWidth)
++MinimumFontSizeFor(nsPresContext* aPresContext, nscoord aContainerWidth)
 +{
-+  // FIXME: Control with prefs.  (Which of sizes or ratios will need
-+  // less adjustment across devices?  With a size preference we'd
-+  // compute the ratio below by dividing screen size by the minimum font
-+  // size.)
-+  if (sFontSizeInflationEmPerLine == 0) {
++  if (sFontSizeInflationEmPerLine == 0 && sFontSizeInflationEmPerInch == 0) {
 +    return 0;
 +  }
-+  return aContainerWidth / sFontSizeInflationEmPerLine;
++  nscoord byLine = 0, byInch = 0;
++  if (sFontSizeInflationEmPerLine != 0) {
++    byLine = aContainerWidth / sFontSizeInflationEmPerLine;
++  }
++  if (sFontSizeInflationEmPerInch != 0) {
++    // REVIEW: Is this giving us app units and sizes *not* counting
++    // viewport scaling?
++    float deviceWidthInches =
++      float(aPresContext->GetVisibleArea().width) /
++      float(aPresContext->DeviceContext()->AppUnitsPerPhysicalInch());
++    byInch = NSToCoordRound(aContainerWidth /
++                            (sFontSizeInflationEmPerInch * deviceWidthInches));
++  }
++  return NS_MAX(byLine, byInch);
 +}
 +
 +// NOTE: line heights should be inflated by the same ratio as the font
 +// size of the same text; the aStyleFontSize parameter here should
 +// always be a font size, and never a line height.
 +static float
-+FontSizeInflationFor(nscoord aContainerContentWidth, nscoord aStyleFontSize)
++FontSizeInflationFor(nsPresContext *aPresContext,
++                     nscoord aContainerContentWidth, nscoord aStyleFontSize)
 +{
 +  if (aStyleFontSize <= 0) {
 +    // Never scale zero font size.
 +    return 1.0;
 +  }
 +
-+  nscoord min = MinimumFontSizeFor(aContainerContentWidth);
++  nscoord min = MinimumFontSizeFor(aPresContext, aContainerContentWidth);
 +  if (min <= 0) {
 +    // No need to scale.
 +    return 1.0;
@@ -169,7 +187,8 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +  }
 +#endif
 +
-+  if (sFontSizeInflationEmPerLine == 0 ||
++  if ((sFontSizeInflationEmPerLine == 0 &&
++       sFontSizeInflationEmPerInch == 0) ||
 +      aReflowState->frame->PresContext()->IsChrome()) {
 +    return 1.0;
 +  }
@@ -183,7 +202,9 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +
 +      NS_ABORT_IF_FALSE(rs->ComputedWidth() != NS_INTRINSICSIZE,
 +                        "must have a computed width");
-+      return ::FontSizeInflationFor(rs->ComputedWidth(),
++      return ::FontSizeInflationFor(
++                 aReflowState->frame->PresContext(),
++                 rs->ComputedWidth(),
 +                 aReflowState->frame->GetStyleFont()->mFont.size);
 +    }
 +  }
@@ -208,7 +229,8 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +  // right size.
 +#endif
 +
-+  if (sFontSizeInflationEmPerLine == 0 ||
++  if ((sFontSizeInflationEmPerLine == 0 &&
++       sFontSizeInflationEmPerInch == 0) ||
 +      aFrame->PresContext()->IsChrome()) {
 +    return 1.0;
 +  }
@@ -219,7 +241,8 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +        return 1.0;
 +      }
 +
-+      return ::FontSizeInflationFor(f->GetContentRect().width,
++      return ::FontSizeInflationFor(aFrame->PresContext(),
++                                    f->GetContentRect().width,
 +                                    aFrame->GetStyleFont()->mFont.size);
 +    }
 +  }
@@ -325,7 +348,7 @@ diff --git a/mobile/app/mobile.js b/mobile/app/mobile.js
 diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
 --- a/modules/libpref/src/init/all.js
 +++ b/modules/libpref/src/init/all.js
-@@ -1527,16 +1527,23 @@ pref("font.minimum-size.x-telu", 0);
+@@ -1527,16 +1527,24 @@ pref("font.minimum-size.x-telu", 0);
  pref("font.minimum-size.x-tibt", 0);
  pref("font.minimum-size.th", 0);
  pref("font.minimum-size.tr", 0);
@@ -340,6 +363,7 @@ diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
 + * text is at least 1/N times the width of the container.
 + */
 +pref("font.size.inflation.emPerLine", 0);
++pref("font.size.inflation.emPerInch", 0);
 +
  #ifdef XP_WIN
  
