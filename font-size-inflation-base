@@ -71,7 +71,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
    }
  }
  
-@@ -4378,8 +4391,253 @@ NS_IMETHODIMP
+@@ -4378,8 +4391,280 @@ NS_IMETHODIMP
  nsReflowFrameRunnable::Run()
  {
    if (mWeakFrame.IsAlive()) {
@@ -119,6 +119,12 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +{
 +  if (aStyleFontSize <= 0) {
 +    // Never scale zero font size.
++    return 1.0;
++  }
++
++  if (aContainerContentWidth <= 0) {
++    // aContainerContentWidth == 0 is a sentinel meaning that inflation
++    // is disabled for that container.
 +    return 1.0;
 +  }
 +
@@ -201,8 +207,8 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +         !(aFrame->GetStateBits() & NS_FRAME_IN_CONSTRAINED_HEIGHT);
 +}
 +
-+float
-+nsLayoutUtils::FontSizeInflationFor(const nsHTMLReflowState &aReflowState)
++nscoord
++nsLayoutUtils::FontSizeInflationContainerWidthFor(const nsHTMLReflowState &aReflowState)
 +{
 +#ifdef DEBUG
 +  {
@@ -215,43 +221,64 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +  }
 +#endif
 +
-+  if (!FontSizeInflationEnabled(aReflowState.frame->PresContext())) {
-+    return 1.0;
-+  }
-+
 +  nsIFrame *reflowRoot = nsnull;
 +  for (const nsHTMLReflowState *rs = &aReflowState; rs;
 +       reflowRoot = rs->frame, rs = rs->parentReflowState) {
 +    if (IsContainerForFontSizeInflation(rs->frame)) {
 +      if (!ShouldInflateFontsForContainer(rs->frame)) {
-+        return 1.0;
++        return 0;
 +      }
 +
 +      NS_ABORT_IF_FALSE(rs->ComputedWidth() != NS_INTRINSICSIZE,
 +                        "must have a computed width");
-+      return ::FontSizeInflationFor(
-+                 aReflowState.frame->PresContext(),
-+                 rs->ComputedWidth(),
-+                 aReflowState.frame->GetStyleFont()->mFont.size);
++      return rs->ComputedWidth();
 +    }
 +  }
 +
-+  for (const nsIFrame *f = reflowRoot; f; f = f->GetParent()) {
++  return FontSizeInflationContainerWidthFor(reflowRoot->GetParent());
++}
++
++nscoord
++nsLayoutUtils::FontSizeInflationContainerWidthFor(const nsIFrame *aFrame)
++{
++#ifdef DEBUG
++  // Check that neither this frame nor any of its ancestors are
++  // currently being reflowed.
++  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
++    NS_ABORT_IF_FALSE(!(f->GetStateBits() & NS_FRAME_IN_REFLOW),
++                      "must call nsHTMLReflowState* version during reflow");
++  }
++  // It's ok if frames are dirty, or even if they've never been
++  // reflowed, since they will be eventually and then we'll get the
++  // right size.
++#endif
++
++  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
 +    if (IsContainerForFontSizeInflation(f)) {
 +      if (!ShouldInflateFontsForContainer(f)) {
-+        return 1.0;
++        return 0;
 +      }
 +
-+      return ::FontSizeInflationFor(
-+                 aReflowState.frame->PresContext(),
-+                 f->GetContentRect().width,
-+                 aReflowState.frame->GetStyleFont()->mFont.size);
++      return f->GetContentRect().width;
 +    }
 +  }
 +
 +  NS_ABORT_IF_FALSE(false, "root should always be container");
 +
-+  return 1.0;
++  return 0;
++}
++
++float
++nsLayoutUtils::FontSizeInflationFor(const nsHTMLReflowState &aReflowState)
++{
++  if (!FontSizeInflationEnabled(aReflowState.frame->PresContext())) {
++    return 1.0;
++  }
++
++  return ::FontSizeInflationFor(
++             aReflowState.frame->PresContext(),
++             FontSizeInflationContainerWidthFor(aReflowState),
++             aReflowState.frame->GetStyleFont()->mFont.size);
 +}
 +
 +float
@@ -273,21 +300,35 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +    return 1.0;
 +  }
 +
++  return ::FontSizeInflationFor(aFrame->PresContext(),
++                                FontSizeInflationContainerWidthFor(aFrame),
++                                aFrame->GetStyleFont()->mFont.size);
++}
++
++/* static */ nscoord
++nsLayoutUtils::FontSizeInflationContainerWidthFor(const nsIFrame *aFrame,
++                                                  nscoord aInflationContainerWidth)
++{
++  if (!FontSizeInflationEnabled(aFrame->PresContext())) {
++    return 0;
++  }
++
 +  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
 +    if (IsContainerForFontSizeInflation(f)) {
 +      if (!ShouldInflateFontsForContainer(f)) {
-+        return 1.0;
++        return 0;
 +      }
 +
-+      return ::FontSizeInflationFor(aFrame->PresContext(),
-+                                    f->GetContentRect().width,
-+                                    aFrame->GetStyleFont()->mFont.size);
++      // The caller is (sketchily) asserting that it picked the right
++      // container when passing aInflationContainerWidth.  We only do
++      // this for text inputs and a few other limited situations.
++      return aInflationContainerWidth;
 +    }
 +  }
 +
 +  NS_ABORT_IF_FALSE(false, "root should always be container");
 +
-+  return 1.0;
++  return 0;
 +}
 +
 +/* static */ float
@@ -298,24 +339,10 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 +    return 1.0;
 +  }
 +
-+  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
-+    if (IsContainerForFontSizeInflation(f)) {
-+      if (!ShouldInflateFontsForContainer(f)) {
-+        return 1.0;
-+      }
-+
-+      // The caller is (sketchily) asserting that it picked the right
-+      // container when passing aInflationContainerWidth.  We only do
-+      // this for text inputs.
-+      return ::FontSizeInflationFor(aFrame->PresContext(),
-+                                    aInflationContainerWidth,
-+                                    aFrame->GetStyleFont()->mFont.size);
-+    }
-+  }
-+
-+  NS_ABORT_IF_FALSE(false, "root should always be container");
-+
-+  return 1.0;
++  return ::FontSizeInflationFor(aFrame->PresContext(),
++                                FontSizeInflationContainerWidthFor(aFrame,
++                                  aInflationContainerWidth),
++                                aFrame->GetStyleFont()->mFont.size);
 +}
 +
 +/* static */ bool
@@ -328,7 +355,7 @@ diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
 --- a/layout/base/nsLayoutUtils.h
 +++ b/layout/base/nsLayoutUtils.h
-@@ -1447,16 +1447,30 @@ public:
+@@ -1447,16 +1447,36 @@ public:
    static nsresult GetTextRunMemoryForFrames(nsIFrame* aFrame,
                                              PRUint64* aTotal);
  
@@ -337,6 +364,12 @@ diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
     */
    static bool Are3DTransformsEnabled();
  
++  static nscoord FontSizeInflationContainerWidthFor(
++    const nsHTMLReflowState &aReflowState);
++  static nscoord FontSizeInflationContainerWidthFor(const nsIFrame *aFrame);
++  static nscoord FontSizeInflationContainerWidthFor(
++    const nsIFrame *aFrame, nscoord aInflationContainerWidth);
++
 +  /**
 +   * Return the font size inflation *ratio* for a given frame; pass a
 +   * reflow state if the frame or any of its ancestors are currently
