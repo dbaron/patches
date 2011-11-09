@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Make other users of font metrics (other than MathML and XUL) honor font size inflation.  (Bug 627842, patch 15)  r=roc
+Make other users of font metrics (other than MathML and XUL) honor font size inflation.  (Bug 627842, patch 15)  r?roc
 
 This does not address users of font metrics in layout/mathml/ (for text
 size and alignment issues) or in layout/xul (for text size and sizing of
@@ -78,7 +78,18 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
    if (focusedContent) {
      nsCOMPtr<nsIDOMHTMLOptionElement> domOpt =
        do_QueryInterface(focusedContent);
-@@ -288,18 +289,20 @@ nsListControlFrame::InvalidateFocus()
+@@ -278,28 +279,36 @@ void nsListControlFrame::PaintFocus(nsRe
+     LookAndFeel::GetColor(lastItemIsSelected ?
+                             LookAndFeel::eColorID_WidgetSelectForeground :
+                             LookAndFeel::eColorID_WidgetSelectBackground);
+ 
+   nsCSSRendering::PaintFocus(presContext, aRC, fRect, color);
+ }
+ 
+ void
+-nsListControlFrame::InvalidateFocus()
++nsListControlFrame::InvalidateFocus(const nsHTMLReflowState *aReflowState)
+ {
    if (mFocused != this)
      return;
  
@@ -87,7 +98,13 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
      // Invalidating from the containerFrame because that's where our focus
      // is drawn.
      // The origin of the scrollport is the origin of containerFrame.
-+    float inflation = nsLayoutUtils::FontSizeInflationFor(this);
++    float inflation;
++    if (aReflowState) {
++      NS_ABORT_IF_FALSE(aReflowState->frame == this, "wrong reflow state");
++      inflation = nsLayoutUtils::FontSizeInflationFor(*aReflowState);
++    } else {
++      inflation = nsLayoutUtils::FontSizeInflationFor(this);
++    }
      nsRect invalidateArea = containerFrame->GetVisualOverflowRect();
 -    nsRect emptyFallbackArea(0, 0, GetScrollPortRect().width, CalcFallbackRowHeight());
 +    nsRect emptyFallbackArea(0, 0, GetScrollPortRect().width,
@@ -100,7 +117,7 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
  NS_QUERYFRAME_HEAD(nsListControlFrame)
    NS_QUERYFRAME_ENTRY(nsIFormControlFrame)
    NS_QUERYFRAME_ENTRY(nsIListControlFrame)
-@@ -360,29 +363,34 @@ GetNumberOfOptionsRecursive(nsIContent* 
+@@ -360,29 +369,34 @@ GetNumberOfOptionsRecursive(nsIContent* 
    }
    return optionCount;
  }
@@ -137,7 +154,7 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
  nscoord
  nsListControlFrame::GetPrefWidth(nsRenderingContext *aRenderingContext)
  {
-@@ -495,17 +503,17 @@ nsListControlFrame::Reflow(nsPresContext
+@@ -495,17 +509,17 @@ nsListControlFrame::Reflow(nsPresContext
      NS_ASSERTION(!IsScrollbarUpdateSuppressed(),
                   "Shouldn't be suppressing if we don't need a second pass!");
      if (!autoHeight) {
@@ -156,7 +173,65 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
        }
      }
  
-@@ -1808,22 +1816,23 @@ nsListControlFrame::IsLeftButton(nsIDOME
+@@ -1162,17 +1176,18 @@ nsListControlFrame::GetSkipSides() const
+ 
+ void
+ nsListControlFrame::OnContentReset()
+ {
+   ResetList(true);
+ }
+ 
+ void 
+-nsListControlFrame::ResetList(bool aAllowScrolling)
++nsListControlFrame::ResetList(bool aAllowScrolling,
++                              const nsHTMLReflowState *aReflowState)
+ {
+   // if all the frames aren't here 
+   // don't bother reseting
+   if (!mIsAllFramesHere) {
+     return;
+   }
+ 
+   if (aAllowScrolling) {
+@@ -1186,17 +1201,17 @@ nsListControlFrame::ResetList(bool aAllo
+     if (selectElement) {
+       selectElement->GetSelectedIndex(&indexToSelect);
+       ScrollToIndex(indexToSelect);
+     }
+   }
+ 
+   mStartSelectionIndex = kNothingSelected;
+   mEndSelectionIndex = kNothingSelected;
+-  InvalidateFocus();
++  InvalidateFocus(aReflowState);
+   // Combobox will redisplay itself with the OnOptionSelected event
+ } 
+  
+ void 
+ nsListControlFrame::SetFocus(bool aOn, bool aRepaint)
+ {
+   InvalidateFocus();
+ 
+@@ -1739,17 +1754,17 @@ nsListControlFrame::DidReflow(nsPresCont
+     // scroll history state AND the list contents have not changed
+     // since we loaded all the children AND nothing else forced us
+     // to scroll by calling ResetList(true). The latter two conditions
+     // are folded into mPostChildrenLoadedReset.
+     //
+     // The idea is that we want scroll history restoration to trump ResetList
+     // scrolling to the selected element, when the ResetList was probably only
+     // caused by content loading normally.
+-    ResetList(!DidHistoryRestore() || mPostChildrenLoadedReset);
++    ResetList(!DidHistoryRestore() || mPostChildrenLoadedReset, aReflowState);
+   }
+ 
+   mHasPendingInterruptAtStartOfReflow = false;
+   return rv;
+ }
+ 
+ nsIAtom*
+ nsListControlFrame::GetType() const
+@@ -1808,22 +1823,23 @@ nsListControlFrame::IsLeftButton(nsIDOME
      if (NS_SUCCEEDED(mouseEvent->GetButton(&whichButton))) {
        return whichButton != 0?false:true;
      }
@@ -185,10 +260,20 @@ diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFra
 diff --git a/layout/forms/nsListControlFrame.h b/layout/forms/nsListControlFrame.h
 --- a/layout/forms/nsListControlFrame.h
 +++ b/layout/forms/nsListControlFrame.h
-@@ -241,17 +241,17 @@ public:
-    * must be called every time mEndSelectionIndex changes.
+@@ -234,24 +234,26 @@ public:
+    * frame
     */
-   void InvalidateFocus();
+   void PaintFocus(nsRenderingContext& aRC, nsPoint aPt);
+   /**
+    * If this frame IsFocused(), invalidates an area that includes anything
+    * that PaintFocus will or could have painted --- basically the whole
+    * GetOptionsContainer, plus some extra stuff if there are no options. This
+    * must be called every time mEndSelectionIndex changes.
++   *
++   * Pass non-null aReflowState if during reflow.
+    */
+-  void InvalidateFocus();
++  void InvalidateFocus(const nsHTMLReflowState* aReflowState = nsnull);
  
    /**
     * Function to calculate the height a row, for use with the "size" attribute.
@@ -204,7 +289,30 @@ diff --git a/layout/forms/nsListControlFrame.h b/layout/forms/nsListControlFrame
    bool MightNeedSecondPass() const {
      return mMightNeedSecondPass;
    }
-@@ -368,17 +368,17 @@ protected:
+@@ -327,18 +329,21 @@ protected:
+    */
+   void       UpdateInListState(nsIDOMEvent* aEvent);
+   void       AdjustIndexForDisabledOpt(PRInt32 aStartIndex, PRInt32 &anNewIndex,
+                                        PRInt32 aNumOptions, PRInt32 aDoAdjustInc, PRInt32 aDoAdjustIncNext);
+ 
+   /**
+    * Resets the select back to it's original default values;
+    * those values as determined by the original HTML
++   *
++   * Pass non-null aReflowState if during reflow.
+    */
+-  virtual void ResetList(bool aAllowScrolling);
++  virtual void ResetList(bool aAllowScrolling,
++                         const nsHTMLReflowState* aReflowState = nsnull);
+ 
+   nsListControlFrame(nsIPresShell* aShell, nsIDocument* aDocument, nsStyleContext* aContext);
+   virtual ~nsListControlFrame();
+ 
+   // Utility methods
+   nsresult GetSizeAttribute(PRInt32 *aSize);
+   nsIContent* GetOptionFromContent(nsIContent *aContent);
+ 
+@@ -368,17 +373,17 @@ protected:
     */
    bool     IsContentSelectedByIndex(PRInt32 aIndex) const;
  
