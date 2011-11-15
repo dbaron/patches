@@ -1,0 +1,293 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Apply font size inflation to list bullets.  (Bug 627842, patch 13)  r=roc
+
+Note that this doesn't do anything about the indentation of the list, so
+for large inflation there may end up being overlap as a result.
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -4597,16 +4597,18 @@ nsLayoutUtils::IsContainerForFontSizeInf
+    * thing to count as a container, so we don't try, and blocks are
+    * always containers.
+    */
+   bool isInline = aFrame->GetStyleDisplay()->mDisplay ==
+                     NS_STYLE_DISPLAY_INLINE ||
+                   aFrame->GetContent()->IsInNativeAnonymousSubtree();
+   NS_ASSERTION(!aFrame->IsFrameOfType(nsIFrame::eLineParticipant) || isInline,
+                "line participants must not be containers");
++  NS_ASSERTION(aFrame->GetType() != nsGkAtoms::bulletFrame || isInline,
++               "bullets should not be containers");
+   return !isInline;
+ }
+ 
+ static bool
+ ShouldInflateFontsForContainer(const nsIFrame *aFrame)
+ {
+   // We only want to inflate fonts for text that is in a place
+   // with room to expand.  The question is what the best heuristic for
+diff --git a/layout/generic/nsBulletFrame.cpp b/layout/generic/nsBulletFrame.cpp
+--- a/layout/generic/nsBulletFrame.cpp
++++ b/layout/generic/nsBulletFrame.cpp
+@@ -60,17 +60,19 @@
+ #include "nsIServiceManager.h"
+ #include "nsIComponentManager.h"
+ #include "nsContentUtils.h"
+ 
+ #ifdef ACCESSIBILITY
+ #include "nsAccessibilityService.h"
+ #endif
+ 
+-#define BULLET_FRAME_IMAGE_LOADING NS_FRAME_STATE_BIT(63)
++using namespace mozilla;
++
++NS_DECLARE_FRAME_PROPERTY(FontSizeInflationProperty, nsnull)
+ 
+ class nsBulletListener : public nsStubImageDecoderObserver
+ {
+ public:
+   nsBulletListener();
+   virtual ~nsBulletListener();
+ 
+   NS_DECL_ISUPPORTS
+@@ -391,17 +393,18 @@ nsBulletFrame::PaintBullet(nsRenderingCo
+   case NS_STYLE_LIST_STYLE_MOZ_KHMER:
+   case NS_STYLE_LIST_STYLE_MOZ_HANGUL:
+   case NS_STYLE_LIST_STYLE_MOZ_HANGUL_CONSONANT:
+   case NS_STYLE_LIST_STYLE_MOZ_ETHIOPIC_HALEHAME:
+   case NS_STYLE_LIST_STYLE_MOZ_ETHIOPIC_NUMERIC:
+   case NS_STYLE_LIST_STYLE_MOZ_ETHIOPIC_HALEHAME_AM:
+   case NS_STYLE_LIST_STYLE_MOZ_ETHIOPIC_HALEHAME_TI_ER:
+   case NS_STYLE_LIST_STYLE_MOZ_ETHIOPIC_HALEHAME_TI_ET:
+-    nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm));
++    nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
++                                          GetFontSizeInflation());
+     GetListItemText(*myList, text);
+     aRenderingContext.SetFont(fm);
+     nscoord ascent = fm->MaxAscent();
+     aRenderingContext.SetTextRunRTL(mTextIsRTL);
+     aRenderingContext.DrawString(text, mPadding.left + aPt.x,
+                                  mPadding.top + aPt.y + ascent);
+     break;
+   }
+@@ -1311,17 +1314,18 @@ nsBulletFrame::GetListItemText(const nsS
+ }
+ 
+ #define MIN_BULLET_SIZE 1
+ 
+ 
+ void
+ nsBulletFrame::GetDesiredSize(nsPresContext*  aCX,
+                               nsRenderingContext *aRenderingContext,
+-                              nsHTMLReflowMetrics& aMetrics)
++                              nsHTMLReflowMetrics& aMetrics,
++                              float aFontSizeInflation)
+ {
+   // Reset our padding.  If we need it, we'll set it below.
+   mPadding.SizeTo(0, 0, 0, 0);
+   
+   const nsStyleList* myList = GetStyleList();
+   nscoord ascent;
+ 
+   RemoveStateBits(BULLET_FRAME_IMAGE_LOADING);
+@@ -1348,17 +1352,18 @@ nsBulletFrame::GetDesiredSize(nsPresCont
+   // mIntrinsicSize to (0,0).  Otherwise, if we used to have an image, it
+   // changed, and the new one is coming in, but we're reflowing before it's
+   // fully there, we'll end up with mIntrinsicSize not matching our size, but
+   // won't trigger a reflow in OnStartContainer (because mIntrinsicSize will
+   // match the image size).
+   mIntrinsicSize.SizeTo(0, 0);
+ 
+   nsRefPtr<nsFontMetrics> fm;
+-  nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm));
++  nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
++                                        aFontSizeInflation);
+   nscoord bulletSize;
+ 
+   nsAutoString text;
+   switch (myList->mListStyleType) {
+     case NS_STYLE_LIST_STYLE_NONE:
+       aMetrics.width = 0;
+       aMetrics.ascent = aMetrics.height = 0;
+       break;
+@@ -1437,18 +1442,21 @@ NS_IMETHODIMP
+ nsBulletFrame::Reflow(nsPresContext* aPresContext,
+                       nsHTMLReflowMetrics& aMetrics,
+                       const nsHTMLReflowState& aReflowState,
+                       nsReflowStatus& aStatus)
+ {
+   DO_GLOBAL_REFLOW_COUNT("nsBulletFrame");
+   DISPLAY_REFLOW(aPresContext, this, aReflowState, aMetrics, aStatus);
+ 
++  float inflation = nsLayoutUtils::FontSizeInflationFor(aReflowState);
++  SetFontSizeInflation(inflation);
++
+   // Get the base size
+-  GetDesiredSize(aPresContext, aReflowState.rendContext, aMetrics);
++  GetDesiredSize(aPresContext, aReflowState.rendContext, aMetrics, inflation);
+ 
+   // Add in the border and padding; split the top/bottom between the
+   // ascent and descent to make things look nice
+   const nsMargin& borderPadding = aReflowState.mComputedBorderPadding;
+   aMetrics.width += borderPadding.left + borderPadding.right;
+   aMetrics.height += borderPadding.top + borderPadding.bottom;
+   aMetrics.ascent += borderPadding.top;
+ 
+@@ -1463,26 +1471,26 @@ nsBulletFrame::Reflow(nsPresContext* aPr
+   return NS_OK;
+ }
+ 
+ /* virtual */ nscoord
+ nsBulletFrame::GetMinWidth(nsRenderingContext *aRenderingContext)
+ {
+   nsHTMLReflowMetrics metrics;
+   DISPLAY_MIN_WIDTH(this, metrics.width);
+-  GetDesiredSize(PresContext(), aRenderingContext, metrics);
++  GetDesiredSize(PresContext(), aRenderingContext, metrics, 1.0f);
+   return metrics.width;
+ }
+ 
+ /* virtual */ nscoord
+ nsBulletFrame::GetPrefWidth(nsRenderingContext *aRenderingContext)
+ {
+   nsHTMLReflowMetrics metrics;
+   DISPLAY_PREF_WIDTH(this, metrics.width);
+-  GetDesiredSize(PresContext(), aRenderingContext, metrics);
++  GetDesiredSize(PresContext(), aRenderingContext, metrics, 1.0f);
+   return metrics.width;
+ }
+ 
+ 
+ NS_IMETHODIMP nsBulletFrame::OnStartContainer(imgIRequest *aRequest,
+                                               imgIContainer *aImage)
+ {
+   if (!aImage) return NS_ERROR_INVALID_ARG;
+@@ -1593,25 +1601,61 @@ nsBulletFrame::GetLoadGroup(nsPresContex
+ 
+   nsIDocument *doc = shell->GetDocument();
+   if (!doc)
+     return;
+ 
+   *aLoadGroup = doc->GetDocumentLoadGroup().get();  // already_AddRefed
+ }
+ 
++union VoidPtrOrFloat {
++  VoidPtrOrFloat() : p(nsnull) {}
++
++  void *p;
++  float f;
++};
++
++float
++nsBulletFrame::GetFontSizeInflation() const
++{
++  if (!HasFontSizeInflation()) {
++    return 1.0f;
++  }
++  VoidPtrOrFloat u;
++  u.p = Properties().Get(FontSizeInflationProperty());
++  return u.f;
++}
++
++void
++nsBulletFrame::SetFontSizeInflation(float aInflation)
++{
++  if (aInflation == 1.0f) {
++    if (HasFontSizeInflation()) {
++      RemoveStateBits(BULLET_FRAME_HAS_FONT_INFLATION);
++      Properties().Delete(FontSizeInflationProperty());
++    }
++    return;
++  }
++
++  AddStateBits(BULLET_FRAME_HAS_FONT_INFLATION);
++  VoidPtrOrFloat u;
++  u.f = aInflation;
++  Properties().Set(FontSizeInflationProperty(), u.p);
++}
++
+ nscoord
+ nsBulletFrame::GetBaseline() const
+ {
+   nscoord ascent = 0, bottomPadding;
+   if (GetStateBits() & BULLET_FRAME_IMAGE_LOADING) {
+     ascent = GetRect().height;
+   } else {
+     nsRefPtr<nsFontMetrics> fm;
+-    nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm));
++    nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
++                                          GetFontSizeInflation());
+     const nsStyleList* myList = GetStyleList();
+     switch (myList->mListStyleType) {
+       case NS_STYLE_LIST_STYLE_NONE:
+         break;
+ 
+       case NS_STYLE_LIST_STYLE_DISC:
+       case NS_STYLE_LIST_STYLE_CIRCLE:
+       case NS_STYLE_LIST_STYLE_SQUARE:
+diff --git a/layout/generic/nsBulletFrame.h b/layout/generic/nsBulletFrame.h
+--- a/layout/generic/nsBulletFrame.h
++++ b/layout/generic/nsBulletFrame.h
+@@ -41,25 +41,31 @@
+ #define nsBulletFrame_h___
+ 
+ #include "nsFrame.h"
+ #include "nsStyleContext.h"
+ 
+ #include "imgIRequest.h"
+ #include "imgIDecoderObserver.h"
+ 
++#define BULLET_FRAME_IMAGE_LOADING NS_FRAME_STATE_BIT(63)
++#define BULLET_FRAME_HAS_FONT_INFLATION NS_FRAME_STATE_BIT(62)
++
+ /**
+  * A simple class that manages the layout and rendering of html bullets.
+  * This class also supports the CSS list-style properties.
+  */
+ class nsBulletFrame : public nsFrame {
+ public:
+   NS_DECL_FRAMEARENA_HELPERS
+ 
+-  nsBulletFrame(nsStyleContext* aContext) : nsFrame(aContext) {}
++  nsBulletFrame(nsStyleContext* aContext)
++    : nsFrame(aContext)
++  {
++  }
+   virtual ~nsBulletFrame();
+ 
+   // nsIFrame
+   virtual void DestroyFrom(nsIFrame* aDestructRoot);
+   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
+                               const nsRect&           aDirtyRect,
+                               const nsDisplayListSet& aLists);
+   virtual nsIAtom* GetType() const;
+@@ -102,20 +108,27 @@ public:
+                          
+   void PaintBullet(nsRenderingContext& aRenderingContext, nsPoint aPt,
+                    const nsRect& aDirtyRect);
+   
+   virtual bool IsEmpty();
+   virtual bool IsSelfEmpty();
+   virtual nscoord GetBaseline() const;
+ 
++  float GetFontSizeInflation() const;
++  bool HasFontSizeInflation() const {
++    return (GetStateBits() & BULLET_FRAME_HAS_FONT_INFLATION) != 0;
++  }
++  void SetFontSizeInflation(float aInflation);
++
+ protected:
+   void GetDesiredSize(nsPresContext* aPresContext,
+                       nsRenderingContext *aRenderingContext,
+-                      nsHTMLReflowMetrics& aMetrics);
++                      nsHTMLReflowMetrics& aMetrics,
++                      float aFontSizeInflation);
+ 
+   void GetLoadGroup(nsPresContext *aPresContext, nsILoadGroup **aLoadGroup);
+ 
+   nsMargin mPadding;
+   nsCOMPtr<imgIRequest> mImageRequest;
+   nsCOMPtr<imgIDecoderObserver> mListener;
+ 
+   nsSize mIntrinsicSize;

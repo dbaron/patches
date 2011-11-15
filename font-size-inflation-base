@@ -1,0 +1,547 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Implement computation of font size inflation for improved readibility of text on mobile devices.  (Bug 627842, patch 4)  r=roc
+
+This implements computation of the font size inflation factor for a
+given frame.  Since Fennec does layout using a fake viewport whose width
+represents a typical viewport width on the desktop and then allows users
+to pan and zoom, fonts are not always readable even when zoomed.  The
+goal of this font size inflation is to ensure that when a block of text
+is zoomed to fill the width of the device, the fonts are large enough to
+read.  We do this by increasing the font sizes in the page.  Since this
+increase is a function of the width of the text's container, the
+inflation must be performed (in later patches in this series) after
+style data computation and after intrinsic width computation.
+
+The font size inflation factor does not vary *within* a block.
+
+Since sync uses a whitelist (the services.sync.prefs.sync.* prefs) for
+preferences (i.e., preferences are not synced by default), this patch
+does not make any changes relating to sync, since we do not want the
+inflation preferences synced across devices (since preferred settings
+are likely to be device-specific).
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -123,16 +123,19 @@ using namespace mozilla::dom;
+ #ifdef DEBUG
+ // TODO: remove, see bug 598468.
+ bool nsLayoutUtils::gPreventAssertInCompareTreePosition = false;
+ #endif // DEBUG
+ 
+ typedef gfxPattern::GraphicsFilter GraphicsFilter;
+ typedef FrameMetrics::ViewID ViewID;
+ 
++static PRUint32 sFontSizeInflationEmPerLine;
++static PRUint32 sFontSizeInflationMinTwips;
++
+ static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
+ 
+ typedef nsDataHashtable<nsUint64HashKey, nsIContent*> ContentMap;
+ static ContentMap* sContentMap = NULL;
+ static ContentMap& GetContentMap() {
+   if (!sContentMap) {
+     sContentMap = new ContentMap();
+ #ifdef DEBUG
+@@ -4314,16 +4317,26 @@ nsLayoutUtils::GetTextRunMemoryForFrames
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ /* static */
+ void
++nsLayoutUtils::Initialize()
++{
++  mozilla::Preferences::AddUintVarCache(&sFontSizeInflationEmPerLine,
++                                        "font.size.inflation.emPerLine");
++  mozilla::Preferences::AddUintVarCache(&sFontSizeInflationMinTwips,
++                                        "font.size.inflation.minTwips");
++}
++
++/* static */
++void
+ nsLayoutUtils::Shutdown()
+ {
+   if (sContentMap) {
+     delete sContentMap;
+     sContentMap = NULL;
+   }
+ }
+ 
+@@ -4474,8 +4487,314 @@ NS_IMETHODIMP
+ nsReflowFrameRunnable::Run()
+ {
+   if (mWeakFrame.IsAlive()) {
+     mWeakFrame->PresContext()->PresShell()->
+       FrameNeedsReflow(mWeakFrame, mIntrinsicDirty, mBitToAdd);
+   }
+   return NS_OK;
+ }
++
++/**
++ * Compute the minimum font size inside of a container with the given
++ * width, such that **when the user zooms the container to fill the full
++ * width of the device**, the fonts satisfy our minima.
++ */
++static nscoord
++MinimumFontSizeFor(nsPresContext* aPresContext, nscoord aContainerWidth)
++{
++  if (sFontSizeInflationEmPerLine == 0 && sFontSizeInflationMinTwips == 0) {
++    return 0;
++  }
++  nscoord byLine = 0, byInch = 0;
++  if (sFontSizeInflationEmPerLine != 0) {
++    byLine = aContainerWidth / sFontSizeInflationEmPerLine;
++  }
++  if (sFontSizeInflationMinTwips != 0) {
++    // REVIEW: Is this giving us app units and sizes *not* counting
++    // viewport scaling?
++    nsDeviceContext *dx = aPresContext->DeviceContext();
++    nsRect clientRect;
++    dx->GetClientRect(clientRect); // FIXME: GetClientRect looks expensive
++    float deviceWidthInches =
++      float(clientRect.width) / float(dx->AppUnitsPerPhysicalInch());
++    byInch = NSToCoordRound(aContainerWidth /
++                            (deviceWidthInches * 1440 /
++                             sFontSizeInflationMinTwips ));
++  }
++  return NS_MAX(byLine, byInch);
++}
++
++/* static */ float
++nsLayoutUtils::FontSizeInflationInner(const nsIFrame *aFrame,
++                                      nscoord aMinFontSize)
++{
++  // Note that line heights should be inflated by the same ratio as the
++  // font size of the same text; thus we operate only on the font size
++  // even when we're scaling a line height.
++  nscoord styleFontSize = aFrame->GetStyleFont()->mFont.size;
++  if (styleFontSize <= 0) {
++    // Never scale zero font size.
++    return 1.0;
++  }
++
++  if (aMinFontSize <= 0) {
++    // No need to scale.
++    return 1.0;
++  }
++
++  // Scale everything from 0-1.5 times min to instead fit in the range
++  // 1-1.5 times min, so that we still show some distinction rather than
++  // just enforcing a minimum.
++  // FIXME: Fiddle with this algorithm; maybe have prefs to control it?
++  float ratio = float(styleFontSize) / float(aMinFontSize);
++  if (ratio >= 1.5f) {
++    // If we're already at 1.5 or more times the minimum, don't scale.
++    return 1.0;
++  }
++
++  // To scale 0-1.5 times min to instead be 1-1.5 times min, we want
++  // to the desired multiple of min to be 1 + (ratio/3) (where ratio
++  // is our input's multiple of min).  The scaling needed to produce
++  // that is that divided by |ratio|, or:
++  return (1.0f / ratio) + (1.0f / 3.0f);
++}
++
++/* static */ bool
++nsLayoutUtils::IsContainerForFontSizeInflation(const nsIFrame *aFrame)
++{
++  /*
++   * Font size inflation is build around the idea that we're inflating
++   * the fonts for a pan-and-zoom UI so that when the user scales up a
++   * block or other container to fill the width of the device, the fonts
++   * will be readable.  To do this, we need to pick what counts as a
++   * container.
++   *
++   * From a code perspective, the only hard requirement is that frames
++   * that are line participants
++   * (nsIFrame::IsFrameOfType(nsIFrame::eLineParticipant)) are never
++   * containers, since line layout assumes that the inflation is
++   * consistent within a line.
++   *
++   * This is not an imposition, since we obviously want a bunch of text
++   * (possibly with inline elements) flowing within a block to count the
++   * block (or higher) as its container.
++   *
++   * We also want form controls, including the text in the anonymous
++   * content inside of them, to match each other and the text next to
++   * them, so they and their anonymous content should also not be a
++   * container.
++   *
++   * There are contexts where it would be nice if some blocks didn't
++   * count as a container, so that, for example, an indented quotation
++   * didn't end up with a smaller font size.  However, it's hard to
++   * distinguish these situations where we really do want the indented
++   * thing to count as a container, so we don't try, and blocks are
++   * always containers.
++   */
++  bool isInline = aFrame->GetStyleDisplay()->mDisplay ==
++                    NS_STYLE_DISPLAY_INLINE ||
++                  aFrame->GetContent()->IsInNativeAnonymousSubtree();
++  NS_ASSERTION(!aFrame->IsFrameOfType(nsIFrame::eLineParticipant) || isInline,
++               "line participants must not be containers");
++  return !isInline;
++}
++
++static bool
++ShouldInflateFontsForContainer(const nsIFrame *aFrame)
++{
++  // We only want to inflate fonts for text that is in a place
++  // with room to expand.  The question is what the best heuristic for
++  // that is...
++  // For now, we're going to use NS_FRAME_IN_CONSTRAINED_HEIGHT, which
++  // indicates whether the frame is inside something with a constrained
++  // height (propagating down the tree), but the propagation stops when
++  // we hit overflow-y: scroll or auto.
++  return aFrame->GetStyleText()->mTextSizeAdjust !=
++           NS_STYLE_TEXT_SIZE_ADJUST_NONE &&
++         !(aFrame->GetStateBits() & NS_FRAME_IN_CONSTRAINED_HEIGHT);
++}
++
++nscoord
++nsLayoutUtils::InflationMinFontSizeFor(const nsHTMLReflowState &aReflowState)
++{
++#ifdef DEBUG
++  {
++    const nsHTMLReflowState *rs = &aReflowState;
++    const nsIFrame *f = aReflowState.frame;
++    for (; rs; rs = rs->parentReflowState, f = f->GetParent()) {
++      NS_ABORT_IF_FALSE(rs->frame == f,
++                        "reflow state parentage must match frame parentage");
++    }
++  }
++#endif
++
++  if (!FontSizeInflationEnabled(aReflowState.frame->PresContext())) {
++    return 0;
++  }
++
++  nsIFrame *reflowRoot = nsnull;
++  for (const nsHTMLReflowState *rs = &aReflowState; rs;
++       reflowRoot = rs->frame, rs = rs->parentReflowState) {
++    if (IsContainerForFontSizeInflation(rs->frame)) {
++      if (!ShouldInflateFontsForContainer(rs->frame)) {
++        return 0;
++      }
++
++      NS_ABORT_IF_FALSE(rs->ComputedWidth() != NS_INTRINSICSIZE,
++                        "must have a computed width");
++      return MinimumFontSizeFor(aReflowState.frame->PresContext(),
++                                rs->ComputedWidth());
++    }
++  }
++
++  // We've hit the end of the reflow state chain.  There are two
++  // possibilities now:  we're either at a reflow root or we're crossing
++  // into flexbox layout.  (Note that sometimes we cross into and out of
++  // flexbox layout on the same frame, e.g., for nsTextControlFrame,
++  // which breaks the reflow state parentage chain.)
++  // This code depends on:
++  //  * When we cross from HTML to XUL and then on the child jump back
++  //    to HTML again, we link the reflow states correctly (see hack in
++  //    nsFrame::BoxReflow setting reflowState.parentReflowState).
++  //  * For any other cases, the XUL frame is a font size inflation
++  //    container, so we won't cross back into HTML (see the conditions
++  //    under which we test the assertion in
++  //    InflationMinFontSizeFor(const nsIFrame *).
++
++  return InflationMinFontSizeFor(reflowRoot->GetParent());
++}
++
++nscoord
++nsLayoutUtils::InflationMinFontSizeFor(const nsIFrame *aFrame)
++{
++#ifdef DEBUG
++  // Check that neither this frame nor any of its ancestors are
++  // currently being reflowed.
++  // It's ok for box frames (but not arbitrary ancestors of box frames)
++  // since they set their size before reflow.
++  if (!(aFrame->IsBoxFrame() && IsContainerForFontSizeInflation(aFrame))) {
++    for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
++      NS_ABORT_IF_FALSE(!(f->GetStateBits() & NS_FRAME_IN_REFLOW),
++                        "must call nsHTMLReflowState& version during reflow");
++    }
++  }
++  // It's ok if frames are dirty, or even if they've never been
++  // reflowed, since they will be eventually and then we'll get the
++  // right size.
++#endif
++
++  if (!FontSizeInflationEnabled(aFrame->PresContext())) {
++    return 0;
++  }
++
++  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
++    if (IsContainerForFontSizeInflation(f)) {
++      if (!ShouldInflateFontsForContainer(f)) {
++        return 0;
++      }
++
++      return MinimumFontSizeFor(aFrame->PresContext(),
++                                f->GetContentRect().width);
++    }
++  }
++
++  NS_ABORT_IF_FALSE(false, "root should always be container");
++
++  return 0;
++}
++
++/* static */ nscoord
++nsLayoutUtils::InflationMinFontSizeFor(const nsIFrame *aFrame,
++                                       nscoord aInflationContainerWidth)
++{
++  if (!FontSizeInflationEnabled(aFrame->PresContext())) {
++    return 0;
++  }
++
++  for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
++    if (IsContainerForFontSizeInflation(f)) {
++      if (!ShouldInflateFontsForContainer(f)) {
++        return 0;
++      }
++
++      // The caller is (sketchily) asserting that it picked the right
++      // container when passing aInflationContainerWidth.  We only do
++      // this for text inputs and a few other limited situations.
++      return MinimumFontSizeFor(aFrame->PresContext(),
++                                aInflationContainerWidth);
++    }
++  }
++
++  NS_ABORT_IF_FALSE(false, "root should always be container");
++
++  return 0;
++}
++
++float
++nsLayoutUtils::FontSizeInflationFor(const nsHTMLReflowState &aReflowState)
++{
++#ifdef DEBUG
++  {
++    const nsHTMLReflowState *rs = &aReflowState;
++    const nsIFrame *f = aReflowState.frame;
++    for (; rs; rs = rs->parentReflowState, f = f->GetParent()) {
++      NS_ABORT_IF_FALSE(rs->frame == f,
++                        "reflow state parentage must match frame parentage");
++    }
++  }
++#endif
++
++  if (!FontSizeInflationEnabled(aReflowState.frame->PresContext())) {
++    return 1.0;
++  }
++
++  return FontSizeInflationInner(aReflowState.frame,
++             InflationMinFontSizeFor(aReflowState));
++}
++
++float
++nsLayoutUtils::FontSizeInflationFor(const nsIFrame *aFrame)
++{
++#ifdef DEBUG
++  // Check that neither this frame nor any of its ancestors are
++  // currently being reflowed.
++  // It's ok for box frames (but not arbitrary ancestors of box frames)
++  // since they set their size before reflow.
++  if (!(aFrame->IsBoxFrame() && IsContainerForFontSizeInflation(aFrame))) {
++    for (const nsIFrame *f = aFrame; f; f = f->GetParent()) {
++      NS_ABORT_IF_FALSE(!(f->GetStateBits() & NS_FRAME_IN_REFLOW),
++                        "must call nsHTMLReflowState& version during reflow");
++    }
++  }
++  // It's ok if frames are dirty, or even if they've never been
++  // reflowed, since they will be eventually and then we'll get the
++  // right size.
++#endif
++
++  if (!FontSizeInflationEnabled(aFrame->PresContext())) {
++    return 1.0;
++  }
++
++  return FontSizeInflationInner(aFrame,
++                                InflationMinFontSizeFor(aFrame));
++}
++
++/* static */ float
++nsLayoutUtils::FontSizeInflationFor(const nsIFrame *aFrame,
++                                    nscoord aInflationContainerWidth)
++{
++  if (!FontSizeInflationEnabled(aFrame->PresContext())) {
++    return 1.0;
++  }
++
++  return FontSizeInflationInner(aFrame,
++                                InflationMinFontSizeFor(aFrame,
++                                  aInflationContainerWidth));
++}
++
++/* static */ bool
++nsLayoutUtils::FontSizeInflationEnabled(nsPresContext *aPresContext)
++{
++  return (sFontSizeInflationEmPerLine != 0 ||
++          sFontSizeInflationMinTwips != 0) &&
++         !aPresContext->IsChrome();
++}
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1447,16 +1447,69 @@ public:
+   static nsresult GetTextRunMemoryForFrames(nsIFrame* aFrame,
+                                             PRUint64* aTotal);
+ 
+   /**
+    * Checks if CSS 3D transforms are currently enabled.
+    */
+   static bool Are3DTransformsEnabled();
+ 
++  /**
++   * Return whether this is a frame whose width is used when computing
++   * the font size inflation of its descendants.
++   */
++  static bool IsContainerForFontSizeInflation(const nsIFrame *aFrame);
++
++  /**
++   * Return the font size inflation *ratio* for a given frame.  This is
++   * the factor by which font sizes should be inflated; it is never
++   * smaller than 1.
++   *
++   * There are three variants: pass a reflow state if the frame or any
++   * of its ancestors are currently being reflowed and a frame
++   * otherwise, or, if you know the width of the inflation container (a
++   * somewhat sketchy assumption), its width.
++   */
++  static float FontSizeInflationFor(const nsHTMLReflowState &aReflowState);
++  static float FontSizeInflationFor(const nsIFrame *aFrame);
++  static float FontSizeInflationFor(const nsIFrame *aFrame,
++                                    nscoord aInflationContainerWidth);
++
++  /**
++   * Perform the first half of the computation of FontSizeInflationFor
++   * (see above).
++   * This includes determining whether inflation should be performed
++   * within this container and returning 0 if it should not be.
++   *
++   * The result is guaranteed not to vary between line participants
++   * (inlines, text frames) within a line.
++   *
++   * The result should not be used directly since font sizes slightly
++   * above the minimum should always be adjusted as done by
++   * FontSizeInflationInner.
++   */
++  static nscoord InflationMinFontSizeFor(const nsHTMLReflowState
++                                                 &aReflowState);
++  static nscoord InflationMinFontSizeFor(const nsIFrame *aFrame);
++  static nscoord InflationMinFontSizeFor(const nsIFrame *aFrame,
++                                         nscoord aInflationContainerWidth);
++
++  /**
++   * Perform the second half of the computation done by
++   * FontSizeInflationFor (see above).
++   *
++   * aMinFontSize must be the result of one of the
++   *   InflationMinFontSizeFor methods above.
++   */
++  static float FontSizeInflationInner(const nsIFrame *aFrame,
++                                      nscoord aMinFontSize);
++
++  static bool FontSizeInflationEnabled(nsPresContext *aPresContext);
++
++  static void Initialize();
+   static void Shutdown();
+ 
+   /**
+    * Register an imgIRequest object with a refresh driver.
+    *
+    * @param aPresContext The nsPresContext whose refresh driver we want to
+    *        register with.
+    * @param aRequest A pointer to the imgIRequest object which the client wants
+diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
+--- a/layout/build/nsLayoutStatics.cpp
++++ b/layout/build/nsLayoutStatics.cpp
+@@ -253,16 +253,17 @@ nsLayoutStatics::Initialize()
+   }
+ 
+ #ifdef MOZ_SYDNEYAUDIO
+   nsAudioStream::InitLibrary();
+ #endif
+ 
+   nsContentSink::InitializeStatics();
+   nsHtml5Module::InitializeStatics();
++  nsLayoutUtils::Initialize();
+   nsIPresShell::InitializeStatics();
+   nsRefreshDriver::InitializeStatics();
+ 
+   nsCORSListenerProxy::Startup();
+ 
+   nsFrameList::Init();
+ 
+   NS_SealStaticAtomTable();
+diff --git a/mobile/app/mobile.js b/mobile/app/mobile.js
+--- a/mobile/app/mobile.js
++++ b/mobile/app/mobile.js
+@@ -414,16 +414,18 @@ pref("browser.ui.kinetic.polynomialC", 1
+ pref("browser.ui.kinetic.swipeLength", 160);
+ 
+ // zooming
+ pref("browser.ui.zoom.pageFitGranularity", 9); // don't zoom to fit by less than 1/9 (11%)
+ pref("browser.ui.zoom.animationDuration", 200); // ms duration of double-tap zoom animation
+ pref("browser.ui.zoom.reflow", false); // Change text wrapping on double-tap
+ pref("browser.ui.zoom.reflow.fontSize", 720);
+ 
++pref("font.size.inflation.minTwips", 160);
++
+ // pinch gesture
+ pref("browser.ui.pinch.maxGrowth", 150);     // max pinch distance growth
+ pref("browser.ui.pinch.maxShrink", 200);     // max pinch distance shrinkage
+ pref("browser.ui.pinch.scalingFactor", 500); // scaling factor for above pinch limits
+ 
+ // Touch radius (area around the touch location to look for target elements),
+ // in 1/240-inch pixels:
+ pref("browser.ui.touch.left", 8);
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -1533,16 +1533,39 @@ pref("font.minimum-size.x-telu", 0);
+ pref("font.minimum-size.x-tibt", 0);
+ pref("font.minimum-size.th", 0);
+ pref("font.minimum-size.tr", 0);
+ pref("font.minimum-size.x-cans", 0);
+ pref("font.minimum-size.x-western", 0);
+ pref("font.minimum-size.x-unicode", 0);
+ pref("font.minimum-size.x-user-def", 0);
+ 
++/*
++ * A value greater than zero enables font size inflation for
++ * pan-and-zoom UIs, so that the fonts in a block are at least the size
++ * that, if a block's width is scaled to match the device's width, the
++ * fonts in the block are big enough that at most the pref value ems of
++ * text fit in *the width of the device*.
++ *
++ * When both this pref and the next are set, the larger inflation is
++ * used.
++ */
++pref("font.size.inflation.emPerLine", 0);
++/*
++ * A value greater than zero enables font size inflation for
++ * pan-and-zoom UIs, so that if a block's width is scaled to match the
++ * device's width, the fonts in a block are at least the font size
++ * given.  The value given is in twips, i.e., 1/20 of a point, or 1/1440
++ * of an inch.
++ *
++ * When both this pref and the previous are set, the larger inflation is
++ * used.
++ */
++pref("font.size.inflation.minTwips", 0);
++
+ #ifdef XP_WIN
+ 
+ pref("font.name.serif.ar", "Times New Roman");
+ pref("font.name.sans-serif.ar", "Arial");
+ pref("font.name.monospace.ar", "Courier New");
+ pref("font.name.cursive.ar", "Comic Sans MS");
+ 
+ pref("font.name.serif.el", "Times New Roman");

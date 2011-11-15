@@ -1,0 +1,171 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Pass block's reflow state to nsTextFrame::UnionAdditionalOverflow.  (Bug 627842, patch 8)  r=roc
+
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -2614,17 +2614,17 @@ nsLineLayout::RelativePositionFrames(Per
+       if (pfd->GetFlag(PFD_ISTEXTFRAME)) {
+         // We need to recompute overflow areas in two cases:
+         // (1) When PFD_RECOMPUTEOVERFLOW is set due to trimming
+         // (2) When there are text decorations, since we can't recompute the
+         //     overflow area until Reflow and VerticalAlignLine have finished
+         if (pfd->GetFlag(PFD_RECOMPUTEOVERFLOW) ||
+             frame->GetStyleContext()->HasTextDecorationLines()) {
+           nsTextFrame* f = static_cast<nsTextFrame*>(frame);
+-          r = f->RecomputeOverflow();
++          r = f->RecomputeOverflow(*mBlockReflowState);
+         }
+         frame->FinishAndStoreOverflow(r, frame->GetSize());
+       }
+ 
+       // If we have something that's not an inline but with a complex frame
+       // hierarchy inside that contains views, they need to be
+       // positioned.
+       // All descendant views must be repositioned even if this frame
+diff --git a/layout/generic/nsLineLayout.h b/layout/generic/nsLineLayout.h
+--- a/layout/generic/nsLineLayout.h
++++ b/layout/generic/nsLineLayout.h
+@@ -364,16 +364,19 @@ public:
+   }
+ 
+   /**
+    * This can't be null. It usually returns a block frame but may return
+    * some other kind of frame when inline frames are reflowed in a non-block
+    * context (e.g. MathML or floating first-letter).
+    */
+   nsIFrame* GetLineContainerFrame() const { return mBlockReflowState->frame; }
++  const nsHTMLReflowState* GetLineContainerRS() const {
++    return mBlockReflowState;
++  }
+   const nsLineList::iterator* GetLine() const {
+     return GetFlag(LL_GOTLINEBOX) ? &mLineBox : nsnull;
+   }
+   nsLineList::iterator* GetLine() {
+     return GetFlag(LL_GOTLINEBOX) ? &mLineBox : nsnull;
+   }
+   
+   /**
+diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
+--- a/layout/generic/nsTextFrame.h
++++ b/layout/generic/nsTextFrame.h
+@@ -259,17 +259,18 @@ public:
+   };
+   TrimOutput TrimTrailingWhiteSpace(nsRenderingContext* aRC);
+   virtual nsresult GetRenderedText(nsAString* aString = nsnull,
+                                    gfxSkipChars* aSkipChars = nsnull,
+                                    gfxSkipCharsIterator* aSkipIter = nsnull,
+                                    PRUint32 aSkippedStartOffset = 0,
+                                    PRUint32 aSkippedMaxLength = PR_UINT32_MAX);
+ 
+-  nsOverflowAreas RecomputeOverflow();
++  nsOverflowAreas
++    RecomputeOverflow(const nsHTMLReflowState& aBlockReflowState);
+ 
+   void AddInlineMinWidthForFlow(nsRenderingContext *aRenderingContext,
+                                 nsIFrame::InlineMinWidthData *aData);
+   void AddInlinePrefWidthForFlow(nsRenderingContext *aRenderingContext,
+                                  InlinePrefWidthData *aData);
+ 
+   /**
+    * Calculate the horizontal bounds of the grapheme clusters that fit entirely
+@@ -429,16 +430,17 @@ protected:
+   gfxTextRun* mTextRun;
+ 
+   // The caller of this method must call DestroySelectionDetails() on the
+   // return value, if that return value is not null.  Calling
+   // DestroySelectionDetails() on a null value is still OK, just not necessary.
+   SelectionDetails* GetSelectionDetails();
+ 
+   void UnionAdditionalOverflow(nsPresContext* aPresContext,
++                               const nsHTMLReflowState& aBlockReflowState,
+                                PropertyProvider& aProvider,
+                                nsRect* aVisualOverflowRect,
+                                bool aIncludeTextDecorations);
+ 
+   void PaintOneShadow(PRUint32 aOffset,
+                       PRUint32 aLength,
+                       nsCSSShadowItem* aShadowDetails,
+                       PropertyProvider* aProvider,
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4370,16 +4370,17 @@ nsTextFrame::GetTextDecorations(nsPresCo
+         break;
+       }
+     }
+   }
+ }
+ 
+ void
+ nsTextFrame::UnionAdditionalOverflow(nsPresContext* aPresContext,
++                                     const nsHTMLReflowState& aBlockReflowState,
+                                      PropertyProvider& aProvider,
+                                      nsRect* aVisualOverflowRect,
+                                      bool aIncludeTextDecorations)
+ {
+   // Text-shadow overflows
+   nsRect shadowRect =
+     nsLayoutUtils::GetTextShadowRectsUnion(*aVisualOverflowRect, this);
+   aVisualOverflowRect->UnionRect(*aVisualOverflowRect, shadowRect);
+@@ -7301,18 +7302,18 @@ nsTextFrame::ReflowText(nsLineLayout& aL
+   // Handle text that runs outside its normal bounds.
+   nsRect boundingBox = RoundOut(textMetrics.mBoundingBox) + nsPoint(0, mAscent);
+   aMetrics.SetOverflowAreasToDesiredBounds();
+   aMetrics.VisualOverflow().UnionRect(aMetrics.VisualOverflow(), boundingBox);
+ 
+   // When we have text decorations, we don't need to compute their overflow now
+   // because we're guaranteed to do it later
+   // (see nsLineLayout::RelativePositionFrames)
+-  UnionAdditionalOverflow(presContext, provider, &aMetrics.VisualOverflow(),
+-                          false);
++  UnionAdditionalOverflow(presContext, *aLineLayout.GetLineContainerRS(),
++                          provider, &aMetrics.VisualOverflow(), false);
+ 
+   /////////////////////////////////////////////////////////////////////
+   // Clean up, update state
+   /////////////////////////////////////////////////////////////////////
+ 
+   // If all our characters are discarded or collapsed, then trimmable width
+   // from the last textframe should be preserved. Otherwise the trimmable width
+   // from this textframe overrides. (Currently in CSS trimmable width can be
+@@ -7539,17 +7540,17 @@ nsTextFrame::TrimTrailingWhiteSpace(nsRe
+ #ifdef NOISY_TRIM
+   ListTag(stdout);
+   printf(": trim => %d\n", result.mDeltaWidth);
+ #endif
+   return result;
+ }
+ 
+ nsOverflowAreas
+-nsTextFrame::RecomputeOverflow()
++nsTextFrame::RecomputeOverflow(const nsHTMLReflowState& aBlockReflowState)
+ {
+   nsRect bounds(nsPoint(0, 0), GetSize());
+   nsOverflowAreas result(bounds, bounds);
+ 
+   gfxSkipCharsIterator iter = EnsureTextRun();
+   if (!mTextRun)
+     return result;
+ 
+@@ -7558,17 +7559,18 @@ nsTextFrame::RecomputeOverflow()
+ 
+   gfxTextRun::Metrics textMetrics =
+     mTextRun->MeasureText(provider.GetStart().GetSkippedOffset(),
+                           ComputeTransformedLength(provider),
+                           gfxFont::LOOSE_INK_EXTENTS, nsnull,
+                           &provider);
+   nsRect &vis = result.VisualOverflow();
+   vis.UnionRect(vis, RoundOut(textMetrics.mBoundingBox) + nsPoint(0, mAscent));
+-  UnionAdditionalOverflow(PresContext(), provider, &vis, true);
++  UnionAdditionalOverflow(PresContext(), aBlockReflowState, provider,
++                          &vis, true);
+   return result;
+ }
+ static PRUnichar TransformChar(const nsStyleText* aStyle, gfxTextRun* aTextRun,
+                                PRUint32 aSkippedOffset, PRUnichar aChar)
+ {
+   if (aChar == '\n') {
+     return aStyle->NewlineIsSignificant() ? aChar : ' ';
+   }

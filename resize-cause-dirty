@@ -1,0 +1,86 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+When font size inflation is enabled, horizontal resizes of blocks must cause a full dirty reflow.  (Bug 627842, patch 5)  r=bzbarsky
+
+This change is sufficient because the places that set mHResize to true
+other than InitResizeFlags and nsFrame::BoxReflow aren't a problem
+because they're in table code whose goal is to force the reflow to
+propagate down to the cell, and once we reach the cell we'll hit the
+code we've added here.
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -7564,18 +7564,26 @@ nsFrame::BoxReflow(nsBoxLayoutState&    
+     }
+ 
+     // Box layout calls SetRect before Layout, whereas non-box layout
+     // calls SetRect after Reflow.
+     // XXX Perhaps we should be doing this by twiddling the rect back to
+     // mLastSize before calling Reflow and then switching it back, but
+     // However, mLastSize can also be the size passed to BoxReflow by
+     // RefreshSizeCache, so that doesn't really make sense.
+-    if (metrics->mLastSize.width != aWidth)
++    if (metrics->mLastSize.width != aWidth) {
+       reflowState.mFlags.mHResize = true;
++
++      // When font size inflation is enabled, a horizontal resize
++      // requires a full reflow.  See nsHTMLReflowState::InitResizeFlags
++      // for more details.
++      if (nsLayoutUtils::FontSizeInflationEnabled(aPresContext)) {
++        AddStateBits(NS_FRAME_IS_DIRTY);
++      }
++    }
+     if (metrics->mLastSize.height != aHeight)
+       reflowState.mFlags.mVResize = true;
+ 
+     #ifdef DEBUG_REFLOW
+       nsAdaptorAddIndents();
+       printf("Size=(%d,%d)\n",reflowState.ComputedWidth(),
+              reflowState.ComputedHeight());
+       nsAdaptorAddIndents();
+diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
+--- a/layout/generic/nsHTMLReflowState.cpp
++++ b/layout/generic/nsHTMLReflowState.cpp
+@@ -360,16 +360,41 @@ IsQuirkContainingBlockHeight(const nsHTM
+ 
+ 
+ void
+ nsHTMLReflowState::InitResizeFlags(nsPresContext* aPresContext, nsIAtom* aFrameType)
+ {
+   mFlags.mHResize = !(frame->GetStateBits() & NS_FRAME_IS_DIRTY) &&
+                     frame->GetSize().width !=
+                       mComputedWidth + mComputedBorderPadding.LeftRight();
++  if (mFlags.mHResize &&
++      nsLayoutUtils::FontSizeInflationEnabled(aPresContext)) {
++    // When font size inflation is enabled, the change in the width of a
++    // block (or anything that returns true in
++    // IsContainerForFontSizeInflation) needs to cause a dirty reflow
++    // since it changes the size of text, line-heights, etc.  This is
++    // relatively similar to a classic case of style change reflow,
++    // except that because inflation doesn't affect the intrinsic sizing
++    // codepath, there's no need to invalidate intrinsic sizes.
++    //
++    // Note that this makes horizontal resizing a good bit more
++    // expensive.  However, font size inflation is targeted at a set of
++    // devices (zoom-and-pan devices) where the main use case for
++    // horizontal resizing needing to be efficient (window resizing) is
++    // not present.  It does still increase the cost of dynamic changes
++    // caused by script where a style or content change in one place
++    // causes a resize in another (e.g., rebalancing a table).
++
++    // FIXME: This isn't so great for the cases where
++    // nsHTMLReflowState::SetComputedWith is called, if the first time
++    // we go through InitResizeFlags we set mHResize to true, and then
++    // the second time we'd set it to false even without the
++    // NS_FRAME_IS_DIRTY bit already set.
++    frame->AddStateBits(NS_FRAME_IS_DIRTY);
++  }
+ 
+   // XXX Should we really need to null check mCBReflowState?  (We do for
+   // at least nsBoxFrame).
+   if (IS_TABLE_CELL(aFrameType) &&
+       (mFlags.mSpecialHeightReflow ||
+        (frame->GetFirstInFlow()->GetStateBits() &
+          NS_TABLE_CELL_HAD_SPECIAL_REFLOW)) &&
+       (frame->GetStateBits() & NS_FRAME_CONTAINS_RELATIVE_HEIGHT)) {
