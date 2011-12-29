@@ -1,0 +1,227 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add a frame state bit for whether a frame is a container for font size inflation (Bug 706609, Bug 706193)
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -4560,70 +4560,16 @@ nsLayoutUtils::FontSizeInflationInner(co
+ 
+   // To scale 0-1.5 times min to instead be 1-1.5 times min, we want
+   // to the desired multiple of min to be 1 + (ratio/3) (where ratio
+   // is our input's multiple of min).  The scaling needed to produce
+   // that is that divided by |ratio|, or:
+   return (1.0f / ratio) + (1.0f / 3.0f);
+ }
+ 
+-/* static */ bool
+-nsLayoutUtils::IsContainerForFontSizeInflation(const nsIFrame *aFrame)
+-{
+-  /*
+-   * Font size inflation is build around the idea that we're inflating
+-   * the fonts for a pan-and-zoom UI so that when the user scales up a
+-   * block or other container to fill the width of the device, the fonts
+-   * will be readable.  To do this, we need to pick what counts as a
+-   * container.
+-   *
+-   * From a code perspective, the only hard requirement is that frames
+-   * that are line participants
+-   * (nsIFrame::IsFrameOfType(nsIFrame::eLineParticipant)) are never
+-   * containers, since line layout assumes that the inflation is
+-   * consistent within a line.
+-   *
+-   * This is not an imposition, since we obviously want a bunch of text
+-   * (possibly with inline elements) flowing within a block to count the
+-   * block (or higher) as its container.
+-   *
+-   * We also want form controls, including the text in the anonymous
+-   * content inside of them, to match each other and the text next to
+-   * them, so they and their anonymous content should also not be a
+-   * container.
+-   *
+-   * However, because we can't reliably compute sizes across XUL during
+-   * reflow, any XUL frame with a XUL parent is always a container.
+-   *
+-   * There are contexts where it would be nice if some blocks didn't
+-   * count as a container, so that, for example, an indented quotation
+-   * didn't end up with a smaller font size.  However, it's hard to
+-   * distinguish these situations where we really do want the indented
+-   * thing to count as a container, so we don't try, and blocks are
+-   * always containers.
+-   */
+-  nsIContent *content = aFrame->GetContent();
+-  bool isInline = (aFrame->GetStyleDisplay()->mDisplay ==
+-                     NS_STYLE_DISPLAY_INLINE ||
+-                   // Given multiple frames for the same node, only the
+-                   // outer one should be considered a container.
+-                   // (Important, e.g., for nsSelectsAreaFrame.)
+-                   (aFrame->GetParent() &&
+-                    aFrame->GetParent()->GetContent() == content) ||
+-                   (content && content->IsHTML(nsGkAtoms::option)) ||
+-                   (content && content->IsInNativeAnonymousSubtree())) &&
+-                  !(aFrame->IsBoxFrame() && aFrame->GetParent() &&
+-                    aFrame->GetParent()->IsBoxFrame());
+-  NS_ASSERTION(!aFrame->IsFrameOfType(nsIFrame::eLineParticipant) || isInline,
+-               "line participants must not be containers");
+-  NS_ASSERTION(aFrame->GetType() != nsGkAtoms::bulletFrame || isInline,
+-               "bullets should not be containers");
+-  return !isInline;
+-}
+-
+ static bool
+ ShouldInflateFontsForContainer(const nsIFrame *aFrame)
+ {
+   // We only want to inflate fonts for text that is in a place
+   // with room to expand.  The question is what the best heuristic for
+   // that is...
+   // For now, we're going to use NS_FRAME_IN_CONSTRAINED_HEIGHT, which
+   // indicates whether the frame is inside something with a constrained
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1461,17 +1461,20 @@ public:
+    * Checks if CSS 3D transforms are currently enabled.
+    */
+   static bool Are3DTransformsEnabled();
+ 
+   /**
+    * Return whether this is a frame whose width is used when computing
+    * the font size inflation of its descendants.
+    */
+-  static bool IsContainerForFontSizeInflation(const nsIFrame *aFrame);
++  static bool IsContainerForFontSizeInflation(const nsIFrame *aFrame)
++  {
++    return aFrame->GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER;
++  }
+ 
+   /**
+    * Return the font size inflation *ratio* for a given frame.  This is
+    * the factor by which font sizes should be inflated; it is never
+    * smaller than 1.
+    *
+    * There are three variants: pass a reflow state if the frame or any
+    * of its ancestors are currently being reflowed and a frame
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -419,16 +419,70 @@ nsFrame::operator delete(void *, size_t)
+ 
+ NS_QUERYFRAME_HEAD(nsFrame)
+   NS_QUERYFRAME_ENTRY(nsIFrame)
+ NS_QUERYFRAME_TAIL_INHERITANCE_ROOT
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ // nsIFrame
+ 
++static bool
++IsFontSizeInflationContainer(nsIFrame* aFrame)
++{
++  /*
++   * Font size inflation is built around the idea that we're inflating
++   * the fonts for a pan-and-zoom UI so that when the user scales up a
++   * block or other container to fill the width of the device, the fonts
++   * will be readable.  To do this, we need to pick what counts as a
++   * container.
++   *
++   * From a code perspective, the only hard requirement is that frames
++   * that are line participants
++   * (nsIFrame::IsFrameOfType(nsIFrame::eLineParticipant)) are never
++   * containers, since line layout assumes that the inflation is
++   * consistent within a line.
++   *
++   * This is not an imposition, since we obviously want a bunch of text
++   * (possibly with inline elements) flowing within a block to count the
++   * block (or higher) as its container.
++   *
++   * We also want form controls, including the text in the anonymous
++   * content inside of them, to match each other and the text next to
++   * them, so they and their anonymous content should also not be a
++   * container.
++   *
++   * However, because we can't reliably compute sizes across XUL during
++   * reflow, any XUL frame with a XUL parent is always a container.
++   *
++   * There are contexts where it would be nice if some blocks didn't
++   * count as a container, so that, for example, an indented quotation
++   * didn't end up with a smaller font size.  However, it's hard to
++   * distinguish these situations where we really do want the indented
++   * thing to count as a container, so we don't try, and blocks are
++   * always containers.
++   */
++  nsIContent *content = aFrame->GetContent();
++  bool isInline = (aFrame->GetStyleDisplay()->mDisplay ==
++                     NS_STYLE_DISPLAY_INLINE ||
++                   // Given multiple frames for the same node, only the
++                   // outer one should be considered a container.
++                   // (Important, e.g., for nsSelectsAreaFrame.)
++                   (aFrame->GetParent() &&
++                    aFrame->GetParent()->GetContent() == content) ||
++                   (content && content->IsHTML(nsGkAtoms::option)) ||
++                   (content && content->IsInNativeAnonymousSubtree())) &&
++                  !(aFrame->IsBoxFrame() && aFrame->GetParent() &&
++                    aFrame->GetParent()->IsBoxFrame());
++  NS_ASSERTION(!aFrame->IsFrameOfType(nsIFrame::eLineParticipant) || isInline,
++               "line participants must not be containers");
++  NS_ASSERTION(aFrame->GetType() != nsGkAtoms::bulletFrame || isInline,
++               "bullets should not be containers");
++  return !isInline;
++}
++
+ NS_IMETHODIMP
+ nsFrame::Init(nsIContent*      aContent,
+               nsIFrame*        aParent,
+               nsIFrame*        aPrevInFlow)
+ {
+   NS_PRECONDITION(!mContent, "Double-initing a frame?");
+   NS_ASSERTION(IsFrameOfType(eDEBUGAllFrames) &&
+                !IsFrameOfType(eDEBUGNoFrames),
+@@ -457,17 +511,23 @@ nsFrame::Init(nsIContent*      aContent,
+     mState |= state & (NS_FRAME_INDEPENDENT_SELECTION |
+                        NS_FRAME_GENERATED_CONTENT);
+   }
+   if (GetStyleDisplay()->HasTransform()) {
+     // The frame gets reconstructed if we toggle the -moz-transform
+     // property, so we can set this bit here and then ignore it.
+     mState |= NS_FRAME_MAY_BE_TRANSFORMED;
+   }
+-  
++
++  if (nsLayoutUtils::FontSizeInflationEnabled(PresContext())) {
++    if (IsFontSizeInflationContainer(this)) {
++      mState |= NS_FRAME_FONT_INFLATION_CONTAINER;
++    }
++  }
++
+   DidSetStyleContext(nsnull);
+ 
+   if (IsBoxWrapped())
+     InitBoxMetrics(false); // XXX propagate allocation failure?
+ 
+   return NS_OK;
+ }
+ 
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -293,16 +293,21 @@ typedef PRUint64 nsFrameState;
+ 
+ // Frame is or is a descendant of something with a fixed height, and
+ // has no closer ancestor that is overflow:auto or overflow:scroll.
+ #define NS_FRAME_IN_CONSTRAINED_HEIGHT              NS_FRAME_STATE_BIT(39)
+ 
+ // This is only set during painting
+ #define NS_FRAME_FORCE_DISPLAY_LIST_DESCEND_INTO    NS_FRAME_STATE_BIT(40)
+ 
++// Is this frame a container for font size inflation, i.e., is it a
++// frame whose width is used to determine the inflation factor for
++// everything whose nearest ancestor container for this frame?
++#define NS_FRAME_FONT_INFLATION_CONTAINER           NS_FRAME_STATE_BIT(41)
++
+ // Box layout bits
+ #define NS_STATE_IS_HORIZONTAL                      NS_FRAME_STATE_BIT(22)
+ #define NS_STATE_IS_DIRECTION_NORMAL                NS_FRAME_STATE_BIT(31)
+ 
+ // Helper macros
+ #define NS_SUBTREE_DIRTY(_frame)  \
+   (((_frame)->GetStateBits() &      \
+     (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN)) != 0)
