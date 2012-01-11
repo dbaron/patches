@@ -2,10 +2,72 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Track which frame we're doing shrink-wrap on.  (FIXME:  We should instead use this approach to track the current container and container width -- since otherwise this is insufficient since we won't be able to get the container width when we decide we want to use inflation during shrink-wrapping.)  (TODO: set to null on containers)
 
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -2258,16 +2258,24 @@ nsLayoutUtils::IntrinsicForContainer(nsR
+ 
+ #ifdef DEBUG_INTRINSIC_WIDTH
+   nsFrame::IndentBy(stdout, gNoiseIndent);
+   static_cast<nsFrame*>(aFrame)->ListTag(stdout);
+   printf(" %s intrinsic width for container:\n",
+          aType == MIN_WIDTH ? "min" : "pref");
+ #endif
+ 
++  nsPresContext *presContext = aFrame->PresContext();
++  AutoRestore<nsIFrame*> ar(presContext->mCurrentInflationContainer);
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(aFrame)) {
++    // If we're a container for font size inflation, then shrink
++    // wrapping inside of us should not apply font size inflation.
++    presContext->mCurrentInflationContainer = nsnull;
++  }
++
+   nsIFrame::IntrinsicWidthOffsetData offsets =
+     aFrame->IntrinsicWidthOffsets(aRenderingContext);
+ 
+   const nsStylePosition *stylePos = aFrame->GetStylePosition();
+   PRUint8 boxSizing = stylePos->mBoxSizing;
+   const nsStyleCoord &styleWidth = stylePos->mWidth;
+   const nsStyleCoord &styleMinWidth = stylePos->mMinWidth;
+   const nsStyleCoord &styleMaxWidth = stylePos->mMaxWidth;
+@@ -2859,27 +2867,33 @@ nsLayoutUtils::ComputeAutoSizeWithIntrin
+ 
+   return nsSize(width, height);
+ }
+ 
+ /* static */ nscoord
+ nsLayoutUtils::MinWidthFromInline(nsIFrame* aFrame,
+                                   nsRenderingContext* aRenderingContext)
+ {
++  NS_ASSERTION(!nsLayoutUtils::IsContainerForFontSizeInflation(aFrame),
++               "should not be container for font size inflation");
++
+   nsIFrame::InlineMinWidthData data;
+   DISPLAY_MIN_WIDTH(aFrame, data.prevLines);
+   aFrame->AddInlineMinWidth(aRenderingContext, &data);
+   data.ForceBreak(aRenderingContext);
+   return data.prevLines;
+ }
+ 
+ /* static */ nscoord
+ nsLayoutUtils::PrefWidthFromInline(nsIFrame* aFrame,
+                                    nsRenderingContext* aRenderingContext)
+ {
++  NS_ASSERTION(!nsLayoutUtils::IsContainerForFontSizeInflation(aFrame),
++               "should not be container for font size inflation");
++
+   nsIFrame::InlinePrefWidthData data;
+   DISPLAY_PREF_WIDTH(aFrame, data.prevLines);
+   aFrame->AddInlinePrefWidth(aRenderingContext, &data);
+   data.ForceBreak(aRenderingContext);
+   return data.prevLines;
+ }
+ 
+ static nscolor
 diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 --- a/layout/base/nsPresContext.h
 +++ b/layout/base/nsPresContext.h
-@@ -1060,16 +1060,24 @@ protected:
+@@ -1060,16 +1060,27 @@ protected:
  
    // Formerly mLangGroup; moving from charset-oriented langGroup to
    // maintaining actual language settings everywhere (see bug 524107).
@@ -15,11 +77,14 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    nsIAtom*              mLanguage;      // [STRONG]
  
 +public:
-+  // The frame that is the root of the current shrink-wrapping
-+  // computation.  We sometimes need to know this in order to know
-+  // whether we should honor font inflation.
-+  // A public member variable so that we can use it with mozilla::AutoToggle.
-+  nsIFrame*             mShrinkWrapFrame; // [WEAK]
++  // The following are public member variables so that we can use them
++  // with mozilla::AutoToggle or mozilla::AutoRestore.
++
++  // The frame that is the container for font size inflation for the
++  // reflow or intrinsic width computation currently happening.  If this
++  // frame is null, then font inflation should not be performed.
++  nsIFrame*             mCurrentInflationContainer; // [WEAK]
++
 +protected:
 +
    nsRefPtrHashtable<nsVoidPtrHashKey, nsImageLoader>
@@ -33,7 +98,7 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -3920,16 +3920,21 @@ nsFrame::ComputeAutoSize(nsRenderingCont
+@@ -3920,16 +3920,24 @@ nsFrame::ComputeAutoSize(nsRenderingCont
    }
    return result;
  }
@@ -42,10 +107,13 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  nsFrame::ShrinkWidthToFit(nsRenderingContext *aRenderingContext,
                            nscoord aWidthInCB)
  {
-+  nsIFrame *shrinkWrapFrame =
-+    nsLayoutUtils::IsContainerForFontSizeInflation(this) ? nsnull : this;
-+  AutoToggle<nsIFrame*> t(PresContext()->mShrinkWrapFrame,
-+                          nsnull, shrinkWrapFrame);
++  nsPresContext *presContext = PresContext();
++  AutoRestore<nsIFrame*> ar(presContext->mCurrentInflationContainer);
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(this)) {
++    // If we're a container for font size inflation, then shrink
++    // wrapping inside of us should not apply font size inflation.
++    presContext->mCurrentInflationContainer = nsnull;
++  }
 +
    nscoord result;
    nscoord minWidth = GetMinWidth(aRenderingContext);
