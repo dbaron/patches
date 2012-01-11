@@ -1,0 +1,178 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Set inflation container and width correctly during reflow.  (Bug 706609)
+
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -7251,16 +7251,30 @@ PresShell::DoReflow(nsIFrame* target, bo
+   nsIFrame* rootFrame = FrameManager()->GetRootFrame();
+ 
+   nsRefPtr<nsRenderingContext> rcx = GetReferenceRenderingContext();
+   if (!rcx) {
+     NS_NOTREACHED("CreateRenderingContext failure");
+     return false;
+   }
+ 
++  NS_ASSERTION(!mPresContext->mCurrentInflationContainer,
++               "current inflation container should be null");
++  AutoRestore<nsIFrame*> restoreInflationContainer(mPresContext->
++                           mCurrentInflationContainer);
++  for (nsIFrame *f = target->GetParent(); f; f = f->GetParent()) {
++    if (nsLayoutUtils::IsContainerForFontSizeInflation(f)) {
++      NS_ASSERTION(!(f->GetStateBits() & NS_FRAME_IN_REFLOW),
++                   "a frame outside should not be in reflow");
++      mPresContext->mCurrentInflationContainer = f;
++      mPresContext->mCurrentInflationContainerWidth = f->GetContentRect().width;
++      break;
++    }
++  }
++
+ #ifdef DEBUG
+   mCurrentReflowRoot = target;
+ #endif
+ 
+   target->WillReflow(mPresContext);
+ 
+   // If the target frame is the root of the frame hierarchy, then
+   // use all the available space. If it's simply a `reflow root',
+diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
+--- a/layout/generic/nsHTMLReflowState.cpp
++++ b/layout/generic/nsHTMLReflowState.cpp
+@@ -85,16 +85,19 @@ static eNormalLineHeightControl sNormalL
+ // use for measuring things.
+ nsHTMLReflowState::nsHTMLReflowState(nsPresContext*       aPresContext,
+                                      nsIFrame*            aFrame,
+                                      nsRenderingContext* aRenderingContext,
+                                      const nsSize&        aAvailableSpace)
+   : nsCSSOffsetState(aFrame, aRenderingContext)
+   , mBlockDelta(0)
+   , mReflowDepth(0)
++  , mRestoreCurrentInflationContainer(aPresContext->mCurrentInflationContainer)
++  , mRestoreCurrentInflationContainerWidth(aPresContext->
++                                             mCurrentInflationContainerWidth)
+ {
+   NS_PRECONDITION(aPresContext, "no pres context");
+   NS_PRECONDITION(aRenderingContext, "no rendering context");
+   NS_PRECONDITION(aFrame, "no frame");
+   parentReflowState = nsnull;
+   availableWidth = aAvailableSpace.width;
+   availableHeight = aAvailableSpace.height;
+   mFloatManager = nsnull;
+@@ -127,16 +130,19 @@ nsHTMLReflowState::nsHTMLReflowState(nsP
+                                      const nsSize&            aAvailableSpace,
+                                      nscoord                  aContainingBlockWidth,
+                                      nscoord                  aContainingBlockHeight,
+                                      bool                     aInit)
+   : nsCSSOffsetState(aFrame, aParentReflowState.rendContext)
+   , mBlockDelta(0)
+   , mReflowDepth(aParentReflowState.mReflowDepth + 1)
+   , mFlags(aParentReflowState.mFlags)
++  , mRestoreCurrentInflationContainer(aPresContext->mCurrentInflationContainer)
++  , mRestoreCurrentInflationContainerWidth(aPresContext->
++                                             mCurrentInflationContainerWidth)
+ {
+   NS_PRECONDITION(aPresContext, "no pres context");
+   NS_PRECONDITION(aFrame, "no frame");
+   NS_PRECONDITION((aContainingBlockWidth == -1) ==
+                     (aContainingBlockHeight == -1),
+                   "cb width and height should only be non-default together");
+   NS_PRECONDITION(!mFlags.mSpecialHeightReflow ||
+                   !NS_SUBTREE_DIRTY(aFrame),
+@@ -1889,16 +1895,21 @@ nsHTMLReflowState::InitConstraints(nsPre
+     }
+   }
+   // Check for blinking text and permission to display it
+   mFlags.mBlinks = (parentReflowState && parentReflowState->mFlags.mBlinks);
+   if (!mFlags.mBlinks && BlinkIsAllowed()) {
+     const nsStyleTextReset* st = frame->GetStyleTextReset();
+     mFlags.mBlinks = (st->mTextBlink != NS_STYLE_TEXT_BLINK_NONE);
+   }
++
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(frame)) {
++    aPresContext->mCurrentInflationContainer = frame;
++    aPresContext->mCurrentInflationContainerWidth = mComputedWidth;
++  }
+ }
+ 
+ static void
+ UpdateProp(FrameProperties& aProps,
+            const FramePropertyDescriptor* aProperty,
+            bool aNeeded,
+            nsMargin& aNewValue)
+ {
+diff --git a/layout/generic/nsHTMLReflowState.h b/layout/generic/nsHTMLReflowState.h
+--- a/layout/generic/nsHTMLReflowState.h
++++ b/layout/generic/nsHTMLReflowState.h
+@@ -38,16 +38,17 @@
+ /* struct containing the input to nsIFrame::Reflow */
+ 
+ #ifndef nsHTMLReflowState_h___
+ #define nsHTMLReflowState_h___
+ 
+ #include "nsMargin.h"
+ #include "nsStyleCoord.h"
+ #include "nsIFrame.h"
++#include "mozilla/AutoRestore.h"
+ 
+ class nsPresContext;
+ class nsRenderingContext;
+ class nsFloatManager;
+ class nsLineLayout;
+ class nsIPercentHeightObserver;
+ 
+ struct nsStyleDisplay;
+@@ -364,16 +365,22 @@ public:
+                                      // basis?
+     PRUint16 mTableIsSplittable:1;   // tables are splittable, this should happen only inside a page
+                                      // and never insider a column frame
+     PRUint16 mHeightDependsOnAncestorCell:1;   // Does frame height depend on
+                                                // an ancestor table-cell?
+     
+   } mFlags;
+ 
++private:
++
++  mozilla::AutoRestore<nsIFrame*> mRestoreCurrentInflationContainer;
++  mozilla::AutoRestore<nscoord> mRestoreCurrentInflationContainerWidth;
++
++public:
+   // Note: The copy constructor is written by the compiler automatically. You
+   // can use that and then override specific values if you want, or you can
+   // call Init as desired...
+ 
+   // Initialize a <b>root</b> reflow state with a rendering context to
+   // use for measuring things.
+   nsHTMLReflowState(nsPresContext*           aPresContext,
+                     nsIFrame*                aFrame,
+diff --git a/layout/xul/base/src/nsBox.cpp b/layout/xul/base/src/nsBox.cpp
+--- a/layout/xul/base/src/nsBox.cpp
++++ b/layout/xul/base/src/nsBox.cpp
+@@ -532,16 +532,27 @@ nsBox::IsCollapsed(nsBoxLayoutState& aSt
+   return GetStyleVisibility()->mVisible == NS_STYLE_VISIBILITY_COLLAPSE;
+ }
+ 
+ nsresult
+ nsIFrame::Layout(nsBoxLayoutState& aState)
+ {
+   NS_ASSERTION(aState.GetRenderingContext(), "must have rendering context");
+ 
++  nsPresContext *presContext = aState.PresContext();
++  AutoRestore<nsIFrame*> restoreCurrentInflationContainer(presContext->
++                           mCurrentInflationContainer);
++  AutoRestore<nscoord> restoreCurrentInflationContainerWidth(presContext->
++                         mCurrentInflationContainerWidth);
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(mParent)) {
++    presContext->mCurrentInflationContainer = mParent;
++    presContext->mCurrentInflationContainerWidth =
++      mParent->GetContentRect().width;
++  }
++
+   nsBox *box = static_cast<nsBox*>(this);
+   DISPLAY_LAYOUT(box);
+ 
+   box->BeginLayout(aState);
+ 
+   box->DoLayout(aState);
+ 
+   box->EndLayout(aState);
