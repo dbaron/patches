@@ -2,6 +2,51 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Switch nsLayoutUtils inflation methods to the new setup with state on the pres context.  (Bug 706609)
 
+diff --git a/content/events/src/nsEventStateManager.cpp b/content/events/src/nsEventStateManager.cpp
+--- a/content/events/src/nsEventStateManager.cpp
++++ b/content/events/src/nsEventStateManager.cpp
+@@ -2544,17 +2544,18 @@ GetScrollableLineHeight(nsIFrame* aTarge
+     nsIScrollableFrame* sf = f->GetScrollTargetFrame();
+     if (sf)
+       return sf->GetLineScrollAmount().height;
+   }
+ 
+   // Fall back to the font height of the target frame.
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(aTargetFrame, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(aTargetFrame));
++    nsLayoutUtils::FontSizeInflationFor(aTargetFrame,
++                                        nsLayoutUtils::eNotInReflow));
+   NS_ASSERTION(fm, "FontMetrics is null!");
+   if (fm)
+     return fm->MaxHeight();
+   return 0;
+ }
+ 
+ void
+ nsEventStateManager::SendLineScrollEvent(nsIFrame* aTargetFrame,
+diff --git a/layout/base/nsCaret.cpp b/layout/base/nsCaret.cpp
+--- a/layout/base/nsCaret.cpp
++++ b/layout/base/nsCaret.cpp
+@@ -346,17 +346,17 @@ nsCaret::GetGeometryForFrame(nsIFrame* a
+     return rv;
+ 
+   nsIFrame *frame = aFrame->GetContentInsertionFrame();
+   NS_ASSERTION(frame, "We should not be in the middle of reflow");
+   nscoord baseline = frame->GetCaretBaseline();
+   nscoord ascent = 0, descent = 0;
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(aFrame, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(aFrame));
++    nsLayoutUtils::FontSizeInflationFor(aFrame, nsLayoutUtils::eNotInReflow));
+   NS_ASSERTION(fm, "We should be able to get the font metrics");
+   if (fm) {
+     ascent = fm->MaxAscent();
+     descent = fm->MaxDescent();
+   }
+   nscoord height = ascent + descent;
+   framePos.y = baseline - ascent;
+   Metrics caretMetrics = ComputeMetrics(aFrame, aFrameOffset, height);
 diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
 --- a/layout/base/nsLayoutUtils.cpp
 +++ b/layout/base/nsLayoutUtils.cpp
@@ -307,3 +352,573 @@ diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
     * aMinFontSize must be the result of one of the
     *   InflationMinFontSizeFor methods above.
     */
+diff --git a/layout/forms/nsListControlFrame.cpp b/layout/forms/nsListControlFrame.cpp
+--- a/layout/forms/nsListControlFrame.cpp
++++ b/layout/forms/nsListControlFrame.cpp
+@@ -252,17 +252,18 @@ void nsListControlFrame::PaintFocus(nsRe
+ 
+   nsRect fRect;
+   if (childframe) {
+     // get the child rect
+     fRect = childframe->GetRect();
+     // get it into our coordinates
+     fRect.MoveBy(childframe->GetParent()->GetOffsetTo(this));
+   } else {
+-    float inflation = nsLayoutUtils::FontSizeInflationFor(this);
++    float inflation = nsLayoutUtils::FontSizeInflationFor(this,
++                        nsLayoutUtils::eNotInReflow);
+     fRect.x = fRect.y = 0;
+     fRect.width = GetScrollPortRect().width;
+     fRect.height = CalcFallbackRowHeight(inflation);
+     fRect.MoveBy(containerFrame->GetOffsetTo(this));
+   }
+   fRect += aPt;
+   
+   bool lastItemIsSelected = false;
+@@ -289,23 +290,19 @@ nsListControlFrame::InvalidateFocus(cons
+   if (mFocused != this)
+     return;
+ 
+   nsIFrame* containerFrame = GetOptionsContainer();
+   if (containerFrame) {
+     // Invalidating from the containerFrame because that's where our focus
+     // is drawn.
+     // The origin of the scrollport is the origin of containerFrame.
+-    float inflation;
+-    if (aReflowState) {
+-      NS_ABORT_IF_FALSE(aReflowState->frame == this, "wrong reflow state");
+-      inflation = nsLayoutUtils::FontSizeInflationFor(*aReflowState);
+-    } else {
+-      inflation = nsLayoutUtils::FontSizeInflationFor(this);
+-    }
++    float inflation = nsLayoutUtils::FontSizeInflationFor(this,
++                        aReflowState ? nsLayoutUtils::eInReflow
++                                     : nsLayoutUtils::eNotInReflow);
+     nsRect invalidateArea = containerFrame->GetVisualOverflowRect();
+     nsRect emptyFallbackArea(0, 0, GetScrollPortRect().width,
+                              CalcFallbackRowHeight(inflation));
+     invalidateArea.UnionRect(invalidateArea, emptyFallbackArea);
+     containerFrame->Invalidate(invalidateArea);
+   }
+ }
+ 
+@@ -369,33 +366,30 @@ GetNumberOfOptionsRecursive(nsIContent* 
+   }
+   return optionCount;
+ }
+ 
+ //-----------------------------------------------------------------
+ // Main Reflow for ListBox/Dropdown
+ //-----------------------------------------------------------------
+ 
+-// Note that it doesn't much matter *which* reflow state aReflowState
+-// is (as long as it's in the right block); we intentionally pass
+-// whatever reflow state is most convenient.
+ nscoord
+-nsListControlFrame::CalcHeightOfARow(const nsHTMLReflowState& aReflowState)
++nsListControlFrame::CalcHeightOfARow()
+ {
+   // Calculate the height of a single row in the listbox or dropdown list by
+   // using the tallest thing in the subtree, since there may be option groups
+   // in addition to option elements, either of which may be visible or
+   // invisible, may use different fonts, etc.
+   PRInt32 heightOfARow = GetMaxOptionHeight(GetOptionsContainer());
+ 
+   // Check to see if we have zero items (and optimize by checking
+   // heightOfARow first)
+   if (heightOfARow == 0 && GetNumberOfOptions() == 0) {
+-    nscoord minFontSize = nsLayoutUtils::InflationMinFontSizeFor(aReflowState);
+-    float inflation = nsLayoutUtils::FontSizeInflationInner(this, minFontSize);
++    float inflation =
++      nsLayoutUtils::FontSizeInflationInner(this, nsLayoutUtils::eInReflow);
+     heightOfARow = CalcFallbackRowHeight(inflation);
+   }
+ 
+   return heightOfARow;
+ }
+ 
+ nscoord
+ nsListControlFrame::GetPrefWidth(nsRenderingContext *aRenderingContext)
+@@ -509,17 +503,17 @@ nsListControlFrame::Reflow(nsPresContext
+     NS_ASSERTION(!IsScrollbarUpdateSuppressed(),
+                  "Shouldn't be suppressing if we don't need a second pass!");
+     if (!autoHeight) {
+       // Update our mNumDisplayRows based on our new row height now that we
+       // know it.  Note that if autoHeight and we landed in this code then we
+       // already set mNumDisplayRows in CalcIntrinsicHeight.  Also note that we
+       // can't use HeightOfARow() here because that just uses a cached value
+       // that we didn't compute.
+-      nscoord rowHeight = CalcHeightOfARow(aReflowState);
++      nscoord rowHeight = CalcHeightOfARow();
+       if (rowHeight == 0) {
+         // Just pick something
+         mNumDisplayRows = 1;
+       } else {
+         mNumDisplayRows = NS_MAX(1, state.ComputedHeight() / rowHeight);
+       }
+     }
+ 
+diff --git a/layout/forms/nsListControlFrame.h b/layout/forms/nsListControlFrame.h
+--- a/layout/forms/nsListControlFrame.h
++++ b/layout/forms/nsListControlFrame.h
+@@ -243,17 +243,17 @@ public:
+    * Pass non-null aReflowState if during reflow.
+    */
+   void InvalidateFocus(const nsHTMLReflowState* aReflowState = nsnull);
+ 
+   /**
+    * Function to calculate the height a row, for use with the "size" attribute.
+    * Can't be const because GetNumberOfOptions() isn't const.
+    */
+-  nscoord CalcHeightOfARow(const nsHTMLReflowState& aReflowState);
++  nscoord CalcHeightOfARow();
+ 
+   /**
+    * Function to ask whether we're currently in what might be the
+    * first pass of a two-pass reflow.
+    */
+   bool MightNeedSecondPass() const {
+     return mMightNeedSecondPass;
+   }
+diff --git a/layout/forms/nsProgressFrame.cpp b/layout/forms/nsProgressFrame.cpp
+--- a/layout/forms/nsProgressFrame.cpp
++++ b/layout/forms/nsProgressFrame.cpp
+@@ -264,18 +264,19 @@ nsProgressFrame::AttributeChanged(PRInt3
+ }
+ 
+ nsSize
+ nsProgressFrame::ComputeAutoSize(nsRenderingContext *aRenderingContext,
+                                  nsSize aCBSize, nscoord aAvailableWidth,
+                                  nsSize aMargin, nsSize aBorder,
+                                  nsSize aPadding, bool aShrinkWrap)
+ {
++  // FIXME: need to ensure we're not a container!
+   float inflation =
+-    nsLayoutUtils::FontSizeInflationFor(this, aCBSize.width);
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
+   nsRefPtr<nsFontMetrics> fontMet;
+   NS_ENSURE_SUCCESS(nsLayoutUtils::GetFontMetricsForFrame(this,
+                                                           getter_AddRefs(fontMet),
+                                                           inflation),
+                     nsSize(0, 0));
+ 
+   nsSize autoSize;
+   autoSize.height = autoSize.width = fontMet->Font().size; // 1em
+diff --git a/layout/forms/nsSelectsAreaFrame.cpp b/layout/forms/nsSelectsAreaFrame.cpp
+--- a/layout/forms/nsSelectsAreaFrame.cpp
++++ b/layout/forms/nsSelectsAreaFrame.cpp
+@@ -229,17 +229,17 @@ nsSelectsAreaFrame::Reflow(nsPresContext
+   
+   nsresult rv = nsBlockFrame::Reflow(aPresContext, aDesiredSize,
+                                     aReflowState, aStatus);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // Check whether we need to suppress scrolbar updates.  We want to do that if
+   // we're in a possible first pass and our height of a row has changed.
+   if (list->MightNeedSecondPass()) {
+-    nscoord newHeightOfARow = list->CalcHeightOfARow(aReflowState);
++    nscoord newHeightOfARow = list->CalcHeightOfARow();
+     // We'll need a second pass if our height of a row changed.  For
+     // comboboxes, we'll also need it if our height changed.  If we're going
+     // to do a second pass, suppress scrollbar updates for this pass.
+     if (newHeightOfARow != mHeightOfARow ||
+         (isInDropdownMode && (oldHeight != aDesiredSize.height ||
+                               oldHeight != GetSize().height))) {
+       mHeightOfARow = newHeightOfARow;
+       list->SetSuppressScrollbarUpdate(true);
+diff --git a/layout/forms/nsTextControlFrame.cpp b/layout/forms/nsTextControlFrame.cpp
+--- a/layout/forms/nsTextControlFrame.cpp
++++ b/layout/forms/nsTextControlFrame.cpp
+@@ -499,17 +499,19 @@ nsTextControlFrame::ComputeAutoSize(nsRe
+                                     nsSize aPadding, bool aShrinkWrap)
+ {
+   float inflation;
+   if (nsLayoutUtils::IsContainerForFontSizeInflation(this)) {
+     // FIXME: This won't turn out so well for the height; maybe disable
+     // inflation entirely in this case?
+     inflation = 1.0f;
+   } else {
+-    inflation = nsLayoutUtils::FontSizeInflationFor(this, aCBSize.width);
++    // FIXME: THIS IS WRONG
++    inflation =
++      nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
+   }
+   nsSize autoSize;
+   nsresult rv = CalcIntrinsicSize(aRenderingContext, autoSize, inflation);
+   if (NS_FAILED(rv)) {
+     // What now?
+     autoSize.SizeTo(0, 0);
+   }
+ #ifdef DEBUG
+@@ -607,34 +609,18 @@ nsTextControlFrame::GetMaxSize(nsBoxLayo
+ }
+ 
+ nscoord
+ nsTextControlFrame::GetBoxAscent(nsBoxLayoutState& aState)
+ {
+   // Return the baseline of the first (nominal) row, with centering for
+   // single-line controls.
+ 
+-  float inflation;
+-  if (nsLayoutUtils::IsContainerForFontSizeInflation(this)) {
+-    inflation =
+-      nsLayoutUtils::FontSizeInflationFor(this, GetContentRect().width);
+-  } else {
+-    const nsHTMLReflowState *outerReflowState = aState.OuterReflowState();
+-    NS_ASSERTION(outerReflowState || !mParent || mParent->IsBoxFrame() ||
+-                 !(mParent->GetStateBits() & NS_FRAME_IN_REFLOW),
+-                 "when a text control is reflowed by one of its ancestors "
+-                 "and its parent is non-XUL, we should have the outer "
+-                 "reflow state in the box layout state");
+-    if (outerReflowState && outerReflowState->frame == this) {
+-      inflation = nsLayoutUtils::FontSizeInflationFor(*outerReflowState);
+-    } else {
+-      inflation = nsLayoutUtils::FontSizeInflationInner(this,
+-                    nsLayoutUtils::InflationMinFontSizeFor(mParent));
+-    }
+-  }
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
+ 
+   // First calculate the ascent wrt the client rect
+   nsRect clientRect;
+   GetClientRect(clientRect);
+   nscoord lineHeight =
+     IsSingleLineTextControl() ? clientRect.height :
+     nsHTMLReflowState::CalcLineHeight(GetStyleContext(), NS_AUTOHEIGHT,
+                                       inflation);
+diff --git a/layout/generic/TextOverflow.cpp b/layout/generic/TextOverflow.cpp
+--- a/layout/generic/TextOverflow.cpp
++++ b/layout/generic/TextOverflow.cpp
+@@ -232,17 +232,17 @@ nsDisplayTextOverflowMarker::Paint(nsDis
+ }
+ 
+ void
+ nsDisplayTextOverflowMarker::PaintTextToContext(nsRenderingContext* aCtx,
+                                                 nsPoint aOffsetFromRect)
+ {
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(mFrame, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(mFrame));
++    nsLayoutUtils::FontSizeInflationFor(mFrame, nsLayoutUtils::eNotInReflow));
+   aCtx->SetFont(fm);
+   gfxFloat y = nsLayoutUtils::GetSnappedBaselineY(mFrame, aCtx->ThebesContext(),
+                                                   mRect.y, mAscent);
+   nsPoint baselinePt(mRect.x, NSToCoordFloor(y));
+   nsLayoutUtils::DrawString(mFrame, aCtx, mString.get(),
+                             mString.Length(), baselinePt + aOffsetFromRect);
+ }
+ 
+@@ -731,17 +731,17 @@ TextOverflow::Marker::SetupString(nsIFra
+ {
+   if (mInitialized) {
+     return;
+   }
+   nsRefPtr<nsRenderingContext> rc =
+     aFrame->PresContext()->PresShell()->GetReferenceRenderingContext();
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(aFrame, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(aFrame));
++    nsLayoutUtils::FontSizeInflationFor(aFrame, nsLayoutUtils::eNotInReflow));
+   rc->SetFont(fm);
+ 
+   mMarkerString = mStyle->mType == NS_STYLE_TEXT_OVERFLOW_ELLIPSIS ?
+                     GetEllipsis(fm) : mStyle->mString;
+   mWidth = nsLayoutUtils::GetStringWidth(aFrame, rc, mMarkerString.get(),
+                                          mMarkerString.Length());
+   mIntrinsicWidth = mWidth;
+   mInitialized = true;
+diff --git a/layout/generic/nsBRFrame.cpp b/layout/generic/nsBRFrame.cpp
+--- a/layout/generic/nsBRFrame.cpp
++++ b/layout/generic/nsBRFrame.cpp
+@@ -146,17 +146,17 @@ BRFrame::Reflow(nsPresContext* aPresCont
+       // line-height makes this necessary to make BR cause a line
+       // of the full line-height
+ 
+       // We also do this in strict mode because BR should act like a
+       // normal inline frame.  That line-height is used is important
+       // here for cases where the line-height is less than 1.
+       nsRefPtr<nsFontMetrics> fm;
+       nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
+-        nsLayoutUtils::FontSizeInflationFor(aReflowState));
++        nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow));
+       aReflowState.rendContext->SetFont(fm); // FIXME: maybe not needed?
+       if (fm) {
+         nscoord logicalHeight = aReflowState.CalcLineHeight();
+         aMetrics.height = logicalHeight;
+         aMetrics.ascent =
+           nsLayoutUtils::GetCenteredFontBaseline(fm, logicalHeight);
+       }
+       else {
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -558,21 +558,21 @@ nsBlockFrame::GetCaretBaseline() const
+   if (!mLines.empty()) {
+     const_line_iterator line = begin_lines();
+     const nsLineBox* firstLine = line;
+     if (firstLine->GetChildCount()) {
+       return bp.top + firstLine->mFirstChild->GetCaretBaseline();
+     }
+   }
+   nsRefPtr<nsFontMetrics> fm;
+-  nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(this));
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eNotInReflow);
++  nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm), inflation);
+   return nsLayoutUtils::GetCenteredFontBaseline(fm, nsHTMLReflowState::
+-      CalcLineHeight(GetStyleContext(), contentRect.height,
+-      nsLayoutUtils::FontSizeInflationFor(this))) +
++      CalcLineHeight(GetStyleContext(), contentRect.height, inflation)) +
+     bp.top;
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ // Child frame enumeration
+ 
+ nsFrameList
+ nsBlockFrame::GetChildList(ChildListID aListID) const
+@@ -2338,17 +2338,17 @@ nsBlockFrame::ReflowDirtyLines(nsBlockRe
+ 
+       if (metrics.ascent == nsHTMLReflowMetrics::ASK_FOR_BASELINE &&
+           !nsLayoutUtils::GetFirstLineBaseline(mBullet, &metrics.ascent)) {
+         metrics.ascent = metrics.height;
+       }
+ 
+       nsRefPtr<nsFontMetrics> fm;
+       nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
+-        nsLayoutUtils::FontSizeInflationFor(aState.mReflowState));
++        nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow));
+       aState.mReflowState.rendContext->SetFont(fm); // FIXME: needed?
+ 
+       nscoord minAscent =
+         nsLayoutUtils::GetCenteredFontBaseline(fm, aState.mMinLineHeight);
+       nscoord minDescent = aState.mMinLineHeight - minAscent;
+ 
+       aState.mY += NS_MAX(minAscent, metrics.ascent) +
+                    NS_MAX(minDescent, metrics.height - metrics.ascent);
+diff --git a/layout/generic/nsBulletFrame.cpp b/layout/generic/nsBulletFrame.cpp
+--- a/layout/generic/nsBulletFrame.cpp
++++ b/layout/generic/nsBulletFrame.cpp
+@@ -1413,17 +1413,18 @@ NS_IMETHODIMP
+ nsBulletFrame::Reflow(nsPresContext* aPresContext,
+                       nsHTMLReflowMetrics& aMetrics,
+                       const nsHTMLReflowState& aReflowState,
+                       nsReflowStatus& aStatus)
+ {
+   DO_GLOBAL_REFLOW_COUNT("nsBulletFrame");
+   DISPLAY_REFLOW(aPresContext, this, aReflowState, aMetrics, aStatus);
+ 
+-  float inflation = nsLayoutUtils::FontSizeInflationFor(aReflowState);
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
+   SetFontSizeInflation(inflation);
+ 
+   // Get the base size
+   GetDesiredSize(aPresContext, aReflowState.rendContext, aMetrics, inflation);
+ 
+   // Add in the border and padding; split the top/bottom between the
+   // ascent and descent to make things look nice
+   const nsMargin& borderPadding = aReflowState.mComputedBorderPadding;
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -7663,18 +7663,18 @@ nsFrame::BoxReflow(nsBoxLayoutState&    
+     // messes up dimensions.
+     const nsHTMLReflowState *outerReflowState = aState.OuterReflowState();
+     NS_ASSERTION(!outerReflowState || outerReflowState->frame != this,
+                  "in and out of XUL on a single frame?");
+     if (outerReflowState && outerReflowState->frame == parentFrame) {
+       // We're a frame (such as a text control frame) that jumps into
+       // box reflow and then straight out of it on the child frame.
+       // This means we actually have a real parent reflow state.
+-      // nsLayoutUtils::InflationMinFontSizeFor needs this to be linked
+-      // up correctly for text control frames, so do so here).
++      // nsLayoutUtils::InflationMinFontSizeFor used to need this to be
++      // linked up correctly for text control frames, so do so here).
+       reflowState.parentReflowState = outerReflowState;
+       reflowState.mCBReflowState = outerReflowState;
+     } else {
+       reflowState.parentReflowState = &parentReflowState;
+       reflowState.mCBReflowState = &parentReflowState;
+     }
+     reflowState.mReflowDepth = aState.GetReflowDepth();
+ 
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -2226,17 +2226,17 @@ nsGfxScrollFrameInner::ScrollBy(nsIntPoi
+   }
+ }
+ 
+ nsSize
+ nsGfxScrollFrameInner::GetLineScrollAmount() const
+ {
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(mOuter, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(mOuter));
++    nsLayoutUtils::FontSizeInflationFor(mOuter, nsLayoutUtils::eNotInReflow));
+   NS_ASSERTION(fm, "FontMetrics is null, assuming fontHeight == 1 appunit");
+   nscoord fontHeight = 1;
+   if (fm) {
+     fontHeight = fm->MaxHeight();
+   }
+ 
+   return nsSize(fontHeight, fontHeight);
+ }
+diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
+--- a/layout/generic/nsHTMLReflowState.cpp
++++ b/layout/generic/nsHTMLReflowState.cpp
+@@ -2201,17 +2201,18 @@ ComputeLineHeight(nsStyleContext* aStyle
+ nscoord
+ nsHTMLReflowState::CalcLineHeight() const
+ {
+   nscoord blockHeight =
+     nsLayoutUtils::IsNonWrapperBlock(frame) ? mComputedHeight :
+     (mCBReflowState ? mCBReflowState->mComputedHeight : NS_AUTOHEIGHT);
+ 
+   return CalcLineHeight(frame->GetStyleContext(), blockHeight,
+-                        nsLayoutUtils::FontSizeInflationFor(*this));
++                        nsLayoutUtils::FontSizeInflationFor(frame,
++                          nsLayoutUtils::eInReflow));
+ }
+ 
+ /* static */ nscoord
+ nsHTMLReflowState::CalcLineHeight(nsStyleContext* aStyleContext,
+                                   nscoord aBlockHeight,
+                                   float aFontSizeInflation)
+ {
+   NS_PRECONDITION(aStyleContext, "Must have a style context");
+diff --git a/layout/generic/nsImageFrame.cpp b/layout/generic/nsImageFrame.cpp
+--- a/layout/generic/nsImageFrame.cpp
++++ b/layout/generic/nsImageFrame.cpp
+@@ -983,17 +983,17 @@ nsImageFrame::DisplayAltText(nsPresConte
+                              nsRenderingContext& aRenderingContext,
+                              const nsString&      aAltText,
+                              const nsRect&        aRect)
+ {
+   // Set font and color
+   aRenderingContext.SetColor(GetStyleColor()->mColor);
+   nsRefPtr<nsFontMetrics> fm;
+   nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm),
+-    nsLayoutUtils::FontSizeInflationFor(this));
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eNotInReflow));
+   aRenderingContext.SetFont(fm);
+ 
+   // Format the text to display within the formatting rect
+ 
+   nscoord maxAscent = fm->MaxAscent();
+   nscoord maxDescent = fm->MaxDescent();
+   nscoord height = fm->MaxHeight();
+ 
+diff --git a/layout/generic/nsInlineFrame.cpp b/layout/generic/nsInlineFrame.cpp
+--- a/layout/generic/nsInlineFrame.cpp
++++ b/layout/generic/nsInlineFrame.cpp
+@@ -641,17 +641,18 @@ nsInlineFrame::ReflowFrames(nsPresContex
+   if (NS_FRAME_IS_COMPLETE(aStatus) &&
+       !GetLastInFlow()->GetNextContinuation() &&
+       !nsLayoutUtils::FrameIsNonLastInIBSplit(this)) {
+     aMetrics.width += ltr ? aReflowState.mComputedBorderPadding.right
+                           : aReflowState.mComputedBorderPadding.left;
+   }
+ 
+   nsRefPtr<nsFontMetrics> fm;
+-  float inflation = nsLayoutUtils::FontSizeInflationFor(aReflowState);
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
+   nsLayoutUtils::GetFontMetricsForFrame(this, getter_AddRefs(fm), inflation);
+   aReflowState.rendContext->SetFont(fm);
+ 
+   if (fm) {
+     // Compute final height of the frame.
+     //
+     // Do things the standard css2 way -- though it's hard to find it
+     // in the css2 spec! It's actually found in the css1 spec section
+diff --git a/layout/generic/nsLineLayout.cpp b/layout/generic/nsLineLayout.cpp
+--- a/layout/generic/nsLineLayout.cpp
++++ b/layout/generic/nsLineLayout.cpp
+@@ -116,17 +116,18 @@ nsLineLayout::nsLineLayout(nsPresContext
+   mTextAlign = mStyleText->mTextAlign;
+   mLineNumber = 0;
+   mFlags = 0; // default all flags to false except those that follow here...
+   mTotalPlacedFrames = 0;
+   mTopEdge = 0;
+   mTrimmableWidth = 0;
+ 
+   mInflationMinFontSize =
+-    nsLayoutUtils::InflationMinFontSizeFor(*aOuterReflowState);
++    nsLayoutUtils::InflationMinFontSizeFor(aOuterReflowState->frame,
++                                           nsLayoutUtils::eInReflow);
+ 
+   // Instead of always pre-initializing the free-lists for frames and
+   // spans, we do it on demand so that situations that only use a few
+   // frames and spans won't waste a lot of time in unneeded
+   // initialization.
+   PL_INIT_ARENA_POOL(&mArena, "nsLineLayout", 1024);
+   mFrameFreeList = nsnull;
+   mSpanFreeList = nsnull;
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -4613,17 +4613,18 @@ nsTextFrame::UnionAdditionalOverflow(nsP
+     // Since CSS 2.1 requires that text-decoration defined on ancestors maintain
+     // style and position, they can be drawn at virtually any y-offset, so
+     // maxima and minima are required to reliably generate the rectangle for
+     // them
+     TextDecorations textDecs;
+     GetTextDecorations(aPresContext, textDecs);
+     if (textDecs.HasDecorationLines()) {
+       nscoord inflationMinFontSize =
+-        nsLayoutUtils::InflationMinFontSizeFor(aBlockReflowState);
++        nsLayoutUtils::InflationMinFontSizeFor(aBlockReflowState.frame,
++                                               nsLayoutUtils::eInReflow);
+ 
+       const nscoord width = GetSize().width;
+       const gfxFloat appUnitsPerDevUnit = aPresContext->AppUnitsPerDevPixel(),
+                      gfxWidth = width / appUnitsPerDevUnit,
+                      ascent = gfxFloat(mAscent) / appUnitsPerDevUnit;
+       nscoord top(nscoord_MAX), bottom(nscoord_MIN);
+       // Below we loop through all text decorations and compute the rectangle
+       // containing all of them, in this frame's coordinate space
+@@ -5596,17 +5597,17 @@ nsTextFrame::DrawTextRunAndDecorations(
+     gfxSize decSize(width / app, 0);
+     const gfxFloat ascent = gfxFloat(mAscent) / app;
+     const gfxFloat frameTop = aFramePt.y;
+ 
+     gfxRect dirtyRect(aDirtyRect.x / app, aDirtyRect.y / app,
+                       aDirtyRect.Width() / app, aDirtyRect.Height() / app);
+ 
+     nscoord inflationMinFontSize =
+-      nsLayoutUtils::InflationMinFontSizeFor(this);
++      nsLayoutUtils::InflationMinFontSizeFor(this, nsLayoutUtils::eNotInReflow);
+ 
+     // Underlines
+     for (PRUint32 i = aDecorations.mUnderlines.Length(); i-- > 0; ) {
+       const LineDecoration& dec = aDecorations.mUnderlines[i];
+ 
+       float inflation = nsLayoutUtils::FontSizeInflationInner(dec.mFrame,
+                           inflationMinFontSize);
+       const gfxFont::Metrics metrics =
+@@ -7344,19 +7345,18 @@ nsTextFrame::ReflowText(nsLineLayout& aL
+         SetLength(offset + length - GetContentOffset(), &aLineLayout,
+                   ALLOW_FRAME_CREATION_AND_DESTRUCTION);
+         // Ensure that the textrun will be rebuilt
+         ClearTextRuns();
+       }
+     } 
+   }
+ 
+-  float fontSizeInflation = nsLayoutUtils::FontSizeInflationInner(this,
+-                              nsLayoutUtils::InflationMinFontSizeFor(
+-                                *aLineLayout.GetLineContainerRS()));
++  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this,
++                              nsLayoutUtils::eInReflow);
+ 
+   if (fontSizeInflation != GetFontSizeInflation()) {
+     // FIXME: Ideally, if we already have a text run, we'd move it to be
+     // the uninflated text run.
+     ClearTextRun(nsnull, nsTextFrame::eInflated);
+   }
+ 
+   gfxSkipCharsIterator iter =
