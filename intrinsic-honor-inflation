@@ -2,33 +2,67 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Honor inflation during intrinsic width computation when needed.  (Bug 706609)
 
+diff --git a/layout/generic/nsTextFrame.h b/layout/generic/nsTextFrame.h
+--- a/layout/generic/nsTextFrame.h
++++ b/layout/generic/nsTextFrame.h
+@@ -268,19 +268,21 @@ public:
+                                    gfxSkipCharsIterator* aSkipIter = nsnull,
+                                    PRUint32 aSkippedStartOffset = 0,
+                                    PRUint32 aSkippedMaxLength = PR_UINT32_MAX);
+ 
+   nsOverflowAreas
+     RecomputeOverflow(const nsHTMLReflowState& aBlockReflowState);
+ 
+   void AddInlineMinWidthForFlow(nsRenderingContext *aRenderingContext,
+-                                nsIFrame::InlineMinWidthData *aData);
++                                nsIFrame::InlineMinWidthData *aData,
++                                float aInflation, TextRunType aTextRunType);
+   void AddInlinePrefWidthForFlow(nsRenderingContext *aRenderingContext,
+-                                 InlinePrefWidthData *aData);
++                                 InlinePrefWidthData *aData,
++                                 float aInflation, TextRunType aTextRunType);
+ 
+   /**
+    * Calculate the horizontal bounds of the grapheme clusters that fit entirely
+    * inside the given left/right edges (which are positive lengths from the
+    * respective frame edge).  If an input value is zero it is ignored and the
+    * result for that edge is zero.  All out parameter values are undefined when
+    * the method returns false.
+    * @return true if at least one whole grapheme cluster fit between the edges
 diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
 --- a/layout/generic/nsTextFrameThebes.cpp
 +++ b/layout/generic/nsTextFrameThebes.cpp
-@@ -6570,18 +6570,21 @@ void nsTextFrame::MarkIntrinsicWidthsDir
+@@ -6566,24 +6566,26 @@ void nsTextFrame::MarkIntrinsicWidthsDir
+   ClearTextRuns();
+   nsFrame::MarkIntrinsicWidthsDirty();
+ }
+ 
  // XXX this doesn't handle characters shaped by line endings. We need to
  // temporarily override the "current line ending" settings.
  void
  nsTextFrame::AddInlineMinWidthForFlow(nsRenderingContext *aRenderingContext,
-                                       nsIFrame::InlineMinWidthData *aData)
+-                                      nsIFrame::InlineMinWidthData *aData)
++                                      nsIFrame::InlineMinWidthData *aData,
++                                      float aInflation,
++                                      TextRunType aTextRunType)
  {
    PRUint32 flowEndInTextRun;
    gfxContext* ctx = aRenderingContext->ThebesContext();
-+  float inflation =
-+    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
-+  TextRunType trtype = (inflation == 1.0f) ? eNotInflated : eInflated;
    gfxSkipCharsIterator iter =
 -    EnsureTextRun(nsTextFrame::eNotInflated, 1.0f, ctx, aData->lineContainer,
-+    EnsureTextRun(trtype, inflation, ctx, aData->lineContainer,
++    EnsureTextRun(aTextRunType, aInflation, ctx, aData->lineContainer,
                    aData->line, &flowEndInTextRun);
-   gfxTextRun *textRun = GetTextRun(nsTextFrame::eNotInflated);
+-  gfxTextRun *textRun = GetTextRun(nsTextFrame::eNotInflated);
++  gfxTextRun *textRun = GetTextRun(aTextRunType);
    if (!textRun)
      return;
  
    // Pass null for the line container. This will disable tab spacing, but that's
    // OK since we can't really handle tabs for intrinsic sizing anyway.
    const nsStyleText* textStyle = GetStyleText();
-@@ -6595,17 +6598,17 @@ nsTextFrame::AddInlineMinWidthForFlow(ns
+   const nsTextFragment* frag = mContent->GetText();
+ 
+@@ -6595,17 +6597,17 @@ nsTextFrame::AddInlineMinWidthForFlow(ns
       (textStyle->mHyphens == NS_STYLE_HYPHENS_MANUAL &&
        (textRun->GetFlags() & gfxTextRunFactory::TEXT_ENABLE_HYPHEN_BREAKS) != 0));
    if (hyphenating) {
@@ -38,7 +72,7 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
    }
    PropertyProvider provider(textRun, textStyle, frag, this,
 -                            iter, len, nsnull, 0, nsTextFrame::eNotInflated);
-+                            iter, len, nsnull, 0, trtype);
++                            iter, len, nsnull, 0, aTextRunType);
  
    bool collapseWhitespace = !textStyle->WhiteSpaceIsSignificant();
    bool preformatNewlines = textStyle->NewlineIsSignificant();
@@ -47,7 +81,19 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
    PRUint32 start =
      FindStartAfterSkippingWhitespace(&provider, aData, textStyle, &iter, flowEndInTextRun);
  
-@@ -6704,56 +6707,60 @@ nsTextFrame::AddInlineMinWidth(nsRenderi
+@@ -6696,64 +6698,70 @@ nsTextFrame::AddInlineMinWidthForFlow(ns
+ }
+ 
+ // XXX Need to do something here to avoid incremental reflow bugs due to
+ // first-line and first-letter changing min-width
+ /* virtual */ void
+ nsTextFrame::AddInlineMinWidth(nsRenderingContext *aRenderingContext,
+                                nsIFrame::InlineMinWidthData *aData)
+ {
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
++  TextRunType trtype = (inflation == 1.0f) ? eNotInflated : eInflated;
++
    nsTextFrame* f;
    gfxTextRun* lastTextRun = nsnull;
    // nsContinuingTextFrame does nothing for AddInlineMinWidth; all text frames
@@ -56,8 +102,8 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
      // f->GetTextRun(nsTextFrame::eNotInflated) could be null if we
      // haven't set up textruns yet for f.  Except in OOM situations,
      // lastTextRun will only be null for the first text frame.
-+    // FIXME
-     if (f == this || f->GetTextRun(nsTextFrame::eNotInflated) != lastTextRun) {
+-    if (f == this || f->GetTextRun(nsTextFrame::eNotInflated) != lastTextRun) {
++    if (f == this || f->GetTextRun(trtype) != lastTextRun) {
        nsIFrame* lc;
        if (aData->lineContainer &&
            aData->lineContainer != (lc = FindLineContainer(f))) {
@@ -68,9 +114,11 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
        }
  
        // This will process all the text frames that share the same textrun as f.
-       f->AddInlineMinWidthForFlow(aRenderingContext, aData);
-+      // FIXME
-       lastTextRun = f->GetTextRun(nsTextFrame::eNotInflated);
+-      f->AddInlineMinWidthForFlow(aRenderingContext, aData);
+-      lastTextRun = f->GetTextRun(nsTextFrame::eNotInflated);
++      f->AddInlineMinWidthForFlow(aRenderingContext, aData,
++                                  inflation, trtype);
++      lastTextRun = f->GetTextRun(trtype);
      }
    }
  }
@@ -79,18 +127,19 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
  // temporarily override the "current line ending" settings.
  void
  nsTextFrame::AddInlinePrefWidthForFlow(nsRenderingContext *aRenderingContext,
-                                        nsIFrame::InlinePrefWidthData *aData)
+-                                       nsIFrame::InlinePrefWidthData *aData)
++                                       nsIFrame::InlinePrefWidthData *aData,
++                                       float aInflation,
++                                       TextRunType aTextRunType)
  {
    PRUint32 flowEndInTextRun;
    gfxContext* ctx = aRenderingContext->ThebesContext();
-+  float inflation =
-+    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
-+  TextRunType trtype = (inflation == 1.0f) ? eNotInflated : eInflated;
    gfxSkipCharsIterator iter =
 -    EnsureTextRun(nsTextFrame::eNotInflated, 1.0f, ctx, aData->lineContainer,
-+    EnsureTextRun(trtype, inflation, ctx, aData->lineContainer,
++    EnsureTextRun(aTextRunType, aInflation, ctx, aData->lineContainer,
                    aData->line, &flowEndInTextRun);
-   gfxTextRun *textRun = GetTextRun(nsTextFrame::eNotInflated);
+-  gfxTextRun *textRun = GetTextRun(nsTextFrame::eNotInflated);
++  gfxTextRun *textRun = GetTextRun(aTextRunType);
    if (!textRun)
      return;
  
@@ -102,7 +151,7 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
    PropertyProvider provider(textRun, textStyle, frag, this,
 -                            iter, PR_INT32_MAX, nsnull, 0,
 -                            nsTextFrame::eNotInflated);
-+                            iter, PR_INT32_MAX, nsnull, 0, trtype);
++                            iter, PR_INT32_MAX, nsnull, 0, aTextRunType);
  
    bool collapseWhitespace = !textStyle->WhiteSpaceIsSignificant();
    bool preformatNewlines = textStyle->NewlineIsSignificant();
@@ -111,7 +160,19 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
    PRUint32 start =
      FindStartAfterSkippingWhitespace(&provider, aData, textStyle, &iter, flowEndInTextRun);
  
-@@ -6831,28 +6838,30 @@ nsTextFrame::AddInlinePrefWidth(nsRender
+@@ -6823,37 +6831,42 @@ nsTextFrame::AddInlinePrefWidthForFlow(n
+ }
+ 
+ // XXX Need to do something here to avoid incremental reflow bugs due to
+ // first-line and first-letter changing pref-width
+ /* virtual */ void
+ nsTextFrame::AddInlinePrefWidth(nsRenderingContext *aRenderingContext,
+                                 nsIFrame::InlinePrefWidthData *aData)
+ {
++  float inflation =
++    nsLayoutUtils::FontSizeInflationFor(this, nsLayoutUtils::eInReflow);
++  TextRunType trtype = (inflation == 1.0f) ? eNotInflated : eInflated;
++
    nsTextFrame* f;
    gfxTextRun* lastTextRun = nsnull;
    // nsContinuingTextFrame does nothing for AddInlineMinWidth; all text frames
@@ -120,8 +181,8 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
      // f->GetTextRun(nsTextFrame::eNotInflated) could be null if we
      // haven't set up textruns yet for f.  Except in OOM situations,
      // lastTextRun will only be null for the first text frame.
-+    // FIXME
-     if (f == this || f->GetTextRun(nsTextFrame::eNotInflated) != lastTextRun) {
+-    if (f == this || f->GetTextRun(nsTextFrame::eNotInflated) != lastTextRun) {
++    if (f == this || f->GetTextRun(trtype) != lastTextRun) {
        nsIFrame* lc;
        if (aData->lineContainer &&
            aData->lineContainer != (lc = FindLineContainer(f))) {
@@ -132,9 +193,11 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
        }
  
        // This will process all the text frames that share the same textrun as f.
-       f->AddInlinePrefWidthForFlow(aRenderingContext, aData);
-+      // FIXME
-       lastTextRun = f->GetTextRun(nsTextFrame::eNotInflated);
+-      f->AddInlinePrefWidthForFlow(aRenderingContext, aData);
+-      lastTextRun = f->GetTextRun(nsTextFrame::eNotInflated);
++      f->AddInlinePrefWidthForFlow(aRenderingContext, aData,
++                                   inflation, trtype);
++      lastTextRun = f->GetTextRun(trtype);
      }
    }
  }
@@ -142,3 +205,4 @@ diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameTh
  /* virtual */ nsSize
  nsTextFrame::ComputeSize(nsRenderingContext *aRenderingContext,
                           nsSize aCBSize, nscoord aAvailableWidth,
+                          nsSize aMargin, nsSize aBorder, nsSize aPadding,
