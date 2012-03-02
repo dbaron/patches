@@ -5,7 +5,7 @@ Build font data structure by walking the necessary text.  (Bug 706193, bug 70719
 diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInflationData.cpp
 --- a/layout/generic/nsFontInflationData.cpp
 +++ b/layout/generic/nsFontInflationData.cpp
-@@ -34,37 +34,128 @@
+@@ -34,37 +34,163 @@
   * the terms of any one of the MPL, the GPL or the LGPL.
   *
   * ***** END LICENSE BLOCK ***** */
@@ -53,7 +53,8 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
 +  NS_ASSERTION(IsBlockFormattingContext(aFrame),
 +               "must be block formatting context");
 +
-+  memset(mSizeBuckets, 0, sizeof(mSizeBuckets));
++  memset(mTextAmounts, 0, sizeof(mTextAmounts));
++  memset(mMaxContainerWidths, 0, sizeof(mMaxContainerWidths));
 +
 +  ScanText(aFrame);
 +}
@@ -63,6 +64,8 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
 +{
 +  // FIXME: Should probably only scan the text that's actually going to
 +  // be inflated!
++
++  // FIXME: Need to record the widths!
 +
 +  nsIFrame::ChildListIterator lists(aFrame);
 +  for (; !lists.IsDone(); lists.Next()) {
@@ -106,7 +109,9 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
 +              }
 +            }
 +          }
-+          RecordText(kid->GetStyleFont()->mFont.size, len);
++          // FIXME: Pass a real container width
++          // FIXME: I HAVE NO IDEA HOW TO DO THIS!
++          RecordText(kid->GetStyleFont()->mFont.size, len, 0);
 +        }
 +      } else if (!IsBlockFormattingContext(kid)) {
 +        // recursive step
@@ -116,30 +121,60 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
 +  }
 +}
 +
++/* static */ size_t
++nsFontInflationData::BucketForFontSize(nscoord aFontSize)
++{
++  NS_ABORT_IF_FALSE(aFontSize > 0, "RecordText should have returned early");
++  PRInt32 pixels = nsPresContext::AppUnitsToIntCSSPixels(aFontSize);
++
++  if (pixels < 16) {
++    if (pixels < 7) {
++      // 0px - 6px in bucket 0
++      return 0;
++    } else {
++      // 7px - 15px in 1 pixel increments in buckets 1-9
++      return pixels - 6;
++    }
++  } else if (pixels < 30) {
++    // 16px - 29px in 2 pixel increments in buckets 10-16
++    return pixels / 2 + 2;
++  } else if (pixels < 60) {
++    // 30px - 59px in 5 pixel increments in buckets 17-22
++    return pixels / 5 + 11;
++  } else {
++    // 60px and up in bucket 23
++    // (We don't care much about distinctions here because such text is
++    // unlikely to need inflation.)
++    return 23;
++  }
++}
++
 +void
-+nsFontInflationData::RecordText(nscoord aFontSize, PRUint32 aTextLength)
++nsFontInflationData::RecordText(nscoord aFontSize, PRUint32 aTextLength,
++                                nscoord aContainerWidth)
 +{
 +  if (aFontSize <= 0) {
 +    // Hidden text.
 +    return;
 +  }
 +
-+  PRUint32 bucket = nsPresContext::AppUnitsToIntCSSPixels(aFontSize);
-+  if (bucket >= ArrayLength(mSizeBuckets)) {
-+    bucket = ArrayLength(mSizeBuckets) - 1;
++  size_t bucket = BucketForFontSize(aFontSize);
++
++  PRUint32 newLength = PRUint32(mTextAmounts[bucket]) + aTextLength;
++  if (aTextLength >= PR_UINT8_MAX || newLength >= PR_UINT8_MAX) {
++    mTextAmounts[bucket] = PR_UINT8_MAX;
++  } else {
++    mTextAmounts[bucket] = newLength;
 +  }
 +
-+  PRUint32 newVal = PRUint32(mSizeBuckets[bucket]) + aTextLength;
-+  if (aTextLength >= PR_UINT8_MAX || newVal >= PR_UINT8_MAX) {
-+    mSizeBuckets[bucket] = PR_UINT8_MAX;
-+  } else {
-+    mSizeBuckets[bucket] = newVal;
++  if (aContainerWidth > mMaxContainerWidths[bucket]) {
++    mMaxContainerWidths[bucket] = aContainerWidth;
 +  }
 +}
 diff --git a/layout/generic/nsFontInflationData.h b/layout/generic/nsFontInflationData.h
 --- a/layout/generic/nsFontInflationData.h
 +++ b/layout/generic/nsFontInflationData.h
-@@ -45,29 +45,46 @@
+@@ -45,29 +45,54 @@
  #include "nsBlockFrame.h"
  
  class nsFontInflationData
@@ -158,9 +193,17 @@ diff --git a/layout/generic/nsFontInflationData.h b/layout/generic/nsFontInflati
 +  // Scan text in the subtree rooted at aFrame
 +  void ScanText(nsIFrame* aFrame);
 +
++  // We gather data about text (amount of text and width of container)
++  // categorized by font size.  This function defines how we bucket the
++  // font sizes.  (We don't want too many buckets, and it's useful to
++  // avoid having a more complex data structure.)
++  enum { eNumBuckets = 24 };
++  static size_t BucketForFontSize(nscoord aFontSize);
++
 +  // Record that the scan encountered aTextLength characters of size
-+  // aFontSize.
-+  void RecordText(nscoord aFontSize, PRUint32 aTextLength);
++  // aFontSize in a container of width aContainerWidth.
++  void RecordText(nscoord aFontSize, PRUint32 aTextLength,
++                  nscoord aContainerWidth);
 +
    static nsIFrame* BlockFormattingContextFor(nsIFrame *aFrame)
    {
@@ -179,10 +222,10 @@ diff --git a/layout/generic/nsFontInflationData.h b/layout/generic/nsFontInflati
              !aFrame->GetParent());
    }
 +
-+  // The amount of text at font sizes from 0 to 63 CSS pixels, with
-+  // anything larger in the 63 bucket.  (We don't care much about large
-+  // sizes because they're unlikely to need inflation.)
-+  PRUint8 mSizeBuckets[64];
++  // The amount of text in each of the groups of font sizes.
++  PRUint8 mTextAmounts[eNumBuckets];
++  // The largest container width in each of the groups of font sizes.
++  nscoord mMaxContainerWidths[eNumBuckets];
  };
  
  #endif /* !defined(nsFontInflationData_h_) */
