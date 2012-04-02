@@ -1,0 +1,468 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add support to the reftest harness for preferences that apply to only one of the test or reference.
+
+TODO: explain how this changes the error handling
+
+diff --git a/layout/tools/reftest/README.txt b/layout/tools/reftest/README.txt
+--- a/layout/tools/reftest/README.txt
++++ b/layout/tools/reftest/README.txt
+@@ -47,17 +47,17 @@ 1. Inclusion of another manifest
+    combined by using the last matching failure type listed.  However, 
+    the failure type on a manifest is combined with the failure type on 
+    the test (or on a nested manifest) with the rule that the last in the
+    following list wins:  fails, random, skip.  (In other words, skip 
+    always wins, and random beats fails.)
+ 
+ 2. A test item
+ 
+-   <failure-type>* <preference>* [<http>] <type> <url> <url_ref>
++   [ <failure-type> | <preference> ]* [<http>] <type> <url> <url_ref>
+ 
+    where
+ 
+    a. <failure-type> (optional) is one of the following:
+ 
+       fails  The test passes if the images of the two renderings DO NOT
+              meet the conditions specified in the <type>.
+ 
+@@ -149,30 +149,34 @@ 2. A test item
+       They are evaluated in a sandbox in which a limited set of
+       variables are defined.  See the BuildConditionSandbox function in
+       layout/tools/reftest.js for details.
+ 
+       Examples of using conditions:
+           fails-if(winWidget) == test reference
+           asserts-if(cocoaWidget,2) load crashtest
+ 
+-   b. <pref-setting> (optional) is a string of the form
++   b. <preference> (optional) is a string of the form
+ 
+           pref(<name>,<value>)
++          test-pref(<name>,<value>)
++          ref-pref(<name>,<value>)
+ 
+       where <name> is the name of a preference setting, as seen in
+       about:config, and <value> is the value to which this preference should
+       be set. <value> may be a boolean (true/false), an integer, or a
+       quoted string *without spaces*, according to the type of the preference.
+ 
+-      The preference will be set to the specified value prior to rendering
+-      the test and reference canvases, and will be restored afterwards so
+-      that following tests are not affected. Note that this feature is only
+-      useful for "live" preferences that take effect immediately, without
+-      requiring a browser restart.
++      The preference will be set to the specified value prior to
++      rendering the test and/or reference canvases (pref() applies to
++      both, test-pref() only to the test, and ref-pref() only to the
++      reference), and will be restored afterwards so that following
++      tests are not affected. Note that this feature is only useful for
++      "live" preferences that take effect immediately, without requiring
++      a browser restart.
+ 
+    c. <http>, if present, is one of the strings (sans quotes) "HTTP" or
+       "HTTP(..)" or "HTTP(../..)" or "HTTP(../../..)", etc. , indicating that
+       the test should be run over an HTTP server because it requires certain
+       HTTP headers or a particular HTTP status.  (Don't use this if your test
+       doesn't require this functionality, because it unnecessarily slows down
+       the test.)
+ 
+diff --git a/layout/tools/reftest/reftest.js b/layout/tools/reftest/reftest.js
+--- a/layout/tools/reftest/reftest.js
++++ b/layout/tools/reftest/reftest.js
+@@ -683,21 +683,21 @@ function ReadManifest(aURL, inherited_st
+         }
+ 
+         var expected_status = EXPECTED_PASS;
+         var allow_silent_fail = false;
+         var minAsserts = 0;
+         var maxAsserts = 0;
+         var needs_focus = false;
+         var slow = false;
+-        var prefSettings = [];
++        var testPrefSettings = [], refPrefSettings = [];
+         var fuzzy_max_delta = 2;
+         var fuzzy_max_pixels = 1;
+-        
+-        while (items[0].match(/^(fails|needs-focus|random|skip|asserts|slow|require-or|silentfail|pref|fuzzy)/)) {
++
++        while (items[0].match(/^(fails|needs-focus|random|skip|asserts|slow|require-or|silentfail|pref|test-pref|ref-pref|fuzzy)/)) {
+             var item = items.shift();
+             var stat;
+             var cond;
+             var m = item.match(/^(fails|random|skip|silentfail)-if(\(.*\))$/);
+             if (m) {
+                 stat = m[1];
+                 // Note: m[2] contains the parentheses, and we want them.
+                 cond = Components.utils.evalInSandbox(m[2], sandbox);
+@@ -749,34 +749,41 @@ function ReadManifest(aURL, inherited_st
+                 }
+             } else if ((m = item.match(/^slow-if\((.*?)\)$/))) {
+                 cond = false;
+                 if (Components.utils.evalInSandbox("(" + m[1] + ")", sandbox))
+                     slow = true;
+             } else if (item == "silentfail") {
+                 cond = false;
+                 allow_silent_fail = true;
+-            } else if ((m = item.match(/^pref\((.+?),(.*)\)$/))) {
++            } else if ((m = item.match(/^(|test-|ref-)pref\((.+?),(.*)\)$/))) {
+                 cond = false;
+-                var prefName = m[1];
+-                var prefVal = Components.utils.evalInSandbox("(" + m[2] + ")", sandbox);
++                var where = m[1];
++                var prefName = m[2];
++                var prefVal = Components.utils.evalInSandbox("(" + m[3] + ")", sandbox);
+                 var prefType;
+                 var valType = typeof(prefVal);
+                 if (valType == "boolean") {
+                     prefType = PREF_BOOLEAN;
+                 } else if (valType == "string") {
+                     prefType = PREF_STRING;
+                 } else if (valType == "number" && (parseInt(prefVal) == prefVal)) {
+                     prefType = PREF_INTEGER;
+                 } else {
+                     throw "Error in pref value in manifest file " + aURL.spec + " line " + lineNo;
+                 }
+-                prefSettings.push( { name: prefName,
+-                                     type: prefType,
+-                                     value: prefVal } );
++                var setting = { name: prefName,
++                                type: prefType,
++                                value: prefVal };
++                if (where != "ref-") {
++                    testPrefSettings.push(setting);
++                }
++                if (where != "test-") {
++                    refPrefSettings.push(setting);
++                }
+             } else if ((m = item.match(/^fuzzy\((\d+),(\d+)\)$/))) {
+               cond = false;
+               expected_status = EXPECTED_FUZZY;
+               fuzzy_max_delta = Number(m[1]);
+               fuzzy_max_pixels = Number(m[2]);
+             } else if ((m = item.match(/^fuzzy-if\((.*?),(\d+),(\d+)\)$/))) {
+               cond = false;
+               if (Components.utils.evalInSandbox("(" + m[1] + ")", sandbox)) {
+@@ -857,17 +864,18 @@ function ReadManifest(aURL, inherited_st
+             gURLs.push( { type: TYPE_LOAD,
+                           expected: expected_status,
+                           allowSilentFail: allow_silent_fail,
+                           prettyPath: prettyPath,
+                           minAsserts: minAsserts,
+                           maxAsserts: maxAsserts,
+                           needsFocus: needs_focus,
+                           slow: slow,
+-                          prefSettings: prefSettings,
++                          prefSettings1: testPrefSettings,
++                          prefSettings2: refPrefSettings,
+                           fuzzyMaxDelta: fuzzy_max_delta,
+                           fuzzyMaxPixels: fuzzy_max_pixels,
+                           url1: testURI,
+                           url2: null } );
+         } else if (items[0] == TYPE_SCRIPT) {
+             if (items.length != 2)
+                 throw "Error 4 in manifest file " + aURL.spec + " line " + lineNo;
+             var [testURI] = runHttp
+@@ -882,17 +890,18 @@ function ReadManifest(aURL, inherited_st
+             gURLs.push( { type: TYPE_SCRIPT,
+                           expected: expected_status,
+                           allowSilentFail: allow_silent_fail,
+                           prettyPath: prettyPath,
+                           minAsserts: minAsserts,
+                           maxAsserts: maxAsserts,
+                           needsFocus: needs_focus,
+                           slow: slow,
+-                          prefSettings: prefSettings,
++                          prefSettings1: testPrefSettings,
++                          prefSettings2: refPrefSettings,
+                           fuzzyMaxDelta: fuzzy_max_delta,
+                           fuzzyMaxPixels: fuzzy_max_pixels,
+                           url1: testURI,
+                           url2: null } );
+         } else if (items[0] == TYPE_REFTEST_EQUAL || items[0] == TYPE_REFTEST_NOTEQUAL) {
+             if (items.length != 3)
+                 throw "Error 5 in manifest file " + aURL.spec + " line " + lineNo;
+             var [testURI, refURI] = runHttp
+@@ -910,17 +919,18 @@ function ReadManifest(aURL, inherited_st
+             gURLs.push( { type: items[0],
+                           expected: expected_status,
+                           allowSilentFail: allow_silent_fail,
+                           prettyPath: prettyPath,
+                           minAsserts: minAsserts,
+                           maxAsserts: maxAsserts,
+                           needsFocus: needs_focus,
+                           slow: slow,
+-                          prefSettings: prefSettings,
++                          prefSettings1: testPrefSettings,
++                          prefSettings2: refPrefSettings,
+                           fuzzyMaxDelta: fuzzy_max_delta,
+                           fuzzyMaxPixels: fuzzy_max_pixels,
+                           url1: testURI,
+                           url2: refURI } );
+         } else {
+             throw "Error 6 in manifest file " + aURL.spec + " line " + lineNo;
+         }
+     }
+@@ -941,20 +951,23 @@ function AddURIUseCount(uri)
+ 
+ function BuildUseCounts()
+ {
+     gURIUseCounts = {};
+     for (var i = 0; i < gURLs.length; ++i) {
+         var url = gURLs[i];
+         if (url.expected != EXPECTED_DEATH &&
+             (url.type == TYPE_REFTEST_EQUAL ||
+-             url.type == TYPE_REFTEST_NOTEQUAL) &&
+-            url.prefSettings.length == 0) {
+-            AddURIUseCount(gURLs[i].url1);
+-            AddURIUseCount(gURLs[i].url2);
++             url.type == TYPE_REFTEST_NOTEQUAL)) {
++            if (url.prefSettings1.length == 0) {
++                AddURIUseCount(gURLs[i].url1);
++            }
++            if (url.prefSettings2.length == 0) {
++                AddURIUseCount(gURLs[i].url2);
++            }
+         }
+     }
+ }
+ 
+ function ServeFiles(manifestURL, depth, aURL, files)
+ {
+     var listURL = aURL.QueryInterface(CI.nsIFileURL);
+     var directory = listURL.file.parent;
+@@ -1013,104 +1026,33 @@ function Focus()
+     }
+     return true;
+ }
+ 
+ function StartCurrentTest()
+ {
+     gTestLog = [];
+ 
+-    RestoreChangedPreferences();
+-
+     // make sure we don't run tests that are expected to kill the browser
+     while (gURLs.length > 0) {
+         var test = gURLs[0];
+         if (test.expected == EXPECTED_DEATH) {
+             ++gTestResults.Skip;
+             gDumpLog("REFTEST TEST-KNOWN-FAIL | " + test.url1.spec + " | (SKIP)\n");
+             gURLs.shift();
+         } else if (test.needsFocus && !Focus()) {
++            // FIXME: Marking this as a known fail is dangerous!  What
++            // if it starts failing all the time?
+             ++gTestResults.Skip;
+             gDumpLog("REFTEST TEST-KNOWN-FAIL | " + test.url1.spec + " | (SKIPPED; COULDN'T GET FOCUS)\n");
+             gURLs.shift();
+         } else if (test.slow && !gRunSlowTests) {
+             ++gTestResults.Slow;
+             gDumpLog("REFTEST TEST-KNOWN-SLOW | " + test.url1.spec + " | (SLOW)\n");
+             gURLs.shift();
+-        } else if (gURLs[0].prefSettings.length > 0) {
+-            var prefs = Components.classes["@mozilla.org/preferences-service;1"].
+-                        getService(Components.interfaces.nsIPrefBranch);
+-            var badPref = undefined;
+-            try {
+-                gURLs[0].prefSettings.forEach(function(ps) {
+-                    var oldVal;
+-                    if (ps.type == PREF_BOOLEAN) {
+-                        try {
+-                            oldVal = prefs.getBoolPref(ps.name);
+-                        } catch (e) {
+-                            badPref = "boolean preference '" + ps.name + "'";
+-                            throw "bad pref";
+-                        }
+-                    } else if (ps.type == PREF_STRING) {
+-                        try {
+-                            oldVal = prefs.getCharPref(ps.name);
+-                        } catch (e) {
+-                            badPref = "string preference '" + ps.name + "'";
+-                            throw "bad pref";
+-                        }
+-                    } else if (ps.type == PREF_INTEGER) {
+-                        try {
+-                            oldVal = prefs.getIntPref(ps.name);
+-                        } catch (e) {
+-                            badPref = "integer preference '" + ps.name + "'";
+-                            throw "bad pref";
+-                        }
+-                    } else {
+-                        throw "internal error - unknown preference type";
+-                    }
+-                    if (oldVal != ps.value) {
+-                        gPrefsToRestore.push( { name: ps.name,
+-                                                type: ps.type,
+-                                                value: oldVal } );
+-                        var value = ps.value;
+-                        if (ps.type == PREF_BOOLEAN) {
+-                            prefs.setBoolPref(ps.name, value);
+-                        } else if (ps.type == PREF_STRING) {
+-                            prefs.setCharPref(ps.name, value);
+-                            value = '"' + value + '"';
+-                        } else if (ps.type == PREF_INTEGER) {
+-                            prefs.setIntPref(ps.name, value);
+-                        }
+-                        gDumpLog("SET PREFERENCE pref(" + ps.name + "," + value + ")\n");
+-                    }
+-                });
+-            } catch (e) {
+-                if (e == "bad pref") {
+-                    if (test.expected == EXPECTED_FAIL) {
+-                        gDumpLog("REFTEST TEST-KNOWN-FAIL | " + test.url1.spec +
+-                                 " | (SKIPPED; " + badPref + " not known or wrong type)\n");
+-                        ++gTestResults.Skip;
+-                    } else {
+-                        gDumpLog("REFTEST TEST-UNEXPECTED-FAIL | " + test.url1.spec +
+-                                 " | " + badPref + " not known or wrong type\n");
+-                        ++gTestResults.UnexpectedFail;
+-                    }
+-                } else {
+-                    throw e;
+-                }
+-            }
+-            if (badPref != undefined) {
+-                // undo anything we changed
+-                RestoreChangedPreferences();
+-
+-                // skip the test that had a bad preference
+-                gURLs.shift();
+-            } else {
+-                break;
+-            }
+         } else {
+             break;
+         }
+     }
+ 
+     if (gURLs.length == 0) {
+         DoneTests();
+     }
+@@ -1122,17 +1064,85 @@ function StartCurrentTest()
+     }
+ }
+ 
+ function StartCurrentURI(aState)
+ {
+     gState = aState;
+     gCurrentURL = gURLs[0]["url" + aState].spec;
+ 
+-    if (gURLs[0].prefSettings.length == 0 &&
++    RestoreChangedPreferences();
++
++    var prefSettings = gURLs[0]["prefSettings" + aState];
++    if (prefSettings.length > 0) {
++        var prefs = Components.classes["@mozilla.org/preferences-service;1"].
++                    getService(Components.interfaces.nsIPrefBranch);
++        var badPref = undefined;
++        try {
++            prefSettings.forEach(function(ps) {
++                var oldVal;
++                if (ps.type == PREF_BOOLEAN) {
++                    try {
++                        oldVal = prefs.getBoolPref(ps.name);
++                    } catch (e) {
++                        badPref = "boolean preference '" + ps.name + "'";
++                        throw "bad pref";
++                    }
++                } else if (ps.type == PREF_STRING) {
++                    try {
++                        oldVal = prefs.getCharPref(ps.name);
++                    } catch (e) {
++                        badPref = "string preference '" + ps.name + "'";
++                        throw "bad pref";
++                    }
++                } else if (ps.type == PREF_INTEGER) {
++                    try {
++                        oldVal = prefs.getIntPref(ps.name);
++                    } catch (e) {
++                        badPref = "integer preference '" + ps.name + "'";
++                        throw "bad pref";
++                    }
++                } else {
++                    throw "internal error - unknown preference type";
++                }
++                if (oldVal != ps.value) {
++                    gPrefsToRestore.push( { name: ps.name,
++                                            type: ps.type,
++                                            value: oldVal } );
++                    var value = ps.value;
++                    if (ps.type == PREF_BOOLEAN) {
++                        prefs.setBoolPref(ps.name, value);
++                    } else if (ps.type == PREF_STRING) {
++                        prefs.setCharPref(ps.name, value);
++                        value = '"' + value + '"';
++                    } else if (ps.type == PREF_INTEGER) {
++                        prefs.setIntPref(ps.name, value);
++                    }
++                    gDumpLog("SET PREFERENCE pref(" + ps.name + "," + value + ")\n");
++                }
++            });
++        } catch (e) {
++            if (e == "bad pref") {
++                if (test.expected == EXPECTED_FAIL) {
++                    gDumpLog("REFTEST TEST-KNOWN-FAIL | " + test.url1.spec +
++                             " | (SKIPPED; " + badPref + " not known or wrong type)\n");
++                    ++gTestResults.Skip;
++                } else {
++                    gDumpLog("REFTEST TEST-UNEXPECTED-FAIL | " + test.url1.spec +
++                             " | " + badPref + " not known or wrong type\n");
++                    ++gTestResults.UnexpectedFail;
++                }
++                // REVIEW:  Now, we just continue on running the test.
++            } else {
++                throw e;
++            }
++        }
++    }
++
++    if (prefSettings.length == 0 &&
+         gURICanvases[gCurrentURL] &&
+         (gURLs[0].type == TYPE_REFTEST_EQUAL ||
+          gURLs[0].type == TYPE_REFTEST_NOTEQUAL) &&
+         gURLs[0].maxAsserts == 0) {
+         // Pretend the document loaded --- RecordResult will notice
+         // there's already a canvas for this URL
+         gContainingWindow.setTimeout(RecordResult, 0);
+     } else {
+@@ -1385,17 +1395,17 @@ function RecordResult(testRunTime, error
+         if (anyFailed && expected == EXPECTED_PASS) {
+             FlushTestLog();
+         }
+ 
+         FinishTestItem();
+         return;
+     }
+ 
+-    if (gURLs[0].prefSettings.length == 0 &&
++    if (gURLs[0]["prefSettings" + gState].length == 0 &&
+         gURICanvases[gCurrentURL]) {
+         gCurrentCanvas = gURICanvases[gCurrentURL];
+     }
+     if (gCurrentCanvas == null) {
+         gDumpLog("REFTEST TEST-UNEXPECTED-FAIL | | program error managing snapshots\n");
+         ++gTestResults.Exception;
+     }
+     if (gState == 1) {
+@@ -1471,18 +1481,20 @@ function RecordResult(testRunTime, error
+                     gDumpLog("REFTEST   IMAGE: " + gCanvas1.toDataURL() + "\n");
+                 }
+             }
+ 
+             if (!test_passed && expected == EXPECTED_PASS) {
+                 FlushTestLog();
+             }
+ 
+-            if (gURLs[0].prefSettings.length == 0) {
++            if (gURLs[0].prefSettings1.length == 0) {
+                 UpdateCanvasCache(gURLs[0].url1, gCanvas1);
++            }
++            if (gURLs[0].prefSettings2.length == 0) {
+                 UpdateCanvasCache(gURLs[0].url2, gCanvas2);
+             }
+ 
+             CleanUpCrashDumpFiles();
+             FinishTestItem();
+             break;
+         default:
+             throw "Unexpected state.";
