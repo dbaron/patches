@@ -32,6 +32,32 @@ diff --git a/layout/generic/Makefile.in b/layout/generic/Makefile.in
  		nsHTMLCanvasFrame.cpp \
  		nsCanvasFrame.cpp \
  		nsHTMLReflowMetrics.cpp \
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -6609,16 +6609,22 @@ nsBlockFrame::Init(nsIContent*      aCon
+   }
+ 
+   nsresult rv = nsBlockFrameSuper::Init(aContent, aParent, aPrevInFlow);
+ 
+   if (!aPrevInFlow ||
+       aPrevInFlow->GetStateBits() & NS_BLOCK_NEEDS_BIDI_RESOLUTION)
+     AddStateBits(NS_BLOCK_NEEDS_BIDI_RESOLUTION);
+ 
++  if ((GetStateBits() &
++       (NS_FRAME_FONT_INFLATION_CONTAINER | NS_BLOCK_FLOAT_MGR)) ==
++      (NS_FRAME_FONT_INFLATION_CONTAINER | NS_BLOCK_FLOAT_MGR)) {
++    AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
++  }
++
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ nsBlockFrame::SetInitialChildList(ChildListID     aListID,
+                                   nsFrameList&    aChildList)
+ {
+   NS_ASSERTION(aListID != kPrincipalList ||
 diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInflationData.cpp
 new file mode 100644
 --- /dev/null
@@ -189,42 +215,8 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  
  #include "mozilla/Preferences.h"
  #include "mozilla/LookAndFeel.h"
-@@ -483,16 +484,34 @@ IsFontSizeInflationContainer(nsIFrame* a
-                aFrame->GetType() == nsGkAtoms::brFrame ||
-                aFrame->IsFrameOfType(nsIFrame::eMathML),
-                "line participants must not be containers");
-   NS_ASSERTION(aFrame->GetType() != nsGkAtoms::bulletFrame || isInline,
-                "bullets should not be containers");
-   return !isInline;
- }
- 
-+static bool
-+ContainsFontSizeInflationFlow(nsIFrame *aFrame)
-+{
-+  NS_ASSERTION(aFrame->GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER,
-+               "should only call this on containers");
-+  nsIAtom *fType = aFrame->GetType();
-+  return (aFrame->IsFrameOfType(nsIFrame::eBlockFrame) &&
-+          (aFrame->GetStateBits() & NS_BLOCK_FLOAT_MGR)) ||
-+         aFrame->IsFrameOfType(nsIFrame::eXULBox) ||
-+         // For cells, NS_BLOCK_FLOAT_MGR is set on the anon box inside,
-+         // which isn't an inflation container at all (since its parent
-+         // has the same content node).
-+         IS_TABLE_CELL(fType) ||
-+         // Likewise for scroll frames.
-+         fType == nsGkAtoms::scrollFrame ||
-+         !aFrame->GetParent();
-+}
-+
- NS_IMETHODIMP
- nsFrame::Init(nsIContent*      aContent,
-               nsIFrame*        aParent,
-               nsIFrame*        aPrevInFlow)
- {
-   NS_PRECONDITION(!mContent, "Double-initing a frame?");
-   NS_ASSERTION(IsFrameOfType(eDEBUGAllFrames) &&
-                !IsFrameOfType(eDEBUGNoFrames),
-@@ -532,16 +551,19 @@ nsFrame::Init(nsIContent*      aContent,
+@@ -531,18 +532,24 @@ nsFrame::Init(nsIContent*      aContent,
+   if (nsLayoutUtils::FontSizeInflationEnabled(PresContext())
  #ifdef DEBUG
        // We have assertions that check inflation invariants even when
        // font size inflation is not enabled.
@@ -232,11 +224,16 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  #endif
        ) {
      if (IsFontSizeInflationContainer(this, disp)) {
-       mState |= NS_FRAME_FONT_INFLATION_CONTAINER;
-+      if (ContainsFontSizeInflationFlow(this)) {
-+        mState |= NS_FRAME_FONT_INFLATION_FLOW_ROOT;
+-      mState |= NS_FRAME_FONT_INFLATION_CONTAINER;
+-    }
++      AddStateBits(NS_FRAME_FONT_INFLATION_CONTAINER);
++      if (!GetParent()) {
++        AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
 +      }
-     }
++    }
++    NS_ASSERTION(GetParent() ||
++                 (GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER),
++                 "root frame should always be a container");
    }
  
    DidSetStyleContext(nsnull);
@@ -244,6 +241,151 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    if (IsBoxWrapped())
      InitBoxMetrics(false); // XXX propagate allocation failure?
  
+   return NS_OK;
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -122,16 +122,26 @@ void
+ nsHTMLScrollFrame::DestroyFrom(nsIFrame* aDestructRoot)
+ {
+   mInner.Destroy();
+   DestroyAbsoluteFrames(aDestructRoot);
+   nsContainerFrame::DestroyFrom(aDestructRoot);
+ }
+ 
+ NS_IMETHODIMP
++nsHTMLScrollFrame::Init(nsIContent* aContent,
++                        nsIFrame*   aParent,
++                        nsIFrame*   aPrevInFlow)
++{
++  nsresult rv = nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
++  mInner.Init();
++  return rv;
++}
++
++NS_IMETHODIMP
+ nsHTMLScrollFrame::SetInitialChildList(ChildListID  aListID,
+                                        nsFrameList& aChildList)
+ {
+   nsresult rv = nsContainerFrame::SetInitialChildList(aListID, aChildList);
+   mInner.ReloadChildFrames();
+   return rv;
+ }
+ 
+@@ -1057,16 +1067,26 @@ nsXULScrollFrame::AppendAnonymousContent
+ void
+ nsXULScrollFrame::DestroyFrom(nsIFrame* aDestructRoot)
+ {
+   mInner.Destroy();
+   nsBoxFrame::DestroyFrom(aDestructRoot);
+ }
+ 
+ NS_IMETHODIMP
++nsXULScrollFrame::Init(nsIContent* aContent,
++                       nsIFrame*   aParent,
++                       nsIFrame*   aPrevInFlow)
++{
++  nsresult rv = nsBoxFrame::Init(aContent, aParent, aPrevInFlow);
++  mInner.Init();
++  return rv;
++}
++
++NS_IMETHODIMP
+ nsXULScrollFrame::SetInitialChildList(ChildListID     aListID,
+                                       nsFrameList&    aChildList)
+ {
+   nsresult rv = nsBoxFrame::SetInitialChildList(aListID, aChildList);
+   mInner.ReloadChildFrames();
+   return rv;
+ }
+ 
+@@ -1598,16 +1618,24 @@ nsGfxScrollFrameInner::~nsGfxScrollFrame
+   delete mAsyncScroll;
+ 
+   if (mScrollActivityTimer) {
+     mScrollActivityTimer->Cancel();
+     mScrollActivityTimer = nsnull;
+   }
+ }
+ 
++void
++nsGfxScrollFrameInner::Init()
++{
++  if (mOuter->GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER) {
++    mOuter->AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
++  }
++}
++
+ static nscoord
+ Clamp(nscoord aLower, nscoord aVal, nscoord aUpper)
+ {
+   if (aVal < aLower)
+     return aLower;
+   if (aVal > aUpper)
+     return aUpper;
+   return aVal;
+diff --git a/layout/generic/nsGfxScrollFrame.h b/layout/generic/nsGfxScrollFrame.h
+--- a/layout/generic/nsGfxScrollFrame.h
++++ b/layout/generic/nsGfxScrollFrame.h
+@@ -72,16 +72,18 @@ struct ScrollReflowState;
+ 
+ class nsGfxScrollFrameInner : public nsIReflowCallback {
+ public:
+   class AsyncScroll;
+ 
+   nsGfxScrollFrameInner(nsContainerFrame* aOuter, bool aIsRoot);
+   ~nsGfxScrollFrameInner();
+ 
++  void Init();
++
+   typedef nsIScrollableFrame::ScrollbarStyles ScrollbarStyles;
+   ScrollbarStyles GetScrollbarStylesFromFrame() const;
+ 
+   // If a child frame was added or removed on the scrollframe,
+   // reload our child frame list.
+   // We need this if a scrollbar frame is recreated.
+   void ReloadChildFrames();
+ 
+@@ -365,16 +367,19 @@ class nsHTMLScrollFrame : public nsConta
+ public:
+   friend nsIFrame* NS_NewHTMLScrollFrame(nsIPresShell* aPresShell, nsStyleContext* aContext, bool aIsRoot);
+ 
+   NS_DECL_QUERYFRAME
+   NS_DECL_FRAMEARENA_HELPERS
+ 
+   // Called to set the child frames. We typically have three: the scroll area,
+   // the vertical scrollbar, and the horizontal scrollbar.
++  NS_IMETHOD Init(nsIContent*      aContent,
++                  nsIFrame*        aParent,
++                  nsIFrame*        aPrevInFlow);
+   NS_IMETHOD SetInitialChildList(ChildListID     aListID,
+                                  nsFrameList&    aChildList);
+ 
+   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
+                               const nsRect&           aDirtyRect,
+                               const nsDisplayListSet& aLists) {
+     return mInner.BuildDisplayList(aBuilder, aDirtyRect, aLists);
+   }
+@@ -593,16 +598,19 @@ class nsXULScrollFrame : public nsBoxFra
+ public:
+   NS_DECL_QUERYFRAME
+   NS_DECL_FRAMEARENA_HELPERS
+ 
+   friend nsIFrame* NS_NewXULScrollFrame(nsIPresShell* aPresShell, nsStyleContext* aContext, bool aIsRoot);
+ 
+   // Called to set the child frames. We typically have three: the scroll area,
+   // the vertical scrollbar, and the horizontal scrollbar.
++  NS_IMETHOD Init(nsIContent*      aContent,
++                  nsIFrame*        aParent,
++                  nsIFrame*        aPrevInFlow);
+   NS_IMETHOD SetInitialChildList(ChildListID     aListID,
+                                  nsFrameList&    aChildList);
+ 
+   NS_IMETHOD BuildDisplayList(nsDisplayListBuilder*   aBuilder,
+                               const nsRect&           aDirtyRect,
+                               const nsDisplayListSet& aLists) {
+     return mInner.BuildDisplayList(aBuilder, aDirtyRect, aLists);
+   }
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
@@ -269,3 +411,75 @@ diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
  #define NS_SUBTREE_DIRTY(_frame)  \
    (((_frame)->GetStateBits() &      \
      (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN)) != 0)
+diff --git a/layout/tables/nsTableCellFrame.cpp b/layout/tables/nsTableCellFrame.cpp
+--- a/layout/tables/nsTableCellFrame.cpp
++++ b/layout/tables/nsTableCellFrame.cpp
+@@ -102,16 +102,20 @@ nsTableCellFrame::GetNextCell() const
+ NS_IMETHODIMP
+ nsTableCellFrame::Init(nsIContent*      aContent,
+                        nsIFrame*        aParent,
+                        nsIFrame*        aPrevInFlow)
+ {
+   // Let the base class do its initialization
+   nsresult rv = nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+ 
++  if (GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER) {
++    AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
++  }
++
+   if (aPrevInFlow) {
+     // Set the column index
+     nsTableCellFrame* cellFrame = (nsTableCellFrame*)aPrevInFlow;
+     PRInt32           colIndex;
+     cellFrame->GetColIndex(colIndex);
+     SetColIndex(colIndex);
+   }
+ 
+diff --git a/layout/xul/base/src/nsBoxFrame.cpp b/layout/xul/base/src/nsBoxFrame.cpp
+--- a/layout/xul/base/src/nsBoxFrame.cpp
++++ b/layout/xul/base/src/nsBoxFrame.cpp
+@@ -195,16 +195,20 @@ nsBoxFrame::DidSetStyleContext(nsStyleCo
+ NS_IMETHODIMP
+ nsBoxFrame::Init(nsIContent*      aContent,
+                  nsIFrame*        aParent,
+                  nsIFrame*        aPrevInFlow)
+ {
+   nsresult  rv = nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  if (GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER) {
++    AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
++  }
++
+   MarkIntrinsicWidthsDirty();
+ 
+   CacheAttributes();
+ 
+ #ifdef DEBUG_LAYOUT
+     // if we are root and this
+   if (mState & NS_STATE_IS_ROOT) 
+       GetDebugPref(GetPresContext());
+diff --git a/layout/xul/base/src/nsLeafBoxFrame.cpp b/layout/xul/base/src/nsLeafBoxFrame.cpp
+--- a/layout/xul/base/src/nsLeafBoxFrame.cpp
++++ b/layout/xul/base/src/nsLeafBoxFrame.cpp
+@@ -90,16 +90,20 @@ NS_IMETHODIMP
+ nsLeafBoxFrame::Init(
+               nsIContent*      aContent,
+               nsIFrame*        aParent,
+               nsIFrame*        aPrevInFlow)
+ {
+   nsresult  rv = nsLeafFrame::Init(aContent, aParent, aPrevInFlow);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  if (GetStateBits() & NS_FRAME_FONT_INFLATION_CONTAINER) {
++    AddStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT);
++  }
++
+   UpdateMouseThrough();
+ 
+   return rv;
+ }
+ 
+ NS_IMETHODIMP
+ nsLeafBoxFrame::AttributeChanged(PRInt32 aNameSpaceID,
+                                  nsIAtom* aAttribute,
