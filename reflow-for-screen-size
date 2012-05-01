@@ -5,7 +5,7 @@ Reflow for screen size change when font.size.inflation.minTwips is set.  (Bug 74
 diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
 --- a/dom/base/nsDOMWindowUtils.cpp
 +++ b/dom/base/nsDOMWindowUtils.cpp
-@@ -327,16 +327,27 @@ nsDOMWindowUtils::SetDisplayPortForEleme
+@@ -327,21 +327,36 @@ nsDOMWindowUtils::SetDisplayPortForEleme
  
    nsIFrame* rootScrollFrame = presShell->GetRootScrollFrame();
    if (rootScrollFrame) {
@@ -14,22 +14,159 @@ diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
        // The pres shell needs a special flag set.
        presShell->SetIgnoreViewportScrolling(true);
  
++      nsPresContext* presContext = GetPresContext();
++
 +      // When the "font.size.inflation.minTwips" preference is set, the
 +      // layout depends on the size of the screen.  Since when the size
 +      // of the screen changes, the root displayport also changes, we
 +      // hook in the needed updates here rather than adding a
 +      // separate notification just for this change.
-+      // FIXME:
-+      // 1. Check relevant inflation pref (minTwips)
-+      // 2. Check against old screen width
-+      // 3. If changed, do synchronous (?) reflow in this pres shell (and
-+      //    all descendants?)
++      if (presContext &&
++          nsLayoutUtils::FontSizeInflationEnabled(presContext) &&
++          nsLayoutUtils::FontSizeInflationMinTwips() != 0) {
++        // FIXME:
++        // 2. Check against old screen width
++        // 3. If changed, do synchronous (?) reflow in this pres shell (and
++        //    all descendants?)
++      }
 +
        // The root document currently has a widget, but we might end up
        // painting content inside the displayport but outside the widget
        // bounds. This ensures the document's view honors invalidations
        // within the displayport.
-       nsPresContext* presContext = GetPresContext();
+-      nsPresContext* presContext = GetPresContext();
        if (presContext && presContext->IsRoot()) {
          nsIFrame* rootFrame = presShell->GetRootFrame();
          nsIView* view = rootFrame->GetView();
+         if (view) {
+           view->SetInvalidationDimensions(&displayport);
+         }
+       }
+     }
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -127,18 +127,18 @@ using namespace mozilla::layout;
+ #ifdef DEBUG
+ // TODO: remove, see bug 598468.
+ bool nsLayoutUtils::gPreventAssertInCompareTreePosition = false;
+ #endif // DEBUG
+ 
+ typedef gfxPattern::GraphicsFilter GraphicsFilter;
+ typedef FrameMetrics::ViewID ViewID;
+ 
+-static PRUint32 sFontSizeInflationEmPerLine;
+-static PRUint32 sFontSizeInflationMinTwips;
++/* static */ PRUint32 nsLayoutUtils::sFontSizeInflationEmPerLine;
++/* static */ PRUint32 nsLayoutUtils::sFontSizeInflationMinTwips;
+ /* static */ PRUint32 nsLayoutUtils::sFontSizeInflationLineThreshold;
+ 
+ static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
+ 
+ typedef nsDataHashtable<nsUint64HashKey, nsIContent*> ContentMap;
+ static ContentMap* sContentMap = NULL;
+ static ContentMap& GetContentMap() {
+   if (!sContentMap) {
+@@ -4652,39 +4652,41 @@ nsReflowFrameRunnable::Run()
+ /**
+  * Compute the minimum font size inside of a container with the given
+  * width, such that **when the user zooms the container to fill the full
+  * width of the device**, the fonts satisfy our minima.
+  */
+ static nscoord
+ MinimumFontSizeFor(nsPresContext* aPresContext, nscoord aContainerWidth)
+ {
+-  if (sFontSizeInflationEmPerLine == 0 && sFontSizeInflationMinTwips == 0) {
++  PRUint32 emPerLine = nsLayoutUtils::FontSizeInflationEmPerLine();
++  PRUint32 minTwips = nsLayoutUtils::FontSizeInflationMinTwips();
++  if (emPerLine == 0 && minTwips == 0) {
+     return 0;
+   }
+ 
+   // Clamp the container width to the device dimensions
+   nscoord iFrameWidth = aPresContext->GetVisibleArea().width;
+   nscoord effectiveContainerWidth = NS_MIN(iFrameWidth, aContainerWidth);
+ 
+   nscoord byLine = 0, byInch = 0;
+-  if (sFontSizeInflationEmPerLine != 0) {
+-    byLine = effectiveContainerWidth / sFontSizeInflationEmPerLine;
+-  }
+-  if (sFontSizeInflationMinTwips != 0) {
++  if (emPerLine != 0) {
++    byLine = effectiveContainerWidth / emPerLine;
++  }
++  if (minTwips != 0) {
+     // REVIEW: Is this giving us app units and sizes *not* counting
+     // viewport scaling?
+     nsDeviceContext *dx = aPresContext->DeviceContext();
+     nsRect clientRect;
+     dx->GetClientRect(clientRect); // FIXME: GetClientRect looks expensive
+     float deviceWidthInches =
+       float(clientRect.width) / float(dx->AppUnitsPerPhysicalInch());
+     byInch = NSToCoordRound(effectiveContainerWidth /
+                             (deviceWidthInches * 1440 /
+-                             sFontSizeInflationMinTwips ));
++                             minTwips ));
+   }
+   return NS_MAX(byLine, byInch);
+ }
+ 
+ /* static */ float
+ nsLayoutUtils::FontSizeInflationInner(const nsIFrame *aFrame,
+                                       nscoord aMinFontSize)
+ {
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1548,16 +1548,32 @@ public:
+    *   InflationMinFontSizeFor methods above.
+    */
+   static float FontSizeInflationInner(const nsIFrame *aFrame,
+                                       nscoord aMinFontSize);
+ 
+   static bool FontSizeInflationEnabled(nsPresContext *aPresContext);
+ 
+   /**
++   * See comment above "font.size.inflation.emPerLine" in
++   * modules/libpref/src/init/all.js .
++   */
++  static PRUint32 FontSizeInflationEmPerLine() {
++    return sFontSizeInflationEmPerLine;
++  }
++
++  /**
++   * See comment above "font.size.inflation.minTwips" in
++   * modules/libpref/src/init/all.js .
++   */
++  static PRUint32 FontSizeInflationMinTwips() {
++    return sFontSizeInflationMinTwips;
++  }
++
++  /**
+    * See comment above "font.size.inflation.lineThreshold" in
+    * modules/libpref/src/init/all.js .
+    */
+   static PRUint32 FontSizeInflationLineThreshold() {
+     return sFontSizeInflationLineThreshold;
+   }
+ 
+   static void Initialize();
+@@ -1635,16 +1651,18 @@ public:
+    * Assert that the frame tree rooted at |aSubtreeRoot| is empty, i.e.,
+    * that it contains no first-in-flows.
+    */
+   static void
+   AssertTreeOnlyEmptyNextInFlows(nsIFrame *aSubtreeRoot);
+ #endif
+ 
+ private:
++  static PRUint32 sFontSizeInflationEmPerLine;
++  static PRUint32 sFontSizeInflationMinTwips;
+   static PRUint32 sFontSizeInflationLineThreshold;
+ };
+ 
+ namespace mozilla {
+   namespace layout {
+ 
+     /**
+      * An RAII class which will, for the duration of its lifetime,
