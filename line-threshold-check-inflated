@@ -1,0 +1,195 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Don't count text towards the line threshold if it's not going to be inflated.  (Bug 760098)
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -4789,19 +4789,22 @@ nsLayoutUtils::FontSizeInflationInner(co
+ 
+   // To scale 0-1.5 times min to instead be 1-1.5 times min, we want
+   // to the desired multiple of min to be 1 + (ratio/3) (where ratio
+   // is our input's multiple of min).  The scaling needed to produce
+   // that is that divided by |ratio|, or:
+   return (1.0f / ratio) + (1.0f / 3.0f);
+ }
+ 
+-static bool
+-ShouldInflateFontsForContainer(const nsIFrame *aFrame)
++/* static */ bool
++nsLayoutUtils::ShouldInflateFontsForContainer(const nsIFrame *aFrame)
+ {
++  NS_ASSERTION(FontSizeInflationEnabled(aFrame->PresContext()),
++               "you're wasting your time");
++
+   // We only want to inflate fonts for text that is in a place
+   // with room to expand.  The question is what the best heuristic for
+   // that is...
+   // For now, we're going to use NS_FRAME_IN_CONSTRAINED_HEIGHT, which
+   // indicates whether the frame is inside something with a constrained
+   // height (propagating down the tree), but the propagation stops when
+   // we hit overflow-y: scroll or auto.
+   const nsStyleText* styleText = aFrame->GetStyleText();
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1513,16 +1513,25 @@ public:
+   /**
+    * Return the font size inflation *ratio* for a given frame.  This is
+    * the factor by which font sizes should be inflated; it is never
+    * smaller than 1.
+    */
+   static float FontSizeInflationFor(const nsIFrame *aFrame);
+ 
+   /**
++   * Should a frame whose nearest ancestor-or-self container for font
++   * size inflation (see IsContainerForFontSizeInflation, above) have
++   * inflation applied.  (This considers things like whether it's in a
++   * constrained height situation or whether line breaking is
++   * forbidden.)
++   */
++  static bool ShouldInflateFontsForContainer(const nsIFrame *aFrame);
++
++  /**
+    * Perform the first half of the computation of FontSizeInflationFor
+    * (see above).
+    * This includes determining whether inflation should be performed
+    * within this container and returning 0 if it should not be.
+    *
+    * The result is guaranteed not to vary between line participants
+    * (inlines, text frames) within a line.
+    *
+diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInflationData.cpp
+--- a/layout/generic/nsFontInflationData.cpp
++++ b/layout/generic/nsFontInflationData.cpp
+@@ -261,17 +261,20 @@ nsFontInflationData::FindEdgeInflatableF
+   return nsnull;
+ }
+ 
+ void
+ nsFontInflationData::ScanText()
+ {
+   mTextDirty = false;
+   mTextAmount = 0;
+-  ScanTextIn(mBFCFrame);
++  NS_ASSERTION(nsLayoutUtils::IsContainerForFontSizeInflation(mBFCFrame),
++               "the second parameter to ScanTextIn doesn't matter when "
++               "the first parameter is a container, which we assume here");
++  ScanTextIn(mBFCFrame, true /* doesn't matter */);
+   mInflationEnabled = mTextAmount >= mTextThreshold;
+ }
+ 
+ static PRUint32
+ DoCharCountOfLargestOption(nsIFrame *aContainer)
+ {
+   PRUint32 result = 0;
+   for (nsIFrame* option = aContainer->GetFirstPrincipalChild();
+@@ -301,69 +304,78 @@ DoCharCountOfLargestOption(nsIFrame *aCo
+ static PRUint32
+ CharCountOfLargestOption(nsIFrame *aListControlFrame)
+ {
+   return DoCharCountOfLargestOption(
+     static_cast<nsListControlFrame*>(aListControlFrame)->GetOptionsContainer());
+ }
+ 
+ void
+-nsFontInflationData::ScanTextIn(nsIFrame *aFrame)
++nsFontInflationData::ScanTextIn(nsIFrame *aFrame,
++                                bool aNearestContainerUsesInflation)
+ {
+   // NOTE: This function has a similar structure to FindEdgeInflatableFrameIn!
+ 
+-  // FIXME: Should probably only scan the text that's actually going to
+-  // be inflated!
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(aFrame)) {
++    aNearestContainerUsesInflation =
++      nsLayoutUtils::ShouldInflateFontsForContainer(aFrame);
++  }
+ 
+   nsIFrame::ChildListIterator lists(aFrame);
+   for (; !lists.IsDone(); lists.Next()) {
+     nsFrameList::Enumerator kids(lists.CurrentList());
+     for (; !kids.AtEnd(); kids.Next()) {
+       nsIFrame *kid = kids.get();
+       if (kid->GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT) {
+         // Goes in a different set of inflation data.
+         continue;
+       }
+ 
++      nscoord addedTextAmount = 0;
++
+       nsIAtom *fType = kid->GetType();
+       if (fType == nsGkAtoms::textFrame) {
+         nsIContent *content = kid->GetContent();
+         if (content && kid == content->GetPrimaryFrame()) {
+           PRUint32 len = nsTextFrameUtils::
+             ComputeApproximateLengthWithWhitespaceCompression(
+               content, kid->GetStyleText());
+           if (len != 0) {
+             nscoord fontSize = kid->GetStyleFont()->mFont.size;
+             if (fontSize > 0) {
+-              mTextAmount += fontSize * len;
++              addedTextAmount += fontSize * len;
+             }
+           }
+         }
+       } else if (fType == nsGkAtoms::textInputFrame) {
+         // We don't want changes to the amount of text in a text input
+         // to change what we count towards inflation.
+         nscoord fontSize = kid->GetStyleFont()->mFont.size;
+         PRInt32 charCount = static_cast<nsTextControlFrame*>(kid)->GetCols();
+-        mTextAmount += charCount * fontSize;
++        addedTextAmount += charCount * fontSize;
+       } else if (fType == nsGkAtoms::comboboxControlFrame) {
+         // See textInputFrame above (with s/amount of text/selected option/).
+         // Don't just recurse down to the list control inside, since we
+         // need to exclude the display frame.
+         nscoord fontSize = kid->GetStyleFont()->mFont.size;
+         PRInt32 charCount = CharCountOfLargestOption(
+           static_cast<nsComboboxControlFrame*>(kid)->GetDropDown());
+-        mTextAmount += charCount * fontSize;
++        addedTextAmount += charCount * fontSize;
+       } else if (fType == nsGkAtoms::listControlFrame) {
+         // See textInputFrame above (with s/amount of text/selected option/).
+         nscoord fontSize = kid->GetStyleFont()->mFont.size;
+         PRInt32 charCount = CharCountOfLargestOption(kid);
+-        mTextAmount += charCount * fontSize;
++        addedTextAmount += charCount * fontSize;
+       } else {
+         // recursive step
+-        ScanTextIn(kid);
++        ScanTextIn(kid, aNearestContainerUsesInflation);
++      }
++
++      if (aNearestContainerUsesInflation) {
++        mTextAmount += addedTextAmount;
+       }
+ 
+       if (mTextAmount >= mTextThreshold) {
+         return;
+       }
+     }
+   }
+ }
+diff --git a/layout/generic/nsFontInflationData.h b/layout/generic/nsFontInflationData.h
+--- a/layout/generic/nsFontInflationData.h
++++ b/layout/generic/nsFontInflationData.h
+@@ -50,17 +50,17 @@ private:
+ 
+   void MarkTextDirty() { mTextDirty = true; }
+   void ScanText();
+   // Scan text in the subtree rooted at aFrame.  Increment mTextAmount
+   // by multiplying the number of characters found by the font size
+   // (yielding the width that would be occupied by the characters if
+   // they were all em squares).  But stop scanning if mTextAmount
+   // crosses mTextThreshold.
+-  void ScanTextIn(nsIFrame *aFrame);
++  void ScanTextIn(nsIFrame *aFrame, bool aNearestContainerUsesInflation);
+ 
+   static const nsIFrame* FlowRootFor(const nsIFrame *aFrame)
+   {
+     while (!(aFrame->GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT)) {
+       aFrame = aFrame->GetParent();
+     }
+     return aFrame;
+   }
