@@ -62,7 +62,117 @@ diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
 diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInflationData.cpp
 --- a/layout/generic/nsFontInflationData.cpp
 +++ b/layout/generic/nsFontInflationData.cpp
-@@ -267,17 +267,20 @@ nsFontInflationData::FindEdgeInflatableF
+@@ -167,26 +167,28 @@ ComputeDescendantWidth(const nsHTMLReflo
+ void
+ nsFontInflationData::UpdateWidth(const nsHTMLReflowState &aReflowState)
+ {
+   nsIFrame *bfc = aReflowState.frame;
+   NS_ASSERTION(bfc->GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT,
+                "must be block formatting context");
+ 
+   nsIFrame *firstInflatableDescendant =
+-             FindEdgeInflatableFrameIn(bfc, eFromStart);
++             FindEdgeInflatableFrameIn(bfc, eFromStart,
++                                       true /* doesn't matter */);
+   if (!firstInflatableDescendant) {
+     mTextAmount = 0;
+     mTextThreshold = 0; // doesn't matter
+     mTextDirty = false;
+     mInflationEnabled = false;
+     return;
+   }
+   nsIFrame *lastInflatableDescendant =
+-             FindEdgeInflatableFrameIn(bfc, eFromEnd);
++             FindEdgeInflatableFrameIn(bfc, eFromEnd,
++                                       true /* doesn't matter */);
+   NS_ABORT_IF_FALSE(!firstInflatableDescendant == !lastInflatableDescendant,
+                     "null-ness should match; NearestCommonAncestorFirstInFlow"
+                     " will crash when passed null");
+ 
+   // Particularly when we're computing for the root BFC, the width of
+   // nca might differ significantly for the width of bfc.
+   nsIFrame *nca = NearestCommonAncestorFirstInFlow(firstInflatableDescendant,
+                                                    lastInflatableDescendant,
+@@ -211,73 +213,86 @@ nsFontInflationData::UpdateWidth(const n
+ 
+   mNCAWidth = newNCAWidth;
+   mTextThreshold = newTextThreshold;
+   mInflationEnabled = mTextAmount >= mTextThreshold;
+ }
+ 
+ /* static */ nsIFrame*
+ nsFontInflationData::FindEdgeInflatableFrameIn(nsIFrame* aFrame,
+-                                               SearchDirection aDirection)
++                                               SearchDirection aDirection,
++                                               bool aNearestContainerUsesInflation)
+ {
+   // NOTE: This function has a similar structure to ScanTextIn!
+ 
+   // FIXME: Should probably only scan the text that's actually going to
+   // be inflated!
+ 
+-  nsIFormControlFrame* fcf = do_QueryFrame(aFrame);
+-  if (fcf) {
+-    return aFrame;
++  if (nsLayoutUtils::IsContainerForFontSizeInflation(aFrame)) {
++    aNearestContainerUsesInflation =
++      nsLayoutUtils::ShouldInflateFontsForContainer(aFrame);
+   }
+ 
+-  // FIXME: aDirection!
++  if (aNearestContainerUsesInflation) {
++    nsIFormControlFrame* fcf = do_QueryFrame(aFrame);
++    if (fcf) {
++      return aFrame;
++    }
++  }
++
+   nsAutoTArray<FrameChildList, 4> lists;
+   aFrame->GetChildLists(&lists);
+   for (PRUint32 i = 0, len = lists.Length(); i < len; ++i) {
+     const nsFrameList& list =
+       lists[(aDirection == eFromStart) ? i : len - i - 1].mList;
+     for (nsIFrame *kid = (aDirection == eFromStart) ? list.FirstChild()
+                                                     : list.LastChild();
+          kid;
+          kid = (aDirection == eFromStart) ? kid->GetNextSibling()
+                                           : kid->GetPrevSibling()) {
+       if (kid->GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT) {
+         // Goes in a different set of inflation data.
+         continue;
+       }
+ 
+       if (kid->GetType() == nsGkAtoms::textFrame) {
+-        nsIContent *content = kid->GetContent();
+-        if (content && kid == content->GetPrimaryFrame()) {
+-          PRUint32 len = nsTextFrameUtils::
+-            ComputeApproximateLengthWithWhitespaceCompression(
+-              content, kid->GetStyleText());
+-          if (len != 0) {
+-            return kid;
++        if (aNearestContainerUsesInflation) {
++          nsIContent *content = kid->GetContent();
++          if (content && kid == content->GetPrimaryFrame()) {
++            PRUint32 len = nsTextFrameUtils::
++              ComputeApproximateLengthWithWhitespaceCompression(
++                content, kid->GetStyleText());
++            if (len != 0) {
++              return kid;
++            }
+           }
+         }
+       } else {
+         nsIFrame *kidResult =
+-          FindEdgeInflatableFrameIn(kid, aDirection);
++          FindEdgeInflatableFrameIn(kid, aDirection,
++                                    aNearestContainerUsesInflation);
+         if (kidResult) {
+           return kidResult;
+         }
+       }
+     }
+   }
+ 
    return nsnull;
  }
  
@@ -84,7 +194,7 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
  {
    PRUint32 result = 0;
    for (nsIFrame* option = aContainer->GetFirstPrincipalChild();
-@@ -307,69 +310,78 @@ DoCharCountOfLargestOption(nsIFrame *aCo
+@@ -307,69 +322,78 @@ DoCharCountOfLargestOption(nsIFrame *aCo
  static PRUint32
  CharCountOfLargestOption(nsIFrame *aListControlFrame)
  {
@@ -174,7 +284,18 @@ diff --git a/layout/generic/nsFontInflationData.cpp b/layout/generic/nsFontInfla
 diff --git a/layout/generic/nsFontInflationData.h b/layout/generic/nsFontInflationData.h
 --- a/layout/generic/nsFontInflationData.h
 +++ b/layout/generic/nsFontInflationData.h
-@@ -50,17 +50,17 @@ private:
+@@ -41,26 +41,27 @@ private:
+   nsFontInflationData(nsIFrame* aBFCFrame);
+ 
+   nsFontInflationData(const nsFontInflationData&) MOZ_DELETE;
+   void operator=(const nsFontInflationData&) MOZ_DELETE;
+ 
+   void UpdateWidth(const nsHTMLReflowState &aReflowState);
+   enum SearchDirection { eFromStart, eFromEnd };
+   static nsIFrame* FindEdgeInflatableFrameIn(nsIFrame *aFrame,
+-                                             SearchDirection aDirection);
++                                             SearchDirection aDirection,
++                                             bool aNearestContainerUsesInflation);
  
    void MarkTextDirty() { mTextDirty = true; }
    void ScanText();
