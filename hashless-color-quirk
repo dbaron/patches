@@ -1,0 +1,271 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Limit the hashless color quirk to the properties where it's needed, per http://simon.html5.org/specs/quirks-mode#the-hashless-hex-color-quirk .
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -636,16 +636,19 @@ protected:
+ 
+   // After an UngetToken is done this flag is true. The next call to
+   // GetToken clears the flag.
+   bool mHavePushBack : 1;
+ 
+   // True if we are in quirks mode; false in standards or almost standards mode
+   bool          mNavQuirkMode : 1;
+ 
++  // True when the hashless color quirk applies.
++  bool mHashlessColorQuirk : 1;
++
+   // True if unsafe rules should be allowed
+   bool mUnsafeRulesEnabled : 1;
+ 
+   // True for parsing media lists for HTML attributes, where we have to
+   // ignore CSS comments.
+   bool mHTMLMediaMode : 1;
+ 
+   // This flag is set when parsing a non-box shorthand; it's used to not apply
+@@ -733,16 +736,17 @@ static void AppendRuleToSheet(css::Rule*
+ CSSParserImpl::CSSParserImpl()
+   : mToken(),
+     mScanner(),
+     mChildLoader(nsnull),
+     mSection(eCSSSection_Charset),
+     mNameSpaceMap(nsnull),
+     mHavePushBack(false),
+     mNavQuirkMode(false),
++    mHashlessColorQuirk(false),
+     mUnsafeRulesEnabled(false),
+     mHTMLMediaMode(false),
+     mParsingCompoundProperty(false),
+     mFoundUnresolvablePrefix(false)
+ #ifdef DEBUG
+     , mScannerInited(false)
+ #endif
+     , mNextFree(nsnull)
+@@ -3745,17 +3749,17 @@ CSSParserImpl::ParseColor(nsCSSValue& aV
+         return false;
+       }
+       break;
+     default:
+       break;
+   }
+ 
+   // try 'xxyyzz' without '#' prefix for compatibility with IE and Nav4x (bug 23236 and 45804)
+-  if (mNavQuirkMode && !IsParsingCompoundProperty()) {
++  if (mHashlessColorQuirk) {
+     // - If the string starts with 'a-f', the nsCSSScanner builds the
+     //   token as a eCSSToken_Ident and we can parse the string as a
+     //   'xxyyzz' RGB color.
+     // - If it only contains '0-9' digits, the token is a
+     //   eCSSToken_Number and it must be converted back to a 6
+     //   characters string to be parsed as a RGB color.
+     // - If it starts with '0-9' and contains any 'a-f', the token is a
+     //   eCSSToken_Dimension, the mNumber part must be converted back to
+@@ -4536,17 +4540,17 @@ CSSParserImpl::ParseVariant(nsCSSValue& 
+     return ParseImageRect(aValue);
+   }
+   if ((aVariantMask & VARIANT_ELEMENT) != 0 &&
+       eCSSToken_Function == tk->mType &&
+       tk->mIdent.LowerCaseEqualsLiteral("-moz-element")) {
+     return ParseElement(aValue);
+   }
+   if ((aVariantMask & VARIANT_COLOR) != 0) {
+-    if ((mNavQuirkMode && !IsParsingCompoundProperty()) || // NONSTANDARD: Nav interprets 'xxyyzz' values even without '#' prefix
++    if (mHashlessColorQuirk || // NONSTANDARD: Nav interprets 'xxyyzz' values even without '#' prefix
+         (eCSSToken_ID == tk->mType) ||
+         (eCSSToken_Ref == tk->mType) ||
+         (eCSSToken_Ident == tk->mType) ||
+         ((eCSSToken_Function == tk->mType) &&
+          (tk->mIdent.LowerCaseEqualsLiteral("rgb") ||
+           tk->mIdent.LowerCaseEqualsLiteral("hsl") ||
+           tk->mIdent.LowerCaseEqualsLiteral("-moz-rgba") ||
+           tk->mIdent.LowerCaseEqualsLiteral("-moz-hsla") ||
+@@ -5344,16 +5348,21 @@ static const nsCSSProperty kOutlineRadiu
+   eCSSProperty__moz_outline_radius_topRight,
+   eCSSProperty__moz_outline_radius_bottomRight,
+   eCSSProperty__moz_outline_radius_bottomLeft
+ };
+ 
+ bool
+ CSSParserImpl::ParseProperty(nsCSSProperty aPropID)
+ {
++  AutoRestore<bool> colorQuirkAR(mHashlessColorQuirk);
++  mHashlessColorQuirk =
++    mNavQuirkMode &&
++    nsCSSProps::PropHasFlags(aPropID, CSS_PROPERTY_HASHLESS_COLOR_QUIRK);
++
+   NS_ASSERTION(aPropID < eCSSProperty_COUNT, "index out of range");
+   switch (nsCSSProps::PropertyParseType(aPropID)) {
+     case CSS_PROPERTY_PARSE_INACCESSIBLE: {
+       // The user can't use these
+       REPORT_UNEXPECTED(PEInaccessibleProperty2);
+       return false;
+     }
+     case CSS_PROPERTY_PARSE_FUNCTION: {
+diff --git a/layout/style/nsCSSPropList.h b/layout/style/nsCSSPropList.h
+--- a/layout/style/nsCSSPropList.h
++++ b/layout/style/nsCSSPropList.h
+@@ -477,17 +477,18 @@ CSS_PROP_BACKGROUND(
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_None)
+ CSS_PROP_BACKGROUND(
+     background-color,
+     background_color,
+     BackgroundColor,
+     CSS_PROPERTY_PARSE_VALUE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE |
+-        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED,
++        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "",
+     VARIANT_HC,
+     nsnull,
+     offsetof(nsStyleBackground, mBackgroundColor),
+     eStyleAnimType_Color)
+ CSS_PROP_BACKGROUND(
+     background-image,
+     background_image,
+@@ -587,17 +588,18 @@ CSS_PROP_SHORTHAND(
+     CSS_PROPERTY_PARSE_FUNCTION,
+     "")
+ CSS_PROP_BORDER(
+     border-bottom-color,
+     border_bottom_color,
+     BorderBottomColor,
+     CSS_PROPERTY_PARSE_VALUE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER |
+-        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED,
++        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "",
+     VARIANT_HCK,
+     kBorderColorKTable,
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_Custom)
+ CSS_PROP_BORDER(
+     -moz-border-bottom-colors,
+     border_bottom_colors,
+@@ -642,17 +644,18 @@ CSS_PROP_TABLEBORDER(
+     VARIANT_HK,
+     kBorderCollapseKTable,
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_None)
+ CSS_PROP_SHORTHAND(
+     border-color,
+     border_color,
+     BorderColor,
+-    CSS_PROPERTY_PARSE_FUNCTION,
++    CSS_PROPERTY_PARSE_FUNCTION |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "")
+ CSS_PROP_SHORTHAND(
+     -moz-border-end,
+     border_end,
+     CSS_PROP_DOMPROP_PREFIXED(BorderEnd),
+     CSS_PROPERTY_PARSE_FUNCTION,
+     "")
+ CSS_PROP_SHORTHAND(
+@@ -780,17 +783,18 @@ CSS_PROP_SHORTHAND(
+     border_left,
+     BorderLeft,
+     CSS_PROPERTY_PARSE_FUNCTION,
+     "")
+ CSS_PROP_SHORTHAND(
+     border-left-color,
+     border_left_color,
+     BorderLeftColor,
+-    CSS_PROPERTY_PARSE_FUNCTION,
++    CSS_PROPERTY_PARSE_FUNCTION |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "")
+ #ifndef CSS_PROP_LIST_EXCLUDE_INTERNAL
+ CSS_PROP_BORDER(
+     border-left-color-value,
+     border_left_color_value,
+     BorderLeftColorValue,
+     CSS_PROPERTY_PARSE_INACCESSIBLE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER |
+@@ -934,17 +938,18 @@ CSS_PROP_SHORTHAND(
+     border_right,
+     BorderRight,
+     CSS_PROPERTY_PARSE_FUNCTION,
+     "")
+ CSS_PROP_SHORTHAND(
+     border-right-color,
+     border_right_color,
+     BorderRightColor,
+-    CSS_PROPERTY_PARSE_FUNCTION,
++    CSS_PROPERTY_PARSE_FUNCTION |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "")
+ #ifndef CSS_PROP_LIST_EXCLUDE_INTERNAL
+ CSS_PROP_BORDER(
+     border-right-color-value,
+     border_right_color_value,
+     BorderRightColorValue,
+     CSS_PROPERTY_PARSE_INACCESSIBLE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER |
+@@ -1171,17 +1176,18 @@ CSS_PROP_SHORTHAND(
+     CSS_PROPERTY_PARSE_FUNCTION,
+     "")
+ CSS_PROP_BORDER(
+     border-top-color,
+     border_top_color,
+     BorderTopColor,
+     CSS_PROPERTY_PARSE_VALUE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER |
+-        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED,
++        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "",
+     VARIANT_HCK,
+     kBorderColorKTable,
+     CSS_PROP_NO_OFFSET,
+     eStyleAnimType_Custom)
+ CSS_PROP_BORDER(
+     -moz-border-top-colors,
+     border_top_colors,
+@@ -1347,17 +1353,18 @@ CSS_PROP_DISPLAY(
+     offsetof(nsStyleDisplay, mClip),
+     eStyleAnimType_Custom)
+ CSS_PROP_COLOR(
+     color,
+     color,
+     Color,
+     CSS_PROPERTY_PARSE_VALUE |
+         CSS_PROPERTY_APPLIES_TO_FIRST_LETTER_AND_FIRST_LINE |
+-        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED,
++        CSS_PROPERTY_IGNORED_WHEN_COLORS_DISABLED |
++        CSS_PROPERTY_HASHLESS_COLOR_QUIRK,
+     "",
+     VARIANT_HC,
+     nsnull,
+     offsetof(nsStyleColor, mColor),
+     eStyleAnimType_Color)
+ CSS_PROP_VISIBILITY(
+     -moz-color-correction,
+     color_correction,
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -87,16 +87,19 @@ MOZ_STATIC_ASSERT((CSS_PROPERTY_PARSE_PR
+ #define CSS_PROPERTY_VALUE_RESTRICTION_MASK       (3<<13)
+ // The parser (in particular, CSSParserImpl::ParseSingleValueProperty)
+ // should enforce that the value of this property must be 0 or larger.
+ #define CSS_PROPERTY_VALUE_NONNEGATIVE            (1<<13)
+ // The parser (in particular, CSSParserImpl::ParseSingleValueProperty)
+ // should enforce that the value of this property must be 1 or larger.
+ #define CSS_PROPERTY_VALUE_AT_LEAST_ONE           (2<<13)
+ 
++// Does this property suppor the hashless hex color quirk in quirks mode?
++#define CSS_PROPERTY_HASHLESS_COLOR_QUIRK         (1<<15)
++
+ // NOTE: next free bit is (1<<15)
+ 
+ /**
+  * Types of animatable values.
+  */
+ enum nsStyleAnimType {
+   // requires a custom implementation in
+   // nsStyleAnimation::ExtractComputedValue
