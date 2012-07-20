@@ -1,0 +1,383 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Only do hyphenation when the language was specified explicitly, rather than using an encoding-inferred language.  (Bug 702121, patch 2)
+
+diff --git a/content/base/public/nsLineBreaker.h b/content/base/public/nsLineBreaker.h
+--- a/content/base/public/nsLineBreaker.h
++++ b/content/base/public/nsLineBreaker.h
+@@ -142,24 +142,24 @@ public:
+   nsresult AppendInvisibleWhitespace(PRUint32 aFlags);
+ 
+   /**
+    * Feed Unicode text into the linebreaker for analysis. aLength must be
+    * nonzero.
+    * @param aSink can be null if the breaks are not actually needed (we may
+    * still be setting up state for later breaks)
+    */
+-  nsresult AppendText(nsIAtom* aLangGroup, const PRUnichar* aText, PRUint32 aLength,
++  nsresult AppendText(nsIAtom* aHyphenationLanguage, const PRUnichar* aText, PRUint32 aLength,
+                       PRUint32 aFlags, nsILineBreakSink* aSink);
+   /**
+    * Feed 8-bit text into the linebreaker for analysis. aLength must be nonzero.
+    * @param aSink can be null if the breaks are not actually needed (we may
+    * still be setting up state for later breaks)
+    */
+-  nsresult AppendText(nsIAtom* aLangGroup, const PRUint8* aText, PRUint32 aLength,
++  nsresult AppendText(nsIAtom* aHyphenationLanguage, const PRUint8* aText, PRUint32 aLength,
+                       PRUint32 aFlags, nsILineBreakSink* aSink);
+   /**
+    * Reset all state. This means the current run has ended; any outstanding
+    * calls through nsILineBreakSink are made, and all outstanding references to
+    * nsILineBreakSink objects are dropped.
+    * After this call, this linebreaker can be reused.
+    * This must be called at least once between any call to AppendText() and
+    * destroying the object.
+@@ -193,27 +193,27 @@ private:
+   // State for the nonwhitespace "word" that started in previous text and hasn't
+   // finished yet.
+ 
+   // When the current word ends, this computes the linebreak opportunities
+   // *inside* the word (excluding either end) and sets them through the
+   // appropriate sink(s). Then we clear the current word state.
+   nsresult FlushCurrentWord();
+ 
+-  void UpdateCurrentWordLangGroup(nsIAtom *aLangGroup);
++  void UpdateCurrentWordLanguage(nsIAtom *aHyphenationLanguage);
+ 
+   void FindHyphenationPoints(nsHyphenator *aHyphenator,
+                              const PRUnichar *aTextStart,
+                              const PRUnichar *aTextLimit,
+                              PRUint8 *aBreakState);
+ 
+   nsAutoTArray<PRUnichar,100> mCurrentWord;
+   // All the items that contribute to mCurrentWord
+   nsAutoTArray<TextItem,2>    mTextItems;
+-  nsIAtom*                    mCurrentWordLangGroup;
++  nsIAtom*                    mCurrentWordLanguage;
+   bool                        mCurrentWordContainsMixedLang;
+   bool                        mCurrentWordContainsComplexChar;
+ 
+   // True if the previous character was breakable whitespace
+   bool                        mAfterBreakableSpace;
+   // True if a break must be allowed at the current position because
+   // a run of breakable whitespace ends here
+   bool                        mBreakHere;
+diff --git a/content/base/src/nsLineBreaker.cpp b/content/base/src/nsLineBreaker.cpp
+--- a/content/base/src/nsLineBreaker.cpp
++++ b/content/base/src/nsLineBreaker.cpp
+@@ -6,17 +6,17 @@
+ #include "nsLineBreaker.h"
+ #include "nsContentUtils.h"
+ #include "nsILineBreaker.h"
+ #include "gfxFont.h" // for the gfxTextRun::CompressedGlyph::FLAG_BREAK_TYPE_* values
+ #include "nsHyphenationManager.h"
+ #include "nsHyphenator.h"
+ 
+ nsLineBreaker::nsLineBreaker()
+-  : mCurrentWordLangGroup(nsnull),
++  : mCurrentWordLanguage(nsnull),
+     mCurrentWordContainsMixedLang(false),
+     mCurrentWordContainsComplexChar(false),
+     mAfterBreakableSpace(false), mBreakHere(false),
+     mWordBreak(nsILineBreaker::kWordBreak_Normal)
+ {
+ }
+ 
+ nsLineBreaker::~nsLineBreaker()
+@@ -72,28 +72,28 @@ nsLineBreaker::FlushCurrentWord()
+              gfxTextRun::CompressedGlyph::FLAG_BREAK_TYPE_NONE,
+            length*sizeof(PRUint8));
+   } else {
+     nsContentUtils::LineBreaker()->
+       GetJISx4051Breaks(mCurrentWord.Elements(), length, mWordBreak,
+                         breakState.Elements());
+   }
+ 
+-  bool autoHyphenate = mCurrentWordLangGroup &&
++  bool autoHyphenate = mCurrentWordLanguage &&
+     !mCurrentWordContainsMixedLang;
+   PRUint32 i;
+   for (i = 0; autoHyphenate && i < mTextItems.Length(); ++i) {
+     TextItem* ti = &mTextItems[i];
+     if (!(ti->mFlags & BREAK_USE_AUTO_HYPHENATION)) {
+       autoHyphenate = false;
+     }
+   }
+   if (autoHyphenate) {
+     nsRefPtr<nsHyphenator> hyphenator =
+-      nsHyphenationManager::Instance()->GetHyphenator(mCurrentWordLangGroup);
++      nsHyphenationManager::Instance()->GetHyphenator(mCurrentWordLanguage);
+     if (hyphenator) {
+       FindHyphenationPoints(hyphenator,
+                             mCurrentWord.Elements(),
+                             mCurrentWord.Elements() + length,
+                             breakState.Elements());
+     }
+   }
+ 
+@@ -135,38 +135,38 @@ nsLineBreaker::FlushCurrentWord()
+     
+     offset += ti->mLength;
+   }
+ 
+   mCurrentWord.Clear();
+   mTextItems.Clear();
+   mCurrentWordContainsComplexChar = false;
+   mCurrentWordContainsMixedLang = false;
+-  mCurrentWordLangGroup = nsnull;
++  mCurrentWordLanguage = nsnull;
+   return NS_OK;
+ }
+ 
+ nsresult
+-nsLineBreaker::AppendText(nsIAtom* aLangGroup, const PRUnichar* aText, PRUint32 aLength,
++nsLineBreaker::AppendText(nsIAtom* aHyphenationLanguage, const PRUnichar* aText, PRUint32 aLength,
+                           PRUint32 aFlags, nsILineBreakSink* aSink)
+ {
+   NS_ASSERTION(aLength > 0, "Appending empty text...");
+ 
+   PRUint32 offset = 0;
+ 
+   // Continue the current word
+   if (mCurrentWord.Length() > 0) {
+     NS_ASSERTION(!mAfterBreakableSpace && !mBreakHere, "These should not be set");
+ 
+     while (offset < aLength && !IsSpace(aText[offset])) {
+       mCurrentWord.AppendElement(aText[offset]);
+       if (!mCurrentWordContainsComplexChar && IsComplexChar(aText[offset])) {
+         mCurrentWordContainsComplexChar = true;
+       }
+-      UpdateCurrentWordLangGroup(aLangGroup);
++      UpdateCurrentWordLanguage(aHyphenationLanguage);
+       ++offset;
+     }
+ 
+     if (offset > 0) {
+       mTextItems.AppendElement(TextItem(aSink, 0, offset, aFlags));
+     }
+ 
+     if (offset == aLength)
+@@ -207,17 +207,17 @@ nsLineBreaker::AppendText(nsIAtom* aLang
+         break;
+     }
+   }
+   PRUint32 wordStart = offset;
+   bool wordHasComplexChar = false;
+ 
+   nsRefPtr<nsHyphenator> hyphenator;
+   if ((aFlags & BREAK_USE_AUTO_HYPHENATION) && !(aFlags & BREAK_SUPPRESS_INSIDE)) {
+-    hyphenator = nsHyphenationManager::Instance()->GetHyphenator(aLangGroup);
++    hyphenator = nsHyphenationManager::Instance()->GetHyphenator(aHyphenationLanguage);
+   }
+ 
+   for (;;) {
+     PRUnichar ch = aText[offset];
+     bool isSpace = IsSpace(ch);
+     bool isBreakableSpace = isSpace && !(aFlags & BREAK_SUPPRESS_INSIDE);
+ 
+     if (aSink) {
+@@ -270,17 +270,17 @@ nsLineBreaker::AppendText(nsIAtom* aLang
+         PRUint32 len = offset - wordStart;
+         PRUnichar* elems = mCurrentWord.AppendElements(len);
+         if (!elems)
+           return NS_ERROR_OUT_OF_MEMORY;
+         memcpy(elems, aText + wordStart, sizeof(PRUnichar)*len);
+         mTextItems.AppendElement(TextItem(aSink, wordStart, len, aFlags));
+         // Ensure that the break-before for this word is written out
+         offset = wordStart + 1;
+-        UpdateCurrentWordLangGroup(aLangGroup);
++        UpdateCurrentWordLanguage(aHyphenationLanguage);
+         break;
+       }
+     }
+   }
+ 
+   if (!noBreaksNeeded) {
+     // aSink must not be null
+     aSink->SetBreaks(start, offset - start, breakState.Elements() + start);
+@@ -306,27 +306,27 @@ nsLineBreaker::FindHyphenationPoints(nsH
+         aBreakState[i + 1] =
+           gfxTextRun::CompressedGlyph::FLAG_BREAK_TYPE_HYPHEN;
+       }
+     }
+   }
+ }
+ 
+ nsresult
+-nsLineBreaker::AppendText(nsIAtom* aLangGroup, const PRUint8* aText, PRUint32 aLength,
++nsLineBreaker::AppendText(nsIAtom* aHyphenationLanguage, const PRUint8* aText, PRUint32 aLength,
+                           PRUint32 aFlags, nsILineBreakSink* aSink)
+ {
+   NS_ASSERTION(aLength > 0, "Appending empty text...");
+ 
+   if (aFlags & (BREAK_NEED_CAPITALIZATION | BREAK_USE_AUTO_HYPHENATION)) {
+     // Defer to the Unicode path if capitalization or hyphenation is required
+     nsAutoString str;
+     const char* cp = reinterpret_cast<const char*>(aText);
+     CopyASCIItoUTF16(nsDependentCSubstring(cp, cp + aLength), str);
+-    return AppendText(aLangGroup, str.get(), aLength, aFlags, aSink);
++    return AppendText(aHyphenationLanguage, str.get(), aLength, aFlags, aSink);
+   }
+ 
+   PRUint32 offset = 0;
+ 
+   // Continue the current word
+   if (mCurrentWord.Length() > 0) {
+     NS_ASSERTION(!mAfterBreakableSpace && !mBreakHere, "These should not be set");
+ 
+@@ -441,22 +441,22 @@ nsLineBreaker::AppendText(nsIAtom* aLang
+ 
+   if (!noBreaksNeeded) {
+     aSink->SetBreaks(start, offset - start, breakState.Elements() + start);
+   }
+   return NS_OK;
+ }
+ 
+ void
+-nsLineBreaker::UpdateCurrentWordLangGroup(nsIAtom *aLangGroup)
++nsLineBreaker::UpdateCurrentWordLanguage(nsIAtom *aHyphenationLanguage)
+ {
+-  if (mCurrentWordLangGroup && mCurrentWordLangGroup != aLangGroup) {
++  if (mCurrentWordLanguage && mCurrentWordLanguage != aHyphenationLanguage) {
+     mCurrentWordContainsMixedLang = true;
+   } else {
+-    mCurrentWordLangGroup = aLangGroup;
++    mCurrentWordLanguage = aHyphenationLanguage;
+   }
+ }
+ 
+ nsresult
+ nsLineBreaker::AppendInvisibleWhitespace(PRUint32 aFlags)
+ {
+   nsresult rv = FlushCurrentWord();
+   if (NS_FAILED(rv))
+diff --git a/layout/generic/nsTextFrameThebes.cpp b/layout/generic/nsTextFrameThebes.cpp
+--- a/layout/generic/nsTextFrameThebes.cpp
++++ b/layout/generic/nsTextFrameThebes.cpp
+@@ -2166,17 +2166,21 @@ HasCompressedLeadingWhitespace(nsTextFra
+ }
+ 
+ void
+ BuildTextRunsScanner::SetupBreakSinksForTextRun(gfxTextRun* aTextRun,
+                                                 const void* aTextPtr,
+                                                 PRUint32    aFlags)
+ {
+   // textruns have uniform language
+-  nsIAtom* language = mMappedFlows[0].mStartFrame->GetStyleFont()->mLanguage;
++  const nsStyleFont *styleFont = mMappedFlows[0].mStartFrame->GetStyleFont();
++  // We should only use a language for hyphenation if it was specified
++  // explicitly.
++  nsIAtom* hyphenationLanguage =
++    styleFont->mExplicitLanguage ? styleFont->mLanguage : nsnull;;
+   // We keep this pointed at the skip-chars data for the current mappedFlow.
+   // This lets us cheaply check whether the flow has compressed initial
+   // whitespace...
+   gfxSkipCharsIterator iter(aTextRun->GetSkipChars());
+ 
+   PRUint32 i;
+   for (i = 0; i < mMappedFlows.Length(); ++i) {
+     MappedFlow* mappedFlow = &mMappedFlows[i];
+@@ -2220,21 +2224,21 @@ BuildTextRunsScanner::SetupBreakSinksFor
+       mLineBreaker.AppendInvisibleWhitespace(flags);
+     }
+ 
+     if (length > 0) {
+       BreakSink* sink =
+         (aFlags & SBS_SUPPRESS_SINK) ? nsnull : (*breakSink).get();
+       if (aFlags & SBS_DOUBLE_BYTE) {
+         const PRUnichar* text = reinterpret_cast<const PRUnichar*>(aTextPtr);
+-        mLineBreaker.AppendText(language, text + offset,
++        mLineBreaker.AppendText(hyphenationLanguage, text + offset,
+                                 length, flags, sink);
+       } else {
+         const PRUint8* text = reinterpret_cast<const PRUint8*>(aTextPtr);
+-        mLineBreaker.AppendText(language, text + offset,
++        mLineBreaker.AppendText(hyphenationLanguage, text + offset,
+                                 length, flags, sink);
+       }
+     }
+     
+     iter = iterNext;
+   }
+ }
+ 
+diff --git a/layout/reftests/text/auto-hyphenation-10.html b/layout/reftests/text/auto-hyphenation-10.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text/auto-hyphenation-10.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html>
++<meta charset="UTF-8">
++<!-- check that hyphenation is not applied when language is not specified -->
++<body>
++<div style="width: 5em; -moz-hyphens: auto;">
++supercalifragilisticexpialidocious
++</div>
++</body>
++</html>
++
+diff --git a/layout/reftests/text/auto-hyphenation-8.html b/layout/reftests/text/auto-hyphenation-8.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text/auto-hyphenation-8.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE html>
++<html>
++<!-- check that hyphenation is not applied when language is not specified -->
++<body>
++<div style="width: 5em; -moz-hyphens: auto;">
++supercalifragilisticexpialidocious
++</div>
++</body>
++</html>
++
+diff --git a/layout/reftests/text/auto-hyphenation-9.html b/layout/reftests/text/auto-hyphenation-9.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/text/auto-hyphenation-9.html
+@@ -0,0 +1,11 @@
++<!DOCTYPE html>
++<html>
++<meta charset="iso-8859-1">
++<!-- check that hyphenation is not applied when language is not specified -->
++<body>
++<div style="width: 5em; -moz-hyphens: auto;">
++supercalifragilisticexpialidocious
++</div>
++</body>
++</html>
++
+diff --git a/layout/reftests/text/reftest.list b/layout/reftests/text/reftest.list
+--- a/layout/reftests/text/reftest.list
++++ b/layout/reftests/text/reftest.list
+@@ -174,16 +174,19 @@ HTTP(..) == graphite-05-feat.html graphi
+ != auto-hyphenation-1.html auto-hyphenation-1-notref.html
+ == auto-hyphenation-1a.html auto-hyphenation-1-ref.html
+ == auto-hyphenation-2.html auto-hyphenation-2-ref.html
+ == auto-hyphenation-3.html auto-hyphenation-3-ref.html
+ == auto-hyphenation-4.html auto-hyphenation-4-ref.html
+ == auto-hyphenation-5.html auto-hyphenation-5-ref.html
+ == auto-hyphenation-6.html auto-hyphenation-6-ref.html
+ == auto-hyphenation-7.html auto-hyphenation-7-ref.html
++== auto-hyphenation-8.html auto-hyphenation-4-ref.html
++== auto-hyphenation-9.html auto-hyphenation-4-ref.html
++== auto-hyphenation-10.html auto-hyphenation-4-ref.html
+ == auto-hyphenation-af-1.html auto-hyphenation-af-1-ref.html
+ == auto-hyphenation-bg-1.html auto-hyphenation-bg-1-ref.html
+ == auto-hyphenation-ca-1.html auto-hyphenation-ca-1-ref.html
+ == auto-hyphenation-cy-1.html auto-hyphenation-cy-1-ref.html
+ == auto-hyphenation-da-1.html auto-hyphenation-da-1-ref.html
+ == auto-hyphenation-de-1901-1.html auto-hyphenation-de-1901-1-ref.html
+ == auto-hyphenation-de-1996-1.html auto-hyphenation-de-1996-1-ref.html
+ != auto-hyphenation-de-1901-1.html auto-hyphenation-de-1996-1.html
+@@ -211,9 +214,8 @@ HTTP(..) == graphite-05-feat.html graphi
+ == auto-hyphenation-ru-1.html auto-hyphenation-ru-1-ref.html
+ == auto-hyphenation-sh-1.html auto-hyphenation-sh-1-ref.html
+ == auto-hyphenation-sl-1.html auto-hyphenation-sl-1-ref.html
+ == auto-hyphenation-sr-1.html auto-hyphenation-sr-1-ref.html
+ == auto-hyphenation-sv-1.html auto-hyphenation-sv-1-ref.html # test swedish patterns
+ != auto-hyphenation-sv-1.html auto-hyphenation-sv-1-notref.html # verify swedish != english
+ == auto-hyphenation-tr-1.html auto-hyphenation-tr-1-ref.html
+ == auto-hyphenation-uk-1.html auto-hyphenation-uk-1-ref.html
+-
