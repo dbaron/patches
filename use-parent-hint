@@ -1,0 +1,106 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make nsStyleContext::CalcStyleDifference force comparison based on the parent's hint.  (Bug 779968, patch 5)
+
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -360,18 +360,23 @@ nsStyleContext::ApplyStyleFixups(nsPresC
+     }
+   }
+ 
+   // Computer User Interface style, to trigger loads of cursors
+   GetStyleUserInterface();
+ }
+ 
+ nsChangeHint
+-nsStyleContext::CalcStyleDifference(nsStyleContext* aOther)
++nsStyleContext::CalcStyleDifference(nsStyleContext* aOther,
++                                    nsChangeHint aParentNoninheritedHints)
+ {
++  NS_ABORT_IF_FALSE(NS_IsHintSubset(aParentNoninheritedHints,
++                                    nsChangeHint_NonInherited_Hints),
++                    "caller is passing inherited hints, but shouldn't be");
++
+   nsChangeHint hint = NS_STYLE_HINT_NONE;
+   NS_ENSURE_TRUE(aOther, hint);
+   // We must always ensure that we populate the structs on the new style
+   // context that are filled in on the old context, so that if we get
+   // two style changes in succession, the second of which causes a real
+   // style change, the PeekStyleData doesn't return null (implying that
+   // nobody ever looked at that struct's data).  In other words, we
+   // can't skip later structs if we get a big change up front, because
+@@ -379,25 +384,33 @@ nsStyleContext::CalcStyleDifference(nsSt
+   // don't want to miss.
+ 
+   // If our rule nodes are the same, then any differences in style data
+   // are already accounted for by differences on ancestors.  We know
+   // this because CalcStyleDifference is always called on two style
+   // contexts that point to the same element, so we know that our
+   // position in the style context tree is the same and our position in
+   // the rule node tree is also the same.
++  // However, if there were noninherited style change hints on the
++  // parent, we might produce these same noninherited hints on this
++  // style context's frame due to 'inherit' values, so we do need to
++  // compare.
++  // (Things like 'em' units are handled by the change hint produced
++  // by font-size changing, so we don't need to worry about them like
++  // we worry about 'inherit' values.)
+   bool compare = mRuleNode != aOther->mRuleNode;
+ 
+ #define DO_STRUCT_DIFFERENCE(struct_)                                         \
+   PR_BEGIN_MACRO                                                              \
+     const nsStyle##struct_* this##struct_ = PeekStyle##struct_();             \
+     if (this##struct_) {                                                      \
+       const nsStyle##struct_* other##struct_ = aOther->GetStyle##struct_();   \
+-      if ((compare || nsStyle##struct_::ForceCompare()) &&                    \
+-          !NS_IsHintSubset(nsStyle##struct_::MaxDifference(), hint) &&        \
++      nsChangeHint maxDifference = nsStyle##struct_::MaxDifference();         \
++      if ((compare || (maxDifference & aParentNoninheritedHints)) &&          \
++          !NS_IsHintSubset(maxDifference, hint) &&                            \
+           this##struct_ != other##struct_) {                                  \
+         NS_ASSERTION(NS_IsHintSubset(                                         \
+              this##struct_->CalcDifference(*other##struct_),                  \
+              nsStyle##struct_::MaxDifference()),                              \
+              "CalcDifference() returned bigger hint than MaxDifference()");   \
+         NS_ASSERTION(nsStyle##struct_::ForceCompare() ||                      \
+              NS_IsHintSubset(nsStyle##struct_::MaxDifference(),               \
+                              nsChangeHint(~nsChangeHint_NonInherited_Hints)), \
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -239,17 +239,33 @@ public:
+     const nsStyle##name_ * PeekStyle##name_() {           \
+       return DoGetStyle##name_(false);                 \
+     }
+   #include "nsStyleStructList.h"
+   #undef STYLE_STRUCT
+ 
+   void* GetUniqueStyleData(const nsStyleStructID& aSID);
+ 
+-  nsChangeHint CalcStyleDifference(nsStyleContext* aOther);
++  /**
++   * Compute the style changes needed during restyling when this style
++   * context is being replaced by aOther.  (This is nonsymmetric since
++   * we optimize by skipping comparison for styles that have never been
++   * requested.)
++   *
++   * This method returns a change hint (see nsChangeHint.h).  All change
++   * hints apply to the frame and its later continuations or special
++   * siblings.  Most (all of those except the "non-inherited hints")
++   * also apply to all descendants.  The caller must pass in any
++   * non-inherited hints that resulted from the parent style context's
++   * style change.  The caller *may* pass more hints than needed, but
++   * must not pass less than needed; therefore if the caller doesn't
++   * know, the caller should pass nsChangeHint_NonInherited_Hints.
++   */
++  nsChangeHint CalcStyleDifference(nsStyleContext* aOther,
++                                   nsChangeHint aParentNoninheritedHints);
+ 
+   /**
+    * Get a color that depends on link-visitedness using this and
+    * this->GetStyleIfVisited().
+    *
+    * aProperty must be a color-valued property that nsStyleAnimation
+    * knows how to extract.  It must also be a property that we know to
+    * do change handling for in nsStyleContext::CalcDifference.
