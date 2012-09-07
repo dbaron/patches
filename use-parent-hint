@@ -45,6 +45,233 @@ diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
                  NS_ASSERTION(!(styleChange & nsChangeHint_ReconstructFrame),
                               "Our frame tree is likely to be bogus!");
                }
+@@ -966,50 +968,58 @@ nsFrameManager::ReparentStyleContext(nsI
+         VerifyStyleTree(GetPresContext(), aFrame, newParentContext);
+ #endif
+       }
+     }
+   }
+   return NS_OK;
+ }
+ 
+-static nsChangeHint
++static void
+ CaptureChange(nsStyleContext* aOldContext, nsStyleContext* aNewContext,
+               nsIFrame* aFrame, nsIContent* aContent,
+-              nsStyleChangeList* aChangeList, nsChangeHint aMinChange,
++              nsStyleChangeList* aChangeList,
++              /*inout*/nsChangeHint &aMinChange,
++              /*in*/nsChangeHint aParentNonInheritedHints,
++              /*out*/nsChangeHint &aNonInheritedHints,
+               nsChangeHint aChangeToAssume)
+ {
+-  nsChangeHint ourChange = aOldContext->CalcStyleDifference(aNewContext);
++  nsChangeHint ourChange =
++    aOldContext->CalcStyleDifference(aNewContext, aParentNonInheritedHints);
+   NS_ASSERTION(!(ourChange & nsChangeHint_ReflowFrame) ||
+                (ourChange & nsChangeHint_NeedReflow),
+                "Reflow hint bits set without actually asking for a reflow");
+ 
+   NS_UpdateHint(ourChange, aChangeToAssume);
+   if (NS_UpdateHint(aMinChange, ourChange)) {
+     if (!(ourChange & nsChangeHint_ReconstructFrame) || aContent) {
+       aChangeList->AppendChange(aFrame, aContent, ourChange);
+     }
+   }
+-  return aMinChange;
++  aNonInheritedHints = NS_NonInheritedHintsIn(ourChange);
+ }
+ 
+ /**
+  * Recompute style for aFrame and accumulate changes into aChangeList
+  * given that aMinChange is already accumulated for an ancestor.
+  * aParentContent is the content node used to resolve the parent style
+  * context.  This means that, for pseudo-elements, it is the content
+  * that should be used for selector matching (rather than the fake
+  * content node attached to the frame).
++ *
++ * For aParentFrameNonInheritedHints, see
++ * nsStyleContext::CalcStyleDifference.
+  */
+ nsChangeHint
+ nsFrameManager::ReResolveStyleContext(nsPresContext     *aPresContext,
+                                       nsIFrame          *aFrame,
+                                       nsIContent        *aParentContent,
+                                       nsStyleChangeList *aChangeList, 
+                                       nsChangeHint       aMinChange,
++                                      nsChangeHint       aParentFrameNonInheritedHints,
+                                       nsRestyleHint      aRestyleHint,
+                                       RestyleTracker&    aRestyleTracker,
+                                       DesiredA11yNotifications aDesiredA11yNotifications,
+                                       nsTArray<nsIContent*>& aVisibleKidsOfHiddenElement,
+                                       TreeMatchContext &aTreeMatchContext)
+ {
+   // We need to generate a new change list entry for every frame whose style
+   // comparision returns one of these hints. These hints don't automatically
+@@ -1100,30 +1110,38 @@ nsFrameManager::ReResolveStyleContext(ns
+       // applied to this frame, no matter what
+       // nsStyleContext::CalcStyleDifference says. CalcStyleDifference
+       // can't be trusted because it assumes any changes to the parent
+       // style context provider will be automatically propagated to
+       // the frame(s) with child style contexts.
+ 
+       assumeDifferenceHint = ReResolveStyleContext(aPresContext, providerFrame,
+                                                    aParentContent, aChangeList,
+-                                                   aMinChange, aRestyleHint,
++                                                   aMinChange,
++                                                   nsChangeHint_NonInheritedHints,
++                                                   aRestyleHint,
+                                                    aRestyleTracker,
+                                                    aDesiredA11yNotifications,
+                                                    aVisibleKidsOfHiddenElement,
+                                                    aTreeMatchContext);
+ 
+       // The provider's new context becomes the parent context of
+       // aFrame's context.
+       parentContext = providerFrame->GetStyleContext();
+       // Set |resolvedChild| so we don't bother resolving the
+       // provider again.
+       resolvedChild = providerFrame;
+     }
+ 
++    if (providerFrame != aFrame->GetParent()) {
++      // We don't actually know what the parent style context's
++      // non-inherited hints were, so assume the worst.
++      aParentFrameNonInheritedHints = nsChangeHint_NonInheritedHints;
++    }
++
+ #ifdef DEBUG
+     {
+       // Check that our assumption that continuations of the same
+       // pseudo-type and with the same style context parent have the
+       // same style context is valid before the reresolution.  (We need
+       // to check the pseudo-type and style context parent because of
+       // :first-letter and :first-line, where we create styled and
+       // unstyled letter/line frames distinguished by pseudo-type, and
+@@ -1162,30 +1180,34 @@ nsFrameManager::ReResolveStyleContext(ns
+                        "continuations should have the same style context");
+         }
+       }
+     }
+ #endif
+ 
+     // do primary context
+     nsRefPtr<nsStyleContext> newContext;
++    nsChangeHint nonInheritedHints = nsChangeHint(0);
+     nsIFrame *prevContinuation =
+       GetPrevContinuationWithPossiblySameStyle(aFrame);
+     nsStyleContext *prevContinuationContext;
+     bool copyFromContinuation =
+       prevContinuation &&
+       (prevContinuationContext = prevContinuation->GetStyleContext())
+         ->GetPseudo() == oldContext->GetPseudo() &&
+        prevContinuationContext->GetParent() == parentContext;
+     if (copyFromContinuation) {
+       // Just use the style context from the frame's previous
+       // continuation (see assertion about aFrame->GetNextContinuation()
+       // above, which we would have previously hit for aFrame's previous
+       // continuation).
+       newContext = prevContinuationContext;
++      // We don't know what changes the previous continuation had, so
++      // assume the worst.
++      nonInheritedHints = nsChangeHint_NonInheritedHints;
+     }
+     else if (pseudoTag == nsCSSAnonBoxes::mozNonElement) {
+       NS_ASSERTION(localContent,
+                    "non pseudo-element frame without content node");
+       newContext = styleSet->ResolveStyleForNonElement(parentContext);
+     }
+     else if (!aRestyleHint && !prevContinuation) {
+       // Unfortunately, if prevContinuation is non-null then we may have
+@@ -1261,19 +1283,19 @@ nsFrameManager::ReResolveStyleContext(ns
+       }
+ 
+       if (newContext != oldContext) {
+         if (!copyFromContinuation) {
+           TryStartingTransition(aPresContext, aFrame->GetContent(),
+                                 oldContext, &newContext);
+         }
+ 
+-        aMinChange = CaptureChange(oldContext, newContext, aFrame,
+-                                   content, aChangeList, aMinChange,
+-                                   assumeDifferenceHint);
++        CaptureChange(oldContext, newContext, aFrame, content, aChangeList,
++                      aMinChange, aParentFrameNonInheritedHints,
++                      nonInheritedHints, assumeDifferenceHint);
+         if (!(aMinChange & nsChangeHint_ReconstructFrame)) {
+           // if frame gets regenerated, let it keep old context
+           aFrame->SetStyleContext(newContext);
+         }
+       }
+       oldContext->Release();
+     }
+     else {
+@@ -1307,19 +1329,21 @@ nsFrameManager::ReResolveStyleContext(ns
+                          nsCSSPseudoElements::ePseudo_PseudoElementCount,
+                        "Unexpected type");
+           newExtraContext = styleSet->ResolvePseudoElementStyle(content->AsElement(),
+                                                                 extraPseudoType,
+                                                                 newContext);
+         }
+         if (newExtraContext) {
+           if (oldExtraContext != newExtraContext) {
+-            aMinChange = CaptureChange(oldExtraContext, newExtraContext,
+-                                       aFrame, content, aChangeList,
+-                                       aMinChange, assumeDifferenceHint);
++            nsChangeHint extraNonInheritedHints = nsChangeHint(0);
++            CaptureChange(oldExtraContext, newExtraContext, aFrame, content,
++                          aChangeList, aMinChange, aParentFrameNonInheritedHints,
++                          extraNonInheritedHints, assumeDifferenceHint);
++            NS_UpdateHint(nonInheritedHints, extraNonInheritedHints);
+             if (!(aMinChange & nsChangeHint_ReconstructFrame)) {
+               aFrame->SetAdditionalStyleContext(contextIndex, newExtraContext);
+             }
+           }
+         }
+       }
+       else {
+         break;
+@@ -1533,37 +1557,40 @@ nsFrameManager::ReResolveStyleContext(ns
+ 
+               // |nsFrame::GetParentStyleContextFrame| checks being out
+               // of flow so that this works correctly.
+               do {
+                 ReResolveStyleContext(aPresContext, outOfFlowFrame,
+                                       content, aChangeList,
+                                       NS_SubtractHint(aMinChange,
+                                                       nsChangeHint_ReflowFrame),
++                                      nonInheritedHints,
+                                       childRestyleHint,
+                                       aRestyleTracker,
+                                       kidsDesiredA11yNotification,
+                                       aVisibleKidsOfHiddenElement,
+                                       aTreeMatchContext);
+               } while ((outOfFlowFrame = outOfFlowFrame->GetNextContinuation()));
+ 
+               // reresolve placeholder's context under the same parent
+               // as the out-of-flow frame
+               ReResolveStyleContext(aPresContext, child, content,
+                                     aChangeList, aMinChange,
++                                    nonInheritedHints,
+                                     childRestyleHint,
+                                     aRestyleTracker,
+                                     kidsDesiredA11yNotification,
+                                     aVisibleKidsOfHiddenElement,
+                                     aTreeMatchContext);
+             }
+             else {  // regular child frame
+               if (child != resolvedChild) {
+                 ReResolveStyleContext(aPresContext, child, content,
+                                       aChangeList, aMinChange,
++                                      nonInheritedHints,
+                                       childRestyleHint,
+                                       aRestyleTracker,
+                                       kidsDesiredA11yNotification,
+                                       aVisibleKidsOfHiddenElement,
+                                       aTreeMatchContext);
+               } else {
+                 NOISY_TRACE_FRAME("child frame already resolved as descendant, skipping",aFrame);
+               }
 diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 --- a/layout/style/nsStyleContext.cpp
 +++ b/layout/style/nsStyleContext.cpp
