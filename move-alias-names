@@ -1,0 +1,173 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Move names for aliases from gAliases into kCSSRawProperties.  (Bug 774169, patch 2)
+
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -25,25 +25,28 @@
+ #include "mozilla/Preferences.h"
+ 
+ using namespace mozilla;
+ 
+ // required to make the symbol external, so that TestCSSPropertyLookup.cpp can link with it
+ extern const char* const kCSSRawProperties[];
+ 
+ // define an array of all CSS properties
+-const char* const kCSSRawProperties[] = {
++const char* const kCSSRawProperties[eCSSProperty_COUNT_with_aliases] = {
+ #define CSS_PROP(name_, id_, method_, flags_, pref_, parsevariant_, kwtable_, \
+                  stylestruct_, stylestructoffset_, animtype_)                 \
+   #name_,
+ #include "nsCSSPropList.h"
+ #undef CSS_PROP
+ #define CSS_PROP_SHORTHAND(name_, id_, method_, flags_, pref_) #name_,
+ #include "nsCSSPropList.h"
+ #undef CSS_PROP_SHORTHAND
++#define CSS_PROP_ALIAS(aliasname_, id_, method_, pref_) #aliasname_,
++#include "nsCSSPropList.h"
++#undef CSS_PROP_ALIAS
+ };
+ 
+ using namespace mozilla;
+ 
+ static int32_t gTableRefCount;
+ static nsStaticCaseInsensitiveNameTable* gPropertyTable;
+ static nsStaticCaseInsensitiveNameTable* gFontDescTable;
+ 
+@@ -72,50 +75,25 @@ SortPropertyAndCount(const void* s1, con
+     return pc1->count - pc2->count;
+   // Secondary sort by property index (highest to lowest)
+   return pc2->property - pc1->property;
+ }
+ 
+ // We need eCSSAliasCount so we can make gAliases nonzero size when there
+ // are no aliases.
+ enum {
+-#define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_)              \
+-  eCSSAliasCountBefore_##aliasmethod_,
+-#include "nsCSSPropAliasList.h"
+-#undef CSS_PROP_ALIAS
+-
+-  eCSSAliasCount
+-};
+-
+-enum {
+-  // We want the largest sizeof(#aliasname_).  To find that, we use the
+-  // auto-incrementing behavior of C++ enums (a value without an
+-  // initializer is one larger than the previous value, or 0 at the
+-  // start of the enum), and for each alias we define two values:
+-  //   eMaxCSSAliasNameSizeBefore_##aliasmethod_ is the largest
+-  //     sizeof(#aliasname_) before that alias.  The first one is
+-  //     conveniently zero.
+-  //   eMaxCSSAliasNameSizeWith_##aliasmethod_ is **one less than** the
+-  //     largest sizeof(#aliasname_) before or including that alias.
+-#define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_)              \
+-  eMaxCSSAliasNameSizeBefore_##aliasmethod_,                                  \
+-  eMaxCSSAliasNameSizeWith_##aliasmethod_ =                                   \
+-    PR_MAX(sizeof(#aliasname_), eMaxCSSAliasNameSizeBefore_##aliasmethod_) - 1,
+-#include "nsCSSPropAliasList.h"
+-#undef CSS_PROP_ALIAS
+-
+-  eMaxCSSAliasNameSize
++  eCSSAliasCount = eCSSProperty_COUNT_with_aliases - eCSSProperty_COUNT
+ };
+ 
+ struct CSSPropertyAlias {
+-  const char name[PR_MAX(eMaxCSSAliasNameSize, 1)];
+   const nsCSSProperty id;
+   bool enabled;
+ };
+ 
++// The names are in kCSSRawProperties.
+ static CSSPropertyAlias gAliases[PR_MAX(eCSSAliasCount, 1)] = {
+ #define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_)  \
+   { #aliasname_, eCSSProperty_##propid_, true },
+ #include "nsCSSPropAliasList.h"
+ #undef CSS_PROP_ALIAS
+ };
+ 
+ void
+@@ -125,17 +103,17 @@ nsCSSProps::AddRefTable(void)
+     NS_ABORT_IF_FALSE(!gPropertyTable, "pre existing array!");
+     NS_ABORT_IF_FALSE(!gFontDescTable, "pre existing array!");
+ 
+     gPropertyTable = new nsStaticCaseInsensitiveNameTable();
+     if (gPropertyTable) {
+ #ifdef DEBUG
+     {
+       // let's verify the table...
+-      for (int32_t index = 0; index < eCSSProperty_COUNT; ++index) {
++      for (int32_t index = 0; index < eCSSProperty_COUNT_with_aliases; ++index) {
+         nsAutoCString temp1(kCSSRawProperties[index]);
+         nsAutoCString temp2(kCSSRawProperties[index]);
+         ToLowerCase(temp1);
+         NS_ABORT_IF_FALSE(temp1.Equals(temp2), "upper case char in prop table");
+         NS_ABORT_IF_FALSE(-1 == temp1.FindChar('_'),
+                           "underscore char in prop table");
+       }
+     }
+@@ -366,25 +344,22 @@ nsCSSProperty
+ nsCSSProps::LookupProperty(const nsACString& aProperty,
+                            EnabledState aEnabled)
+ {
+   NS_ABORT_IF_FALSE(gPropertyTable, "no lookup table, needs addref");
+ 
+   nsCSSProperty res = nsCSSProperty(gPropertyTable->Lookup(aProperty));
+   // Check eCSSAliasCount against 0 to make it easy for the
+   // compiler to optimize away the 0-aliases case.
+-  if (eCSSAliasCount != 0 && res == eCSSProperty_UNKNOWN) {
+-    for (const CSSPropertyAlias *alias = gAliases,
+-                            *alias_end = ArrayEnd(gAliases);
+-         alias < alias_end; ++alias) {
+-      if (aProperty.LowerCaseEqualsASCII(alias->name) &&
+-          (alias->enabled || aEnabled == eAny)) {
+-        res = alias->id;
+-        break;
+-      }
++  if (eCSSAliasCount != 0 && res >= eCSSProperty_COUNT) {
++    const CSSPropertyAlias &alias = gAliases[res - eCSSProperty_COUNT];
++    if (alias.enabled || aEnabled == eAny) {
++      res = alias->id;
++    } else {
++      res = eCSSProperty_UNKNOWN;
+     }
+   }
+   if (res != eCSSProperty_UNKNOWN && aEnabled == eEnabled && !IsEnabled(res)) {
+     res = eCSSProperty_UNKNOWN;
+   }
+   return res;
+ }
+ 
+@@ -393,25 +368,22 @@ nsCSSProps::LookupProperty(const nsAStri
+ {
+   // This is faster than converting and calling
+   // LookupProperty(nsACString&).  The table will do its own
+   // converting and avoid a PromiseFlatCString() call.
+   NS_ABORT_IF_FALSE(gPropertyTable, "no lookup table, needs addref");
+   nsCSSProperty res = nsCSSProperty(gPropertyTable->Lookup(aProperty));
+   // Check eCSSAliasCount against 0 to make it easy for the
+   // compiler to optimize away the 0-aliases case.
+-  if (eCSSAliasCount != 0 && res == eCSSProperty_UNKNOWN) {
+-    for (const CSSPropertyAlias *alias = gAliases,
+-                            *alias_end = ArrayEnd(gAliases);
+-         alias < alias_end; ++alias) {
+-      if (aProperty.LowerCaseEqualsASCII(alias->name) &&
+-          (alias->enabled || aEnabled == eAny)) {
+-        res = alias->id;
+-        break;
+-      }
++  if (eCSSAliasCount != 0 && res >= eCSSProperty_COUNT) {
++    const CSSPropertyAlias &alias = gAliases[res - eCSSProperty_COUNT];
++    if (alias.enabled || aEnabled == eAny) {
++      res = alias->id;
++    } else {
++      res = eCSSProperty_UNKNOWN;
+     }
+   }
+   if (res != eCSSProperty_UNKNOWN && aEnabled == eEnabled && !IsEnabled(res)) {
+     res = eCSSProperty_UNKNOWN;
+   }
+   return res;
+ }
+ 

@@ -1,0 +1,164 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Move enabled state for aliases from gAliases to gPropertyEnabled.  (Bug 774169, patch 3)
+
+diff --git a/layout/style/nsCSSProps.cpp b/layout/style/nsCSSProps.cpp
+--- a/layout/style/nsCSSProps.cpp
++++ b/layout/style/nsCSSProps.cpp
+@@ -80,17 +80,16 @@ SortPropertyAndCount(const void* s1, con
+ // We need eCSSAliasCount so we can make gAliases nonzero size when there
+ // are no aliases.
+ enum {
+   eCSSAliasCount = eCSSProperty_COUNT_with_aliases - eCSSProperty_COUNT
+ };
+ 
+ struct CSSPropertyAlias {
+   const nsCSSProperty id;
+-  bool enabled;
+ };
+ 
+ // The names are in kCSSRawProperties.
+ static CSSPropertyAlias gAliases[PR_MAX(eCSSAliasCount, 1)] = {
+ #define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_)  \
+   { #aliasname_, eCSSProperty_##propid_, true },
+ #include "nsCSSPropAliasList.h"
+ #undef CSS_PROP_ALIAS
+@@ -142,40 +141,35 @@ nsCSSProps::AddRefTable(void)
+     BuildShorthandsContainingTable();
+ 
+     static bool prefObserversInited = false;
+     if (!prefObserversInited) {
+       prefObserversInited = true;
+       
+       #define OBSERVE_PROP(pref_, id_)                                        \
+         if (pref_[0]) {                                                       \
+-          Preferences::AddBoolVarCache(&gPropertyEnabled[eCSSProperty_##id_], \
++          Preferences::AddBoolVarCache(&gPropertyEnabled[id_],                \
+                                        pref_);                                \
+         }
+ 
+       #define CSS_PROP(name_, id_, method_, flags_, pref_, parsevariant_,     \
+                        kwtable_, stylestruct_, stylestructoffset_, animtype_) \
+-        OBSERVE_PROP(pref_, id_)
++        OBSERVE_PROP(pref_, eCSSProperty_##id_)
+       #include "nsCSSPropList.h"
+       #undef CSS_PROP
+ 
+       #define  CSS_PROP_SHORTHAND(name_, id_, method_, flags_, pref_) \
+-        OBSERVE_PROP(pref_, id_)
++        OBSERVE_PROP(pref_, eCSSProperty_##id_)
+       #include "nsCSSPropList.h"
+       #undef CSS_PROP_SHORTHAND
+ 
+       #undef OBSERVE_PROP
+ 
+-      size_t aliasIndex = 0;
+       #define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_)    \
+-        if (pref_[0]) {                                                   \
+-          Preferences::AddBoolVarCache(&gAliases[aliasIndex].enabled,     \
+-                                       pref_);                            \
+-        }                                                                 \
+-        ++aliasIndex;
++        OBSERVE_PROP(pref_, eCSSPropertyAlias_##aliasmethod_)
+       #include "nsCSSPropAliasList.h"
+       #undef CSS_PROP_ALIAS
+     }
+   }
+ }
+ 
+ #undef  DEBUG_SHORTHANDS_CONTAINING
+ 
+@@ -346,17 +340,17 @@ nsCSSProps::LookupProperty(const nsACStr
+ {
+   NS_ABORT_IF_FALSE(gPropertyTable, "no lookup table, needs addref");
+ 
+   nsCSSProperty res = nsCSSProperty(gPropertyTable->Lookup(aProperty));
+   // Check eCSSAliasCount against 0 to make it easy for the
+   // compiler to optimize away the 0-aliases case.
+   if (eCSSAliasCount != 0 && res >= eCSSProperty_COUNT) {
+     const CSSPropertyAlias &alias = gAliases[res - eCSSProperty_COUNT];
+-    if (alias.enabled || aEnabled == eAny) {
++    if (IsEnabled(alias.id) || aEnabled == eAny) {
+       res = alias->id;
+     } else {
+       res = eCSSProperty_UNKNOWN;
+     }
+   }
+   if (res != eCSSProperty_UNKNOWN && aEnabled == eEnabled && !IsEnabled(res)) {
+     res = eCSSProperty_UNKNOWN;
+   }
+@@ -370,17 +364,17 @@ nsCSSProps::LookupProperty(const nsAStri
+   // LookupProperty(nsACString&).  The table will do its own
+   // converting and avoid a PromiseFlatCString() call.
+   NS_ABORT_IF_FALSE(gPropertyTable, "no lookup table, needs addref");
+   nsCSSProperty res = nsCSSProperty(gPropertyTable->Lookup(aProperty));
+   // Check eCSSAliasCount against 0 to make it easy for the
+   // compiler to optimize away the 0-aliases case.
+   if (eCSSAliasCount != 0 && res >= eCSSProperty_COUNT) {
+     const CSSPropertyAlias &alias = gAliases[res - eCSSProperty_COUNT];
+-    if (alias.enabled || aEnabled == eAny) {
++    if (IsEnabled(alias.id) || aEnabled == eAny) {
+       res = alias->id;
+     } else {
+       res = eCSSProperty_UNKNOWN;
+     }
+   }
+   if (res != eCSSProperty_UNKNOWN && aEnabled == eEnabled && !IsEnabled(res)) {
+     res = eCSSProperty_UNKNOWN;
+   }
+@@ -2425,20 +2419,25 @@ nsCSSProps::gPropertyIndexInStruct[eCSSP
+     ePropertyIndex_for_##id_,
+   #include "nsCSSPropList.h"
+   #undef CSS_PROP
+   #undef CSS_PROP_BACKENDONLY
+ 
+ };
+ 
+ /* static */ bool
+-nsCSSProps::gPropertyEnabled[eCSSProperty_COUNT] = {
++nsCSSProps::gPropertyEnabled[eCSSProperty_COUNT_with_aliases] = {
+   #define CSS_PROP(name_, id_, method_, flags_, pref_, parsevariant_,     \
+                    kwtable_, stylestruct_, stylestructoffset_, animtype_) \
+     true,
+   #include "nsCSSPropList.h"
+   #undef CSS_PROP
+ 
+   #define  CSS_PROP_SHORTHAND(name_, id_, method_, flags_, pref_) \
+     true,
+   #include "nsCSSPropList.h"
+   #undef CSS_PROP_SHORTHAND
++
++  #define CSS_PROP_ALIAS(aliasname_, propid_, aliasmethod_, pref_) \
++    true,
++  #include "nsCSSPropAliasList.h"
++  #undef CSS_PROP_ALIAS
+ };
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -301,22 +301,23 @@ public:
+   static size_t PropertyIndexInStruct(nsCSSProperty aProperty) {
+     NS_ABORT_IF_FALSE(0 <= aProperty &&
+                          aProperty < eCSSProperty_COUNT_no_shorthands,
+                       "out of range");
+     return gPropertyIndexInStruct[aProperty];
+   }
+ 
+ private:
+-  static bool gPropertyEnabled[eCSSProperty_COUNT];
++  static bool gPropertyEnabled[eCSSProperty_COUNT_with_aliases];
+ 
+ public:
+ 
+   static bool IsEnabled(nsCSSProperty aProperty) {
+-    NS_ABORT_IF_FALSE(0 <= aProperty && aProperty < eCSSProperty_COUNT,
++    NS_ABORT_IF_FALSE(0 <= aProperty &&
++                      aProperty < eCSSProperty_COUNT_with_aliases,
+                       "out of range");
+     return gPropertyEnabled[aProperty];
+   }
+ 
+ public:
+ 
+ #define CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(iter_, prop_)                    \
+   for (const nsCSSProperty* iter_ = nsCSSProps::SubpropertyEntryFor(prop_);   \
