@@ -1,0 +1,240 @@
+# HG changeset patch
+# User Chris Jones <jones.chris.g@gmail.com>
+# Date 1352893098 -28800
+# Node ID 451eab119158984fa72c219bac3b9db50244c065
+# Parent  d8fed46ba90d78fb9d27d2a45292f43b93fdc93b
+Bug 803908: Enable font inflation for async pan/zoomed browsers. r=dbaron
+
+diff --git a/b2g/app/b2g.js b/b2g/app/b2g.js
+--- a/b2g/app/b2g.js
++++ b/b2g/app/b2g.js
+@@ -582,8 +582,11 @@ pref("browser.prompt.allowNative", false
+ // a restart is required to enable a new value.
+ pref("network.activity.blipIntervalMilliseconds", 250);
+ 
+ // Send some sites a custom user-agent.
+ pref("general.useragent.override.facebook.com", "\(Mobile#(Android; Mobile");
+ pref("general.useragent.override.youtube.com", "\(Mobile#(Android; Mobile");
+ 
+ pref("jsloader.reuseGlobal", true);
++
++// Enable font inflation for browser tab content.
++pref("font.size.inflation.minTwips", 120);
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -1285,16 +1285,20 @@ public:
+   uint32_t FontSizeInflationMinTwips() const {
+     return mFontSizeInflationMinTwips;
+   }
+ 
+   uint32_t FontSizeInflationLineThreshold() const {
+     return mFontSizeInflationLineThreshold;
+   }
+ 
++  bool FontSizeInflationForceEnabled() const {
++    return mFontSizeInflationForceEnabled;
++  }
++
+   virtual void AddInvalidateHiddenPresShellObserver(nsRefreshDriver *aDriver) = 0;
+ 
+   void InvalidatePresShellIfHidden();
+ 
+   /**
+    * Refresh observer management.
+    */
+ protected:
+@@ -1436,16 +1440,17 @@ protected:
+ 
+   static nsIContent*        gKeyDownTarget;
+ 
+   // Cached font inflation values. This is done to prevent changing of font
+   // inflation until a page is reloaded.
+   uint32_t mFontSizeInflationEmPerLine;
+   uint32_t mFontSizeInflationMinTwips;
+   uint32_t mFontSizeInflationLineThreshold;
++  bool mFontSizeInflationForceEnabled;
+ 
+   // The maximum width of a line box. Text on a single line that exceeds this
+   // width will be wrapped. A value of 0 indicates that no limit is enforced.
+   nscoord mMaxLineBoxWidth;
+ };
+ 
+ /**
+  * Create a new empty presentation shell. Upon success, call Init
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -73,16 +73,18 @@
+ #include "nsFontFaceList.h"
+ #include "nsFontInflationData.h"
+ #include "nsSVGUtils.h"
+ #include "nsSVGIntegrationUtils.h"
+ #include "nsSVGForeignObjectFrame.h"
+ #include "nsSVGOuterSVGFrame.h"
+ #include "nsStyleStructInlines.h"
+ 
++#include "mozilla/dom/PBrowserChild.h"
++#include "mozilla/dom/TabChild.h"
+ #include "mozilla/Preferences.h"
+ 
+ #ifdef MOZ_XUL
+ #include "nsXULPopupManager.h"
+ #endif
+ 
+ #include "sampler.h"
+ #include "nsAnimationManager.h"
+@@ -103,16 +105,17 @@ bool nsLayoutUtils::gPreventAssertInComp
+ typedef gfxPattern::GraphicsFilter GraphicsFilter;
+ typedef FrameMetrics::ViewID ViewID;
+ 
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationEmPerLine;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationMinTwips;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationLineThreshold;
+ /* static */ int32_t  nsLayoutUtils::sFontSizeInflationMappingIntercept;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationMaxRatio;
++/* static */ bool nsLayoutUtils::sFontSizeInflationForceEnabled;
+ 
+ static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
+ 
+ #ifdef MOZ_FLEXBOX
+ // These are indices into kDisplayKTable.  They'll be initialized
+ // the first time that FlexboxEnabledPrefChangeCallback() is invoked.
+ static int32_t sIndexOfFlexInDisplayTable;
+ static int32_t sIndexOfInlineFlexInDisplayTable;
+@@ -4747,16 +4750,18 @@ nsLayoutUtils::Initialize()
+   Preferences::AddUintVarCache(&sFontSizeInflationEmPerLine,
+                                "font.size.inflation.emPerLine");
+   Preferences::AddUintVarCache(&sFontSizeInflationMinTwips,
+                                "font.size.inflation.minTwips");
+   Preferences::AddUintVarCache(&sFontSizeInflationLineThreshold,
+                                "font.size.inflation.lineThreshold");
+   Preferences::AddIntVarCache(&sFontSizeInflationMappingIntercept,
+                               "font.size.inflation.mappingIntercept");
++  Preferences::AddBoolVarCache(&sFontSizeInflationForceEnabled,
++                               "font.size.inflation.forceEnabled");
+ 
+ #ifdef MOZ_FLEXBOX
+   Preferences::RegisterCallback(FlexboxEnabledPrefChangeCallback,
+                                 FLEXBOX_ENABLED_PREF_NAME);
+   FlexboxEnabledPrefChangeCallback(FLEXBOX_ENABLED_PREF_NAME, nullptr);
+ #endif // MOZ_FLEXBOX
+ }
+ 
+@@ -5131,16 +5136,22 @@ nsLayoutUtils::FontSizeInflationEnabled(
+   nsIPresShell* presShell = aPresContext->GetPresShell();
+ 
+   if (!presShell ||
+       (presShell->FontSizeInflationEmPerLine() == 0 &&
+        presShell->FontSizeInflationMinTwips() == 0) ||
+        aPresContext->IsChrome()) {
+     return false;
+   }
++  if (TabChild* tab = GetTabChildFrom(presShell)) {
++    if (!presShell->FontSizeInflationForceEnabled() &&
++        !tab->IsAsyncPanZoomEnabled()) {
++      return false;
++    }
++  }
+ 
+   // XXXjwir3:
+   // See bug 706918, comment 23 for more information on this particular section
+   // of the code. We're using "screen size" in place of the size of the content
+   // area, because on mobile, these are close or equal. This will work for our
+   // purposes (bug 706198), but it will need to be changed in the future to be
+   // more correct when we bring the rest of the viewport code into platform.
+   // We actually want the size of the content area, in the event that we don't
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1638,16 +1638,20 @@ public:
+   /**
+    * See comment above "font.size.inflation.lineThreshold" in
+    * modules/libpref/src/init/all.js .
+    */
+   static uint32_t FontSizeInflationLineThreshold() {
+     return sFontSizeInflationLineThreshold;
+   }
+ 
++  static bool FontSizeInflationForceEnabled() {
++    return sFontSizeInflationForceEnabled;
++  }
++
+   /**
+    * See comment above "font.size.inflation.mappingIntercept" in
+    * modules/libpref/src/init/all.js .
+    */
+   static int32_t FontSizeInflationMappingIntercept() {
+     return sFontSizeInflationMappingIntercept;
+   }
+ 
+@@ -1756,16 +1760,17 @@ public:
+ #endif
+ 
+ private:
+   static uint32_t sFontSizeInflationEmPerLine;
+   static uint32_t sFontSizeInflationMinTwips;
+   static uint32_t sFontSizeInflationLineThreshold;
+   static int32_t  sFontSizeInflationMappingIntercept;
+   static uint32_t sFontSizeInflationMaxRatio;
++  static bool sFontSizeInflationForceEnabled;
+ };
+ 
+ template<typename PointType, typename RectType, typename CoordType>
+ /* static */ bool
+ nsLayoutUtils::PointIsCloserToRect(PointType aPoint, const RectType& aRect,
+                                    CoordType& aClosestXDistance,
+                                    CoordType& aClosestYDistance)
+ {
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -9190,16 +9190,17 @@ nsIPresShell::SetScrollPositionClampingS
+ }
+ 
+ void
+ PresShell::SetupFontInflation()
+ {
+   mFontSizeInflationEmPerLine = nsLayoutUtils::FontSizeInflationEmPerLine();
+   mFontSizeInflationMinTwips = nsLayoutUtils::FontSizeInflationMinTwips();
+   mFontSizeInflationLineThreshold = nsLayoutUtils::FontSizeInflationLineThreshold();
++  mFontSizeInflationForceEnabled = nsLayoutUtils::FontSizeInflationForceEnabled();
+ }
+ 
+ void
+ nsIPresShell::SetMaxLineBoxWidth(nscoord aMaxLineBoxWidth)
+ {
+   NS_ASSERTION(aMaxLineBoxWidth >= 0, "attempting to set max line box width to a negative value");
+ 
+   mMaxLineBoxWidth = aMaxLineBoxWidth;
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -1780,16 +1780,27 @@ pref("font.size.inflation.emPerLine", 0)
+  * given.  The value given is in twips, i.e., 1/20 of a point, or 1/1440
+  * of an inch.
+  *
+  * When both this pref and the previous are set, the larger inflation is
+  * used.
+  */
+ pref("font.size.inflation.minTwips", 0);
+ /*
++ * In products with multi-mode pan-and-zoom and non-pan-and-zoom UIs,
++ * this pref forces font inflation to always be enabled in all modes.
++ * That is, any heuristics used to detect pan-and-zoom
++ * vs. non-pan-and-zoom modes are disabled and all content is treated
++ * as pan-and-zoom mode wrt font inflation.
++ *
++ * This pref has no effect if font inflation is not enabled through
++ * either of the prefs above.  It has no meaning in single-mode UIs.
++ */
++pref("font.size.inflation.forceEnabled", false);
++/*
+  * Since the goal of font size inflation is to avoid having to
+  * repeatedly scroll side to side to read a block of text, and there are
+  * a number of page layouts where a relatively small chunk of text is
+  * better of not being inflated according to the same algorithm we use
+  * for larger chunks of text, we want a threshold for an amount of text
+  * that triggers font size inflation.  This preference controls that
+  * threshold.
+  *
