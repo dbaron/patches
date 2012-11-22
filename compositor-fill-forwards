@@ -1,0 +1,94 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 788409:  When the compositor runs past the end of an animation, just fill forwards until the main thread catches up.
+
+diff --git a/gfx/layers/ipc/CompositorParent.cpp b/gfx/layers/ipc/CompositorParent.cpp
+--- a/gfx/layers/ipc/CompositorParent.cpp
++++ b/gfx/layers/ipc/CompositorParent.cpp
+@@ -715,22 +715,16 @@ SampleAnimations(Layer* aLayer, TimeStam
+       animation.numIterations() : NS_IEEEPositiveInfinity();
+     double positionInIteration =
+       ElementAnimations::GetPositionInIteration(animation.startTime(),
+                                                 aPoint,
+                                                 animation.duration(),
+                                                 numIterations,
+                                                 animation.direction());
+ 
+-    if (positionInIteration == -1) {
+-      animations.RemoveElementAt(i);
+-      animationData.RemoveElementAt(i);
+-      continue;
+-    }
+-
+     NS_ABORT_IF_FALSE(0.0 <= positionInIteration &&
+                       positionInIteration <= 1.0,
+                       "position should be in [0-1]");
+ 
+     int segmentIndex = 0;
+     AnimationSegment* segment = animation.segments().Elements();
+     while (segment->endPortion() < positionInIteration) {
+       ++segment;
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -49,37 +49,40 @@ ElementAnimations::GetPositionInIteratio
+ {
+   // Set |currentIterationCount| to the (fractional) number of
+   // iterations we've completed up to the current position.
+   TimeDuration currentTimeDuration = aCurrentTime - aStartTime;
+   double currentIterationCount =
+     currentTimeDuration / aDuration;
+   bool dispatchStartOrIteration = false;
+   if (currentIterationCount >= aIterationCount) {
+-    if (!aAnimation) {
+-      // We are on the compositor, so send a signal that the animation is over.
+-      // The main thread will fire the animationend event.
+-      return -1;
+-    }
+-    // Dispatch 'animationend' when needed.
+-    if (aIsForElement &&
+-        aAnimation->mLastNotification !=
+-          ElementAnimation::LAST_NOTIFICATION_END) {
+-      aAnimation->mLastNotification = ElementAnimation::LAST_NOTIFICATION_END;
+-      // XXXdz: if this animation was done on the compositor, we should
+-      // invalidate the frame and update style once we start throttling style
+-      // updates.
+-      AnimationEventInfo ei(aEa->mElement, aAnimation->mName, NS_ANIMATION_END,
+-                            currentTimeDuration);
+-      aEventsToDispatch->AppendElement(ei);
+-    }
++    if (aAnimation) {
++      // Dispatch 'animationend' when needed.
++      if (aIsForElement &&
++          aAnimation->mLastNotification !=
++            ElementAnimation::LAST_NOTIFICATION_END) {
++        aAnimation->mLastNotification = ElementAnimation::LAST_NOTIFICATION_END;
++        // XXXdz: if this animation was done on the compositor, we should
++        // invalidate the frame and update style once we start throttling style
++        // updates.
++        AnimationEventInfo ei(aEa->mElement, aAnimation->mName, NS_ANIMATION_END,
++                              currentTimeDuration);
++        aEventsToDispatch->AppendElement(ei);
++      }
+ 
+-    if (!aAnimation->FillsForwards()) {
+-      // No animation data.
+-      return -1;
++      if (!aAnimation->FillsForwards()) {
++        // No animation data.
++        return -1;
++      }
++    } else {
++      // If aAnimation is null, that means we're on the compositor
++      // thread.  We want to just keep filling forwards until the main
++      // thread gets around to updating the compositor thread (which
++      // might take a little while).  So just assume we fill fowards and
++      // move on.
+     }
+     currentIterationCount = double(aAnimation->mIterationCount);
+   } else {
+     if (aAnimation && !aAnimation->IsPaused()) {
+       aEa->mNeedsRefreshes = true;
+     }
+     if (currentIterationCount < 0.0) {
+       NS_ASSERTION(aAnimation, "Should not run animation that hasn't started yet on the compositor");
