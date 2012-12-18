@@ -4,10 +4,144 @@ Change record of animation start to be before delay so that dynamic changes to a
 
 Note: per CSS WG, afternoon of 2012-10-29.
 
+TODO: Is there something that copies the start time to the layer?
+
+TODO: tests
+
+diff --git a/gfx/layers/ipc/CompositorParent.cpp b/gfx/layers/ipc/CompositorParent.cpp
+--- a/gfx/layers/ipc/CompositorParent.cpp
++++ b/gfx/layers/ipc/CompositorParent.cpp
+@@ -715,18 +715,17 @@ SampleAnimations(Layer* aLayer, TimeStam
+ 
+   for (uint32_t i = animations.Length(); i-- !=0; ) {
+     Animation& animation = animations[i];
+     AnimData& animData = animationData[i];
+ 
+     double numIterations = animation.numIterations() != -1 ?
+       animation.numIterations() : NS_IEEEPositiveInfinity();
+     double positionInIteration =
+-      ElementAnimations::GetPositionInIteration(animation.startTime(),
+-                                                aPoint,
++      ElementAnimations::GetPositionInIteration(animation.startTime() - aPoint,
+                                                 animation.duration(),
+                                                 numIterations,
+                                                 animation.direction());
+ 
+     NS_ABORT_IF_FALSE(0.0 <= positionInIteration &&
+                       positionInIteration <= 1.0,
+                       "position should be in [0-1]");
+ 
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -686,17 +686,18 @@ nsAnimationManager::BuildAnimations(nsSt
+@@ -34,38 +34,37 @@ ElementAnimationsPropertyDtor(void      
+ #ifdef DEBUG
+   NS_ABORT_IF_FALSE(!ea->mCalledPropertyDtor, "can't call dtor twice");
+   ea->mCalledPropertyDtor = true;
+ #endif
+   delete ea;
+ }
+ 
+ double
+-ElementAnimations::GetPositionInIteration(TimeStamp aStartTime, TimeStamp aCurrentTime,
+-                                          TimeDuration aDuration, double aIterationCount,
++ElementAnimations::GetPositionInIteration(TimeDuration aElapsedDuration,
++                                          TimeDuration aIterationDuration,
++                                          double aIterationCount,
+                                           uint32_t aDirection, bool aIsForElement,
+                                           ElementAnimation* aAnimation,
+                                           ElementAnimations* aEa,
+                                           EventArray* aEventsToDispatch)
+ {
+   // Set |currentIterationCount| to the (fractional) number of
+   // iterations we've completed up to the current position.
+-  TimeDuration currentTimeDuration = aCurrentTime - aStartTime;
+-  double currentIterationCount =
+-    currentTimeDuration / aDuration;
++  double currentIterationCount = aElapsedDuration / aDuration;
+   bool dispatchStartOrIteration = false;
+   if (currentIterationCount >= aIterationCount) {
+     if (aAnimation) {
+       // Dispatch 'animationend' when needed.
+       if (aIsForElement &&
+           aAnimation->mLastNotification !=
+             ElementAnimation::LAST_NOTIFICATION_END) {
+         aAnimation->mLastNotification = ElementAnimation::LAST_NOTIFICATION_END;
+         AnimationEventInfo ei(aEa->mElement, aAnimation->mName, NS_ANIMATION_END,
+-                              currentTimeDuration);
++                              aElapsedDuration);
+         aEventsToDispatch->AppendElement(ei);
+       }
+ 
+       if (!aAnimation->FillsForwards()) {
+         // No animation data.
+         return -1;
+       }
+     } else {
+@@ -134,17 +133,17 @@ ElementAnimations::GetPositionInIteratio
+     // immediately in many cases.  It's not clear to me if that's the
+     // right thing to do.
+     uint32_t message =
+       aAnimation->mLastNotification == ElementAnimation::LAST_NOTIFICATION_NONE
+         ? NS_ANIMATION_START : NS_ANIMATION_ITERATION;
+ 
+     aAnimation->mLastNotification = whichIteration;
+     AnimationEventInfo ei(aEa->mElement, aAnimation->mName, message,
+-                          currentTimeDuration);
++                          aElapsedDuration);
+     aEventsToDispatch->AppendElement(ei);
+   }
+ 
+   return positionInIteration;
+ }
+ 
+ void
+ ElementAnimations::EnsureStyleRuleFor(TimeStamp aRefreshTime,
+@@ -185,17 +184,17 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+       if (anim.IsPaused()) {
+         // FIXME: avoid recalculating every time
+         currentTime = anim.mPauseStart;
+       } else {
+         currentTime = aRefreshTime;
+       }
+ 
+       double positionInIteration =
+-        GetPositionInIteration(anim.mStartTime, currentTime,
++        GetPositionInIteration(anim.ElapsedDurationAt(currentTime),
+                                anim.mIterationDuration, anim.mIterationCount,
+                                anim.mDirection, IsForElement(),
+                                &anim, this, &aEventsToDispatch);
+ 
+       // The position is -1 when we don't have fill data for the current time,
+       // so we shouldn't animate.
+       if (positionInIteration == -1)
+         continue;
+@@ -263,18 +262,22 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+       }
+     }
+   }
+ }
+ 
+ bool
+ ElementAnimation::IsRunningAt(TimeStamp aTime) const
+ {
+-  return !IsPaused() && aTime >= mStartTime &&
+-    (aTime - mStartTime)  / mIterationDuration < mIterationCount;
++  if (IsPaused()) {
++    return false;
++  }
++
++  double iterationsElapsed = ElapsedDurationAt(aTime) / mIterationDuration;
++  return 0.0 <= iterationsElapsed && iterationsElapsed < mIterationCount;
+ }
+ 
+ 
+ bool
+ ElementAnimation::HasAnimationOfProperty(nsCSSProperty aProperty) const
+ {
+   for (uint32_t propIdx = 0, propEnd = mProperties.Length();
+        propIdx != propEnd; ++propIdx) {
+@@ -686,17 +689,18 @@ nsAnimationManager::BuildAnimations(nsSt
      ElementAnimation& aDest = *aAnimations.AppendElement();
  
      aDest.mName = aSrc.GetName();
@@ -30,7 +164,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
 --- a/layout/style/nsAnimationManager.h
 +++ b/layout/style/nsAnimationManager.h
-@@ -88,18 +88,19 @@ struct ElementAnimation
+@@ -88,18 +88,26 @@ struct ElementAnimation
  
    bool IsPaused() const {
      return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED;
@@ -40,6 +174,13 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
    bool IsRunningAt(mozilla::TimeStamp aTime) const;
  
 -  mozilla::TimeStamp mStartTime; // with delay taken into account
++  // Return the duration, at aTime, since the *end* of the delay period.
++  // May be negative.
++  mozilla::TimeDuration ElapsedDurationAt(mozilla::TimeStamp aTime) const {
++    NS_ABORT_IF_FALSE(!IsPaused(), "should not call if paused");
++    return aTime - mStartTime - mDelay;
++  }
++
 +  mozilla::TimeStamp mStartTime; // the beginning of the delay period
    mozilla::TimeStamp mPauseStart;
 +  mozilla::TimeDuration mDelay;
@@ -51,3 +192,25 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
    };
    // One of the above constants, or an integer for the iteration
    // whose start we last notified on.
+@@ -127,19 +135,18 @@ struct ElementAnimations MOZ_FINAL
+   // that if the animation has not started yet, has already ended, or is paused,
+   // it should not be run from the compositor.  When this function is called 
+   // from the main thread, we need the actual ElementAnimation* in order to 
+   // get correct animation-fill behavior and to fire animation events.
+   // This function returns -1 for the position if the animation should not be
+   // run (because it is not currently active and has no fill behavior), but
+   // only does so if aAnimation is non-null; with a null aAnimation it is an
+   // error to give aCurrentTime < aStartTime, and fill-forwards is assumed.
+-  static double GetPositionInIteration(TimeStamp aStartTime,
+-                                       TimeStamp aCurrentTime,
+-                                       TimeDuration aDuration,
++  static double GetPositionInIteration(TimeDuration aElapsedDuration,
++                                       TimeDuration aIterationDuration,
+                                        double aIterationCount,
+                                        uint32_t aDirection,
+                                        bool aIsForElement = true,
+                                        ElementAnimation* aAnimation = nullptr,
+                                        ElementAnimations* aEa = nullptr,
+                                        EventArray* aEventsToDispatch = nullptr);
+ 
+   void EnsureStyleRuleFor(TimeStamp aRefreshTime,
