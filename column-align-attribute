@@ -2,134 +2,38 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Follow HTML rules for inheritance of presentational attributes in tables and then map the final result into CSS, associated with the table cell.  (Bug 915)
 
-diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/content/src/nsHTMLTableCellElement.cpp
---- a/content/html/content/src/nsHTMLTableCellElement.cpp
-+++ b/content/html/content/src/nsHTMLTableCellElement.cpp
-@@ -14,16 +14,17 @@
- #include "nsGenericHTMLElement.h"
- #include "nsAttrValueInlines.h"
- #include "nsGkAtoms.h"
- #include "nsStyleConsts.h"
- #include "nsPresContext.h"
- #include "nsRuleData.h"
- #include "nsRuleWalker.h"
- #include "celldata.h"
-+#include "nsHTMLStyleSheet.h"
- 
- using namespace mozilla;
- using namespace mozilla::dom;
- 
- class nsHTMLTableCellElement : public nsGenericHTMLElement,
-                                public nsIDOMHTMLTableCellElement
- {
- public:
-@@ -48,38 +49,56 @@ public:
-   virtual bool ParseAttribute(int32_t aNamespaceID,
-                               nsIAtom* aAttribute,
-                               const nsAString& aValue,
-                               nsAttrValue& aResult);
-   virtual nsMapRuleToAttributesFunc GetAttributeMappingFunction() const;
-   NS_IMETHOD WalkContentStyleRules(nsRuleWalker* aRuleWalker);
-   NS_IMETHOD_(bool) IsAttributeMapped(const nsIAtom* aAttribute) const;
- 
-+  // XXX Override AttributeChanged here and on other table elements
-+  // to cause marking mTableInheritedAttributes dirty.
-+
-   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
- 
-   virtual nsXPCClassInfo* GetClassInfo();
- 
-   virtual nsIDOMNode* AsDOMNode() { return this; }
- protected:
-   nsHTMLTableElement* GetTable() const;
- 
--  already_AddRefed<nsIDOMHTMLTableRowElement> GetRow() const;
-+  nsIContent* GetRow() const;
-+  nsIContent* GetRowGroup() const;
-+
-+  // Sentinel value of 0x1 indicates that this is dirty and needs to be
-+  // recalculated.
-+  nsMappedAttributes *mTableInheritedAttributes;
-+  void ReleaseInheritedAttributes() {
-+    if (mTableInheritedAttributes &&
-+        mTableInheritedAttributes != TABLE_ATTRS_DIRTY)
-+      NS_RELEASE(mTableInheritedAttributes);
-+  }
-+  void BuildInheritedAttributes();
-+  static const nsAttrValue* FindInheritedAttr(nsIAtom *aAttribute,
-+                                              nsIContent **aElements);
- };
- 
- 
+diff --git a/content/html/content/src/HTMLTableCellElement.cpp b/content/html/content/src/HTMLTableCellElement.cpp
+--- a/content/html/content/src/HTMLTableCellElement.cpp
++++ b/content/html/content/src/HTMLTableCellElement.cpp
+@@ -18,16 +18,17 @@
  NS_IMPL_NS_NEW_HTML_ELEMENT(TableCell)
+ DOMCI_NODE_DATA(HTMLTableCellElement, mozilla::dom::HTMLTableCellElement)
  
+ namespace mozilla {
+ namespace dom {
  
- nsHTMLTableCellElement::nsHTMLTableCellElement(already_AddRefed<nsINodeInfo> aNodeInfo)
-   : nsGenericHTMLElement(aNodeInfo)
-+  , mTableInheritedAttributes(TABLE_ATTRS_DIRTY)
- {
- }
- 
- nsHTMLTableCellElement::~nsHTMLTableCellElement()
+ HTMLTableCellElement::~HTMLTableCellElement()
  {
 +  ReleaseInheritedAttributes();
  }
  
- 
- NS_IMPL_ADDREF_INHERITED(nsHTMLTableCellElement, Element)
- NS_IMPL_RELEASE_INHERITED(nsHTMLTableCellElement, Element)
- 
- 
- DOMCI_NODE_DATA(HTMLTableCellElement, nsHTMLTableCellElement)
-@@ -92,24 +111,16 @@ NS_INTERFACE_TABLE_HEAD(nsHTMLTableCellE
-                                                nsGenericHTMLElement)
- NS_HTML_CONTENT_INTERFACE_TABLE_TAIL_CLASSINFO(HTMLTableCellElement)
- 
- 
- NS_IMPL_ELEMENT_CLONE(nsHTMLTableCellElement)
- 
- 
- // protected method
--already_AddRefed<nsIDOMHTMLTableRowElement>
--nsHTMLTableCellElement::GetRow() const
--{
--  nsCOMPtr<nsIDOMHTMLTableRowElement> row = do_QueryInterface(GetParent());
--  return row.forget();
--}
--
--// protected method
- nsHTMLTableElement*
- nsHTMLTableCellElement::GetTable() const
+ JSObject*
+ HTMLTableCellElement::WrapNode(JSContext *aCx, JSObject *aScope,
+                                bool *aTriedToWrap)
  {
-   nsIContent *parent = GetParent();
-   if (!parent) {
-     return nullptr;
-   }
- 
-@@ -128,22 +139,51 @@ nsHTMLTableCellElement::GetTable() const
-   nsIContent* result = section->GetParent();
-   if (result && result->IsHTML(nsGkAtoms::table)) {
-     return static_cast<nsHTMLTableElement*>(result);
-   }
- 
-   return nullptr;
+   return HTMLTableCellElementBinding::Wrap(aCx, aScope, this, aTriedToWrap);
+ }
+@@ -50,16 +51,33 @@ NS_IMPL_ELEMENT_CLONE(HTMLTableCellEleme
+ // protected method
+ HTMLTableRowElement*
+ HTMLTableCellElement::GetRow() const
+ {
+   return HTMLTableRowElement::FromContentOrNull(GetParent());
  }
  
-+// protected method
+ // protected method
 +nsIContent*
-+nsHTMLTableCellElement::GetRow() const
-+{
-+  nsIContent *row = GetParent();
-+  if (!row ||
-+      !row->IsHTML() ||
-+      !row->NodeInfo()->Equals(nsGkAtoms::tr))
-+    row = nullptr;
-+  return row;
-+}
-+
-+// protected method
-+nsIContent*
-+nsHTMLTableCellElement::GetRowGroup() const
++HTMLTableCellElement::GetRowGroup() const
 +{
 +  nsIContent *row = GetRow();
 +  if (!row)
@@ -144,24 +48,18 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +  return rowGroup;
 +}
 +
- NS_IMETHODIMP
- nsHTMLTableCellElement::GetCellIndex(int32_t* aCellIndex)
++// protected method
+ HTMLTableElement*
+ HTMLTableCellElement::GetTable() const
  {
-   *aCellIndex = -1;
- 
--  nsCOMPtr<nsIDOMHTMLTableRowElement> row = GetRow();
-+  nsCOMPtr<nsIDOMHTMLTableRowElement> row = do_QueryInterface(GetRow());
-   if (!row) {
-     return NS_OK;
+   nsIContent *parent = GetParent();
+   if (!parent) {
+     return nullptr;
    }
  
-   nsCOMPtr<nsIDOMHTMLCollection> cells;
+@@ -121,16 +139,25 @@ HTMLTableCellElement::WalkContentStyleRu
  
-   row->GetCells(getter_AddRefs(cells));
- 
-@@ -176,16 +216,25 @@ nsHTMLTableCellElement::WalkContentStyle
- 
-   if (nsHTMLTableElement* table = GetTable()) {
+   if (HTMLTableElement* table = GetTable()) {
      nsMappedAttributes* tableInheritedAttributes =
        table->GetAttributesMappedForCell();
      if (tableInheritedAttributes) {
@@ -180,35 +78,31 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
    return NS_OK;
  }
  
- 
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, Abbr, abbr)
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, Axis, axis)
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, BgColor, bgcolor)
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, Ch, _char)
-@@ -198,19 +247,21 @@ NS_IMPL_INT_ATTR_DEFAULT_VALUE(nsHTMLTab
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, Scope, scope)
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, VAlign, valign)
- NS_IMPL_STRING_ATTR(nsHTMLTableCellElement, Width, width)
- 
- 
  NS_IMETHODIMP
- nsHTMLTableCellElement::GetAlign(nsAString& aValue)
+ HTMLTableCellElement::SetAbbr(const nsAString& aAbbr)
+ {
+   ErrorResult rv;
+   SetAbbr(aAbbr, rv);
+@@ -359,16 +386,18 @@ HTMLTableCellElement::GetRowSpan(int32_t
+ {
+   *aRowSpan = RowSpan();
+   return NS_OK;
+ }
+ 
+ void
+ HTMLTableCellElement::GetAlign(nsString& aValue)
  {
 +  // XXX What is this supposed to do!
 +
    if (!GetAttr(kNameSpaceID_None, nsGkAtoms::align, aValue)) {
      // There's no align attribute, ask the row for the alignment.
--    nsCOMPtr<nsIDOMHTMLTableRowElement> row = GetRow();
-+    nsCOMPtr<nsIDOMHTMLTableRowElement> row = do_QueryInterface(GetRow());
+     HTMLTableRowElement* row = GetRow();
      if (row) {
-       return row->GetAlign(aValue);
+       row->GetAlign(aValue);
      }
    }
- 
-   return NS_OK;
  }
- 
-@@ -327,48 +378,31 @@ void MapAttributesIntoRule(const nsMappe
+@@ -479,48 +508,31 @@ void MapAttributesIntoRule(const nsMappe
        else if (value && value->Type() == nsAttrValue::ePercent) {
          if (value->GetPercentValue() > 0.0f)
            height->SetPercentValue(value->GetPercentValue());
@@ -255,18 +149,17 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
  }
  
  NS_IMETHODIMP_(bool)
- nsHTMLTableCellElement::IsAttributeMapped(const nsIAtom* aAttribute) const
+ HTMLTableCellElement::IsAttributeMapped(const nsIAtom* aAttribute) const
  {
-@@ -398,8 +432,224 @@ nsHTMLTableCellElement::IsAttributeMappe
-   return FindAttributeDependence(aAttribute, map);
+@@ -551,10 +563,226 @@ HTMLTableCellElement::IsAttributeMapped(
  }
  
  nsMapRuleToAttributesFunc
- nsHTMLTableCellElement::GetAttributeMappingFunction() const
+ HTMLTableCellElement::GetAttributeMappingFunction() const
  {
    return &MapAttributesIntoRule;
  }
-+
+ 
 +static void
 +MapInheritedTableAttributesIntoRule(const nsMappedAttributes* aAttributes,
 +                                    nsRuleData* aData)
@@ -294,8 +187,8 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +#define INHERIT_ELEMENTS (6)
 +
 +/* static */ const nsAttrValue*
-+nsHTMLTableCellElement::FindInheritedAttr(nsIAtom *aAttribute,
-+                                          nsIContent **aElements)
++HTMLTableCellElement::FindInheritedAttr(nsIAtom *aAttribute,
++                                        nsIContent **aElements)
 +{
 +  for (nsIContent **elementp = aElements,
 +              **elementp_end = aElements + INHERIT_ELEMENTS;
@@ -303,10 +196,10 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +    nsIContent *element = *elementp;
 +    if (element) {
 +      // XXX It's really just nsGenericHTMLElement, but we have to cast
-+      // to nsHTMLTableCellElement to make it compile because C++ says
++      // to HTMLTableCellElement to make it compile because C++ says
 +      // so.
 +      const nsAttrValue* value =
-+        static_cast<nsHTMLTableCellElement*>(element)->
++        static_cast<HTMLTableCellElement*>(element)->
 +          mAttrsAndChildren.GetAttr(aAttribute);
 +      if (value) {
 +        return value;
@@ -317,7 +210,7 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +}
 +
 +void
-+nsHTMLTableCellElement::BuildInheritedAttributes()
++HTMLTableCellElement::BuildInheritedAttributes()
 +{
 +  NS_ASSERTION(mTableInheritedAttributes == TABLE_ATTRS_DIRTY,
 +               "potential leak, plus waste of work");
@@ -365,9 +258,9 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +        nsIAtom *tag = child->Tag();
 +        if (tag == nsGkAtoms::col) {
 +          // XXX It's really just nsGenericHTMLElement, but we have
-+          // to cast to nsHTMLTableCellElement to make it compile because
++          // to cast to HTMLTableCellElement to make it compile because
 +          // C++ says so.
-+          int32_t span = static_cast<nsHTMLTableCellElement*>(child)->
++          int32_t span = static_cast<HTMLTableCellElement*>(child)->
 +            GetIntAttr(nsGkAtoms::span, 1);
 +          if (curCol + span > colNumber) {
 +            col = child;
@@ -386,9 +279,9 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +              haveCols = true;
 +
 +              // XXX It's really just nsGenericHTMLElement, but we have
-+              // to cast to nsHTMLTableCellElement to make it compile
++              // to cast to HTMLTableCellElement to make it compile
 +              // because C++ says so.
-+              int32_t span = static_cast<nsHTMLTableCellElement*>(cgchild)->
++              int32_t span = static_cast<HTMLTableCellElement*>(cgchild)->
 +                GetIntAttr(nsGkAtoms::span, 1);
 +              if (curCol + span > colNumber) {
 +                colGroup = child;
@@ -403,9 +296,9 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +
 +          if (!haveCols) {
 +            // XXX It's really just nsGenericHTMLElement, but we have to
-+            // cast to nsHTMLTableCellElement to make it compile because
++            // cast to HTMLTableCellElement to make it compile because
 +            // C++ says so.
-+            int32_t span = static_cast<nsHTMLTableCellElement*>(child)->
++            int32_t span = static_cast<HTMLTableCellElement*>(child)->
 +              GetIntAttr(nsGkAtoms::span, 1);
 +            if (curCol + span > colNumber) {
 +              colGroup = child;
@@ -482,10 +375,92 @@ diff --git a/content/html/content/src/nsHTMLTableCellElement.cpp b/content/html/
 +  mTableInheritedAttributes = newAttrs;
 +  NS_IF_ADDREF(mTableInheritedAttributes);
 +}
-diff --git a/content/html/content/src/nsHTMLTableColElement.cpp b/content/html/content/src/nsHTMLTableColElement.cpp
---- a/content/html/content/src/nsHTMLTableColElement.cpp
-+++ b/content/html/content/src/nsHTMLTableColElement.cpp
-@@ -110,19 +110,23 @@ nsHTMLTableColElement::ParseAttribute(in
++
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/content/html/content/src/HTMLTableCellElement.h b/content/html/content/src/HTMLTableCellElement.h
+--- a/content/html/content/src/HTMLTableCellElement.h
++++ b/content/html/content/src/HTMLTableCellElement.h
+@@ -2,30 +2,32 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #ifndef mozilla_dom_HTMLTableCellElement_h
+ #define mozilla_dom_HTMLTableCellElement_h
+ 
+ #include "nsGenericHTMLElement.h"
+ #include "nsIDOMHTMLTableCellElement.h"
++#include "nsHTMLStyleSheet.h"
+ 
+ class nsIDOMHTMLTableRowElement;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class HTMLTableElement;
+ 
+ class HTMLTableCellElement : public nsGenericHTMLElement,
+                              public nsIDOMHTMLTableCellElement
+ {
+ public:
+   HTMLTableCellElement(already_AddRefed<nsINodeInfo> aNodeInfo)
+     : nsGenericHTMLElement(aNodeInfo)
++    , mTableInheritedAttributes(TABLE_ATTRS_DIRTY)
+   {
+     SetIsDOMBinding();
+   }
+   virtual ~HTMLTableCellElement();
+ 
+   // nsISupports
+   NS_DECL_ISUPPORTS_INHERITED
+ 
+@@ -157,26 +159,41 @@ public:
+   virtual bool ParseAttribute(int32_t aNamespaceID,
+                               nsIAtom* aAttribute,
+                               const nsAString& aValue,
+                               nsAttrValue& aResult);
+   virtual nsMapRuleToAttributesFunc GetAttributeMappingFunction() const;
+   NS_IMETHOD WalkContentStyleRules(nsRuleWalker* aRuleWalker);
+   NS_IMETHOD_(bool) IsAttributeMapped(const nsIAtom* aAttribute) const;
+ 
++  // XXX Override AttributeChanged here and on other table elements
++  // to cause marking mTableInheritedAttributes dirty.
++
+   virtual nsresult Clone(nsINodeInfo *aNodeInfo, nsINode **aResult) const;
+ 
+   virtual nsXPCClassInfo* GetClassInfo();
+ 
+   virtual nsIDOMNode* AsDOMNode() { return this; }
+ protected:
+   virtual JSObject* WrapNode(JSContext *aCx, JSObject *aScope,
+                              bool *aTriedToWrap) MOZ_OVERRIDE;
+ 
+   HTMLTableElement* GetTable() const;
++  HTMLTableRowElement* GetRow() const;
++  nsIContent* GetRowGroup() const;
+ 
+-  HTMLTableRowElement* GetRow() const;
++  // Sentinel value of 0x1 indicates that this is dirty and needs to be
++  // recalculated.
++  nsMappedAttributes *mTableInheritedAttributes;
++  void ReleaseInheritedAttributes() {
++    if (mTableInheritedAttributes &&
++        mTableInheritedAttributes != TABLE_ATTRS_DIRTY)
++      NS_RELEASE(mTableInheritedAttributes);
++  }
++  void BuildInheritedAttributes();
++  static const nsAttrValue* FindInheritedAttr(nsIAtom *aAttribute,
++                                              nsIContent **aElements);
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+ 
+ #endif /* mozilla_dom_HTMLTableCellElement_h */
+diff --git a/content/html/content/src/HTMLTableColElement.cpp b/content/html/content/src/HTMLTableColElement.cpp
+--- a/content/html/content/src/HTMLTableColElement.cpp
++++ b/content/html/content/src/HTMLTableColElement.cpp
+@@ -159,19 +159,23 @@ HTMLTableColElement::ParseAttribute(int3
      if (aAttribute == nsGkAtoms::span) {
        /* protection from unrealistic large colspan values */
        return aResult.ParseIntWithBounds(aValue, 1, MAX_COLSPAN);
@@ -509,7 +484,7 @@ diff --git a/content/html/content/src/nsHTMLTableColElement.cpp b/content/html/c
                                                aResult);
  }
  
-@@ -165,25 +169,29 @@ void MapAttributesIntoRule(const nsMappe
+@@ -214,25 +218,29 @@ void MapAttributesIntoRule(const nsMappe
          }
        }
      }
@@ -539,21 +514,21 @@ diff --git a/content/html/content/src/nsHTMLTableColElement.cpp b/content/html/c
  
    nsGenericHTMLElement::MapCommonAttributesInto(aAttributes, aData);
  }
-diff --git a/content/html/content/src/nsHTMLTableElement.cpp b/content/html/content/src/nsHTMLTableElement.cpp
---- a/content/html/content/src/nsHTMLTableElement.cpp
-+++ b/content/html/content/src/nsHTMLTableElement.cpp
-@@ -1139,16 +1139,37 @@ nsHTMLTableElement::IsAttributeMapped(co
+diff --git a/content/html/content/src/HTMLTableElement.cpp b/content/html/content/src/HTMLTableElement.cpp
+--- a/content/html/content/src/HTMLTableElement.cpp
++++ b/content/html/content/src/HTMLTableElement.cpp
+@@ -1160,16 +1160,37 @@ HTMLTableElement::IsAttributeMapped(cons
  }
  
  nsMapRuleToAttributesFunc
- nsHTMLTableElement::GetAttributeMappingFunction() const
+ HTMLTableElement::GetAttributeMappingFunction() const
  {
    return &MapAttributesIntoRule;
  }
  
 +/* virtual */ nsresult
-+nsHTMLTableElement::InsertChildAt(nsIContent* aKid, uint32_t aIndex,
-+                                  bool aNotify)
++HTMLTableElement::InsertChildAt(nsIContent* aKid, uint32_t aIndex,
++                                bool aNotify)
 +{
 +  if (aKid->IsHTML() &&
 +      (aKid->Tag() == nsGkAtoms::col ||
@@ -565,7 +540,7 @@ diff --git a/content/html/content/src/nsHTMLTableElement.cpp b/content/html/cont
 +}
 +
 +/* virtual */ void
-+nsHTMLTableElement::RemoveChildAt(uint32_t aIndex, bool aNotify)
++HTMLTableElement::RemoveChildAt(uint32_t aIndex, bool aNotify)
 +{
 +  // invalidate cellmap if needed
 +
@@ -580,10 +555,10 @@ diff --git a/content/html/content/src/nsHTMLTableElement.cpp b/content/html/cont
      const nsAttrValue* value = aAttributes->GetAttr(nsGkAtoms::cellpadding);
      if (value && value->Type() == nsAttrValue::eInteger) {
        // We have cellpadding.  This will override our padding values if we
-diff --git a/content/html/content/src/nsHTMLTableElement.h b/content/html/content/src/nsHTMLTableElement.h
---- a/content/html/content/src/nsHTMLTableElement.h
-+++ b/content/html/content/src/nsHTMLTableElement.h
-@@ -35,16 +35,20 @@ public:
+diff --git a/content/html/content/src/HTMLTableElement.h b/content/html/content/src/HTMLTableElement.h
+--- a/content/html/content/src/HTMLTableElement.h
++++ b/content/html/content/src/HTMLTableElement.h
+@@ -174,16 +174,20 @@ public:
  
    virtual bool ParseAttribute(int32_t aNamespaceID,
                                  nsIAtom* aAttribute,
@@ -604,12 +579,12 @@ diff --git a/content/html/content/src/nsHTMLTableElement.h b/content/html/conten
                                nsIContent* aBindingParent,
                                bool aCompileEventHandlers);
    virtual void UnbindFromTree(bool aDeep = true,
-@@ -72,16 +76,18 @@ public:
+@@ -216,16 +220,18 @@ protected:
+         return cur;
+       }
+     }
+     return nullptr;
    }
-   already_AddRefed<nsIDOMHTMLTableCaptionElement> GetCaption();
-   nsContentList* TBodies();
- protected:
-   already_AddRefed<nsIDOMHTMLTableSectionElement> GetSection(nsIAtom *aTag);
  
    nsRefPtr<nsContentList> mTBodies;
    nsRefPtr<TableRowsCollection> mRows;
@@ -623,10 +598,10 @@ diff --git a/content/html/content/src/nsHTMLTableElement.h b/content/html/conten
      if (mTableInheritedAttributes &&
          mTableInheritedAttributes != TABLE_ATTRS_DIRTY)
        NS_RELEASE(mTableInheritedAttributes);
-diff --git a/content/html/content/src/nsHTMLTableRowElement.cpp b/content/html/content/src/nsHTMLTableRowElement.cpp
---- a/content/html/content/src/nsHTMLTableRowElement.cpp
-+++ b/content/html/content/src/nsHTMLTableRowElement.cpp
-@@ -329,22 +329,26 @@ nsHTMLTableRowElement::ParseAttribute(in
+diff --git a/content/html/content/src/HTMLTableRowElement.cpp b/content/html/content/src/HTMLTableRowElement.cpp
+--- a/content/html/content/src/HTMLTableRowElement.cpp
++++ b/content/html/content/src/HTMLTableRowElement.cpp
+@@ -363,22 +363,26 @@ HTMLTableRowElement::ParseAttribute(int3
      }
      if (aAttribute == nsGkAtoms::height) {
        return aResult.ParseSpecialIntValue(aValue);
@@ -653,7 +628,7 @@ diff --git a/content/html/content/src/nsHTMLTableRowElement.cpp b/content/html/c
                                                          aAttribute, aValue,
                                                          aResult) ||
           nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
-@@ -364,25 +368,29 @@ void MapAttributesIntoRule(const nsMappe
+@@ -398,25 +402,29 @@ void MapAttributesIntoRule(const nsMappe
        else if (value && value->Type() == nsAttrValue::ePercent)
          height->SetPercentValue(value->GetPercentValue());
      }
@@ -683,10 +658,10 @@ diff --git a/content/html/content/src/nsHTMLTableRowElement.cpp b/content/html/c
  
    nsGenericHTMLElement::MapBackgroundAttributesInto(aAttributes, aData);
    nsGenericHTMLElement::MapCommonAttributesInto(aAttributes, aData);
-diff --git a/content/html/content/src/nsHTMLTableSectionElement.cpp b/content/html/content/src/nsHTMLTableSectionElement.cpp
---- a/content/html/content/src/nsHTMLTableSectionElement.cpp
-+++ b/content/html/content/src/nsHTMLTableSectionElement.cpp
-@@ -224,22 +224,26 @@ nsHTMLTableSectionElement::ParseAttribut
+diff --git a/content/html/content/src/HTMLTableSectionElement.cpp b/content/html/content/src/HTMLTableSectionElement.cpp
+--- a/content/html/content/src/HTMLTableSectionElement.cpp
++++ b/content/html/content/src/HTMLTableSectionElement.cpp
+@@ -235,22 +235,26 @@ HTMLTableSectionElement::ParseAttribute(
      */
      if (aAttribute == nsGkAtoms::charoff) {
        return aResult.ParseIntWithBounds(aValue, 0);
@@ -713,7 +688,7 @@ diff --git a/content/html/content/src/nsHTMLTableSectionElement.cpp b/content/ht
                                                          aAttribute, aValue,
                                                          aResult) ||
           nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
-@@ -257,25 +261,29 @@ void MapAttributesIntoRule(const nsMappe
+@@ -268,25 +272,29 @@ void MapAttributesIntoRule(const nsMappe
        if (value && value->Type() == nsAttrValue::eInteger)
          height->SetFloatValue((float)value->GetIntegerValue(), eCSSUnit_Pixel);
      }
