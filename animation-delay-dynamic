@@ -4,8 +4,27 @@ Change record of animation start to be before delay so that dynamic changes to a
 
 Note: per CSS WG, afternoon of 2012-10-29.
 
-TODO: Is there something that copies the start time to the layer?
-
+diff --git a/gfx/layers/Layers.h b/gfx/layers/Layers.h
+--- a/gfx/layers/Layers.h
++++ b/gfx/layers/Layers.h
+@@ -771,16 +771,17 @@ public:
+    * A layer is "fixed position" when it draws content from a content
+    * (not chrome) document, the topmost content document has a root scrollframe
+    * with a displayport, but the layer does not move when that displayport scrolls.
+    */
+   void SetIsFixedPosition(bool aFixedPosition) { mIsFixedPosition = aFixedPosition; }
+ 
+   // Call AddAnimation to add a new animation to this layer from layout code.
+   // Caller must add segments to the returned animation.
++  // aStart represents the time at the *end* of the delay.
+   Animation* AddAnimation(mozilla::TimeStamp aStart, mozilla::TimeDuration aDuration,
+                           float aIterations, int aDirection,
+                           nsCSSProperty aProperty, const AnimationData& aData);
+   // ClearAnimations clears animations on this layer.
+   void ClearAnimations();
+   // This is only called when the layer tree is updated. Do not call this from
+   // layout code.  To add an animation to this layer, use AddAnimation.
+   void SetAnimations(const AnimationArray& aAnimations);
 diff --git a/gfx/layers/ipc/CompositorParent.cpp b/gfx/layers/ipc/CompositorParent.cpp
 --- a/gfx/layers/ipc/CompositorParent.cpp
 +++ b/gfx/layers/ipc/CompositorParent.cpp
@@ -29,6 +48,72 @@ diff --git a/gfx/layers/ipc/CompositorParent.cpp b/gfx/layers/ipc/CompositorPare
                        positionInIteration <= 1.0,
                        "position should be in [0-1]");
  
+diff --git a/gfx/layers/ipc/PLayers.ipdl b/gfx/layers/ipc/PLayers.ipdl
+--- a/gfx/layers/ipc/PLayers.ipdl
++++ b/gfx/layers/ipc/PLayers.ipdl
+@@ -147,16 +147,19 @@ struct TransformData {
+ };
+ 
+ union AnimationData {
+   null_t;
+   TransformData;
+ };
+ 
+ struct Animation {
++  // Unlike in nsAnimationManager, this start time is at the end of the
++  // delay.  If the delay is changed dynamically, the layer's data will
++  // be updated.
+   TimeStamp startTime;
+   TimeDuration duration;
+   // For each frame, the interpolation point is computed based on the
+   // startTime, the direction, the duration, and the current time.
+   // The segments must uniquely cover the portion from 0.0 to 1.0
+   AnimationSegment[] segments;
+   // How many times to repeat the animation.  < 0 means "forever".
+   float numIterations;
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -296,17 +296,17 @@ AddAnimationsForProperty(nsIFrame* aFram
+                          AnimationData& aData)
+ {
+   NS_ASSERTION(aLayer->AsContainerLayer(), "Should only animate ContainerLayer");
+   nsStyleContext* styleContext = aFrame->GetStyleContext();
+   nsPresContext* presContext = aFrame->PresContext();
+   nsRect bounds = nsDisplayTransform::GetFrameBoundsForTransform(aFrame);
+   float scale = presContext->AppUnitsPerDevPixel();
+ 
+-  TimeStamp startTime = ea->mStartTime;
++  TimeStamp startTime = ea->mStartTime + ea->mDelay;
+   TimeDuration duration = ea->mIterationDuration;
+   float iterations = ea->mIterationCount != NS_IEEEPositiveInfinity()
+                      ? ea->mIterationCount : -1;
+   int direction = ea->mDirection;
+ 
+   Animation* animation = aLayer->AddAnimation(startTime, duration,
+                                               iterations, direction,
+                                               aProperty, aData);
+@@ -405,17 +405,20 @@ AddAnimationsAndTransitionsToLayer(Layer
+       if (pt->mProperty != aProperty || !pt->IsRunningAt(currentTime)) {
+         continue;
+       }
+ 
+       ElementAnimation anim;
+       anim.mIterationCount = 1;
+       anim.mDirection = NS_STYLE_ANIMATION_DIRECTION_NORMAL;
+       anim.mFillMode = NS_STYLE_ANIMATION_FILL_MODE_NONE;
++      // Transition mStartTime is end-of-delay; animation mStartTime
++      // is start-of-delay, so set delay here to 0.
+       anim.mStartTime = pt->mStartTime;
++      anim.mDelay = TimeDuration::FromMilliseconds(0);
+       anim.mIterationDuration = pt->mDuration;
+ 
+       AnimationProperty& prop = *anim.mProperties.AppendElement();
+       prop.mProperty = pt->mProperty;
+ 
+       AnimationPropertySegment& segment = *prop.mSegments.AppendElement();
+       segment.mFromKey = 0;
+       segment.mToKey = 1;
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
 +++ b/layout/style/nsAnimationManager.cpp
