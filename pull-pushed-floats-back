@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 588237, patch 4:  Pull pushed floats back from the next-in-flow at the start of reflow.
+Bug 588237, patch 4:  Pull pushed floats back from the next-in-flow at the start of reflow.  r=roc
 
 diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstructor.h
 --- a/layout/base/nsCSSFrameConstructor.h
@@ -29,7 +29,40 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -4515,27 +4515,68 @@ nsBlockFrame::DrainPushedFloats(nsBlockR
+@@ -4503,39 +4503,101 @@ nsBlockFrame::DrainSelfOverflowList()
+   if (!ourOverflowLines->mLines.empty()) {
+     mFrames.AppendFrames(nullptr, ourOverflowLines->mFrames);
+     mLines.splice(mLines.end(), ourOverflowLines->mLines);
+   }
+   delete ourOverflowLines;
+   return true;
+ }
+ 
++/**
++ * Pushed floats are floats whose placeholders are in a previous
++ * continuation.  They might themselves be next-continuations of a float
++ * that partially fit in an earlier continuation, or they might be the
++ * first continuation of a float that couldn't be placed at all.
++ *
++ * Pushed floats live permanently at the beginning of a block's float
++ * list, where they must live *before* any floats whose placeholders are
++ * in that block.
++ *
++ * Temporarily, during reflow, they also live on the pushed floats list,
++ * which only holds them between (a) when one continuation pushes them to
++ * its pushed floats list because they don't fit and (b) when the next
++ * continuation pulls them onto the beginning of its float list.
++ *
++ * DrainPushedFloats sets up pushed floats the way we need them at the
++ * start of reflow; they are then reflowed by ReflowPushedFloats (which
++ * might push some of them on).  Floats with placeholders in this block
++ * are reflowed by (nsBlockReflowState/nsLineLayout)::AddFloat, which
++ * also maintains these invariants.
++ */
+ void
+ nsBlockFrame::DrainPushedFloats(nsBlockReflowState& aState)
+ {
+ #ifdef DEBUG
    // Between when we drain pushed floats and when we complete reflow,
    // we're allowed to have multiple continuations of the same float on
    // our floats list, since a first-in-flow might get pushed to a later
@@ -106,3 +139,69 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
  {
    if (!HasOverflowLines()) {
      return nullptr;
+@@ -5925,16 +5987,18 @@ nsBlockFrame::FindTrailingClear()
+ }
+ 
+ nsresult
+ nsBlockFrame::ReflowPushedFloats(nsBlockReflowState& aState,
+                                  nsOverflowAreas&    aOverflowAreas,
+                                  nsReflowStatus&     aStatus)
+ {
+   nsresult rv = NS_OK;
++  // Pushed floats live at the start of our float list; see comment
++  // above nsBlockFrame::DrainPushedFloats.
+   for (nsIFrame* f = mFloats.FirstChild(), *next;
+        f && (f->GetStateBits() & NS_FRAME_IS_PUSHED_FLOAT);
+        f = next) {
+     // save next sibling now, since reflowing could push the entire
+     // float, changing its siblings
+     next = f->GetNextSibling();
+ 
+     // When we push a first-continuation float in a non-initial reflow,
+diff --git a/layout/generic/nsBlockFrame.h b/layout/generic/nsBlockFrame.h
+--- a/layout/generic/nsBlockFrame.h
++++ b/layout/generic/nsBlockFrame.h
+@@ -778,17 +778,19 @@ protected:
+ 
+   /**
+    * @return true if this frame has pushed floats.
+    */
+   bool HasPushedFloats() const {
+     return 0 != (GetStateBits() & NS_BLOCK_HAS_PUSHED_FLOATS);
+   }
+ 
+-  // Get the pushed floats list
++  // Get the pushed floats list, which is used for *temporary* storage
++  // of floats during reflow, between when we decide they don't fit in
++  // this block until our next continuation takes them.
+   nsFrameList* GetPushedFloats() const;
+   // Get the pushed floats list, or if there is not currently one,
+   // make a new empty one.
+   nsFrameList* EnsurePushedFloats();
+   // Remove and return the pushed floats list.
+   nsFrameList* RemovePushedFloats();
+ 
+ #ifdef DEBUG
+diff --git a/layout/generic/nsBlockReflowState.cpp b/layout/generic/nsBlockReflowState.cpp
+--- a/layout/generic/nsBlockReflowState.cpp
++++ b/layout/generic/nsBlockReflowState.cpp
+@@ -460,16 +460,19 @@ nsBlockReflowState::AddFloat(nsLineLayou
+                     "float should be in this block unless it was marked as "
+                     "pushed float");
+   if (aFloat->GetStateBits() & NS_FRAME_IS_PUSHED_FLOAT) {
+     // If, in a previous reflow, the float was pushed entirely to
+     // another column/page, we need to steal it back.  (We might just
+     // push it again, though.)  Likewise, if that previous reflow
+     // reflowed this block but not its next continuation, we might need
+     // to steal it from our own float-continuations list.
++    //
++    // For more about pushed floats, see the comment above
++    // nsBlockFrame::DrainPushedFloats.
+     nsBlockFrame *floatParent =
+       static_cast<nsBlockFrame*>(aFloat->GetParent());
+     floatParent->StealFrame(mPresContext, aFloat);
+ 
+     aFloat->RemoveStateBits(NS_FRAME_IS_PUSHED_FLOAT);
+ 
+     // Appending is fine, since if a float was pushed to the next
+     // page/column, all later floats were also pushed.
