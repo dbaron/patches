@@ -1,0 +1,164 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 835007:  Make 'transition-property: all' work as an item within a list.
+
+TODO: needs tests
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -9558,42 +9558,40 @@ bool CSSParserImpl::ParseTransformOrigin
+   }
+   return true;
+ }
+ 
+ bool
+ CSSParserImpl::ParseTransitionProperty()
+ {
+   nsCSSValue value;
+-  if (ParseVariant(value, VARIANT_INHERIT | VARIANT_NONE | VARIANT_ALL,
+-                   nullptr)) {
+-    // 'inherit', 'initial', 'none', and 'all' must be alone
++  if (ParseVariant(value, VARIANT_INHERIT | VARIANT_NONE, nullptr)) {
++    // 'inherit', 'initial', and 'none' must be alone
+     if (!ExpectEndProperty()) {
+       return false;
+     }
+   } else {
+     // Accept a list of arbitrary identifiers.  They should be
+     // CSS properties, but we want to accept any so that we
+     // accept properties that we don't know about yet, e.g.
+     // transition-property: invalid-property, left, opacity;
+     nsCSSValueList* cur = value.SetListValue();
+     for (;;) {
+-      if (!ParseVariant(cur->mValue, VARIANT_IDENTIFIER, nullptr)) {
++      if (!ParseVariant(cur->mValue, VARIANT_IDENTIFIER | VARIANT_ALL, nullptr)) {
+         return false;
+       }
+-      nsDependentString str(cur->mValue.GetStringBufferValue());
+-      // Exclude 'none' and 'all' and 'inherit' and 'initial'
+-      // according to the same rules as for 'counter-reset' in CSS 2.1
+-      // (except 'counter-reset' doesn't exclude 'all' since it
+-      // doesn't support 'all' as a special value).
+-      if (str.LowerCaseEqualsLiteral("none") ||
+-          str.LowerCaseEqualsLiteral("all") ||
+-          str.LowerCaseEqualsLiteral("inherit") ||
+-          str.LowerCaseEqualsLiteral("initial")) {
+-        return false;
++      if (cur->mValue.GetUnit() == eCSSUnit_Identifier) {
++        nsDependentString str(cur->mValue.GetStringBufferValue());
++        // Exclude 'none' and 'inherit' and 'initial' according to the
++        // same rules as for 'counter-reset' in CSS 2.1.
++        if (str.LowerCaseEqualsLiteral("none") ||
++            str.LowerCaseEqualsLiteral("inherit") ||
++            str.LowerCaseEqualsLiteral("initial")) {
++          return false;
++        }
+       }
+       if (CheckEndProperty()) {
+         break;
+       }
+       if (!ExpectSymbol(',', true)) {
+         REPORT_UNEXPECTED_TOKEN(PEExpectedComma);
+         return false;
+       }
+@@ -9845,35 +9843,31 @@ CSSParserImpl::ParseTransition()
+   {
+     NS_ABORT_IF_FALSE(kTransitionProperties[3] ==
+                         eCSSProperty_transition_property,
+                       "array index mismatch");
+     nsCSSValueList *l = values[3].GetListValue();
+     bool multipleItems = !!l->mNext;
+     do {
+       const nsCSSValue& val = l->mValue;
+-      if (val.GetUnit() != eCSSUnit_Ident) {
+-        NS_ABORT_IF_FALSE(val.GetUnit() == eCSSUnit_None ||
+-                          val.GetUnit() == eCSSUnit_All, "unexpected unit");
++      if (val.GetUnit() == eCSSUnit_None) {
+         if (multipleItems) {
+           // This is a syntax error.
+           return false;
+         }
+ 
+-        // Unbox a solitary 'none' or 'all'.
+-        if (val.GetUnit() == eCSSUnit_None) {
+-          values[3].SetNoneValue();
+-        } else {
+-          values[3].SetAllValue();
++        // Unbox a solitary 'none'.
++        values[3].SetNoneValue();
++        break;
++      }
++      if (val.GetUnit() == eCSSUnit_Identifier) {
++        nsDependentString str(val.GetStringBufferValue());
++        if (str.EqualsLiteral("inherit") || str.EqualsLiteral("initial")) {
++          return false;
+         }
+-        break;
+-      }
+-      nsDependentString str(val.GetStringBufferValue());
+-      if (str.EqualsLiteral("inherit") || str.EqualsLiteral("initial")) {
+-        return false;
+       }
+     } while ((l = l->mNext));
+   }
+ 
+   // Save all parsed transition sub-properties in mTempData
+   for (uint32_t i = 0; i < numProps; ++i) {
+     AppendValue(kTransitionProperties[i], values[i]);
+   }
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -4382,34 +4382,38 @@ nsRuleNode::ComputeDisplayData(void* aSt
+     if (i >= property.num) {
+       transition->CopyPropertyFrom(display->mTransitions[i % property.num]);
+     } else if (property.unit == eCSSUnit_Inherit) {
+       NS_ABORT_IF_FALSE(i < parentDisplay->mTransitionPropertyCount,
+                         "property.num computed incorrectly");
+       NS_ABORT_IF_FALSE(!canStoreInRuleTree,
+                         "should have made canStoreInRuleTree false above");
+       transition->CopyPropertyFrom(parentDisplay->mTransitions[i]);
+-    } else if (property.unit == eCSSUnit_Initial ||
+-               property.unit == eCSSUnit_All) {
++    } else if (property.unit == eCSSUnit_Initial) {
+       transition->SetProperty(eCSSPropertyExtra_all_properties);
+     } else if (property.unit == eCSSUnit_None) {
+       transition->SetProperty(eCSSPropertyExtra_no_properties);
+     } else if (property.list) {
+-      NS_ABORT_IF_FALSE(property.list->mValue.GetUnit() == eCSSUnit_Ident,
+-                        nsPrintfCString("Invalid transition property unit %d",
+-                                        property.list->mValue.GetUnit()).get());
+-
+-      nsDependentString
+-        propertyStr(property.list->mValue.GetStringBufferValue());
+-      nsCSSProperty prop = nsCSSProps::LookupProperty(propertyStr,
+-                                                      nsCSSProps::eEnabled);
+-      if (prop == eCSSProperty_UNKNOWN) {
+-        transition->SetUnknownProperty(propertyStr);
++      const nsCSSValue &val = property.list->mValue;
++
++      if (val.GetUnit() == eCSSUnit_Ident) {
++        nsDependentString
++          propertyStr(property.list->mValue.GetStringBufferValue());
++        nsCSSProperty prop = nsCSSProps::LookupProperty(propertyStr,
++                                                        nsCSSProps::eEnabled);
++        if (prop == eCSSProperty_UNKNOWN) {
++          transition->SetUnknownProperty(propertyStr);
++        } else {
++          transition->SetProperty(prop);
++        }
+       } else {
+-        transition->SetProperty(prop);
++        NS_ABORT_IF_FALSE(val.GetUnit() == eCSSUnit_All,
++                          nsPrintfCString("Invalid transition property unit %d",
++                                          val.GetUnit()).get());
++        transition->SetProperty(eCSSPropertyExtra_all_properties);
+       }
+     }
+ 
+     if (i >= timingFunction.num) {
+       transition->SetTimingFunction(
+         display->mTransitions[i % timingFunction.num].GetTimingFunction());
+     } else if (timingFunction.unit == eCSSUnit_Inherit) {
+       NS_ABORT_IF_FALSE(i < parentDisplay->mTransitionTimingFunctionCount,
