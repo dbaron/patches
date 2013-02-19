@@ -1,9 +1,10 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 839809:  Make counter-increments and list counting that would go past our internal (int32_t) limit keep the counter at its current value rather than wrapping.
+Bug 839809:  Make counter-increments and list counting that would go past our internal (int32_t) limit keep the counter at its current value rather than wrapping.  r=dholbert
 
 Per CSS WG resolution regarding counter-styles-3, afternoon of 2013-02-05:
 http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590
+http://lists.w3.org/Archives/Public/www-style/2013Feb/0392.html
 
 Note that this patch depends on signed integer overflow behavior in C++,
 which I believe is portable despite being unspecified.
@@ -11,7 +12,7 @@ which I believe is portable despite being unspecified.
 diff --git a/layout/base/nsCounterManager.cpp b/layout/base/nsCounterManager.cpp
 --- a/layout/base/nsCounterManager.cpp
 +++ b/layout/base/nsCounterManager.cpp
-@@ -53,17 +53,25 @@ void nsCounterUseNode::Calc(nsCounterLis
+@@ -53,17 +53,17 @@ void nsCounterUseNode::Calc(nsCounterLis
  void nsCounterChangeNode::Calc(nsCounterList *aList)
  {
      NS_ASSERTION(!aList->IsDirty(),
@@ -21,15 +22,7 @@ diff --git a/layout/base/nsCounterManager.cpp b/layout/base/nsCounterManager.cpp
      } else {
          NS_ASSERTION(mType == INCREMENT, "invalid type");
 -        mValueAfter = aList->ValueBefore(this) + mChangeValue;
-+        int32_t valueBefore = aList->ValueBefore(this);
-+        int32_t valueAfter = valueBefore + mChangeValue;
-+        // The CSS Working Group resolved that a counter-increment that
-+        // exceeds internal limits should not increment at all.
-+        // http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590
-+        if ((mChangeValue > 0) != (valueAfter > valueBefore)) {
-+          valueAfter = valueBefore;
-+        }
-+        mValueAfter = valueAfter;
++        mValueAfter = IncrementCounter(aList->ValueBefore(this), mChangeValue);
      }
  }
  
@@ -38,10 +31,45 @@ diff --git a/layout/base/nsCounterManager.cpp b/layout/base/nsCounterManager.cpp
  nsCounterUseNode::GetText(nsString& aResult)
  {
      aResult.Truncate();
+diff --git a/layout/base/nsCounterManager.h b/layout/base/nsCounterManager.h
+--- a/layout/base/nsCounterManager.h
++++ b/layout/base/nsCounterManager.h
+@@ -224,16 +224,31 @@ public:
+ 
+     // Clear all data.
+     void Clear() { mNames.Clear(); }
+ 
+ #ifdef DEBUG
+     void Dump();
+ #endif
+ 
++    static int32_t IncrementCounter(int32_t aOldValue, int32_t aIncrement)
++    {
++        int32_t newValue = aOldValue + aIncrement;
++        // The CSS Working Group resolved that a counter-increment that
++        // exceeds internal limits should not increment at all.
++        // http://lists.w3.org/Archives/Public/www-style/2013Feb/0392.html
++        // (This means, for example, that if aIncrement is 5, the
++        // counter will get stuck at the largest multiple of 5 less than
++        // the maximum 32-bit integer.)
++        if ((aIncrement > 0) != (newValue > aOldValue)) {
++          newValue = aOldValue;
++        }
++        return newValue;
++    }
++
+ private:
+     // for |AddCounterResetsAndIncrements| only
+     bool AddResetOrIncrement(nsIFrame *aFrame, int32_t aIndex,
+                                const nsStyleCounterData *aCounterData,
+                                nsCounterNode::Type aType);
+ 
+     nsClassHashtable<nsStringHashKey, nsCounterList> mNames;
+ };
 diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 --- a/layout/generic/nsBlockFrame.cpp
 +++ b/layout/generic/nsBlockFrame.cpp
-@@ -6767,16 +6767,18 @@ nsBlockFrame::RenumberLists(nsPresContex
+@@ -6767,16 +6767,19 @@ nsBlockFrame::RenumberLists(nsPresContex
      ordinal = attr->GetIntegerValue();
    } else if (increment < 0) {
      // <ol reversed> case, or some other case with a negative increment: count
@@ -51,7 +79,8 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
           kid = kid->GetNextSibling()) {
        if (kid->IsHTML(nsGkAtoms::li)) {
 +        // FIXME: This isn't right in terms of what CSS says to do for
-+        // overflow of counters.
++        // overflow of counters (but it only matters when this node has
++        // more than numeric_limits<int32_t>::max() children).
          ordinal -= increment;
        }
      }
@@ -63,7 +92,25 @@ diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
 diff --git a/layout/generic/nsBulletFrame.cpp b/layout/generic/nsBulletFrame.cpp
 --- a/layout/generic/nsBulletFrame.cpp
 +++ b/layout/generic/nsBulletFrame.cpp
-@@ -412,17 +412,26 @@ nsBulletFrame::SetListItemOrdinal(int32_
+@@ -16,16 +16,17 @@
+ #include "nsIPresShell.h"
+ #include "nsIDocument.h"
+ #include "nsRenderingContext.h"
+ #include "nsILoadGroup.h"
+ #include "nsIURL.h"
+ #include "nsNetUtil.h"
+ #include "prprf.h"
+ #include "nsDisplayList.h"
++#include "nsCounterManager.h"
+ 
+ #include "imgILoader.h"
+ #include "imgIContainer.h"
+ #include "imgRequestProxy.h"
+ 
+ #include "nsIServiceManager.h"
+ #include "nsIComponentManager.h"
+ #include <algorithm>
+@@ -412,17 +413,17 @@ nsBulletFrame::SetListItemOrdinal(int32_
          // Use ordinal specified by the value attribute
          mOrdinal = attr->GetIntegerValue();
        }
@@ -73,16 +120,7 @@ diff --git a/layout/generic/nsBulletFrame.cpp b/layout/generic/nsBulletFrame.cpp
    *aChanged = oldOrdinal != mOrdinal;
  
 -  return mOrdinal + aIncrement;
-+  int32_t nextOrdinal = mOrdinal + aIncrement;
-+
-+  // The CSS Working Group resolved that a counter-increment that
-+  // exceeds internal limits should not increment at all.
-+  // http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590
-+  if ((aIncrement > 0) != (nextOrdinal > mOrdinal)) {
-+    nextOrdinal = mOrdinal;
-+  }
-+
-+  return nextOrdinal;
++  return nsCounterManager::IncrementCounter(mOrdinal, aIncrement);
  }
  
  
@@ -447,7 +485,7 @@ diff --git a/layout/reftests/counters/counter-ua-limits-list-01-ref.html b/layou
 new file mode 100644
 --- /dev/null
 +++ b/layout/reftests/counters/counter-ua-limits-list-01-ref.html
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,50 @@
 +<!DOCTYPE html>
 +<html>
 + <head>
@@ -477,6 +515,7 @@ new file mode 100644
 +
 + <!--
 +    Work around our inability to parse -2147483648 as an HTML integer attribute
++    (Bug 586761)
 +   -->
 + <ol reversed start="-2147483645">
 +   <li class="hidden">hidden
