@@ -1,0 +1,595 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 839809:  Make counter-increments and list counting that would go past our internal (int32_t) limit keep the counter at its current value rather than wrapping.  r=dholbert
+
+Per CSS WG resolution regarding counter-styles-3, afternoon of 2013-02-05:
+http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590
+http://lists.w3.org/Archives/Public/www-style/2013Feb/0392.html
+
+Note that this patch depends on signed integer overflow behavior in C++,
+which I believe is portable despite being unspecified.
+
+diff --git a/layout/base/nsCounterManager.cpp b/layout/base/nsCounterManager.cpp
+--- a/layout/base/nsCounterManager.cpp
++++ b/layout/base/nsCounterManager.cpp
+@@ -53,17 +53,18 @@ void nsCounterUseNode::Calc(nsCounterLis
+ void nsCounterChangeNode::Calc(nsCounterList *aList)
+ {
+     NS_ASSERTION(!aList->IsDirty(),
+                  "Why are we calculating with a dirty list?");
+     if (mType == RESET) {
+         mValueAfter = mChangeValue;
+     } else {
+         NS_ASSERTION(mType == INCREMENT, "invalid type");
+-        mValueAfter = aList->ValueBefore(this) + mChangeValue;
++        mValueAfter = nsCounterManager::IncrementCounter(aList->ValueBefore(this),
++                                                         mChangeValue);
+     }
+ }
+ 
+ // The text that should be displayed for this counter.
+ void
+ nsCounterUseNode::GetText(nsString& aResult)
+ {
+     aResult.Truncate();
+diff --git a/layout/base/nsCounterManager.h b/layout/base/nsCounterManager.h
+--- a/layout/base/nsCounterManager.h
++++ b/layout/base/nsCounterManager.h
+@@ -224,16 +224,31 @@ public:
+ 
+     // Clear all data.
+     void Clear() { mNames.Clear(); }
+ 
+ #ifdef DEBUG
+     void Dump();
+ #endif
+ 
++    static int32_t IncrementCounter(int32_t aOldValue, int32_t aIncrement)
++    {
++        int32_t newValue = aOldValue + aIncrement;
++        // The CSS Working Group resolved that a counter-increment that
++        // exceeds internal limits should not increment at all.
++        // http://lists.w3.org/Archives/Public/www-style/2013Feb/0392.html
++        // (This means, for example, that if aIncrement is 5, the
++        // counter will get stuck at the largest multiple of 5 less than
++        // the maximum 32-bit integer.)
++        if ((aIncrement > 0) != (newValue > aOldValue)) {
++          newValue = aOldValue;
++        }
++        return newValue;
++    }
++
+ private:
+     // for |AddCounterResetsAndIncrements| only
+     bool AddResetOrIncrement(nsIFrame *aFrame, int32_t aIndex,
+                                const nsStyleCounterData *aCounterData,
+                                nsCounterNode::Type aType);
+ 
+     nsClassHashtable<nsStringHashKey, nsCounterList> mNames;
+ };
+diff --git a/layout/generic/nsBlockFrame.cpp b/layout/generic/nsBlockFrame.cpp
+--- a/layout/generic/nsBlockFrame.cpp
++++ b/layout/generic/nsBlockFrame.cpp
+@@ -6686,16 +6686,19 @@ nsBlockFrame::RenumberLists(nsPresContex
+     ordinal = attr->GetIntegerValue();
+   } else if (increment < 0) {
+     // <ol reversed> case, or some other case with a negative increment: count
+     // up the child list
+     ordinal = 0;
+     for (nsIContent* kid = mContent->GetFirstChild(); kid;
+          kid = kid->GetNextSibling()) {
+       if (kid->IsHTML(nsGkAtoms::li)) {
++        // FIXME: This isn't right in terms of what CSS says to do for
++        // overflow of counters (but it only matters when this node has
++        // more than numeric_limits<int32_t>::max() children).
+         ordinal -= increment;
+       }
+     }
+   }
+ 
+   // Get to first-in-flow
+   nsBlockFrame* block = (nsBlockFrame*) GetFirstInFlow();
+   return RenumberListsInBlock(aPresContext, block, &ordinal, 0, increment);
+diff --git a/layout/generic/nsBulletFrame.cpp b/layout/generic/nsBulletFrame.cpp
+--- a/layout/generic/nsBulletFrame.cpp
++++ b/layout/generic/nsBulletFrame.cpp
+@@ -16,16 +16,17 @@
+ #include "nsIPresShell.h"
+ #include "nsIDocument.h"
+ #include "nsRenderingContext.h"
+ #include "nsILoadGroup.h"
+ #include "nsIURL.h"
+ #include "nsNetUtil.h"
+ #include "prprf.h"
+ #include "nsDisplayList.h"
++#include "nsCounterManager.h"
+ 
+ #include "imgILoader.h"
+ #include "imgIContainer.h"
+ #include "imgRequestProxy.h"
+ 
+ #include "nsIServiceManager.h"
+ #include "nsIComponentManager.h"
+ #include <algorithm>
+@@ -412,17 +413,17 @@ nsBulletFrame::SetListItemOrdinal(int32_
+         // Use ordinal specified by the value attribute
+         mOrdinal = attr->GetIntegerValue();
+       }
+     }
+   }
+ 
+   *aChanged = oldOrdinal != mOrdinal;
+ 
+-  return mOrdinal + aIncrement;
++  return nsCounterManager::IncrementCounter(mOrdinal, aIncrement);
+ }
+ 
+ 
+ // XXX change roman/alpha to use unsigned math so that maxint and
+ // maxnegint will work
+ 
+ /**
+  * For all functions below, a return value of true means that we
+diff --git a/layout/reftests/counters/counter-ua-limits-00-ref.html b/layout/reftests/counters/counter-ua-limits-00-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-00-ref.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++ </head>
++ <body>
++
++ <div id="test">
++   <span>2147483646</span>
++   <span>2147483647</span>
++   <span>2147483647</span>
++   <span>2147483647</span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-00.html b/layout/reftests/counters/counter-ua-limits-00.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-00.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  #test { counter-reset: c 2147483645; }
++  #test span { counter-increment: c; }
++  #test span:before { content: counter(c); }
++
++  </style>
++ </head>
++ <body>
++
++ <div id="test">
++   <span></span>
++   <span></span>
++   <span></span>
++   <span></span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-01-ref.html b/layout/reftests/counters/counter-ua-limits-01-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-01-ref.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++ </head>
++ <body>
++
++ <div id="test">
++   <span>2147483640</span>
++   <span>2147483645</span>
++   <span>2147483645</span>
++   <span>2147483645</span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-01.html b/layout/reftests/counters/counter-ua-limits-01.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-01.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  #test { counter-reset: c 2147483635; }
++  #test span { counter-increment: c 5; }
++  #test span:before { content: counter(c); }
++
++  </style>
++ </head>
++ <body>
++
++ <div id="test">
++   <span></span>
++   <span></span>
++   <span></span>
++   <span></span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-02-ref.html b/layout/reftests/counters/counter-ua-limits-02-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-02-ref.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++ </head>
++ <body>
++
++ <div id="test">
++   <span>-2147483646</span>
++   <span>-2147483647</span>
++   <span>-2147483648</span>
++   <span>-2147483648</span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-02.html b/layout/reftests/counters/counter-ua-limits-02.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-02.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  #test { counter-reset: c -2147483645; }
++  #test span { counter-increment: c -1; }
++  #test span:before { content: counter(c); }
++
++  </style>
++ </head>
++ <body>
++
++ <div id="test">
++   <span></span>
++   <span></span>
++   <span></span>
++   <span></span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-03-ref.html b/layout/reftests/counters/counter-ua-limits-03-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-03-ref.html
+@@ -0,0 +1,26 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++ </head>
++ <body>
++
++ <div id="test">
++   <span>-2147483640</span>
++   <span>-2147483645</span>
++   <span>-2147483645</span>
++   <span>-2147483645</span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-03.html b/layout/reftests/counters/counter-ua-limits-03.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-03.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>css-counter-styles-3 Test Suite: content: counter(c)</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  #test { counter-reset: c -2147483635; }
++  #test span { counter-increment: c -5; }
++  #test span:before { content: counter(c); }
++
++  </style>
++ </head>
++ <body>
++
++ <div id="test">
++   <span></span>
++   <span></span>
++   <span></span>
++   <span></span>
++ </div>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-list-00-ref.html b/layout/reftests/counters/counter-ua-limits-list-00-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-list-00-ref.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>test of counter UA overflow rules for HTML lists</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.  It also can't be contributed because it's testing HTML
++    lists.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  ol { margin-left: 10em; padding-left: 0; }
++  li { margin-left: 0; padding-left: 0 }
++
++  </style>
++ </head>
++ <body>
++
++ <ol>
++   <li value="2147483646">Alpha
++   <li value="2147483647">Bravo
++   <li value="2147483647">Charlie
++   <li value="2147483647">Delta
++ </ol>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-list-00.html b/layout/reftests/counters/counter-ua-limits-list-00.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-list-00.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>test of counter UA overflow rules for HTML lists</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.  It also can't be contributed because it's testing HTML
++    lists.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  ol { margin-left: 10em; padding-left: 0; }
++  li { margin-left: 0; padding-left: 0 }
++
++  </style>
++ </head>
++ <body>
++
++ <ol start="2147483646">
++   <li>Alpha
++   <li>Bravo
++   <li>Charlie
++   <li>Delta
++ </ol>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-list-01-ref.html b/layout/reftests/counters/counter-ua-limits-list-01-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-list-01-ref.html
+@@ -0,0 +1,50 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>test of counter UA overflow rules for HTML lists</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.  It also can't be contributed because it's testing HTML
++    lists.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  ol { margin-left: 10em; padding-left: 0; }
++  li { margin-left: 0; padding-left: 0 }
++  li.hidden { visibility: hidden; height: 0 }
++  ol { margin-bottom: 0 }
++  ol + ol { margin-top: 0 }
++
++  </style>
++ </head>
++ <body>
++
++ <!--
++    Work around our inability to parse -2147483648 as an HTML integer attribute
++    (Bug 586761)
++   -->
++ <ol reversed start="-2147483645">
++   <li class="hidden">hidden
++   <li>Alpha
++ </ol>
++ <ol reversed start="-2147483646">
++   <li class="hidden">hidden
++   <li>Bravo
++ </ol>
++ <ol reversed start="-2147483647">
++   <li class="hidden">hidden
++   <li>Charlie
++ </ol>
++ <ol reversed start="-2147483647">
++   <li class="hidden">hidden
++   <li>Delta
++ </ol>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/counter-ua-limits-list-01.html b/layout/reftests/counters/counter-ua-limits-list-01.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/counters/counter-ua-limits-list-01.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<html>
++ <head>
++  <title>test of counter UA overflow rules for HTML lists</title>
++  <!--
++    NOTE: This test cannot be contributed to the test suite because
++    it presumes a 4-byte unsigned integer, which is not required by
++    the spec.  It also can't be contributed because it's testing HTML
++    lists.
++
++    However, it tests the rules for what happens at the UA-specific
++    limit, which are required by the spec.
++   -->
++  <link rel="help" href="http://dev.w3.org/csswg/css-counter-styles-3/#counter-style-range"/>
++  <link rel="help" href="http://krijnhoetmer.nl/irc-logs/css/20130205#l-1590"/>
++  <style type="text/css">
++
++  ol { margin-left: 10em; padding-left: 0; }
++  li { margin-left: 0; padding-left: 0 }
++
++  </style>
++ </head>
++ <body>
++
++ <ol reversed start="-2147483646">
++   <li>Alpha
++   <li>Bravo
++   <li>Charlie
++   <li>Delta
++ </ol>
++
++ </body>
++</html>
+diff --git a/layout/reftests/counters/reftest.list b/layout/reftests/counters/reftest.list
+--- a/layout/reftests/counters/reftest.list
++++ b/layout/reftests/counters/reftest.list
+@@ -56,8 +56,14 @@
+ == t120401-scope-04-d-test.html t120401-scope-04-d-reference.html
+ == t120403-content-none-00-c-test.html t120403-content-none-00-c-reference.html
+ == t120403-display-none-00-c-test.html t120403-display-none-00-c-reference.html
+ == t120403-visibility-00-c-test.html t120403-visibility-00-c-reference.html
+ == text-boundaries-subpixel.html text-boundaries-subpixel-ref.html
+ == counter-hebrew-test.html counter-hebrew-reference.html
+ == counters-hebrew-test.html counters-hebrew-reference.html
+ == counter-reset-integer-range.html counter-reset-integer-range-ref.html
++== counter-ua-limits-00.html counter-ua-limits-00-ref.html
++== counter-ua-limits-01.html counter-ua-limits-01-ref.html
++== counter-ua-limits-02.html counter-ua-limits-02-ref.html
++== counter-ua-limits-03.html counter-ua-limits-03-ref.html
++== counter-ua-limits-list-00.html counter-ua-limits-list-00-ref.html
++== counter-ua-limits-list-01.html counter-ua-limits-list-01-ref.html
