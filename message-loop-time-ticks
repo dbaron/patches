@@ -1,0 +1,759 @@
+From: jar@chromium.org, L. David Baron <dbaron@dbaron.org>
+
+Bug 842550:  Switch to using TimeTicks rather than Time in message loops
+
+The ipc/chromium/src/base/ changes here are the majority of the base/
+changes (excluding those that patch code that does not exist yet in our
+copy) in:
+> From: jar@chromium.org <jar@chromium.org@0039d316-1c4b-4281-b951-d872f2087c98>
+> Date: Sat, 6 Nov 2010 22:23:29 +0000 (+0000)
+> Subject: Switch to using TimeTicks rather than Time in message loops
+> X-Git-Url: http://git.chromium.org/gitweb/?p=chromium.git;a=commitdiff_plain;h=f592c218c18bd1f8308489aaef2e329244ced330
+>
+> Switch to using TimeTicks rather than Time in message loops
+>
+> Switch to using TimeTicks rather than Time so that we
+> are not dependent on changes in the system clock.
+>
+> r=mbelshe,darin
+> Review URL: http://codereview.chromium.org/3884001
+>
+> git-svn-id: svn://svn.chromium.org/chrome/trunk/src@65322 0039d316-1c4b-4281-b951-d872f2087c98
+
+The ipc/glue changes change signatures to match.
+
+diff --git a/ipc/chromium/src/base/message_loop.cc b/ipc/chromium/src/base/message_loop.cc
+--- a/ipc/chromium/src/base/message_loop.cc
++++ b/ipc/chromium/src/base/message_loop.cc
+@@ -30,16 +30,17 @@
+ #ifdef ANDROID
+ #include "base/message_pump_android.h"
+ #endif
+ 
+ #include "MessagePump.h"
+ 
+ using base::Time;
+ using base::TimeDelta;
++using base::TimeTicks;
+ 
+ // A lazily created thread local storage for quick access to a thread's message
+ // loop, if one exists.  This should be safe and free of static constructors.
+ static base::LazyInstance<base::ThreadLocalPointer<MessageLoop> > lazy_tls_ptr(
+     base::LINKER_INITIALIZED);
+ 
+ //------------------------------------------------------------------------------
+ 
+@@ -276,17 +277,17 @@ void MessageLoop::PostTask_Helper(
+     const tracked_objects::Location& from_here, Task* task, int delay_ms,
+     bool nestable) {
+   task->SetBirthPlace(from_here);
+ 
+   PendingTask pending_task(task, nestable);
+ 
+   if (delay_ms > 0) {
+     pending_task.delayed_run_time =
+-        Time::Now() + TimeDelta::FromMilliseconds(delay_ms);
++        TimeTicks::Now() + TimeDelta::FromMilliseconds(delay_ms);
+   } else {
+     DCHECK(delay_ms == 0) << "delay should not be negative";
+   }
+ 
+   // Warning: Don't try to short-circuit, and handle this thread's tasks more
+   // directly, as it could starve handling of foreign threads.  Put every task
+   // into this queue.
+ 
+@@ -443,23 +444,23 @@ bool MessageLoop::DoWork() {
+       }
+     } while (!work_queue_.empty());
+   }
+ 
+   // Nothing happened.
+   return false;
+ }
+ 
+-bool MessageLoop::DoDelayedWork(Time* next_delayed_work_time) {
++bool MessageLoop::DoDelayedWork(TimeTicks* next_delayed_work_time) {
+   if (!nestable_tasks_allowed_ || delayed_work_queue_.empty()) {
+-    *next_delayed_work_time = Time();
++    *next_delayed_work_time = TimeTicks();
+     return false;
+   }
+ 
+-  if (delayed_work_queue_.top().delayed_run_time > Time::Now()) {
++  if (delayed_work_queue_.top().delayed_run_time > TimeTicks::Now()) {
+     *next_delayed_work_time = delayed_work_queue_.top().delayed_run_time;
+     return false;
+   }
+ 
+   PendingTask pending_task = delayed_work_queue_.top();
+   delayed_work_queue_.pop();
+ 
+   if (!delayed_work_queue_.empty())
+diff --git a/ipc/chromium/src/base/message_loop.h b/ipc/chromium/src/base/message_loop.h
+--- a/ipc/chromium/src/base/message_loop.h
++++ b/ipc/chromium/src/base/message_loop.h
+@@ -287,20 +287,20 @@ public:
+     ~AutoRunState();
+    private:
+     MessageLoop* loop_;
+     RunState* previous_state_;
+   };
+ 
+   // This structure is copied around by value.
+   struct PendingTask {
+-    Task* task;                   // The task to run.
+-    base::Time delayed_run_time;  // The time when the task should be run.
+-    int sequence_num;             // Used to facilitate sorting by run time.
+-    bool nestable;                // True if OK to dispatch from a nested loop.
++    Task* task;                        // The task to run.
++    base::TimeTicks delayed_run_time;  // The time when the task should be run.
++    int sequence_num;                  // Secondary sort key for run time.
++    bool nestable;                     // OK to dispatch from a nested loop.
+ 
+     PendingTask(Task* task, bool nestable)
+         : task(task), sequence_num(0), nestable(nestable) {
+     }
+ 
+     // Used to support sorting.
+     bool operator<(const PendingTask& other) const;
+   };
+@@ -365,17 +365,17 @@ public:
+   bool DeletePendingTasks();
+ 
+   // Post a task to our incomming queue.
+   void PostTask_Helper(const tracked_objects::Location& from_here, Task* task,
+                        int delay_ms, bool nestable);
+ 
+   // base::MessagePump::Delegate methods:
+   virtual bool DoWork();
+-  virtual bool DoDelayedWork(base::Time* next_delayed_work_time);
++  virtual bool DoDelayedWork(base::TimeTicks* next_delayed_work_time);
+   virtual bool DoIdleWork();
+ 
+   Type type_;
+ 
+   // A list of tasks that need to be processed by this instance.  Note that
+   // this queue is only accessed (push/pop) by our current thread.
+   TaskQueue work_queue_;
+ 
+diff --git a/ipc/chromium/src/base/message_pump.h b/ipc/chromium/src/base/message_pump.h
+--- a/ipc/chromium/src/base/message_pump.h
++++ b/ipc/chromium/src/base/message_pump.h
+@@ -4,17 +4,17 @@
+ 
+ #ifndef BASE_MESSAGE_PUMP_H_
+ #define BASE_MESSAGE_PUMP_H_
+ 
+ #include "base/ref_counted.h"
+ 
+ namespace base {
+ 
+-class Time;
++class TimeTicks;
+ 
+ class MessagePump : public RefCountedThreadSafe<MessagePump> {
+  public:
+   // Please see the comments above the Run method for an illustration of how
+   // these delegate methods are used.
+   class Delegate {
+    public:
+     virtual ~Delegate() {}
+@@ -27,17 +27,17 @@ class MessagePump : public RefCountedThr
+     // Called from within Run in response to ScheduleDelayedWork or when the
+     // message pump would otherwise sleep waiting for more work.  Returns true
+     // to indicate that delayed work was done.  DoIdleWork will not be called
+     // if DoDelayedWork returns true.  Upon return |next_delayed_work_time|
+     // indicates the time when DoDelayedWork should be called again.  If
+     // |next_delayed_work_time| is null (per Time::is_null), then the queue of
+     // future delayed work (timer events) is currently empty, and no additional
+     // calls to this function need to be scheduled.
+-    virtual bool DoDelayedWork(Time* next_delayed_work_time) = 0;
++    virtual bool DoDelayedWork(TimeTicks* next_delayed_work_time) = 0;
+ 
+     // Called from within Run just before the message pump goes to sleep.
+     // Returns true to indicate that idle work was done.
+     virtual bool DoIdleWork() = 0;
+   };
+ 
+   virtual ~MessagePump() {}
+ 
+@@ -117,14 +117,14 @@ class MessagePump : public RefCountedThr
+   // If a MessagePump can already guarantee that DoWork will be called
+   // "reasonably soon", this method can be a no-op to avoid expensive
+   // atomic tests and/or syscalls required for ScheduleWork().
+   virtual void ScheduleWorkForNestedLoop() { ScheduleWork(); };
+ 
+   // Schedule a DoDelayedWork callback to happen at the specified time,
+   // cancelling any pending DoDelayedWork callback.  This method may only be
+   // used on the thread that called Run.
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time) = 0;
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time) = 0;
+ };
+ 
+ }  // namespace base
+ 
+ #endif  // BASE_MESSAGE_PUMP_H_
+diff --git a/ipc/chromium/src/base/message_pump_default.cc b/ipc/chromium/src/base/message_pump_default.cc
+--- a/ipc/chromium/src/base/message_pump_default.cc
++++ b/ipc/chromium/src/base/message_pump_default.cc
+@@ -36,23 +36,23 @@ void MessagePumpDefault::Run(Delegate* d
+       break;
+ 
+     if (did_work)
+       continue;
+ 
+     if (delayed_work_time_.is_null()) {
+       event_.Wait();
+     } else {
+-      TimeDelta delay = delayed_work_time_ - Time::Now();
++      TimeDelta delay = delayed_work_time_ - TimeTicks::Now();
+       if (delay > TimeDelta()) {
+         event_.TimedWait(delay);
+       } else {
+         // It looks like delayed_work_time_ indicates a time in the past, so we
+         // need to call DoDelayedWork now.
+-        delayed_work_time_ = Time();
++        delayed_work_time_ = TimeTicks();
+       }
+     }
+     // Since event_ is auto-reset, we don't need to do anything special here
+     // other than service each delegate method.
+   }
+ 
+   keep_running_ = true;
+ }
+@@ -62,16 +62,17 @@ void MessagePumpDefault::Quit() {
+ }
+ 
+ void MessagePumpDefault::ScheduleWork() {
+   // Since this can be called on any thread, we need to ensure that our Run
+   // loop wakes up.
+   event_.Signal();
+ }
+ 
+-void MessagePumpDefault::ScheduleDelayedWork(const Time& delayed_work_time) {
++void MessagePumpDefault::ScheduleDelayedWork(
++    const TimeTicks& delayed_work_time) {
+   // We know that we can't be blocked on Wait right now since this method can
+   // only be called on the same thread as Run, so we only need to update our
+   // record of how long to sleep when we do sleep.
+   delayed_work_time_ = delayed_work_time;
+ }
+ 
+ }  // namespace base
+diff --git a/ipc/chromium/src/base/message_pump_default.h b/ipc/chromium/src/base/message_pump_default.h
+--- a/ipc/chromium/src/base/message_pump_default.h
++++ b/ipc/chromium/src/base/message_pump_default.h
+@@ -15,27 +15,27 @@ class MessagePumpDefault : public Messag
+  public:
+   MessagePumpDefault();
+   ~MessagePumpDefault() {}
+ 
+   // MessagePump methods:
+   virtual void Run(Delegate* delegate);
+   virtual void Quit();
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+  protected:
+   // This flag is set to false when Run should return.
+   bool keep_running_;
+ 
+   // Used to sleep until there is more work to do.
+   WaitableEvent event_;
+ 
+   // The time at which we should call DoDelayedWork.
+-  Time delayed_work_time_;
++  TimeTicks delayed_work_time_;
+ 
+  private:
+   DISALLOW_COPY_AND_ASSIGN(MessagePumpDefault);
+ };
+ 
+ }  // namespace base
+ 
+ #endif  // BASE_MESSAGE_PUMP_DEFAULT_H_
+diff --git a/ipc/chromium/src/base/message_pump_glib.cc b/ipc/chromium/src/base/message_pump_glib.cc
+--- a/ipc/chromium/src/base/message_pump_glib.cc
++++ b/ipc/chromium/src/base/message_pump_glib.cc
+@@ -16,25 +16,25 @@
+ 
+ namespace {
+ 
+ // We send a byte across a pipe to wakeup the event loop.
+ const char kWorkScheduled = '\0';
+ 
+ // Return a timeout suitable for the glib loop, -1 to block forever,
+ // 0 to return right away, or a timeout in milliseconds from now.
+-int GetTimeIntervalMilliseconds(base::Time from) {
++int GetTimeIntervalMilliseconds(const base::TimeTicks& from) {
+   if (from.is_null())
+     return -1;
+ 
+   // Be careful here.  TimeDelta has a precision of microseconds, but we want a
+   // value in milliseconds.  If there are 5.5ms left, should the delay be 5 or
+   // 6?  It should be 6 to avoid executing delayed work too early.
+   int delay = static_cast<int>(
+-      ceil((from - base::Time::Now()).InMillisecondsF()));
++      ceil((from - base::TimeTicks::Now()).InMillisecondsF()));
+ 
+   // If this value is negative, then we need to run delayed work soon.
+   return delay < 0 ? 0 : delay;
+ }
+ 
+ // A brief refresher on GLib:
+ //     GLib sources have four callbacks: Prepare, Check, Dispatch and Finalize.
+ // On each iteration of the GLib pump, it calls each source's Prepare function.
+@@ -304,17 +304,17 @@ void MessagePumpForUI::ScheduleWork() {
+   // variables as we would then need locks all over.  This ensures that if
+   // we are sleeping in a poll that we will wake up.
+   char msg = '!';
+   if (HANDLE_EINTR(write(wakeup_pipe_write_, &msg, 1)) != 1) {
+     NOTREACHED() << "Could not write to the UI message loop wakeup pipe!";
+   }
+ }
+ 
+-void MessagePumpForUI::ScheduleDelayedWork(const Time& delayed_work_time) {
++void MessagePumpForUI::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
+   // We need to wake up the loop in case the poll timeout needs to be
+   // adjusted.  This will cause us to try to do work, but that's ok.
+   delayed_work_time_ = delayed_work_time;
+   ScheduleWork();
+ }
+ 
+ // static
+ void MessagePumpForUI::EventDispatcher(GdkEvent* event, gpointer data) {
+diff --git a/ipc/chromium/src/base/message_pump_glib.h b/ipc/chromium/src/base/message_pump_glib.h
+--- a/ipc/chromium/src/base/message_pump_glib.h
++++ b/ipc/chromium/src/base/message_pump_glib.h
+@@ -54,17 +54,17 @@ class MessagePumpForUI : public MessageP
+   virtual ~MessagePumpForUI();
+ 
+   // Like MessagePump::Run, but GdkEvent objects are routed through dispatcher.
+   virtual void RunWithDispatcher(Delegate* delegate, Dispatcher* dispatcher);
+ 
+   virtual void Run(Delegate* delegate) { RunWithDispatcher(delegate, NULL); }
+   virtual void Quit();
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+   // Internal methods used for processing the pump callbacks.  They are
+   // public for simplicity but should not be used directly.  HandlePrepare
+   // is called during the prepare step of glib, and returns a timeout that
+   // will be passed to the poll. HandleCheck is called after the poll
+   // has completed, and returns whether or not HandleDispatch should be called.
+   // HandleDispatch is called if HandleCheck returned true.
+   int HandlePrepare();
+@@ -111,17 +111,17 @@ class MessagePumpForUI : public MessageP
+   RunState* state_;
+ 
+   // This is a GLib structure that we can add event sources to.  We use the
+   // default GLib context, which is the one to which all GTK events are
+   // dispatched.
+   GMainContext* context_;
+ 
+   // This is the time when we need to do delayed work.
+-  Time delayed_work_time_;
++  TimeTicks delayed_work_time_;
+ 
+   // The work source.  It is shared by all calls to Run and destroyed when
+   // the message pump is destroyed.
+   GSource* work_source_;
+ 
+   // We use a wakeup pipe to make sure we'll get out of the glib polling phase
+   // when another thread has scheduled us to do some work.  There is a glib
+   // mechanism g_main_context_wakeup, but this won't guarantee that our event's
+diff --git a/ipc/chromium/src/base/message_pump_libevent.cc b/ipc/chromium/src/base/message_pump_libevent.cc
+--- a/ipc/chromium/src/base/message_pump_libevent.cc
++++ b/ipc/chromium/src/base/message_pump_libevent.cc
+@@ -326,27 +326,27 @@ void MessagePumpLibevent::Run(Delegate* 
+     if (did_work)
+       continue;
+ 
+     // EVLOOP_ONCE tells libevent to only block once,
+     // but to service all pending events when it wakes up.
+     if (delayed_work_time_.is_null()) {
+       event_base_loop(event_base_, EVLOOP_ONCE);
+     } else {
+-      TimeDelta delay = delayed_work_time_ - Time::Now();
++      TimeDelta delay = delayed_work_time_ - TimeTicks::Now();
+       if (delay > TimeDelta()) {
+         struct timeval poll_tv;
+         poll_tv.tv_sec = delay.InSeconds();
+         poll_tv.tv_usec = delay.InMicroseconds() % Time::kMicrosecondsPerSecond;
+         event_base_loopexit(event_base_, &poll_tv);
+         event_base_loop(event_base_, EVLOOP_ONCE);
+       } else {
+         // It looks like delayed_work_time_ indicates a time in the past, so we
+         // need to call DoDelayedWork now.
+-        delayed_work_time_ = Time();
++        delayed_work_time_ = TimeTicks();
+       }
+     }
+   }
+ 
+   keep_running_ = true;
+   in_run_ = old_in_run;
+ }
+ 
+@@ -360,17 +360,18 @@ void MessagePumpLibevent::Quit() {
+ void MessagePumpLibevent::ScheduleWork() {
+   // Tell libevent (in a threadsafe way) that it should break out of its loop.
+   char buf = 0;
+   int nwrite = HANDLE_EINTR(write(wakeup_pipe_in_, &buf, 1));
+   DCHECK(nwrite == 1 || errno == EAGAIN)
+       << "[nwrite:" << nwrite << "] [errno:" << errno << "]";
+ }
+ 
+-void MessagePumpLibevent::ScheduleDelayedWork(const Time& delayed_work_time) {
++void MessagePumpLibevent::ScheduleDelayedWork(
++    const TimeTicks& delayed_work_time) {
+   // We know that we can't be blocked on Wait right now since this method can
+   // only be called on the same thread as Run, so we only need to update our
+   // record of how long to sleep when we do sleep.
+   delayed_work_time_ = delayed_work_time;
+ }
+ 
+ void LineWatcher::OnFileCanReadWithoutBlocking(int aFd)
+ {
+diff --git a/ipc/chromium/src/base/message_pump_libevent.h b/ipc/chromium/src/base/message_pump_libevent.h
+--- a/ipc/chromium/src/base/message_pump_libevent.h
++++ b/ipc/chromium/src/base/message_pump_libevent.h
+@@ -132,31 +132,31 @@ class MessagePumpLibevent : public Messa
+                    SignalEvent* sigevent,
+                    SignalWatcher* delegate);
+ 
+ 
+   // MessagePump methods:
+   virtual void Run(Delegate* delegate);
+   virtual void Quit();
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+  private:
+ 
+   // Risky part of constructor.  Returns true on success.
+   bool Init();
+ 
+   // This flag is set to false when Run should return.
+   bool keep_running_;
+ 
+   // This flag is set when inside Run.
+   bool in_run_;
+ 
+   // The time at which we should call DoDelayedWork.
+-  Time delayed_work_time_;
++  TimeTicks delayed_work_time_;
+ 
+   // Libevent dispatcher.  Watches all sockets registered with it, and sends
+   // readiness callbacks when a socket is ready for I/O.
+   event_base* event_base_;
+ 
+   // Called by libevent to tell us a registered FD can be read/written to.
+   static void OnLibeventNotification(int fd, short flags,
+                                      void* context);
+diff --git a/ipc/chromium/src/base/message_pump_mac.h b/ipc/chromium/src/base/message_pump_mac.h
+--- a/ipc/chromium/src/base/message_pump_mac.h
++++ b/ipc/chromium/src/base/message_pump_mac.h
+@@ -38,34 +38,34 @@
+ #if defined(__OBJC__)
+ @class NSAutoreleasePool;
+ #else  // defined(__OBJC__)
+ class NSAutoreleasePool;
+ #endif  // defined(__OBJC__)
+ 
+ namespace base {
+ 
+-class Time;
++class TimeTicks;
+ 
+ class MessagePumpCFRunLoopBase : public MessagePump {
+   // Needs access to CreateAutoreleasePool.
+   friend class MessagePumpScopedAutoreleasePool;
+  public:
+   MessagePumpCFRunLoopBase();
+   virtual ~MessagePumpCFRunLoopBase();
+ 
+   // Subclasses should implement the work they need to do in MessagePump::Run
+   // in the DoRun method.  MessagePumpCFRunLoopBase::Run calls DoRun directly.
+   // This arrangement is used because MessagePumpCFRunLoopBase needs to set
+   // up and tear down things before and after the "meat" of DoRun.
+   virtual void Run(Delegate* delegate);
+   virtual void DoRun(Delegate* delegate) = 0;
+ 
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+  protected:
+   // Accessors for private data members to be used by subclasses.
+   CFRunLoopRef run_loop() const { return run_loop_; }
+   int nesting_level() const { return nesting_level_; }
+   int run_nesting_level() const { return run_nesting_level_; }
+ 
+   // Return an autorelease pool to wrap around any work being performed.
+diff --git a/ipc/chromium/src/base/message_pump_mac.mm b/ipc/chromium/src/base/message_pump_mac.mm
+--- a/ipc/chromium/src/base/message_pump_mac.mm
++++ b/ipc/chromium/src/base/message_pump_mac.mm
+@@ -220,21 +220,27 @@ void MessagePumpCFRunLoopBase::Run(Deleg
+ // May be called on any thread.
+ void MessagePumpCFRunLoopBase::ScheduleWork() {
+   CFRunLoopSourceSignal(work_source_);
+   CFRunLoopWakeUp(run_loop_);
+ }
+ 
+ // Must be called on the run loop thread.
+ void MessagePumpCFRunLoopBase::ScheduleDelayedWork(
+-    const Time& delayed_work_time) {
++    const TimeTicks& delayed_work_time) {
++  // TODO(jar): We may need a more efficient way to go between these times, but
++  // the difference will change not only when we sleep/wake, it will also change
++  // when the user changes the wall clock time :-/.
++  Time absolute_work_time =
++      (delayed_work_time - TimeTicks::Now()) + Time::Now();
++
+   Time::Exploded exploded;
+-  delayed_work_time.UTCExplode(&exploded);
++  absolute_work_time.UTCExplode(&exploded);
+   double seconds = exploded.second +
+-                   (static_cast<double>((delayed_work_time.ToInternalValue()) %
++                   (static_cast<double>((absolute_work_time.ToInternalValue()) %
+                                         Time::kMicrosecondsPerSecond) /
+                     Time::kMicrosecondsPerSecond);
+   CFGregorianDate gregorian = {
+     exploded.year,
+     exploded.month,
+     exploded.day_of_month,
+     exploded.hour,
+     exploded.minute,
+@@ -315,22 +321,22 @@ bool MessagePumpCFRunLoopBase::RunDelaye
+ 
+   // The NSApplication-based run loop only drains the autorelease pool at each
+   // UI event (NSEvent).  The autorelease pool is not drained for each
+   // CFRunLoopSource target that's run.  Use a local pool for any autoreleased
+   // objects if the app is not currently handling a UI event to ensure they're
+   // released promptly even in the absence of UI events.
+   MessagePumpScopedAutoreleasePool autorelease_pool(this);
+ 
+-  Time next_time;
++  TimeTicks next_time;
+   delegate_->DoDelayedWork(&next_time);
+ 
+   bool more_work = !next_time.is_null();
+   if (more_work) {
+-    TimeDelta delay = next_time - Time::Now();
++    TimeDelta delay = next_time - TimeTicks::Now();
+     if (delay > TimeDelta()) {
+       // There's more delayed work to be done in the future.
+       ScheduleDelayedWork(next_time);
+     } else {
+       // There's more delayed work to be done, and its time is in the past.
+       // Arrange to come back here directly as long as the loop is still
+       // running.
+       CFRunLoopSourceSignal(delayed_work_source_);
+diff --git a/ipc/chromium/src/base/message_pump_win.cc b/ipc/chromium/src/base/message_pump_win.cc
+--- a/ipc/chromium/src/base/message_pump_win.cc
++++ b/ipc/chromium/src/base/message_pump_win.cc
+@@ -65,17 +65,18 @@ void MessagePumpWin::Quit() {
+ 
+ int MessagePumpWin::GetCurrentDelay() const {
+   if (delayed_work_time_.is_null())
+     return -1;
+ 
+   // Be careful here.  TimeDelta has a precision of microseconds, but we want a
+   // value in milliseconds.  If there are 5.5ms left, should the delay be 5 or
+   // 6?  It should be 6 to avoid executing delayed work too early.
+-  double timeout = ceil((delayed_work_time_ - Time::Now()).InMillisecondsF());
++  double timeout =
++      ceil((delayed_work_time_ - TimeTicks::Now()).InMillisecondsF());
+ 
+   // If this value is negative, then we need to run delayed work soon.
+   int delay = static_cast<int>(timeout);
+   if (delay < 0)
+     delay = 0;
+ 
+   return delay;
+ }
+@@ -99,17 +100,17 @@ void MessagePumpForUI::ScheduleWork() {
+   // Make sure the MessagePump does some work for us.
+   PostMessage(message_hwnd_, kMsgHaveWork, reinterpret_cast<WPARAM>(this), 0);
+ 
+   // In order to wake up any cross-process COM calls which may currently be
+   // pending on the main thread, we also have to post a UI message.
+   PostMessage(message_hwnd_, WM_NULL, 0, 0);
+ }
+ 
+-void MessagePumpForUI::ScheduleDelayedWork(const Time& delayed_work_time) {
++void MessagePumpForUI::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
+   //
+   // We would *like* to provide high resolution timers.  Windows timers using
+   // SetTimer() have a 10ms granularity.  We have to use WM_TIMER as a wakeup
+   // mechanism because the application can enter modal windows loops where it
+   // is not running our MessageLoop; the only way to have our timers fire in
+   // these cases is to post messages there.
+   //
+   // To provide sub-10ms timers, we process timers directly from our run loop.
+@@ -426,17 +427,17 @@ void MessagePumpForIO::ScheduleWork() {
+ 
+   // Make sure the MessagePump does some work for us.
+   BOOL ret = PostQueuedCompletionStatus(port_, 0,
+                                         reinterpret_cast<ULONG_PTR>(this),
+                                         reinterpret_cast<OVERLAPPED*>(this));
+   DCHECK(ret);
+ }
+ 
+-void MessagePumpForIO::ScheduleDelayedWork(const Time& delayed_work_time) {
++void MessagePumpForIO::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
+   // We know that we can't be blocked right now since this method can only be
+   // called on the same thread as Run, so we only need to update our record of
+   // how long to sleep when we do sleep.
+   delayed_work_time_ = delayed_work_time;
+ }
+ 
+ void MessagePumpForIO::RegisterIOHandler(HANDLE file_handle,
+                                          IOHandler* handler) {
+diff --git a/ipc/chromium/src/base/message_pump_win.h b/ipc/chromium/src/base/message_pump_win.h
+--- a/ipc/chromium/src/base/message_pump_win.h
++++ b/ipc/chromium/src/base/message_pump_win.h
+@@ -91,17 +91,17 @@ class MessagePumpWin : public MessagePum
+   };
+ 
+   virtual void DoRunLoop() = 0;
+   int GetCurrentDelay() const;
+ 
+   ObserverList<Observer> observers_;
+ 
+   // The time at which delayed work should run.
+-  Time delayed_work_time_;
++  TimeTicks delayed_work_time_;
+ 
+   // A boolean value used to indicate if there is a kMsgDoWork message pending
+   // in the Windows Message queue.  There is at most one such message, and it
+   // can drive execution of tasks when a native message pump is running.
+   LONG have_work_;
+ 
+   // State for the current invocation of Run.
+   RunState* state_;
+@@ -157,17 +157,17 @@ class MessagePumpWin : public MessagePum
+ //
+ class MessagePumpForUI : public MessagePumpWin {
+  public:
+   MessagePumpForUI();
+   virtual ~MessagePumpForUI();
+ 
+   // MessagePump methods:
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+   // Applications can call this to encourage us to process all pending WM_PAINT
+   // messages.  This method will process all paint messages the Windows Message
+   // queue can provide, up to some fixed number (to avoid any infinite loops).
+   void PumpOutPendingPaintMessages();
+ 
+  private:
+   static LRESULT CALLBACK WndProcThunk(
+@@ -294,17 +294,17 @@ class MessagePumpForIO : public MessageP
+     IOHandler* handler;
+   };
+ 
+   MessagePumpForIO();
+   virtual ~MessagePumpForIO() {}
+ 
+   // MessagePump methods:
+   virtual void ScheduleWork();
+-  virtual void ScheduleDelayedWork(const Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const TimeTicks& delayed_work_time);
+ 
+   // Register the handler to be used when asynchronous IO for the given file
+   // completes. The registration persists as long as |file_handle| is valid, so
+   // |handler| must be valid as long as there is pending IO for the given file.
+   void RegisterIOHandler(HANDLE file_handle, IOHandler* handler);
+ 
+   // Waits for the next IO completion that should be processed by |filter|, for
+   // up to |timeout| milliseconds. Return true if any IO operation completed,
+diff --git a/ipc/glue/MessagePump.cpp b/ipc/glue/MessagePump.cpp
+--- a/ipc/glue/MessagePump.cpp
++++ b/ipc/glue/MessagePump.cpp
+@@ -17,17 +17,17 @@
+ 
+ #ifdef MOZ_WIDGET_ANDROID
+ #include "AndroidBridge.h"
+ #endif
+ 
+ using mozilla::ipc::DoWorkRunnable;
+ using mozilla::ipc::MessagePump;
+ using mozilla::ipc::MessagePumpForChildProcess;
+-using base::Time;
++using base::TimeTicks;
+ 
+ NS_IMPL_THREADSAFE_ISUPPORTS2(DoWorkRunnable, nsIRunnable, nsITimerCallback)
+ 
+ NS_IMETHODIMP
+ DoWorkRunnable::Run()
+ {
+   MessageLoop* loop = MessageLoop::current();
+   NS_ASSERTION(loop, "Shouldn't be null!");
+@@ -142,17 +142,17 @@ MessagePump::ScheduleWorkForNestedLoop()
+ {
+   // This method is called when our MessageLoop has just allowed
+   // nested tasks.  In our setup, whenever that happens we know that
+   // DoWork() will be called "soon", so there's no need to pay the
+   // cost of what will be a no-op nsThread::Dispatch(mDoWorkEvent).
+ }
+ 
+ void
+-MessagePump::ScheduleDelayedWork(const base::Time& aDelayedTime)
++MessagePump::ScheduleDelayedWork(const base::TimeTicks& aDelayedTime)
+ {
+   if (!mDelayedWorkTimer) {
+     mDelayedWorkTimer = do_CreateInstance(NS_TIMER_CONTRACTID);
+     if (!mDelayedWorkTimer) {
+         // Called before XPCOM has started up? We can't do this correctly.
+         NS_WARNING("Delayed task might not run!");
+         delayed_work_time_ = aDelayedTime;
+         return;
+@@ -160,17 +160,17 @@ MessagePump::ScheduleDelayedWork(const b
+   }
+ 
+   if (!delayed_work_time_.is_null()) {
+     mDelayedWorkTimer->Cancel();
+   }
+ 
+   delayed_work_time_ = aDelayedTime;
+ 
+-  base::TimeDelta delay = aDelayedTime - base::Time::Now();
++  base::TimeDelta delay = aDelayedTime - base::TimeTicks::Now();
+   uint32_t delayMS = uint32_t(delay.InMilliseconds());
+   mDelayedWorkTimer->InitWithCallback(mDoWorkEvent, delayMS,
+                                       nsITimer::TYPE_ONE_SHOT);
+ }
+ 
+ void
+ MessagePump::DoDelayedWork(base::MessagePump::Delegate* aDelegate)
+ {
+diff --git a/ipc/glue/MessagePump.h b/ipc/glue/MessagePump.h
+--- a/ipc/glue/MessagePump.h
++++ b/ipc/glue/MessagePump.h
+@@ -41,17 +41,17 @@ class MessagePump : public base::Message
+ {
+ 
+ public:
+   MessagePump();
+ 
+   virtual void Run(base::MessagePump::Delegate* aDelegate);
+   virtual void ScheduleWork();
+   virtual void ScheduleWorkForNestedLoop();
+-  virtual void ScheduleDelayedWork(const base::Time& delayed_work_time);
++  virtual void ScheduleDelayedWork(const base::TimeTicks& delayed_work_time);
+ 
+   void DoDelayedWork(base::MessagePump::Delegate* aDelegate);
+ 
+ private:
+   nsRefPtr<DoWorkRunnable> mDoWorkEvent;
+   nsCOMPtr<nsITimer> mDelayedWorkTimer;
+ 
+   // Weak!
