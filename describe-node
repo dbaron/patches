@@ -1,0 +1,160 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add nsINode::DescribeNode for use in debugging.
+
+diff --git a/content/base/public/nsINode.h b/content/base/public/nsINode.h
+--- a/content/base/public/nsINode.h
++++ b/content/base/public/nsINode.h
+@@ -526,16 +526,25 @@ public:
+    * the non-namespaced tag, and for other nodes it's something like "#text",
+    * "#comment", "#document", etc.
+    */
+   nsIAtom* Tag() const
+   {
+     return mNodeInfo->NameAtom();
+   }
+ 
++#ifdef DEBUG
++  /**
++   * Append a description of this node, in CSS selector-like form, to
++   * the given UTF-16 string.  The result is intended to be usable for
++   * printing to the console or to logs during debugging.
++   */
++   void DescribeNode(nsSubstring &aDestString, uint32_t aDepthLimit = UINT32_MAX);
++#endif
++
+   /**
+    * Insert a content node at a particular index.  This method handles calling
+    * BindToTree on the child appropriately.
+    *
+    * @param aKid the content to insert
+    * @param aIndex the index it is being inserted at (the index it will have
+    *        after it is inserted)
+    * @param aNotify whether to notify the document (current document for
+diff --git a/content/base/src/nsINode.cpp b/content/base/src/nsINode.cpp
+--- a/content/base/src/nsINode.cpp
++++ b/content/base/src/nsINode.cpp
+@@ -84,16 +84,17 @@
+ #include "nsNodeInfoManager.h"
+ #include "nsNodeUtils.h"
+ #include "nsPIBoxObject.h"
+ #include "nsPIDOMWindow.h"
+ #include "nsPresContext.h"
+ #include "nsRuleProcessorData.h"
+ #include "nsString.h"
+ #include "nsStyleConsts.h"
++#include "nsStyleUtil.h"
+ #include "nsSVGFeatures.h"
+ #include "nsSVGUtils.h"
+ #include "nsTextNode.h"
+ #include "nsUnicharUtils.h"
+ #include "nsXBLBinding.h"
+ #include "nsXBLInsertionPoint.h"
+ #include "nsXBLPrototypeBinding.h"
+ #include "prprf.h"
+@@ -142,16 +143,105 @@ nsINode::nsSlots::Unlink()
+ //----------------------------------------------------------------------
+ 
+ nsINode::~nsINode()
+ {
+   NS_ASSERTION(!HasSlots(), "nsNodeUtils::LastRelease was not called?");
+   NS_ASSERTION(mSubtreeRoot == this, "Didn't restore state properly?");
+ }
+ 
++#ifdef DEBUG
++void
++nsINode::DescribeNode(nsSubstring &aDestString, uint32_t aDepthLimit)
++{
++  nsAutoTArray<nsINode*, 64> stack;
++  for (nsINode *n = this; n && aDepthLimit-- != 0; n = n->GetParentNode()) {
++    stack.AppendElement(n);
++  }
++
++  if (stack.IsEmpty()) {
++    return;
++  }
++
++  for (uint32_t stackIdx = stack.Length(); stackIdx-- != 0; ) {
++    nsINode *n = stack[stackIdx];
++    switch (n->NodeType()) {
++      case nsIDOMNode::ELEMENT_NODE: {
++        Element *e = n->AsElement();
++        // tag name
++        nsStyleUtil::AppendEscapedCSSIdent(n->NodeName(), aDestString);
++        // id
++        nsIAtom *id = e->GetID();
++        if (id) {
++          aDestString.AppendASCII("#");
++          nsStyleUtil::AppendEscapedCSSIdent(
++            nsDependentAtomString(id), aDestString);
++        }
++        // classes
++        const nsAttrValue *classes = e->GetClasses();
++        if (classes) {
++          for (uint32_t classIdx = 0, classEnd = classes->GetAtomCount();
++               classIdx < classEnd; ++classIdx) {
++            aDestString.AppendASCII(".");
++            nsStyleUtil::AppendEscapedCSSIdent(
++              nsDependentAtomString(classes->AtomAt(classIdx)), aDestString);
++          }
++        }
++
++        // index in parent
++        // FIXME: do this only when needed
++        nsNthIndexCache cache;
++        int32_t index = cache.GetNthIndex(e, false, false, false);
++        aDestString.AppendASCII(":nth-child(");
++        aDestString.AppendInt(index);
++        aDestString.AppendASCII(")");
++        break;
++      }
++      case nsIDOMNode::DOCUMENT_NODE: {
++        nsIDocument *doc = n->OwnerDoc();
++        nsIURI *uri = doc->GetDocumentURI();
++        nsAutoCString spec;
++        if (uri) {
++          uri->GetSpec(spec);
++        }
++        aDestString.AppendASCII("::document(");
++        nsStyleUtil::AppendEscapedCSSString(
++          NS_ConvertUTF8toUTF16(spec), aDestString);
++        aDestString.AppendASCII(")");
++        break;
++      }
++      default: {
++        aDestString.AppendASCII("::node(");
++        const nsString& nodeName = n->NodeName();
++        if (!nodeName.IsEmpty() && nodeName.First() == '#') {
++          nsStyleUtil::AppendEscapedCSSIdent(Substring(nodeName, 1),
++                                             aDestString);
++          nsAutoString nodeValue;
++          n->GetNodeValue(nodeValue);
++          if (!nodeValue.IsEmpty()) {
++            aDestString.AppendASCII(", ");
++            nsStyleUtil::AppendEscapedCSSString(nodeValue, aDestString);
++          }
++        } else {
++          aDestString.AppendASCII("type ");
++          aDestString.AppendInt(n->NodeType());
++          aDestString.AppendASCII(", ");
++          nsStyleUtil::AppendEscapedCSSString(nodeName, aDestString);
++        }
++        aDestString.AppendASCII(")");
++        break;
++      }
++    }
++    if (stackIdx != 0) {
++      aDestString.AppendASCII(" > ");
++    }
++  }
++}
++#endif
++
+ void*
+ nsINode::GetProperty(uint16_t aCategory, nsIAtom *aPropertyName,
+                      nsresult *aStatus) const
+ {
+   return OwnerDoc()->PropertyTable(aCategory)->GetProperty(this, aPropertyName,
+                                                            aStatus);
+ }
+ 
