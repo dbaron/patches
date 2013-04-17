@@ -1,0 +1,235 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make jprof work on Android/B2G.
+
+diff --git a/tools/jprof/stub/libmalloc.cpp b/tools/jprof/stub/libmalloc.cpp
+--- a/tools/jprof/stub/libmalloc.cpp
++++ b/tools/jprof/stub/libmalloc.cpp
+@@ -23,18 +23,20 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <signal.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <sys/syscall.h>
++#ifndef ANDROID
+ #include <ucontext.h>
+ #include <execinfo.h>
++#endif
+ 
+ #include "libmalloc.h"
+ #include "jprof.h"
+ #include <string.h>
+ #include <errno.h>
+ #include <dlfcn.h>
+ 
+ #include "mozilla/mozalloc_undef_macro_wrappers.h"
+@@ -49,20 +51,24 @@ void moz_xfree(void *mem)
+ {
+     free(mem);
+ }
+ 
+ #ifdef NTO
+ #include <sys/link.h>
+ extern r_debug _r_debug;
+ #else
++#ifndef ANDROID
+ #include <link.h>
+ #endif
++#endif
+ 
++#ifndef ANDROID
+ #define USE_GLIBC_BACKTRACE 1
++#endif
+ // To debug, use #define JPROF_STATIC
+ #define JPROF_STATIC static
+ 
+ static int gLogFD = -1;
+ static pthread_t main_thread;
+ 
+ static void startSignalCounter(unsigned long millisec);
+ static int enableRTCSignals(bool enable);
+@@ -82,17 +88,17 @@ struct JprofShutdown {
+ 
+ static void RegisterJprofShutdown() {
+     // This instanciates the dummy class above, and will trigger the class
+     // destructor when libxul is unloaded. This is equivalent to atexit(),
+     // but gracefully handles dlclose().
+     static JprofShutdown t;
+ }
+ 
+-#if defined(i386) || defined(_i386) || defined(__x86_64__)
++#if defined(i386) || defined(_i386) || defined(__x86_64__) || defined(__arm__)
+ JPROF_STATIC void CrawlStack(malloc_log_entry* me,
+                              void* stack_top, void* top_instr_ptr)
+ {
+ #if USE_GLIBC_BACKTRACE
+     // This probably works on more than x86!  But we need a way to get the
+     // top instruction pointer, which is kindof arch-specific
+     void *array[500];
+     int cnt, i;
+@@ -118,17 +124,17 @@ JPROF_STATIC void CrawlStack(malloc_log_
+ #if defined(__i386)
+   __asm__( "movl %%ebp, %0" : "=g"(bp));
+ #elif defined(__x86_64__)
+   __asm__( "movq %%rbp, %0" : "=g"(bp));
+ #else
+   // It would be nice if this worked uniformly, but at least on i386 and
+   // x86_64, it stopped working with gcc 4.1, because it points to the
+   // end of the saved registers instead of the start.
+-  bp = __builtin_frame_address(0);
++  bp = (void**)__builtin_frame_address(0);
+ #endif
+   u_long numpcs = 0;
+   bool tracing = false;
+ 
+   me->pcs[numpcs++] = (char*) top_instr_ptr;
+ 
+   while (numpcs < MAX_STACK_CRAWL) {
+     void** nextbp = (void**) *bp++;
+@@ -398,17 +404,17 @@ JprofBufferDump()
+ 
+ JPROF_STATIC void
+ JprofLog(u_long aTime, void* stack_top, void* top_instr_ptr)
+ {
+   // Static is simply to make debugging tolerable
+   static malloc_log_entry me;
+ 
+   me.delTime = aTime;
+-  me.thread = syscall(SYS_gettid); //gettid();
++  me.thread = gettid();
+   if (was_paused) {
+       me.flags = JP_FIRST_AFTER_PAUSE;
+       was_paused = 0;
+   } else {
+       me.flags = 0;
+   }
+ 
+   CrawlStack(&me, stack_top, top_instr_ptr);
+@@ -514,16 +520,57 @@ static int enableRTCSignals(bool enable)
+         }            
+         return 0;
+     }
+ 
+     return 1;
+ }
+ #endif
+ 
++#ifdef ANDROID
++    // The Android kernel has the structures we need, but it doesn't
++    // expose a header for them.
++  #ifdef __arm__
++      struct moz_sigcontext {
++        unsigned long trap_no;
++        unsigned long error_code;
++        unsigned long oldmask;
++        unsigned long arm_r0;
++        unsigned long arm_r1;
++        unsigned long arm_r2;
++        unsigned long arm_r3;
++        unsigned long arm_r4;
++        unsigned long arm_r5;
++        unsigned long arm_r6;
++        unsigned long arm_r7;
++        unsigned long arm_r8;
++        unsigned long arm_r9;
++        unsigned long arm_r10;
++        unsigned long arm_fp;
++        unsigned long arm_ip;
++        unsigned long arm_sp;
++        unsigned long arm_lr;
++        unsigned long arm_pc;
++        unsigned long arm_cpsr;
++        unsigned long fault_address;
++      };
++
++    struct moz_ucontext {
++      unsigned long uc_flags;
++      struct moz_ucontext  *uc_link;
++      stack_t uc_stack;
++      struct moz_sigcontext uc_mcontext;
++      // more here, but we don't need it
++    };
++
++  #else
++    #error "Unknown platform"
++  #endif
++#endif
++
+ JPROF_STATIC void StackHook(
+ int signum,
+ siginfo_t *info,
+ void *ucontext)
+ {
+     static struct timeval tFirst;
+     static int first=1;
+     size_t millisec = 0;
+@@ -556,21 +603,33 @@ void *ucontext)
+             struct timeval tNow;
+             gettimeofday(&tNow, 0);
+             double usec = 1e6*(tNow.tv_sec - tFirst.tv_sec);
+             usec += (tNow.tv_usec - tFirst.tv_usec);
+             millisec = static_cast<size_t>(usec*1e-3);
+         }
+     }
+ 
++#ifdef ANDROID
++    // The Android kernel has the structures we need, but it doesn't
++    // expose a header for them.
++  #ifdef __arm__
++    moz_sigcontext &mcontext = ((moz_ucontext*)ucontext)->uc_mcontext;
++    JprofLog(millisec, (void*)mcontext.arm_sp, (void*)mcontext.arm_pc);
++  #else
++    #error "Unknown platform"
++  #endif
++
++#else
+     gregset_t &gregs = ((ucontext_t*)ucontext)->uc_mcontext.gregs;
+-#ifdef __x86_64__
++  #ifdef __x86_64__
+     JprofLog(millisec, (void*)gregs[REG_RSP], (void*)gregs[REG_RIP]);
+-#else
++  #else
+     JprofLog(millisec, (void*)gregs[REG_ESP], (void*)gregs[REG_EIP]);
++  #endif
+ #endif
+ 
+     if (!rtcHz)
+         startSignalCounter(timerMiliSec);
+ }
+ 
+ NS_EXPORT_(void) setupProfilingStuff(void)
+ {
+@@ -665,27 +724,27 @@ NS_EXPORT_(void) setupProfilingStuff(voi
+                     rtcHz = 2048;
+                 }
+ #else
+                 fputs("JP_RTC_HZ found, but RTC profiling only supported on "
+                       "Linux!\n", stderr);
+                   
+ #endif
+             }
+-            char *f = strstr(tst,"JP_FILENAME=");
++            const char *f = strstr(tst,"JP_FILENAME=");
+             if (f)
+                 f = f + strlen("JP_FILENAME=");
+             else
+                 f = M_LOGFILE;
+ 
+-            char *is_slave = getenv("JPROF_SLAVE");
++            const char *is_slave = getenv("JPROF_SLAVE");
+             if (!is_slave)
+                 setenv("JPROF_SLAVE","", 0);
+ 
+-            int pid = syscall(SYS_gettid); //gettid();
++            int pid = gettid();
+             if (is_slave)
+                 snprintf(filename,sizeof(filename),"%s-%d",f,pid);
+             else
+                 snprintf(filename,sizeof(filename),"%s",f);
+ 
+             // XXX FIX! inherit current capture state!
+ 	}
+ 
