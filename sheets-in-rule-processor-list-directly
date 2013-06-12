@@ -2,10 +2,80 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug TOFILE patch 2:  Stop putting the presentational hint and style attribute style sheets in the style set's list of style sheets; put them only in the list of rule processors.
 
+diff --git a/content/base/src/nsDocument.cpp b/content/base/src/nsDocument.cpp
+--- a/content/base/src/nsDocument.cpp
++++ b/content/base/src/nsDocument.cpp
+@@ -2231,34 +2231,32 @@ nsDocument::ResetStylesheetsToURI(nsIURI
+   // now, but it could in the future -- in which case not releasing them
+   // is probably the right thing to do.
+ 
+   // Now reset our inline style and attribute sheets.
+   if (mAttrStyleSheet) {
+     // Remove this sheet from all style sets
+     nsCOMPtr<nsIPresShell> shell = GetShell();
+     if (shell) {
+-      shell->StyleSet()->RemoveStyleSheet(nsStyleSet::ePresHintSheet,
+-                                          mAttrStyleSheet);
++      shell->StyleSet()->DirtyRuleProcessor(nsStyleSet::ePresHintSheet);
+     }
+     mAttrStyleSheet->Reset(aURI);
+   } else {
+     mAttrStyleSheet = new nsHTMLStyleSheet(aURI, this);
+   }
+ 
+   // Don't use AddStyleSheet, since it'll put the sheet into style
+   // sets in the document level, which is not desirable here.
+   mAttrStyleSheet->SetOwningDocument(this);
+ 
+   if (mStyleAttrStyleSheet) {
+     // Remove this sheet from all style sets
+     nsCOMPtr<nsIPresShell> shell = GetShell();
+     if (shell) {
+-      shell->StyleSet()->
+-        RemoveStyleSheet(nsStyleSet::eStyleAttrSheet, mStyleAttrStyleSheet);
++      shell->StyleSet()->DirtyRuleProcessor(nsStyleSet::eStyleAttrSheet);
+     }
+     mStyleAttrStyleSheet->Reset(aURI);
+   } else {
+     mStyleAttrStyleSheet = new nsHTMLCSSStyleSheet(aURI, this);
+   }
+ 
+   // The loop over style sets below will handle putting this sheet
+   // into style sets as needed.
+@@ -2289,29 +2287,18 @@ AppendSheetsToStyleSet(nsStyleSet* aStyl
+   }
+ }
+ 
+ 
+ void
+ nsDocument::FillStyleSet(nsStyleSet* aStyleSet)
+ {
+   NS_PRECONDITION(aStyleSet, "Must have a style set");
+-  NS_PRECONDITION(aStyleSet->SheetCount(nsStyleSet::ePresHintSheet) == 0,
+-                  "Style set already has a preshint sheet?");
+   NS_PRECONDITION(aStyleSet->SheetCount(nsStyleSet::eDocSheet) == 0,
+                   "Style set already has document sheets?");
+-  NS_PRECONDITION(aStyleSet->SheetCount(nsStyleSet::eStyleAttrSheet) == 0,
+-                  "Style set already has style attr sheets?");
+-  NS_PRECONDITION(mStyleAttrStyleSheet, "No style attr stylesheet?");
+-  NS_PRECONDITION(mAttrStyleSheet, "No attr stylesheet?");
+-
+-  aStyleSet->AppendStyleSheet(nsStyleSet::ePresHintSheet, mAttrStyleSheet);
+-
+-  aStyleSet->AppendStyleSheet(nsStyleSet::eStyleAttrSheet,
+-                              mStyleAttrStyleSheet);
+ 
+   int32_t i;
+   for (i = mStyleSheets.Count() - 1; i >= 0; --i) {
+     nsIStyleSheet* sheet = mStyleSheets[i];
+     if (sheet->IsApplicable()) {
+       aStyleSet->AddDocStyleSheet(sheet, this);
+     }
+   }
 diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 --- a/layout/style/nsStyleSet.cpp
 +++ b/layout/style/nsStyleSet.cpp
-@@ -313,29 +313,33 @@ nsStyleSet::GatherRuleProcessors(sheetTy
+@@ -313,29 +313,37 @@ nsStyleSet::GatherRuleProcessors(sheetTy
    if (mAuthorStyleDisabled && (aType == eDocSheet || 
                                 aType == eScopedDocSheet ||
                                 aType == eStyleAttrSheet)) {
@@ -31,15 +101,19 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 +    // handle the types for which have a rule processor that does not
 +    // implement the style sheet interface.
 +    case eAnimationSheet:
++      MOZ_ASSERT(mSheets[aType].Count() == 0);
 +      mRuleProcessors[aType] = PresContext()->AnimationManager();
 +      return NS_OK;
 +    case eTransitionSheet:
++      MOZ_ASSERT(mSheets[aType].Count() == 0);
 +      mRuleProcessors[aType] = PresContext()->TransitionManager();
 +      return NS_OK;
 +    case eStyleAttrSheet:
++      MOZ_ASSERT(mSheets[aType].Count() == 0);
 +      mRuleProcessors[aType] = PresContext()->Document()->GetInlineStyleSheet();
 +      return NS_OK;
 +    case ePresHintSheet:
++      MOZ_ASSERT(mSheets[aType].Count() == 0);
 +      mRuleProcessors[aType] = PresContext()->Document()->GetAttributeStyleSheet();
 +      return NS_OK;
 +    default:
@@ -52,3 +126,53 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
        // Gather the scoped style sheets into an array as
        // nsCSSStyleSheets, and mark all of their scope elements
        // as scoped style roots.
+@@ -494,16 +502,27 @@ nsStyleSet::InsertStyleSheetBefore(sheet
+ 
+   if (!mBatching)
+     return GatherRuleProcessors(aType);
+ 
+   mDirty |= 1 << aType;
+   return NS_OK;
+ }
+ 
++nsresult
++nsStyleSet::DirtyRuleProcessor(sheetType aType)
++{
++  MOZ_ASSERT(aType == ePresHintSheet || aType == eStyleAttrSheet);
++  if (!mBatching)
++    return GatherRuleProcessors(aType);
++
++  mDirty |= 1 << aType;
++  return NS_OK;
++}
++
+ bool
+ nsStyleSet::GetAuthorStyleDisabled()
+ {
+   return mAuthorStyleDisabled;
+ }
+ 
+ nsresult
+ nsStyleSet::SetAuthorStyleDisabled(bool aStyleDisabled)
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -254,16 +254,18 @@ class nsStyleSet
+   nsresult AppendStyleSheet(sheetType aType, nsIStyleSheet *aSheet);
+   nsresult PrependStyleSheet(sheetType aType, nsIStyleSheet *aSheet);
+   nsresult RemoveStyleSheet(sheetType aType, nsIStyleSheet *aSheet);
+   nsresult ReplaceSheets(sheetType aType,
+                          const nsCOMArray<nsIStyleSheet> &aNewSheets);
+   nsresult InsertStyleSheetBefore(sheetType aType, nsIStyleSheet *aNewSheet,
+                                   nsIStyleSheet *aReferenceSheet);
+ 
++  nsresult DirtyRuleProcessor(sheetType aType);
++
+   // Enable/Disable entire author style level (Doc, ScopedDoc & PresHint levels)
+   bool GetAuthorStyleDisabled();
+   nsresult SetAuthorStyleDisabled(bool aStyleDisabled);
+ 
+   int32_t SheetCount(sheetType aType) const {
+     return mSheets[aType].Count();
+   }
+ 
