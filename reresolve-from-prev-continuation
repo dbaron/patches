@@ -5,7 +5,87 @@ Bug 828312 patch 11:  Change ReResolveStyleContext to reach next-continuations f
 diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
 --- a/layout/base/nsFrameManager.cpp
 +++ b/layout/base/nsFrameManager.cpp
-@@ -983,18 +983,21 @@ CaptureChange(nsStyleContext* aOldContex
+@@ -726,18 +726,24 @@ ElementForStyleContext(nsIContent* aPare
+     nsBlockFrame* block = nsBlockFrame::GetNearestAncestorBlock(aFrame);
+     return block->GetContent()->AsElement();
+   }
+ 
+   nsIContent* content = aParentContent ? aParentContent : aFrame->GetContent();
+   return content->AsElement();
+ }
+ 
++/**
++ * Get the previous continuation or similar special sibling (assuming
++ * block/inline alternation), conditionally on it having the same style.
++ * This assumes that we're not between resolving the two (i.e., that
++ * they're both already resolved.
++ */
+ static nsIFrame*
+-GetPrevContinuationWithPossiblySameStyle(nsIFrame* aFrame)
++GetPrevContinuationWithSameStyle(nsIFrame* aFrame)
+ {
+   // Account for {ib} splits when looking for "prevContinuation".  In
+   // particular, for the first-continuation of a part of an {ib} split we
+   // want to use the special prevsibling of the special prevsibling of
+   // aFrame, which should have the same style context as aFrame itself.
+   // In particular, if aFrame is the first continuation of an inline part
+   // of an {ib} split then its special prevsibling is a block, and the
+   // special prevsibling of _that_ is an inline, just like aFrame.
+@@ -751,19 +757,53 @@ GetPrevContinuationWithPossiblySameStyle
+     // property directly
+     prevContinuation = static_cast<nsIFrame*>(
+       aFrame->Properties().Get(nsIFrame::IBSplitSpecialPrevSibling()));
+     if (prevContinuation) {
+       prevContinuation = static_cast<nsIFrame*>(
+         prevContinuation->Properties().Get(nsIFrame::IBSplitSpecialPrevSibling()));
+     }
+   }
++  if (prevContinuation->StyleContext() != aFrame->StyleContext()) {
++    prevContinuation = nullptr;
++  }
+   return prevContinuation;
+ }
+ 
++/**
++ * Get the next continuation or similar special sibling (assuming
++ * block/inline alternation), conditionally on it having the same style.
++ *
++ * Since this is used when deciding to copy the new style context, it
++ * takes as an argument the old style context to check if the style is
++ * the same.
++ */
++static nsIFrame*
++GetNextContinuationWithSameStyle(nsIFrame* aFrame,
++                                 nsStyleContext* aOldStyleContext)
++{
++  // See GetPrevContinuationWithSameStyle about {ib} splits.
++
++  nsIFrame *nextContinuation = aFrame->GetNextContinuation();
++  if (!nextContinuation && (aFrame->GetStateBits() & NS_FRAME_IS_SPECIAL)) {
++    // We're the last continuation, so we have to hop back to the first
++    // before getting the frame property
++    nextContinuation = static_cast<nsIFrame*>(aFrame->GetFirstContinuation()->
++      Properties().Get(nsIFrame::IBSplitSpecialSibling()));
++    if (nextContinuation) {
++      nextContinuation = static_cast<nsIFrame*>(
++        nextContinuation->Properties().Get(nsIFrame::IBSplitSpecialSibling()));
++    }
++  }
++  if (nextContinuation->StyleContext() != aOldStyleContext) {
++    nextContinuation = nullptr;
++  }
++  return nextContinuation;
++}
++
+ nsresult
+ nsFrameManager::ReparentStyleContext(nsIFrame* aFrame)
+ {
+   if (nsGkAtoms::placeholderFrame == aFrame->GetType()) {
+     // Also reparent the out-of-flow and all its continuations.
+     nsIFrame* outOfFlow =
+       nsPlaceholderFrame::GetRealFrameForPlaceholder(aFrame);
+     NS_ASSERTION(outOfFlow, "no out-of-flow frame");
+@@ -983,18 +1023,21 @@ CaptureChange(nsStyleContext* aOldContex
      if (!(ourChange & nsChangeHint_ReconstructFrame) || aContent) {
        aChangeList->AppendChange(aFrame, aContent, ourChange);
      }
@@ -29,7 +109,7 @@ diff --git a/layout/base/nsFrameManager.cpp b/layout/base/nsFrameManager.cpp
   * For aParentFrameHintsNotHandledForDescendants, see
   * nsStyleContext::CalcStyleDifference.
   */
-@@ -1665,70 +1668,64 @@ nsFrameManager::ComputeStyleChangeFor(ns
+@@ -1665,70 +1708,64 @@ nsFrameManager::ComputeStyleChangeFor(ns
    PROFILER_LABEL("CSS", "ComputeStyleChangeFor");
  
    nsIContent *content = aFrame->GetContent();
