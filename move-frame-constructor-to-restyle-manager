@@ -5,10 +5,19 @@ Move restyle management code from nsCSSFrameConstructor to RestyleManager.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -9,12 +9,561 @@
+@@ -4,17 +4,571 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ /**
+  * Code responsible for managing style changes: tracking what style
+  * changes need to happen, scheduling them, and doing them.
   */
  
  #include "RestyleManager.h"
++#include "nsLayoutUtils.h"
++#include "nsPlaceholderFrame.h"
++#include "GeckoProfiler.h"
++#include "nsStyleChangeList.h"
  
  namespace mozilla {
  
@@ -118,9 +127,9 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +
 +  // Make sure to not rebuild quote or counter lists while we're
 +  // processing restyles
-+  BeginUpdate();
++  FrameConstructor()->BeginUpdate();
 +
-+  nsPresContext* presContext = mPresShell->GetPresContext();
++  nsPresContext* presContext = PresContext();
 +  FramePropertyTable* propTable = presContext->PropertyTable();
 +
 +  // Mark frames so that we skip frames that die along the way, bug 123049.
@@ -289,7 +298,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +        }
 +      }
 +      if ((hint & nsChangeHint_UpdateCursor) && !didUpdateCursor) {
-+        mPresShell->SynthesizeMouseMove(false);
++        mPresContext->GetPresShell()->SynthesizeMouseMove(false);
 +        didUpdateCursor = true;
 +      }
 +    }
@@ -352,7 +361,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  if (GetPresContext()->UsesRootEMUnits() && aPrimaryFrame) {
 +    nsStyleContext *oldContext = aPrimaryFrame->StyleContext();
 +    if (!oldContext->GetParent()) { // check that we're the root element
-+      nsRefPtr<nsStyleContext> newContext = mPresShell->StyleSet()->
++      nsRefPtr<nsStyleContext> newContext = mPresContext->StyleSet()->
 +        ResolveStyleFor(aElement, nullptr /* == oldContext->GetParent() */);
 +      if (oldContext->StyleFont()->mFont.size !=
 +          newContext->StyleFont()->mFont.size) {
@@ -391,28 +400,28 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  NS_UpdateHint(aExtraHint, mRebuildAllExtraHint);
 +  mRebuildAllExtraHint = nsChangeHint(0);
 +
-+  if (!mPresShell || !mPresShell->GetRootFrame())
++  nsIPresShell *presShell = mPresContext->GetPresShell();
++  if (!presShell || !presShell->GetRootFrame())
 +    return;
 +
 +  // Make sure that the viewmanager will outlive the presshell
-+  nsRefPtr<nsViewManager> vm = mPresShell->GetViewManager();
++  nsRefPtr<nsViewManager> vm = presShell->GetViewManager();
 +
 +  // Processing the style changes could cause a flush that propagates to
 +  // the parent frame and thus destroys the pres shell.
-+  nsCOMPtr<nsIPresShell> kungFuDeathGrip(mPresShell);
++  nsCOMPtr<nsIPresShell> kungFuDeathGrip(presShell);
 +
 +  // We may reconstruct frames below and hence process anything that is in the
 +  // tree. We don't want to get notified to process those items again after.
-+  mPresShell->GetDocument()->FlushPendingNotifications(Flush_ContentAndNotify);
++  presShell->GetDocument()->FlushPendingNotifications(Flush_ContentAndNotify);
 +
 +  nsAutoScriptBlocker scriptBlocker;
 +
-+  nsPresContext *presContext = mPresShell->GetPresContext();
-+  presContext->SetProcessingRestyles(true);
++  mPresContext->SetProcessingRestyles(true);
 +
 +  DoRebuildAllStyleData(mPendingRestyles, aExtraHint);
 +
-+  presContext->SetProcessingRestyles(false);
++  mPresContext->SetProcessingRestyles(false);
 +
 +  // Make sure that we process any pending animation restyles from the
 +  // above style change.  Note that we can *almost* implement the above
@@ -427,7 +436,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +{
 +  // Tell the style set to get the old rule tree out of the way
 +  // so we can recalculate while maintaining rule tree immutability
-+  nsresult rv = mPresShell->StyleSet()->BeginReconstruct();
++  nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
 +  if (NS_FAILED(rv)) {
 +    return;
 +  }
@@ -442,7 +451,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  // XXX Does it matter that we're passing aExtraHint to the real root
 +  // frame and not the root node's primary frame?
 +  // Note: The restyle tracker we pass in here doesn't matter.
-+  ComputeStyleChangeFor(mPresShell->GetRootFrame(),
++  ComputeStyleChangeFor(mPresContext->GetPresShell()->GetRootFrame(),
 +                        &changeList, aExtraHint,
 +                        aRestyleTracker, true);
 +  // Process the required changes
@@ -454,7 +463,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  // change list has frame reconstructs in it (since frames to be
 +  // reconstructed will still have their old style context pointers
 +  // until they are destroyed).
-+  mPresShell->StyleSet()->EndReconstruct();
++  mPresContext->GetPresShell()->StyleSet()->EndReconstruct();
 +}
 +
 +void
@@ -465,7 +474,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +                  "Missing a script blocker!");
 +
 +  // Process non-animation restyles...
-+  nsPresContext *presContext = mPresShell->GetPresContext();
++  nsPresContext *presContext = mPresContext;
 +  NS_ABORT_IF_FALSE(!presContext->IsProcessingRestyles(),
 +                    "Nesting calls to ProcessPendingRestyles?");
 +  presContext->SetProcessingRestyles(true);
@@ -518,7 +527,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +                                       nsChangeHint aMinChangeHint,
 +                                       bool aForAnimation)
 +{
-+  if (MOZ_UNLIKELY(mPresShell->IsDestroying())) {
++  if (MOZ_UNLIKELY(mPresContext->GetPresShell()->IsDestroying())) {
 +    return;
 +  }
 +
@@ -541,15 +550,16 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  // a call to ProcessPendingRestyles coming and there's no need to
 +  // add ourselves as a refresh observer until then.
 +  bool inRefresh = !aForLazyConstruction && mInStyleRefresh;
++  nsIPresShell *presShell = mPresContext->GetPresShell();
 +  if (!mObservingRefreshDriver && !inRefresh) {
-+    mObservingRefreshDriver = mPresShell->GetPresContext()->RefreshDriver()->
-+      AddStyleFlushObserver(mPresShell);
++    mObservingRefreshDriver = mPresContext->RefreshDriver()->
++      AddStyleFlushObserver(presShell);
 +  }
 +
 +  // Unconditionally flag our document as needing a flush.  The other
 +  // option here would be a dedicated boolean to track whether we need
 +  // to do so (set here and unset in ProcessPendingRestyles).
-+  mPresShell->GetDocument()->SetNeedStyleFlush();
++  presShell->GetDocument()->SetNeedStyleFlush();
 +}
 +
 +void
@@ -889,7 +899,25 @@ diff --git a/layout/base/RestyleTracker.h b/layout/base/RestyleTracker.h
 diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
 --- a/layout/base/nsCSSFrameConstructor.cpp
 +++ b/layout/base/nsCSSFrameConstructor.cpp
-@@ -1413,32 +1413,22 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+@@ -45,17 +45,16 @@
+ #include "nsIDOMHTMLLegendElement.h"
+ #include "nsIComboboxControlFrame.h"
+ #include "nsIListControlFrame.h"
+ #include "nsISelectControlFrame.h"
+ #include "nsIDOMCharacterData.h"
+ #include "nsIDOMHTMLImageElement.h"
+ #include "nsPlaceholderFrame.h"
+ #include "nsTableRowGroupFrame.h"
+-#include "nsStyleChangeList.h"
+ #include "nsIFormControl.h"
+ #include "nsCSSAnonBoxes.h"
+ #include "nsTextFragment.h"
+ #include "nsIAnonymousContentCreator.h"
+ #include "nsLegendFrame.h"
+ #include "nsIContentIterator.h"
+ #include "nsBoxLayoutState.h"
+ #include "nsBindingManager.h"
+@@ -1413,32 +1412,22 @@ nsCSSFrameConstructor::nsCSSFrameConstru
    , mDocElementContainingBlock(nullptr)
    , mGfxScrollFrame(nullptr)
    , mPageSequenceFrame(nullptr)
@@ -923,7 +951,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      if (flags) {
        bool error = false;
        for (;;) {
-@@ -6266,17 +6256,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
+@@ -6266,17 +6255,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
                     //XXX the child->GetPrimaryFrame()->GetContent() != child
                     // check is needed due to bug 135040. Remove it once that's
                     // fixed.
@@ -942,7 +970,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    NS_ASSERTION(!aContent->HasFlag(NODE_NEEDS_FRAME),
      "shouldn't get here with a content node that has needs frame bit set");
-@@ -7995,370 +7985,16 @@ nsCSSFrameConstructor::CharacterDataChan
+@@ -7995,370 +7984,16 @@ nsCSSFrameConstructor::CharacterDataChan
      if (haveFirstLetterStyle) {
        RecoverLetterFrames(block);
      }
@@ -1313,7 +1341,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    // we'd have to make ESM guarantee that usefully.
    if (!aContent->IsElement()) {
      return NS_OK;
-@@ -8581,18 +8217,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
+@@ -8581,18 +8216,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
  
    mIsDestroyingFrameTree = true;
  
@@ -1335,7 +1363,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  //STATIC
  
-@@ -11970,202 +11607,16 @@ nsCSSFrameConstructor::RestyleForRemove(
+@@ -11970,202 +11606,16 @@ nsCSSFrameConstructor::RestyleForRemove(
        if (content == aFollowingSibling) {
          reachedFollowingSibling = true;
        }
