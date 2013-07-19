@@ -5,7 +5,7 @@ Move restyle management code from nsCSSFrameConstructor to RestyleManager.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -4,17 +4,571 @@
+@@ -4,17 +4,572 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  /**
@@ -26,6 +26,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  , mRebuildAllStyleData(false)
 +  , mObservingRefreshDriver(false)
 +  , mInStyleRefresh(false)
++  , mPromoteReflowsToReframeRoot(false)
 +  , mPendingRestyles(ELEMENT_HAS_PENDING_RESTYLE |
 +                     ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
 +  , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
@@ -580,7 +581,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
-@@ -7,33 +7,152 @@
+@@ -7,33 +7,158 @@
   * Code responsible for managing style changes: tracking what style
   * changes need to happen, scheduling them, and doing them.
   */
@@ -708,6 +709,9 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 +   */
 +  void PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint);
 +
++  void SetPromoteReflowsToReframeRoot(bool aPromote)
++    { mPromoteReflowsToReframeRoot = aPromote; }
++
 +private:
 +  /* aMinHint is the minimal change that should be made to the element */
 +  // XXXbz do we really need the aPrimaryFrame argument here?
@@ -724,6 +728,9 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 +  bool mObservingRefreshDriver : 1;
 +  // True if we're in the middle of a nsRefreshDriver refresh
 +  bool mInStyleRefresh : 1;
++  // True if reflows/frame reconstruction should be promoted to reframe
++  // the root element
++  bool mPromoteReflowsToReframeRoot : 1;
 +
 +  OverflowChangedTracker mOverflowChangedTracker;
 +  RestyleTracker mPendingRestyles;
@@ -917,7 +924,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  #include "nsIContentIterator.h"
  #include "nsBoxLayoutState.h"
  #include "nsBindingManager.h"
-@@ -1413,32 +1412,22 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+@@ -1413,32 +1412,21 @@ nsCSSFrameConstructor::nsCSSFrameConstru
    , mDocElementContainingBlock(nullptr)
    , mGfxScrollFrame(nullptr)
    , mPageSequenceFrame(nullptr)
@@ -930,7 +937,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    , mHasRootAbsPosContainingBlock(false)
 -  , mObservingRefreshDriver(false)
 -  , mInStyleRefresh(false)
-   , mPromoteReflowsToReframeRoot(false)
+-  , mPromoteReflowsToReframeRoot(false)
    , mHoverGeneration(0)
    , mRebuildAllExtraHint(nsChangeHint(0))
    , mAnimationGeneration(0)
@@ -951,7 +958,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      if (flags) {
        bool error = false;
        for (;;) {
-@@ -6266,17 +6255,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
+@@ -6266,17 +6254,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
                     //XXX the child->GetPrimaryFrame()->GetContent() != child
                     // check is needed due to bug 135040. Remove it once that's
                     // fixed.
@@ -970,7 +977,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    NS_ASSERTION(!aContent->HasFlag(NODE_NEEDS_FRAME),
      "shouldn't get here with a content node that has needs frame bit set");
-@@ -7995,370 +7984,16 @@ nsCSSFrameConstructor::CharacterDataChan
+@@ -7995,370 +7983,16 @@ nsCSSFrameConstructor::CharacterDataChan
      if (haveFirstLetterStyle) {
        RecoverLetterFrames(block);
      }
@@ -1341,7 +1348,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    // we'd have to make ESM guarantee that usefully.
    if (!aContent->IsElement()) {
      return NS_OK;
-@@ -8581,18 +8216,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
+@@ -8581,18 +8215,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
  
    mIsDestroyingFrameTree = true;
  
@@ -1363,7 +1370,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  //STATIC
  
-@@ -11970,202 +11606,16 @@ nsCSSFrameConstructor::RestyleForRemove(
+@@ -11970,202 +11605,16 @@ nsCSSFrameConstructor::RestyleForRemove(
        if (content == aFollowingSibling) {
          reachedFollowingSibling = true;
        }
@@ -1780,7 +1787,19 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // Copy over fixed frames from aParentFrame's prev-in-flow
    nsresult ReplicateFixedFrames(nsPageContentFrame* aParentFrame);
-@@ -392,24 +309,16 @@ private:
+@@ -380,36 +297,26 @@ public:
+   // have a psuedo-element style
+   nsIFrame* GetRootElementStyleFrame() { return mRootElementStyleFrame; }
+   nsIFrame* GetPageSequenceFrame() { return mPageSequenceFrame; }
+ 
+   // Get the frame that is the parent of the root element.
+   nsIFrame* GetDocElementContainingBlock()
+     { return mDocElementContainingBlock; }
+ 
+-  void SetPromoteReflowsToReframeRoot(bool aPromote) { mPromoteReflowsToReframeRoot = aPromote; }
+-
+ private:
+   struct FrameConstructionItem;
    class FrameConstructionItemList;
  
    nsIFrame* ConstructPageFrame(nsIPresShell*  aPresShell, 
@@ -1805,7 +1824,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // aState can be null if not available; it's used as an optimization.
    // XXXbz IsValidSibling is the only caller that doesn't pass a state here!
-@@ -1875,33 +1784,23 @@ private:
+@@ -1875,33 +1782,21 @@ private:
    nsQuoteList         mQuoteList;
    nsCounterManager    mCounterManager;
    // Current ProcessChildren depth.
@@ -1821,8 +1840,8 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
 -  bool                mObservingRefreshDriver : 1;
 -  // True if we're in the middle of a nsRefreshDriver refresh
 -  bool                mInStyleRefresh : 1;
-   // True if reflows/frame reconstruction should be promoted to reframe the root element
-   bool                mPromoteReflowsToReframeRoot : 1;
+-  // True if reflows/frame reconstruction should be promoted to reframe the root element
+-  bool                mPromoteReflowsToReframeRoot : 1;
    uint32_t            mHoverGeneration;
    nsChangeHint        mRebuildAllExtraHint;
  
@@ -2303,6 +2322,28 @@ diff --git a/layout/mathml/nsMathMLmtableFrame.cpp b/layout/mathml/nsMathMLmtabl
  
  // --------
  // implementation of nsMathMLmtdFrame
+diff --git a/layout/printing/nsPrintEngine.cpp b/layout/printing/nsPrintEngine.cpp
+--- a/layout/printing/nsPrintEngine.cpp
++++ b/layout/printing/nsPrintEngine.cpp
+@@ -2354,17 +2354,17 @@ nsPrintEngine::CalcNumPrintablePages(int
+ 
+ void
+ nsPrintEngine::PromoteReflowsToReframeRoot()
+ {
+   for (uint32_t i=0; i<mPrt->mPrintDocList.Length(); i++) {
+     nsPrintObject* po = mPrt->mPrintDocList.ElementAt(i);
+     NS_ASSERTION(po, "nsPrintObject can't be null!");
+     if (po->mPresContext) {
+-      po->mPresContext->PresShell()->FrameConstructor()->SetPromoteReflowsToReframeRoot(true);
++      po->mPresContext->RestyleManager()->SetPromoteReflowsToReframeRoot(true);
+     }
+   }
+ }
+ 
+ //-----------------------------------------------------------------
+ //-- Done: Reflow Methods
+ //-----------------------------------------------------------------
+ 
 diff --git a/layout/style/nsHTMLStyleSheet.cpp b/layout/style/nsHTMLStyleSheet.cpp
 --- a/layout/style/nsHTMLStyleSheet.cpp
 +++ b/layout/style/nsHTMLStyleSheet.cpp
