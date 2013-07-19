@@ -5,7 +5,7 @@ Move restyle management code from nsCSSFrameConstructor to RestyleManager.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -4,17 +4,574 @@
+@@ -4,17 +4,575 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  /**
@@ -29,6 +29,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  , mObservingRefreshDriver(false)
 +  , mInStyleRefresh(false)
 +  , mPromoteReflowsToReframeRoot(false)
++  , mAnimationGeneration(0)
 +  , mPendingRestyles(ELEMENT_HAS_PENDING_RESTYLE |
 +                     ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
 +  , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
@@ -583,7 +584,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
-@@ -7,33 +7,161 @@
+@@ -7,33 +7,170 @@
   * Code responsible for managing style changes: tracking what style
   * changes need to happen, scheduling them, and doing them.
   */
@@ -624,6 +625,10 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
  
 +  nsCSSFrameConstructor* FrameConstructor() const
 +    { return PresContext()->FrameConstructor(); }
++
++  // Get a counter that increments on every style change, that we use to
++  // track whether off-main-thread animations are up-to-date.
++  uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
 +
 +  // Note: It's the caller's responsibility to make sure to wrap a
 +  // ProcessRestyledFrames call in a view update batch and a script blocker.
@@ -739,6 +744,11 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 +  bool mPromoteReflowsToReframeRoot : 1;
 +
 +  OverflowChangedTracker mOverflowChangedTracker;
++
++  // The total number of animation flushes by this frame constructor.
++  // Used to keep the layer and animation manager in sync.
++  uint64_t mAnimationGeneration;
++
 +  RestyleTracker mPendingRestyles;
 +  RestyleTracker mPendingAnimationRestyles;
  };
@@ -930,7 +940,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  #include "nsIContentIterator.h"
  #include "nsBoxLayoutState.h"
  #include "nsBindingManager.h"
-@@ -1413,32 +1412,21 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+@@ -1413,32 +1412,20 @@ nsCSSFrameConstructor::nsCSSFrameConstru
    , mDocElementContainingBlock(nullptr)
    , mGfxScrollFrame(nullptr)
    , mPageSequenceFrame(nullptr)
@@ -946,7 +956,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -  , mPromoteReflowsToReframeRoot(false)
    , mHoverGeneration(0)
    , mRebuildAllExtraHint(nsChangeHint(0))
-   , mAnimationGeneration(0)
+-  , mAnimationGeneration(0)
 -  , mPendingRestyles(ELEMENT_HAS_PENDING_RESTYLE |
 -                     ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
 -  , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
@@ -964,7 +974,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      if (flags) {
        bool error = false;
        for (;;) {
-@@ -6266,17 +6254,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
+@@ -6266,17 +6253,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
                     //XXX the child->GetPrimaryFrame()->GetContent() != child
                     // check is needed due to bug 135040. Remove it once that's
                     // fixed.
@@ -983,7 +993,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    NS_ASSERTION(!aContent->HasFlag(NODE_NEEDS_FRAME),
      "shouldn't get here with a content node that has needs frame bit set");
-@@ -7995,370 +7983,16 @@ nsCSSFrameConstructor::CharacterDataChan
+@@ -7995,370 +7982,16 @@ nsCSSFrameConstructor::CharacterDataChan
      if (haveFirstLetterStyle) {
        RecoverLetterFrames(block);
      }
@@ -1354,7 +1364,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    // we'd have to make ESM guarantee that usefully.
    if (!aContent->IsElement()) {
      return NS_OK;
-@@ -8581,18 +8215,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
+@@ -8581,18 +8214,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
  
    mIsDestroyingFrameTree = true;
  
@@ -1376,7 +1386,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  //STATIC
  
-@@ -11970,202 +11605,16 @@ nsCSSFrameConstructor::RestyleForRemove(
+@@ -11970,202 +11604,16 @@ nsCSSFrameConstructor::RestyleForRemove(
        if (content == aFollowingSibling) {
          reachedFollowingSibling = true;
        }
@@ -1669,15 +1679,19 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
    };
  
    // aChild is the child being inserted for inserts, and the first
-@@ -234,27 +240,17 @@ public:
+@@ -230,31 +236,17 @@ public:
+   // Gets called when the presshell is destroying itself and also
+   // when we tear down our frame tree to reconstruct it
+   void WillDestroyFrameTree();
+ 
    // Get an integer that increments every time there is a style change
    // as a result of a change to the :hover content state.
    uint32_t GetHoverGeneration() const { return mHoverGeneration; }
  
-   // Get a counter that increments on every style change, that we use to
-   // track whether off-main-thread animations are up-to-date.
-   uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
- 
+-  // Get a counter that increments on every style change, that we use to
+-  // track whether off-main-thread animations are up-to-date.
+-  uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
+-
 -  // Note: It's the caller's responsibility to make sure to wrap a
 -  // ProcessRestyledFrames call in a view update batch and a script blocker.
 -  // This function does not call ProcessAttachedQueue() on the binding manager.
@@ -1697,7 +1711,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
    // the container is null, no work is needed.
    void RestyleForInsertOrChange(Element* aContainer, nsIContent* aChild);
  
-@@ -265,95 +261,16 @@ public:
+@@ -265,95 +257,16 @@ public:
    // is the sibling that used to come after aOldChild before the removal.
    void RestyleForRemove(Element* aContainer,
                          nsIContent* aOldChild,
@@ -1793,7 +1807,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // Copy over fixed frames from aParentFrame's prev-in-flow
    nsresult ReplicateFixedFrames(nsPageContentFrame* aParentFrame);
-@@ -380,36 +297,26 @@ public:
+@@ -380,36 +293,26 @@ public:
    // have a psuedo-element style
    nsIFrame* GetRootElementStyleFrame() { return mRootElementStyleFrame; }
    nsIFrame* GetPageSequenceFrame() { return mPageSequenceFrame; }
@@ -1830,7 +1844,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // aState can be null if not available; it's used as an optimization.
    // XXXbz IsValidSibling is the only caller that doesn't pass a state here!
-@@ -1875,33 +1782,21 @@ private:
+@@ -1875,33 +1778,17 @@ private:
    nsQuoteList         mQuoteList;
    nsCounterManager    mCounterManager;
    // Current ProcessChildren depth.
@@ -1852,12 +1866,12 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
    nsChangeHint        mRebuildAllExtraHint;
  
    nsCOMPtr<nsILayoutHistoryState> mTempFrameTreeState;
- 
+-
 -  OverflowChangedTracker mOverflowChangedTracker;
 -
-   // The total number of animation flushes by this frame constructor.
-   // Used to keep the layer and animation manager in sync.
-   uint64_t mAnimationGeneration;
+-  // The total number of animation flushes by this frame constructor.
+-  // Used to keep the layer and animation manager in sync.
+-  uint64_t mAnimationGeneration;
 -
 -  RestyleTracker mPendingRestyles;
 -  RestyleTracker mPendingAnimationRestyles;
@@ -2350,6 +2364,24 @@ diff --git a/layout/printing/nsPrintEngine.cpp b/layout/printing/nsPrintEngine.c
  //-- Done: Reflow Methods
  //-----------------------------------------------------------------
  
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -377,13 +377,13 @@ CommonElementAnimationData::CanThrottleA
+ 
+   return CanThrottleTransformChanges(aTime);
+ }
+ 
+ void 
+ CommonElementAnimationData::UpdateAnimationGeneration(nsPresContext* aPresContext)
+ {
+   mAnimationGeneration =
+-    aPresContext->PresShell()->FrameConstructor()->GetAnimationGeneration();
++    aPresContext->RestyleManager()->GetAnimationGeneration();
+ }
+ 
+ }
+ }
 diff --git a/layout/style/nsHTMLStyleSheet.cpp b/layout/style/nsHTMLStyleSheet.cpp
 --- a/layout/style/nsHTMLStyleSheet.cpp
 +++ b/layout/style/nsHTMLStyleSheet.cpp
