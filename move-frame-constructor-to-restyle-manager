@@ -9,10 +9,32 @@ This is the first of two big chunks of code moved in this patch series.
 A later patch in this series will move related code from nsFrameManager
 into the same destination file.
 
+diff --git a/editor/libeditor/html/nsHTMLAnonymousUtils.cpp b/editor/libeditor/html/nsHTMLAnonymousUtils.cpp
+--- a/editor/libeditor/html/nsHTMLAnonymousUtils.cpp
++++ b/editor/libeditor/html/nsHTMLAnonymousUtils.cpp
+@@ -231,17 +231,17 @@ nsHTMLEditor::DeleteRefToAnonymousNode(n
+         if (docObserver) {
+           // Call BeginUpdate() so that the nsCSSFrameConstructor/PresShell
+           // knows we're messing with the frame tree.
+           nsCOMPtr<nsIDocument> document = GetDocument();
+           if (document)
+             docObserver->BeginUpdate(document, UPDATE_CONTENT_MODEL);
+ 
+           // XXX This is wrong (bug 439258).  Once it's fixed, the NS_WARNING
+-          // in nsCSSFrameConstructor::RestyleForRemove should be changed back
++          // in RestyleManager::RestyleForRemove should be changed back
+           // to an assertion.
+           docObserver->ContentRemoved(content->GetCurrentDoc(),
+                                       aParentContent, content, -1,
+                                       content->GetPreviousSibling());
+           if (document)
+             docObserver->EndUpdate(document, UPDATE_CONTENT_MODEL);
+         }
+       }
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -4,17 +4,1186 @@
+@@ -4,17 +4,1452 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  /**
@@ -24,6 +46,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +#include "nsLayoutUtils.h"
 +#include "GeckoProfiler.h"
 +#include "nsStyleChangeList.h"
++#include "nsStyleUtil.h"
 +#include "nsCSSFrameConstructor.h"
 +#include "nsSVGEffects.h"
 +#include "nsCSSRendering.h"
@@ -861,6 +884,271 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +}
 +
 +void
++RestyleManager::RestyleForEmptyChange(Element* aContainer)
++{
++  // In some cases (:empty + E, :empty ~ E), a change if the content of
++  // an element requires restyling its parent's siblings.
++  nsRestyleHint hint = eRestyle_Subtree;
++  nsIContent* grandparent = aContainer->GetParent();
++  if (grandparent &&
++      (grandparent->GetFlags() & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS)) {
++    hint = nsRestyleHint(hint | eRestyle_LaterSiblings);
++  }
++  PostRestyleEvent(aContainer, hint, NS_STYLE_HINT_NONE);
++}
++
++void
++RestyleManager::RestyleForAppend(Element* aContainer,
++                                 nsIContent* aFirstNewContent)
++{
++  NS_ASSERTION(aContainer, "must have container for append");
++#ifdef DEBUG
++  {
++    for (nsIContent* cur = aFirstNewContent; cur; cur = cur->GetNextSibling()) {
++      NS_ASSERTION(!cur->IsRootOfAnonymousSubtree(),
++                   "anonymous nodes should not be in child lists");
++    }
++  }
++#endif
++  uint32_t selectorFlags =
++    aContainer->GetFlags() & (NODE_ALL_SELECTOR_FLAGS &
++                              ~NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS);
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    bool wasEmpty = true; // :empty or :-moz-only-whitespace
++    for (nsIContent* cur = aContainer->GetFirstChild();
++         cur != aFirstNewContent;
++         cur = cur->GetNextSibling()) {
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(cur, true, false)) {
++        wasEmpty = false;
++        break;
++      }
++    }
++    if (wasEmpty) {
++      RestyleForEmptyChange(aContainer);
++      return;
++    }
++  }
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
++    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the last element child before this node
++    for (nsIContent* cur = aFirstNewContent->GetPreviousSibling();
++         cur;
++         cur = cur->GetPreviousSibling()) {
++      if (cur->IsElement()) {
++        PostRestyleEvent(cur->AsElement(), eRestyle_Subtree, NS_STYLE_HINT_NONE);
++        break;
++      }
++    }
++  }
++}
++
++// Needed since we can't use PostRestyleEvent on non-elements (with
++// eRestyle_LaterSiblings or nsRestyleHint(eRestyle_Subtree |
++// eRestyle_LaterSiblings) as appropriate).
++static void
++RestyleSiblingsStartingWith(RestyleManager *aRestyleManager,
++                            nsIContent *aStartingSibling /* may be null */)
++{
++  for (nsIContent *sibling = aStartingSibling; sibling;
++       sibling = sibling->GetNextSibling()) {
++    if (sibling->IsElement()) {
++      aRestyleManager->
++        PostRestyleEvent(sibling->AsElement(),
++                         nsRestyleHint(eRestyle_Subtree | eRestyle_LaterSiblings),
++                         NS_STYLE_HINT_NONE);
++      break;
++    }
++  }
++}
++
++// Restyling for a ContentInserted or CharacterDataChanged notification.
++// This could be used for ContentRemoved as well if we got the
++// notification before the removal happened (and sometimes
++// CharacterDataChanged is more like a removal than an addition).
++// The comments are written and variables are named in terms of it being
++// a ContentInserted notification.
++void
++RestyleManager::RestyleForInsertOrChange(Element* aContainer,
++                                         nsIContent* aChild)
++{
++  NS_ASSERTION(!aChild->IsRootOfAnonymousSubtree(),
++               "anonymous nodes should not be in child lists");
++  uint32_t selectorFlags =
++    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    bool wasEmpty = true; // :empty or :-moz-only-whitespace
++    for (nsIContent* child = aContainer->GetFirstChild();
++         child;
++         child = child->GetNextSibling()) {
++      if (child == aChild)
++        continue;
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(child, true, false)) {
++        wasEmpty = false;
++        break;
++      }
++    }
++    if (wasEmpty) {
++      RestyleForEmptyChange(aContainer);
++      return;
++    }
++  }
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
++    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
++    // Restyle all later siblings.
++    RestyleSiblingsStartingWith(this, aChild->GetNextSibling());
++  }
++
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the previously-first element child if it is after this node
++    bool passedChild = false;
++    for (nsIContent* content = aContainer->GetFirstChild();
++         content;
++         content = content->GetNextSibling()) {
++      if (content == aChild) {
++        passedChild = true;
++        continue;
++      }
++      if (content->IsElement()) {
++        if (passedChild) {
++          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
++                           NS_STYLE_HINT_NONE);
++        }
++        break;
++      }
++    }
++    // restyle the previously-last element child if it is before this node
++    passedChild = false;
++    for (nsIContent* content = aContainer->GetLastChild();
++         content;
++         content = content->GetPreviousSibling()) {
++      if (content == aChild) {
++        passedChild = true;
++        continue;
++      }
++      if (content->IsElement()) {
++        if (passedChild) {
++          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
++                           NS_STYLE_HINT_NONE);
++        }
++        break;
++      }
++    }
++  }
++}
++
++void
++RestyleManager::RestyleForRemove(Element* aContainer,
++                                 nsIContent* aOldChild,
++                                 nsIContent* aFollowingSibling)
++{
++  if (aOldChild->IsRootOfAnonymousSubtree()) {
++    // This should be an assert, but this is called incorrectly in
++    // nsHTMLEditor::DeleteRefToAnonymousNode and the assertions were clogging
++    // up the logs.  Make it an assert again when that's fixed.
++    NS_WARNING("anonymous nodes should not be in child lists (bug 439258)");
++  }
++  uint32_t selectorFlags =
++    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
++  if (selectorFlags == 0)
++    return;
++
++  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
++    // see whether we need to restyle the container
++    bool isEmpty = true; // :empty or :-moz-only-whitespace
++    for (nsIContent* child = aContainer->GetFirstChild();
++         child;
++         child = child->GetNextSibling()) {
++      // We don't know whether we're testing :empty or :-moz-only-whitespace,
++      // so be conservative and assume :-moz-only-whitespace (i.e., make
++      // IsSignificantChild less likely to be true, and thus make us more
++      // likely to restyle).
++      if (nsStyleUtil::IsSignificantChild(child, true, false)) {
++        isEmpty = false;
++        break;
++      }
++    }
++    if (isEmpty) {
++      RestyleForEmptyChange(aContainer);
++      return;
++    }
++  }
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
++    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
++    // Restyling the container is the most we can do here, so we're done.
++    return;
++  }
++
++  if (selectorFlags & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
++    // Restyle all later siblings.
++    RestyleSiblingsStartingWith(this, aFollowingSibling);
++  }
++
++  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
++    // restyle the now-first element child if it was after aOldChild
++    bool reachedFollowingSibling = false;
++    for (nsIContent* content = aContainer->GetFirstChild();
++         content;
++         content = content->GetNextSibling()) {
++      if (content == aFollowingSibling) {
++        reachedFollowingSibling = true;
++        // do NOT continue here; we might want to restyle this node
++      }
++      if (content->IsElement()) {
++        if (reachedFollowingSibling) {
++          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
++                           NS_STYLE_HINT_NONE);
++        }
++        break;
++      }
++    }
++    // restyle the now-last element child if it was before aOldChild
++    reachedFollowingSibling = (aFollowingSibling == nullptr);
++    for (nsIContent* content = aContainer->GetLastChild();
++         content;
++         content = content->GetPreviousSibling()) {
++      if (content->IsElement()) {
++        if (reachedFollowingSibling) {
++          PostRestyleEvent(content->AsElement(), eRestyle_Subtree, NS_STYLE_HINT_NONE);
++        }
++        break;
++      }
++      if (content == aFollowingSibling) {
++        reachedFollowingSibling = true;
++      }
++    }
++  }
++}
++
++void
 +RestyleManager::RebuildAllStyleData(nsChangeHint aExtraHint)
 +{
 +  NS_ASSERTION(!(aExtraHint & nsChangeHint_ReconstructFrame),
@@ -1202,7 +1490,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
-@@ -7,33 +7,201 @@
+@@ -7,33 +7,223 @@
   * Code responsible for managing style changes: tracking what style
   * changes need to happen, scheduling them, and doing them.
   */
@@ -1275,6 +1563,28 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 +  // If the caller wants that to happen synchronously, it needs to handle that
 +  // itself.
 +  nsresult ProcessRestyledFrames(nsStyleChangeList& aRestyleArray);
++
++private:
++  void RestyleForEmptyChange(Element* aContainer);
++
++public:
++  // Restyling for a ContentInserted (notification after insertion) or
++  // for a CharacterDataChanged.  |aContainer| must be non-null; when
++  // the container is null, no work is needed.
++  void RestyleForInsertOrChange(Element* aContainer, nsIContent* aChild);
++
++  // This would be the same as RestyleForInsertOrChange if we got the
++  // notification before the removal.  However, we get it after, so we need the
++  // following sibling in addition to the old child.  |aContainer| must be
++  // non-null; when the container is null, no work is needed.  aFollowingSibling
++  // is the sibling that used to come after aOldChild before the removal.
++  void RestyleForRemove(Element* aContainer,
++                        nsIContent* aOldChild,
++                        nsIContent* aFollowingSibling);
++
++  // Same for a ContentAppended.  |aContainer| must be non-null; when
++  // the container is null, no work is needed.
++  void RestyleForAppend(Element* aContainer, nsIContent* aFirstNewContent);
 +
 +  // Process any pending restyles. This should be called after
 +  // CreateNeededFrames.
@@ -1589,7 +1899,17 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  #include "nsIContentIterator.h"
  #include "nsBoxLayoutState.h"
  #include "nsBindingManager.h"
-@@ -85,19 +84,16 @@
+@@ -75,29 +74,25 @@
+ #include "nsLayoutUtils.h"
+ #include "nsAutoPtr.h"
+ #include "nsBoxFrame.h"
+ #include "nsBoxLayout.h"
+ #include "nsFlexContainerFrame.h"
+ #include "nsImageFrame.h"
+ #include "nsIObjectLoadingContent.h"
+ #include "nsIPrincipal.h"
+-#include "nsStyleUtil.h"
+ #include "nsBox.h"
  #include "nsTArray.h"
  #include "nsGenericDOMDataNode.h"
  #include "mozilla/dom/Element.h"
@@ -1609,7 +1929,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  #include "nsIRootBox.h"
  #include "nsIDOMXULCommandDispatcher.h"
  #include "nsIDOMXULDocument.h"
-@@ -1413,32 +1409,18 @@ nsCSSFrameConstructor::nsCSSFrameConstru
+@@ -1413,32 +1408,18 @@ nsCSSFrameConstructor::nsCSSFrameConstru
    , mDocElementContainingBlock(nullptr)
    , mGfxScrollFrame(nullptr)
    , mPageSequenceFrame(nullptr)
@@ -1643,7 +1963,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      if (flags) {
        bool error = false;
        for (;;) {
-@@ -1498,17 +1480,17 @@ nsCSSFrameConstructor::NotifyDestroyingF
+@@ -1498,17 +1479,17 @@ nsCSSFrameConstructor::NotifyDestroyingF
  
    if (mCounterManager.DestroyNodesFor(aFrame)) {
      // Technically we don't need to update anything if we destroyed only
@@ -1662,7 +1982,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    nsAutoPtr<nsGenConNode> mNode;
    nsGenConList*           mList;
    void (nsCSSFrameConstructor::*mDirtyAll)();
-@@ -6266,17 +6248,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
+@@ -6266,17 +6247,17 @@ nsCSSFrameConstructor::MaybeConstructLaz
                     //XXX the child->GetPrimaryFrame()->GetContent() != child
                     // check is needed due to bug 135040. Remove it once that's
                     // fixed.
@@ -1681,7 +2001,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  {
    NS_ASSERTION(!aContent->HasFlag(NODE_NEEDS_FRAME),
      "shouldn't get here with a content node that has needs frame bit set");
-@@ -7596,257 +7578,16 @@ nsCSSFrameConstructor::ContentRemoved(ns
+@@ -7596,257 +7577,16 @@ nsCSSFrameConstructor::ContentRemoved(ns
        parentFrame->List(stdout, 0);
      }
  #endif
@@ -1939,7 +2259,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
   * @param aFrame a frame for a content node about to be removed or a frame that
   *               was just created for a content node that was inserted.
   */ 
-@@ -7880,59 +7621,16 @@ InvalidateCanvasIfNeeded(nsIPresShell* p
+@@ -7880,59 +7620,16 @@ InvalidateCanvasIfNeeded(nsIPresShell* p
    // XHTML or something), but chances are we want to.  Play it safe.
    // Invalidate the viewport.
  
@@ -1999,7 +2319,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
    if ((aContent->HasFlag(NS_CREATE_FRAME_IF_NON_WHITESPACE) &&
         !aContent->TextIsOnlyWhitespace()) ||
-@@ -7994,534 +7692,16 @@ nsCSSFrameConstructor::CharacterDataChan
+@@ -7994,534 +7691,16 @@ nsCSSFrameConstructor::CharacterDataChan
      if (haveFirstLetterStyle) {
        RecoverLetterFrames(block);
      }
@@ -2534,7 +2854,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    nsRootPresContext* rootPresContext =
      mPresShell->GetPresContext()->GetRootPresContext();
    if (rootPresContext) {
-@@ -8572,18 +7752,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
+@@ -8572,18 +7751,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
  
    mIsDestroyingFrameTree = true;
  
@@ -2556,15 +2876,281 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  //STATIC
  
-@@ -11961,202 +11142,16 @@ nsCSSFrameConstructor::RestyleForRemove(
-       if (content == aFollowingSibling) {
-         reachedFollowingSibling = true;
-       }
+@@ -11695,468 +10875,16 @@ nsCSSFrameConstructor::ReframeContaining
      }
    }
+ 
+   // If we get here, we're screwed!
+   return RecreateFramesForContent(mPresShell->GetDocument()->GetRootElement(),
+ 				  true);
  }
  
- 
+-void
+-nsCSSFrameConstructor::RestyleForEmptyChange(Element* aContainer)
+-{
+-  // In some cases (:empty + E, :empty ~ E), a change if the content of
+-  // an element requires restyling its parent's siblings.
+-  nsRestyleHint hint = eRestyle_Subtree;
+-  nsIContent* grandparent = aContainer->GetParent();
+-  if (grandparent &&
+-      (grandparent->GetFlags() & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS)) {
+-    hint = nsRestyleHint(hint | eRestyle_LaterSiblings);
+-  }
+-  PostRestyleEvent(aContainer, hint, NS_STYLE_HINT_NONE);
+-}
+-
+-void
+-nsCSSFrameConstructor::RestyleForAppend(Element* aContainer,
+-                                        nsIContent* aFirstNewContent)
+-{
+-  NS_ASSERTION(aContainer, "must have container for append");
+-#ifdef DEBUG
+-  {
+-    for (nsIContent* cur = aFirstNewContent; cur; cur = cur->GetNextSibling()) {
+-      NS_ASSERTION(!cur->IsRootOfAnonymousSubtree(),
+-                   "anonymous nodes should not be in child lists");
+-    }
+-  }
+-#endif
+-  uint32_t selectorFlags =
+-    aContainer->GetFlags() & (NODE_ALL_SELECTOR_FLAGS &
+-                              ~NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS);
+-  if (selectorFlags == 0)
+-    return;
+-
+-  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
+-    // see whether we need to restyle the container
+-    bool wasEmpty = true; // :empty or :-moz-only-whitespace
+-    for (nsIContent* cur = aContainer->GetFirstChild();
+-         cur != aFirstNewContent;
+-         cur = cur->GetNextSibling()) {
+-      // We don't know whether we're testing :empty or :-moz-only-whitespace,
+-      // so be conservative and assume :-moz-only-whitespace (i.e., make
+-      // IsSignificantChild less likely to be true, and thus make us more
+-      // likely to restyle).
+-      if (nsStyleUtil::IsSignificantChild(cur, true, false)) {
+-        wasEmpty = false;
+-        break;
+-      }
+-    }
+-    if (wasEmpty) {
+-      RestyleForEmptyChange(aContainer);
+-      return;
+-    }
+-  }
+-
+-  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
+-    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
+-    // Restyling the container is the most we can do here, so we're done.
+-    return;
+-  }
+-
+-  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
+-    // restyle the last element child before this node
+-    for (nsIContent* cur = aFirstNewContent->GetPreviousSibling();
+-         cur;
+-         cur = cur->GetPreviousSibling()) {
+-      if (cur->IsElement()) {
+-        PostRestyleEvent(cur->AsElement(), eRestyle_Subtree, NS_STYLE_HINT_NONE);
+-        break;
+-      }
+-    }
+-  }
+-}
+-
+-// Needed since we can't use PostRestyleEvent on non-elements (with
+-// eRestyle_LaterSiblings or nsRestyleHint(eRestyle_Subtree |
+-// eRestyle_LaterSiblings) as appropriate).
+-static void
+-RestyleSiblingsStartingWith(nsCSSFrameConstructor *aFrameConstructor,
+-                            nsIContent *aStartingSibling /* may be null */)
+-{
+-  for (nsIContent *sibling = aStartingSibling; sibling;
+-       sibling = sibling->GetNextSibling()) {
+-    if (sibling->IsElement()) {
+-      aFrameConstructor->
+-        PostRestyleEvent(sibling->AsElement(),
+-                         nsRestyleHint(eRestyle_Subtree | eRestyle_LaterSiblings),
+-                         NS_STYLE_HINT_NONE);
+-      break;
+-    }
+-  }
+-}
+-
+-// Restyling for a ContentInserted or CharacterDataChanged notification.
+-// This could be used for ContentRemoved as well if we got the
+-// notification before the removal happened (and sometimes
+-// CharacterDataChanged is more like a removal than an addition).
+-// The comments are written and variables are named in terms of it being
+-// a ContentInserted notification.
+-void
+-nsCSSFrameConstructor::RestyleForInsertOrChange(Element* aContainer,
+-                                                nsIContent* aChild)
+-{
+-  NS_ASSERTION(!aChild->IsRootOfAnonymousSubtree(),
+-               "anonymous nodes should not be in child lists");
+-  uint32_t selectorFlags =
+-    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
+-  if (selectorFlags == 0)
+-    return;
+-
+-  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
+-    // see whether we need to restyle the container
+-    bool wasEmpty = true; // :empty or :-moz-only-whitespace
+-    for (nsIContent* child = aContainer->GetFirstChild();
+-         child;
+-         child = child->GetNextSibling()) {
+-      if (child == aChild)
+-        continue;
+-      // We don't know whether we're testing :empty or :-moz-only-whitespace,
+-      // so be conservative and assume :-moz-only-whitespace (i.e., make
+-      // IsSignificantChild less likely to be true, and thus make us more
+-      // likely to restyle).
+-      if (nsStyleUtil::IsSignificantChild(child, true, false)) {
+-        wasEmpty = false;
+-        break;
+-      }
+-    }
+-    if (wasEmpty) {
+-      RestyleForEmptyChange(aContainer);
+-      return;
+-    }
+-  }
+-
+-  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
+-    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
+-    // Restyling the container is the most we can do here, so we're done.
+-    return;
+-  }
+-
+-  if (selectorFlags & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
+-    // Restyle all later siblings.
+-    RestyleSiblingsStartingWith(this, aChild->GetNextSibling());
+-  }
+-
+-  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
+-    // restyle the previously-first element child if it is after this node
+-    bool passedChild = false;
+-    for (nsIContent* content = aContainer->GetFirstChild();
+-         content;
+-         content = content->GetNextSibling()) {
+-      if (content == aChild) {
+-        passedChild = true;
+-        continue;
+-      }
+-      if (content->IsElement()) {
+-        if (passedChild) {
+-          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
+-                           NS_STYLE_HINT_NONE);
+-        }
+-        break;
+-      }
+-    }
+-    // restyle the previously-last element child if it is before this node
+-    passedChild = false;
+-    for (nsIContent* content = aContainer->GetLastChild();
+-         content;
+-         content = content->GetPreviousSibling()) {
+-      if (content == aChild) {
+-        passedChild = true;
+-        continue;
+-      }
+-      if (content->IsElement()) {
+-        if (passedChild) {
+-          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
+-                           NS_STYLE_HINT_NONE);
+-        }
+-        break;
+-      }
+-    }
+-  }
+-}
+-
+-void
+-nsCSSFrameConstructor::RestyleForRemove(Element* aContainer,
+-                                        nsIContent* aOldChild,
+-                                        nsIContent* aFollowingSibling)
+-{
+-  if (aOldChild->IsRootOfAnonymousSubtree()) {
+-    // This should be an assert, but this is called incorrectly in
+-    // nsHTMLEditor::DeleteRefToAnonymousNode and the assertions were clogging
+-    // up the logs.  Make it an assert again when that's fixed.
+-    NS_WARNING("anonymous nodes should not be in child lists (bug 439258)");
+-  }
+-  uint32_t selectorFlags =
+-    aContainer ? (aContainer->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
+-  if (selectorFlags == 0)
+-    return;
+-
+-  if (selectorFlags & NODE_HAS_EMPTY_SELECTOR) {
+-    // see whether we need to restyle the container
+-    bool isEmpty = true; // :empty or :-moz-only-whitespace
+-    for (nsIContent* child = aContainer->GetFirstChild();
+-         child;
+-         child = child->GetNextSibling()) {
+-      // We don't know whether we're testing :empty or :-moz-only-whitespace,
+-      // so be conservative and assume :-moz-only-whitespace (i.e., make
+-      // IsSignificantChild less likely to be true, and thus make us more
+-      // likely to restyle).
+-      if (nsStyleUtil::IsSignificantChild(child, true, false)) {
+-        isEmpty = false;
+-        break;
+-      }
+-    }
+-    if (isEmpty) {
+-      RestyleForEmptyChange(aContainer);
+-      return;
+-    }
+-  }
+-
+-  if (selectorFlags & NODE_HAS_SLOW_SELECTOR) {
+-    PostRestyleEvent(aContainer, eRestyle_Subtree, NS_STYLE_HINT_NONE);
+-    // Restyling the container is the most we can do here, so we're done.
+-    return;
+-  }
+-
+-  if (selectorFlags & NODE_HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
+-    // Restyle all later siblings.
+-    RestyleSiblingsStartingWith(this, aFollowingSibling);
+-  }
+-
+-  if (selectorFlags & NODE_HAS_EDGE_CHILD_SELECTOR) {
+-    // restyle the now-first element child if it was after aOldChild
+-    bool reachedFollowingSibling = false;
+-    for (nsIContent* content = aContainer->GetFirstChild();
+-         content;
+-         content = content->GetNextSibling()) {
+-      if (content == aFollowingSibling) {
+-        reachedFollowingSibling = true;
+-        // do NOT continue here; we might want to restyle this node
+-      }
+-      if (content->IsElement()) {
+-        if (reachedFollowingSibling) {
+-          PostRestyleEvent(content->AsElement(), eRestyle_Subtree,
+-                           NS_STYLE_HINT_NONE);
+-        }
+-        break;
+-      }
+-    }
+-    // restyle the now-last element child if it was before aOldChild
+-    reachedFollowingSibling = (aFollowingSibling == nullptr);
+-    for (nsIContent* content = aContainer->GetLastChild();
+-         content;
+-         content = content->GetPreviousSibling()) {
+-      if (content->IsElement()) {
+-        if (reachedFollowingSibling) {
+-          PostRestyleEvent(content->AsElement(), eRestyle_Subtree, NS_STYLE_HINT_NONE);
+-        }
+-        break;
+-      }
+-      if (content == aFollowingSibling) {
+-        reachedFollowingSibling = true;
+-      }
+-    }
+-  }
+-}
+-
+-
 -void
 -nsCSSFrameConstructor::RebuildAllStyleData(nsChangeHint aExtraHint)
 -{
@@ -2759,7 +3345,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      BeginUpdate();
  
      nsFrameItems childItems;
-@@ -12393,158 +11388,8 @@ Iterator::DeleteItemsTo(const Iterator& 
+@@ -12393,158 +11121,8 @@ Iterator::DeleteItemsTo(const Iterator& 
      NS_ASSERTION(!IsDone(), "Ran off end of list?");
      FrameConstructionItem* item = ToItem(mCurrent);
      Next();
@@ -3013,7 +3599,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
      CONTENTINSERT
    };
  
-@@ -199,62 +210,32 @@ public:
+@@ -199,161 +210,31 @@ public:
                            nsIContent* aChild,
                            nsIContent* aOldNextSibling,
                            RemoveFlags aFlags,
@@ -3064,27 +3650,30 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
 -  // itself.
 -  nsresult ProcessRestyledFrames(nsStyleChangeList& aRestyleArray);
 -
- private:
+-private:
 -
 -  friend class mozilla::RestyleTracker;
 -
-   void RestyleForEmptyChange(Element* aContainer);
- 
- public:
-   // Restyling for a ContentInserted (notification after insertion) or
-   // for a CharacterDataChanged.  |aContainer| must be non-null; when
-   // the container is null, no work is needed.
-   void RestyleForInsertOrChange(Element* aContainer, nsIContent* aChild);
- 
-@@ -265,95 +246,16 @@ public:
-   // is the sibling that used to come after aOldChild before the removal.
-   void RestyleForRemove(Element* aContainer,
-                         nsIContent* aOldChild,
-                         nsIContent* aFollowingSibling);
-   // Same for a ContentAppended.  |aContainer| must be non-null; when
-   // the container is null, no work is needed.
-   void RestyleForAppend(Element* aContainer, nsIContent* aFirstNewContent);
- 
+-  void RestyleForEmptyChange(Element* aContainer);
+-
+-public:
+-  // Restyling for a ContentInserted (notification after insertion) or
+-  // for a CharacterDataChanged.  |aContainer| must be non-null; when
+-  // the container is null, no work is needed.
+-  void RestyleForInsertOrChange(Element* aContainer, nsIContent* aChild);
+-
+-  // This would be the same as RestyleForInsertOrChange if we got the
+-  // notification before the removal.  However, we get it after, so we need the
+-  // following sibling in addition to the old child.  |aContainer| must be
+-  // non-null; when the container is null, no work is needed.  aFollowingSibling
+-  // is the sibling that used to come after aOldChild before the removal.
+-  void RestyleForRemove(Element* aContainer,
+-                        nsIContent* aOldChild,
+-                        nsIContent* aFollowingSibling);
+-  // Same for a ContentAppended.  |aContainer| must be non-null; when
+-  // the container is null, no work is needed.
+-  void RestyleForAppend(Element* aContainer, nsIContent* aFirstNewContent);
+-
 -  // Process any pending restyles. This should be called after
 -  // CreateNeededFrames.
 -  // Note: It's the caller's responsibility to make sure to wrap a
@@ -3172,7 +3761,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // Copy over fixed frames from aParentFrame's prev-in-flow
    nsresult ReplicateFixedFrames(nsPageContentFrame* aParentFrame);
-@@ -380,36 +282,26 @@ public:
+@@ -380,36 +261,26 @@ public:
    // have a psuedo-element style
    nsIFrame* GetRootElementStyleFrame() { return mRootElementStyleFrame; }
    nsIFrame* GetPageSequenceFrame() { return mPageSequenceFrame; }
@@ -3209,7 +3798,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
  
    // aState can be null if not available; it's used as an optimization.
    // XXXbz IsValidSibling is the only caller that doesn't pass a state here!
-@@ -1649,23 +1541,16 @@ private:
+@@ -1649,23 +1520,16 @@ private:
                               nsIFrame*                aContainingBlock,
                               nsIFrame*                aFrame,
                               FrameConstructionItemList& aItems,
@@ -3233,7 +3822,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.h b/layout/base/nsCSSFrameConstru
                                   nsIFrame*                aBlockFrame,
                                   nsIContent*              aTextContent,
                                   nsIFrame*                aTextFrame,
-@@ -1875,33 +1760,15 @@ private:
+@@ -1875,33 +1739,15 @@ private:
    nsQuoteList         mQuoteList;
    nsCounterManager    mCounterManager;
    // Current ProcessChildren depth.
@@ -3517,7 +4106,28 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
      // be good.
  
      if (flushType >= (mSuppressInterruptibleReflows ? Flush_Layout : Flush_InterruptibleLayout) &&
-@@ -3972,34 +3974,35 @@ PresShell::ContentStateChanged(nsIDocume
+@@ -3953,53 +3955,54 @@ PresShell::CharacterDataChanged(nsIDocum
+   // not cases when the frame constructor calls its own methods to force
+   // frame reconstruction.
+   nsIContent *container = aContent->GetParent();
+   uint32_t selectorFlags =
+     container ? (container->GetFlags() & NODE_ALL_SELECTOR_FLAGS) : 0;
+   if (selectorFlags != 0 && !aContent->IsRootOfAnonymousSubtree()) {
+     Element* element = container->AsElement();
+     if (aInfo->mAppend && !aContent->GetNextSibling())
+-      mFrameConstructor->RestyleForAppend(element, aContent);
++      mPresContext->RestyleManager()->RestyleForAppend(element, aContent);
+     else
+-      mFrameConstructor->RestyleForInsertOrChange(element, aContent);
++      mPresContext->RestyleManager()->RestyleForInsertOrChange(element, aContent);
+   }
+ 
+   mFrameConstructor->CharacterDataChanged(aContent, aInfo);
+   VERIFY_STYLE_TREE;
+ }
+ 
+ void
+ PresShell::ContentStateChanged(nsIDocument* aDocument,
                                 nsIContent* aContent,
                                 nsEventStates aStateMask)
  {
@@ -3598,7 +4208,68 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
  PresShell::ContentAppended(nsIDocument *aDocument,
                             nsIContent* aContainer,
                             nsIContent* aFirstNewContent,
-@@ -4226,28 +4229,29 @@ nsIPresShell::ReconstructStyleDataIntern
+@@ -4066,17 +4069,18 @@ PresShell::ContentAppended(nsIDocument *
+     return;
+   }
+   
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
+   // Call this here so it only happens for real content mutations and
+   // not cases when the frame constructor calls its own methods to force
+   // frame reconstruction.
+-  mFrameConstructor->RestyleForAppend(aContainer->AsElement(), aFirstNewContent);
++  mPresContext->RestyleManager()->
++    RestyleForAppend(aContainer->AsElement(), aFirstNewContent);
+ 
+   mFrameConstructor->ContentAppended(aContainer, aFirstNewContent, true);
+ 
+   if (static_cast<nsINode*>(aContainer) == static_cast<nsINode*>(aDocument) &&
+       aFirstNewContent->NodeType() == nsIDOMNode::DOCUMENT_TYPE_NODE) {
+     NotifyFontSizeInflationEnabledIsDirty();
+   }
+ 
+@@ -4097,17 +4101,18 @@ PresShell::ContentInserted(nsIDocument* 
+   }
+   
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
+   // Call this here so it only happens for real content mutations and
+   // not cases when the frame constructor calls its own methods to force
+   // frame reconstruction.
+   if (aContainer)
+-    mFrameConstructor->RestyleForInsertOrChange(aContainer->AsElement(), aChild);
++    mPresContext->RestyleManager()->
++      RestyleForInsertOrChange(aContainer->AsElement(), aChild);
+ 
+   mFrameConstructor->ContentInserted(aContainer, aChild, nullptr, true);
+ 
+   if (((!aContainer && aDocument) ||
+       (static_cast<nsINode*>(aContainer) == static_cast<nsINode*>(aDocument))) &&
+       aChild->NodeType() == nsIDOMNode::DOCUMENT_TYPE_NODE) {
+     NotifyFontSizeInflationEnabledIsDirty();
+   }
+@@ -4148,18 +4153,18 @@ PresShell::ContentRemoved(nsIDocument *a
+   nsIContent* oldNextSibling;
+   if (aContainer) {
+     oldNextSibling = aContainer->GetChildAt(aIndexInContainer);
+   } else {
+     oldNextSibling = nullptr;
+   }
+   
+   if (aContainer && aContainer->IsElement()) {
+-    mFrameConstructor->RestyleForRemove(aContainer->AsElement(), aChild,
+-                                        oldNextSibling);
++    mPresContext->RestyleManager()->
++      RestyleForRemove(aContainer->AsElement(), aChild, oldNextSibling);
+   }
+ 
+   bool didReconstruct;
+   mFrameConstructor->ContentRemoved(aContainer, aChild, oldNextSibling,
+                                     nsCSSFrameConstructor::REMOVE_CONTENT,
+                                     &didReconstruct);
+ 
+ 
+@@ -4226,28 +4231,29 @@ nsIPresShell::ReconstructStyleDataIntern
      // Nothing to do here, since we have no frames yet
      return;
    }
@@ -3633,7 +4304,7 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
  nsIPresShell::ReconstructStyleDataExternal()
  {
    ReconstructStyleDataInternal();
-@@ -8148,18 +8152,19 @@ PresShell::Observe(nsISupports* aSubject
+@@ -8148,18 +8154,19 @@ PresShell::Observe(nsISupports* aSubject
          nsStyleChangeList changeList;
          WalkFramesThroughPlaceholders(mPresContext, rootFrame,
                                        ReframeImageBoxes, &changeList);
