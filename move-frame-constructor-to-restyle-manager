@@ -5,7 +5,7 @@ Bug 896138 patch 4:  Move restyle management code from nsCSSFrameConstructor to 
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -4,17 +4,1198 @@
+@@ -4,17 +4,1186 @@
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  /**
@@ -171,7 +171,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +  NS_PRECONDITION(gInApplyRenderingChangeToTree,
 +                  "should only be called within ApplyRenderingChangeToTree");
 +
-+  for ( ; aFrame; aFrame = aFrame->GetNextContinuation()) {
++  for ( ; aFrame; aFrame = nsLayoutUtils::GetNextContinuationOrSpecialSibling(aFrame)) {
 +    // Invalidate and sync views on all descendant frames, following placeholders.
 +    // We don't need to update transforms in SyncViewsAndInvalidateDescendants, because
 +    // there can't be any out-of-flows or popups that need to be transformed;
@@ -328,7 +328,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +
 +  do {
 +    mPresContext->GetPresShell()->FrameNeedsReflow(aFrame, dirtyType, dirtyBits);
-+    aFrame = aFrame->GetNextContinuation();
++    aFrame = nsLayoutUtils::GetNextContinuationOrSpecialSibling(aFrame);
 +  } while (aFrame);
 +
 +  return NS_OK;
@@ -447,8 +447,6 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +
 +  index = count;
 +
-+  bool didUpdateCursor = false;
-+
 +  while (0 <= --index) {
 +    nsIFrame* frame;
 +    nsIContent* content;
@@ -494,28 +492,26 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +      if (NeedToReframeForAddingOrRemovingTransform(frame)) {
 +        NS_UpdateHint(hint, nsChangeHint_ReconstructFrame);
 +      } else {
-+        for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
-+          // Normally frame construction would set state bits as needed,
-+          // but we're not going to reconstruct the frame so we need to set them.
-+          // It's because we need to set this state on each affected frame
-+          // that we can't coalesce nsChangeHint_AddOrRemoveTransform hints up
-+          // to ancestors (i.e. it can't be an inherited change hint).
-+          if (cont->IsPositioned()) {
-+            // If a transform has been added, we'll be taking this path,
-+            // but we may be taking this path even if a transform has been
-+            // removed. It's OK to add the bit even if it's not needed.
-+            cont->AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
-+            if (!cont->IsAbsoluteContainer() &&
-+                (cont->GetStateBits() & NS_FRAME_CAN_HAVE_ABSPOS_CHILDREN)) {
-+              cont->MarkAsAbsoluteContainingBlock();
-+            }
-+          } else {
-+            // Don't remove NS_FRAME_MAY_BE_TRANSFORMED since it may still by
-+            // transformed by other means. It's OK to have the bit even if it's
-+            // not needed.
-+            if (cont->IsAbsoluteContainer()) {
-+              cont->MarkAsNotAbsoluteContainingBlock();
-+            }
++        // Normally frame construction would set state bits as needed,
++        // but we're not going to reconstruct the frame so we need to set them.
++        // It's because we need to set this state on each affected frame
++        // that we can't coalesce nsChangeHint_AddOrRemoveTransform hints up
++        // to ancestors (i.e. it can't be an inherited change hint).
++        if (frame->IsPositioned()) {
++          // If a transform has been added, we'll be taking this path,
++          // but we may be taking this path even if a transform has been
++          // removed. It's OK to add the bit even if it's not needed.
++          frame->AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
++          if (!frame->IsAbsoluteContainer() &&
++              (frame->GetStateBits() & NS_FRAME_CAN_HAVE_ABSPOS_CHILDREN)) {
++            frame->MarkAsAbsoluteContainingBlock();
++          }
++        } else {
++          // Don't remove NS_FRAME_MAY_BE_TRANSFORMED since it may still by
++          // transformed by other means. It's OK to have the bit even if it's
++          // not needed.
++          if (frame->IsAbsoluteContainer()) {
++            frame->MarkAsNotAbsoluteContainingBlock();
 +          }
 +        }
 +      }
@@ -541,9 +537,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +      }
 +
 +      if (hint & nsChangeHint_UpdateEffects) {
-+        for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
-+          nsSVGEffects::UpdateEffects(cont);
-+        }
++        nsSVGEffects::UpdateEffects(frame);
 +      }
 +      if (hint & nsChangeHint_NeedReflow) {
 +        StyleChangeReflow(frame, hint);
@@ -568,10 +562,6 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +          // The overflow areas of the child frames need to be updated:
 +          nsIFrame* hintFrame = GetFrameForChildrenOnlyTransformHint(frame);
 +          nsIFrame* childFrame = hintFrame->GetFirstPrincipalChild();
-+          NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrSpecialSibling(frame),
-+                       "SVG frames should not have continuations or special siblings");
-+          NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrSpecialSibling(hintFrame),
-+                       "SVG frames should not have continuations or special siblings");
 +          for ( ; childFrame; childFrame = childFrame->GetNextSibling()) {
 +            NS_ABORT_IF_FALSE(childFrame->IsFrameOfType(nsIFrame::eSVG),
 +                              "Not expecting non-SVG children");
@@ -591,14 +581,16 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +        // overflows since that will happen when it's reflowed.
 +        if (!(frame->GetStateBits() &
 +              (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN))) {
-+          for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
-+            mOverflowChangedTracker.AddFrame(cont);
++          while (frame) {
++            mOverflowChangedTracker.AddFrame(frame);
++
++            frame =
++              nsLayoutUtils::GetNextContinuationOrSpecialSibling(frame);
 +          }
 +        }
 +      }
-+      if ((hint & nsChangeHint_UpdateCursor) && !didUpdateCursor) {
++      if (hint & nsChangeHint_UpdateCursor) {
 +        mPresContext->GetPresShell()->SynthesizeMouseMove(false);
-+        didUpdateCursor = true;
 +      }
 +    }
 +  }
@@ -1095,22 +1087,20 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +        break;
 +    }
 +
-+    for (nsIFrame *cont = aFrame; cont; cont = cont->GetNextContinuation()) {
-+      nsIFrame* cb = cont->GetContainingBlock();
-+      const nsSize size = cb->GetSize();
-+      const nsPoint oldOffsets = cont->GetRelativeOffset();
-+      nsMargin newOffsets;
++    nsIFrame* cb = aFrame->GetContainingBlock();
++    const nsSize size = cb->GetSize();
++    const nsPoint oldOffsets = aFrame->GetRelativeOffset();
++    nsMargin newOffsets;
 +
-+      // Move the frame
-+      nsHTMLReflowState::ComputeRelativeOffsets(
-+          cb->StyleVisibility()->mDirection,
-+          cont, size.width, size.height, newOffsets);
-+      NS_ASSERTION(newOffsets.left == -newOffsets.right &&
-+                   newOffsets.top == -newOffsets.bottom,
-+                   "ComputeRelativeOffsets should return valid results");
-+      cont->SetPosition(cont->GetPosition() - oldOffsets +
-+                          nsPoint(newOffsets.left, newOffsets.top));
-+    }
++    // Move the frame
++    nsHTMLReflowState::ComputeRelativeOffsets(
++        cb->StyleVisibility()->mDirection,
++        aFrame, size.width, size.height, newOffsets);
++    NS_ASSERTION(newOffsets.left == -newOffsets.right &&
++                 newOffsets.top == -newOffsets.bottom,
++                 "ComputeRelativeOffsets should return valid results");
++    aFrame->SetPosition(aFrame->GetPosition() - oldOffsets +
++                        nsPoint(newOffsets.left, newOffsets.top));
 +
 +    return true;
 +  }
@@ -1131,69 +1121,67 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +    nsRefPtr<nsRenderingContext> rc = aFrame->PresContext()->GetPresShell()->
 +      GetReferenceRenderingContext();
 +
-+    for (nsIFrame *cont = aFrame; cont; cont = cont->GetNextContinuation()) {
-+      // Construct a bogus parent reflow state so that there's a usable
-+      // containing block reflow state.
-+      nsIFrame* parentFrame = cont->GetParent();
-+      nsSize parentSize = parentFrame->GetSize();
++    // Construct a bogus parent reflow state so that there's a usable
++    // containing block reflow state.
++    nsIFrame* parentFrame = aFrame->GetParent();
++    nsSize parentSize = parentFrame->GetSize();
 +
-+      nsFrameState savedState = parentFrame->GetStateBits();
-+      nsHTMLReflowState parentReflowState(cont->PresContext(), parentFrame,
-+                                          rc, parentSize);
-+      parentFrame->RemoveStateBits(~nsFrameState(0));
-+      parentFrame->AddStateBits(savedState);
++    nsFrameState savedState = parentFrame->GetStateBits();
++    nsHTMLReflowState parentReflowState(aFrame->PresContext(), parentFrame,
++                                        rc, parentSize);
++    parentFrame->RemoveStateBits(~nsFrameState(0));
++    parentFrame->AddStateBits(savedState);
 +
-+      NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
-+                       parentSize.height != NS_INTRINSICSIZE,
-+                       "parentSize should be valid");
-+      parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
-+      parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
-+      parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
-+      parentSize.height = NS_AUTOHEIGHT;
++    NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
++                     parentSize.height != NS_INTRINSICSIZE,
++                     "parentSize should be valid");
++    parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
++    parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
++    parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
++    parentSize.height = NS_AUTOHEIGHT;
 +
-+      parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
-+      parentReflowState.mComputedBorderPadding =
-+        parentFrame->GetUsedBorderAndPadding();
++    parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
++    parentReflowState.mComputedBorderPadding =
++      parentFrame->GetUsedBorderAndPadding();
 +
-+      nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
++    nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
 +
-+      nsSize size = cont->GetSize();
-+      ViewportFrame* viewport = do_QueryFrame(parentFrame);
-+      nsSize cbSize = viewport ?
-+        viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
-+        : cont->GetContainingBlock()->GetSize();
-+      const nsMargin& parentBorder =
-+        parentReflowState.mStyleBorder->GetComputedBorder();
-+      cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
-+      nsHTMLReflowState reflowState(cont->PresContext(), parentReflowState,
-+                                    cont, availSize, cbSize.width,
-+                                    cbSize.height);
++    nsSize size = aFrame->GetSize();
++    ViewportFrame* viewport = do_QueryFrame(parentFrame);
++    nsSize cbSize = viewport ?
++      viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
++      : aFrame->GetContainingBlock()->GetSize();
++    const nsMargin& parentBorder =
++      parentReflowState.mStyleBorder->GetComputedBorder();
++    cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
++    nsHTMLReflowState reflowState(aFrame->PresContext(), parentReflowState,
++                                  aFrame, availSize, cbSize.width,
++                                  cbSize.height);
 +
-+      // If we're solving for 'left' or 'top', then compute it here, in order to
-+      // match the reflow code path.
-+      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
-+        reflowState.mComputedOffsets.left = cbSize.width -
-+                                            reflowState.mComputedOffsets.right -
-+                                            reflowState.mComputedMargin.right -
-+                                            size.width -
-+                                            reflowState.mComputedMargin.left;
-+      }
-+
-+      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
-+        reflowState.mComputedOffsets.top = cbSize.height -
-+                                           reflowState.mComputedOffsets.bottom -
-+                                           reflowState.mComputedMargin.bottom -
-+                                           size.height -
-+                                           reflowState.mComputedMargin.top;
-+      }
-+
-+      // Move the frame
-+      nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
-+                  reflowState.mComputedMargin.left,
-+                  parentBorder.top + reflowState.mComputedOffsets.top +
-+                  reflowState.mComputedMargin.top);
-+      cont->SetPosition(pos);
++    // If we're solving for 'left' or 'top', then compute it here, in order to
++    // match the reflow code path.
++    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
++      reflowState.mComputedOffsets.left = cbSize.width -
++                                          reflowState.mComputedOffsets.right -
++                                          reflowState.mComputedMargin.right -
++                                          size.width -
++                                          reflowState.mComputedMargin.left;
 +    }
++
++    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
++      reflowState.mComputedOffsets.top = cbSize.height -
++                                         reflowState.mComputedOffsets.bottom -
++                                         reflowState.mComputedMargin.bottom -
++                                         size.height -
++                                         reflowState.mComputedMargin.top;
++    }
++
++    // Move the frame
++    nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
++                reflowState.mComputedMargin.left,
++                parentBorder.top + reflowState.mComputedOffsets.top +
++                reflowState.mComputedMargin.top);
++    aFrame->SetPosition(pos);
 +
 +    return true;
 +  }
@@ -1807,7 +1795,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -  NS_PRECONDITION(gInApplyRenderingChangeToTree,
 -                  "should only be called within ApplyRenderingChangeToTree");
 -
--  for ( ; aFrame; aFrame = aFrame->GetNextContinuation()) {
+-  for ( ; aFrame; aFrame = nsLayoutUtils::GetNextContinuationOrSpecialSibling(aFrame)) {
 -    // Invalidate and sync views on all descendant frames, following placeholders.
 -    // We don't need to update transforms in SyncViewsAndInvalidateDescendants, because
 -    // there can't be any out-of-flows or popups that need to be transformed;
@@ -1989,7 +1977,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -
 -  do {
 -    mPresShell->FrameNeedsReflow(aFrame, dirtyType, dirtyBits);
--    aFrame = aFrame->GetNextContinuation();
+-    aFrame = nsLayoutUtils::GetNextContinuationOrSpecialSibling(aFrame);
 -  } while (aFrame);
 -
 -  return NS_OK;
@@ -2004,7 +1992,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
    if ((aContent->HasFlag(NS_CREATE_FRAME_IF_NON_WHITESPACE) &&
         !aContent->TextIsOnlyWhitespace()) ||
-@@ -7995,542 +7693,16 @@ nsCSSFrameConstructor::CharacterDataChan
+@@ -7995,534 +7693,16 @@ nsCSSFrameConstructor::CharacterDataChan
      if (haveFirstLetterStyle) {
        RecoverLetterFrames(block);
      }
@@ -2126,8 +2114,6 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -
 -  index = count;
 -
--  bool didUpdateCursor = false;
--
 -  while (0 <= --index) {
 -    nsIFrame* frame;
 -    nsIContent* content;
@@ -2173,28 +2159,26 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -      if (NeedToReframeForAddingOrRemovingTransform(frame)) {
 -        NS_UpdateHint(hint, nsChangeHint_ReconstructFrame);
 -      } else {
--        for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
--          // Normally frame construction would set state bits as needed,
--          // but we're not going to reconstruct the frame so we need to set them.
--          // It's because we need to set this state on each affected frame
--          // that we can't coalesce nsChangeHint_AddOrRemoveTransform hints up
--          // to ancestors (i.e. it can't be an inherited change hint).
--          if (cont->IsPositioned()) {
--            // If a transform has been added, we'll be taking this path,
--            // but we may be taking this path even if a transform has been
--            // removed. It's OK to add the bit even if it's not needed.
--            cont->AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
--            if (!cont->IsAbsoluteContainer() &&
--                (cont->GetStateBits() & NS_FRAME_CAN_HAVE_ABSPOS_CHILDREN)) {
--              cont->MarkAsAbsoluteContainingBlock();
--            }
--          } else {
--            // Don't remove NS_FRAME_MAY_BE_TRANSFORMED since it may still by
--            // transformed by other means. It's OK to have the bit even if it's
--            // not needed.
--            if (cont->IsAbsoluteContainer()) {
--              cont->MarkAsNotAbsoluteContainingBlock();
--            }
+-        // Normally frame construction would set state bits as needed,
+-        // but we're not going to reconstruct the frame so we need to set them.
+-        // It's because we need to set this state on each affected frame
+-        // that we can't coalesce nsChangeHint_AddOrRemoveTransform hints up
+-        // to ancestors (i.e. it can't be an inherited change hint).
+-        if (frame->IsPositioned()) {
+-          // If a transform has been added, we'll be taking this path,
+-          // but we may be taking this path even if a transform has been
+-          // removed. It's OK to add the bit even if it's not needed.
+-          frame->AddStateBits(NS_FRAME_MAY_BE_TRANSFORMED);
+-          if (!frame->IsAbsoluteContainer() &&
+-              (frame->GetStateBits() & NS_FRAME_CAN_HAVE_ABSPOS_CHILDREN)) {
+-            frame->MarkAsAbsoluteContainingBlock();
+-          }
+-        } else {
+-          // Don't remove NS_FRAME_MAY_BE_TRANSFORMED since it may still by
+-          // transformed by other means. It's OK to have the bit even if it's
+-          // not needed.
+-          if (frame->IsAbsoluteContainer()) {
+-            frame->MarkAsNotAbsoluteContainingBlock();
 -          }
 -        }
 -      }
@@ -2220,9 +2204,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -      }
 -
 -      if (hint & nsChangeHint_UpdateEffects) {
--        for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
--          nsSVGEffects::UpdateEffects(cont);
--        }
+-        nsSVGEffects::UpdateEffects(frame);
 -      }
 -      if (hint & nsChangeHint_NeedReflow) {
 -        StyleChangeReflow(frame, hint);
@@ -2247,10 +2229,6 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -          // The overflow areas of the child frames need to be updated:
 -          nsIFrame* hintFrame = GetFrameForChildrenOnlyTransformHint(frame);
 -          nsIFrame* childFrame = hintFrame->GetFirstPrincipalChild();
--          NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrSpecialSibling(frame),
--                       "SVG frames should not have continuations or special siblings");
--          NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrSpecialSibling(hintFrame),
--                       "SVG frames should not have continuations or special siblings");
 -          for ( ; childFrame; childFrame = childFrame->GetNextSibling()) {
 -            NS_ABORT_IF_FALSE(childFrame->IsFrameOfType(nsIFrame::eSVG),
 -                              "Not expecting non-SVG children");
@@ -2270,14 +2248,16 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -        // overflows since that will happen when it's reflowed.
 -        if (!(frame->GetStateBits() &
 -              (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN))) {
--          for (nsIFrame *cont = frame; cont; cont = cont->GetNextContinuation()) {
--            mOverflowChangedTracker.AddFrame(cont);
+-          while (frame) {
+-            mOverflowChangedTracker.AddFrame(frame);
+-
+-            frame =
+-              nsLayoutUtils::GetNextContinuationOrSpecialSibling(frame);
 -          }
 -        }
 -      }
--      if ((hint & nsChangeHint_UpdateCursor) && !didUpdateCursor) {
+-      if (hint & nsChangeHint_UpdateCursor) {
 -        mPresShell->SynthesizeMouseMove(false);
--        didUpdateCursor = true;
 -      }
 -    }
 -  }
@@ -2547,7 +2527,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
    nsRootPresContext* rootPresContext =
      mPresShell->GetPresContext()->GetRootPresContext();
    if (rootPresContext) {
-@@ -8581,18 +7753,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
+@@ -8573,18 +7753,19 @@ nsCSSFrameConstructor::WillDestroyFrameT
  
    mIsDestroyingFrameTree = true;
  
@@ -2569,7 +2549,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
  
  //STATIC
  
-@@ -11970,202 +11143,16 @@ nsCSSFrameConstructor::RestyleForRemove(
+@@ -11962,202 +11143,16 @@ nsCSSFrameConstructor::RestyleForRemove(
        if (content == aFollowingSibling) {
          reachedFollowingSibling = true;
        }
@@ -2772,7 +2752,7 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
      BeginUpdate();
  
      nsFrameItems childItems;
-@@ -12402,162 +11389,8 @@ Iterator::DeleteItemsTo(const Iterator& 
+@@ -12394,158 +11389,8 @@ Iterator::DeleteItemsTo(const Iterator& 
      NS_ASSERTION(!IsDone(), "Ran off end of list?");
      FrameConstructionItem* item = ToItem(mCurrent);
      Next();
@@ -2828,22 +2808,20 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -        break;
 -    }
 -
--    for (nsIFrame *cont = aFrame; cont; cont = cont->GetNextContinuation()) {
--      nsIFrame* cb = cont->GetContainingBlock();
--      const nsSize size = cb->GetSize();
--      const nsPoint oldOffsets = cont->GetRelativeOffset();
--      nsMargin newOffsets;
+-    nsIFrame* cb = aFrame->GetContainingBlock();
+-    const nsSize size = cb->GetSize();
+-    const nsPoint oldOffsets = aFrame->GetRelativeOffset();
+-    nsMargin newOffsets;
 -
--      // Move the frame
--      nsHTMLReflowState::ComputeRelativeOffsets(
--          cb->StyleVisibility()->mDirection,
--          cont, size.width, size.height, newOffsets);
--      NS_ASSERTION(newOffsets.left == -newOffsets.right &&
--                   newOffsets.top == -newOffsets.bottom,
--                   "ComputeRelativeOffsets should return valid results");
--      cont->SetPosition(cont->GetPosition() - oldOffsets +
--                          nsPoint(newOffsets.left, newOffsets.top));
--    }
+-    // Move the frame
+-    nsHTMLReflowState::ComputeRelativeOffsets(
+-        cb->StyleVisibility()->mDirection,
+-        aFrame, size.width, size.height, newOffsets);
+-    NS_ASSERTION(newOffsets.left == -newOffsets.right &&
+-                 newOffsets.top == -newOffsets.bottom,
+-                 "ComputeRelativeOffsets should return valid results");
+-    aFrame->SetPosition(aFrame->GetPosition() - oldOffsets +
+-                        nsPoint(newOffsets.left, newOffsets.top));
 -
 -    return true;
 -  }
@@ -2864,69 +2842,67 @@ diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConst
 -    nsRefPtr<nsRenderingContext> rc = aFrame->PresContext()->GetPresShell()->
 -      GetReferenceRenderingContext();
 -
--    for (nsIFrame *cont = aFrame; cont; cont = cont->GetNextContinuation()) {
--      // Construct a bogus parent reflow state so that there's a usable
--      // containing block reflow state.
--      nsIFrame* parentFrame = cont->GetParent();
--      nsSize parentSize = parentFrame->GetSize();
+-    // Construct a bogus parent reflow state so that there's a usable
+-    // containing block reflow state.
+-    nsIFrame* parentFrame = aFrame->GetParent();
+-    nsSize parentSize = parentFrame->GetSize();
 -
--      nsFrameState savedState = parentFrame->GetStateBits();
--      nsHTMLReflowState parentReflowState(cont->PresContext(), parentFrame,
--                                          rc, parentSize);
--      parentFrame->RemoveStateBits(~nsFrameState(0));
--      parentFrame->AddStateBits(savedState);
+-    nsFrameState savedState = parentFrame->GetStateBits();
+-    nsHTMLReflowState parentReflowState(aFrame->PresContext(), parentFrame,
+-                                        rc, parentSize);
+-    parentFrame->RemoveStateBits(~nsFrameState(0));
+-    parentFrame->AddStateBits(savedState);
 -
--      NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
--                       parentSize.height != NS_INTRINSICSIZE,
--                       "parentSize should be valid");
--      parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
--      parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
--      parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
--      parentSize.height = NS_AUTOHEIGHT;
+-    NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
+-                     parentSize.height != NS_INTRINSICSIZE,
+-                     "parentSize should be valid");
+-    parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
+-    parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
+-    parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
+-    parentSize.height = NS_AUTOHEIGHT;
 -
--      parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
--      parentReflowState.mComputedBorderPadding =
--        parentFrame->GetUsedBorderAndPadding();
+-    parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
+-    parentReflowState.mComputedBorderPadding =
+-      parentFrame->GetUsedBorderAndPadding();
 -
--      nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
+-    nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
 -
--      nsSize size = cont->GetSize();
--      ViewportFrame* viewport = do_QueryFrame(parentFrame);
--      nsSize cbSize = viewport ?
--        viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
--        : cont->GetContainingBlock()->GetSize();
--      const nsMargin& parentBorder =
--        parentReflowState.mStyleBorder->GetComputedBorder();
--      cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
--      nsHTMLReflowState reflowState(cont->PresContext(), parentReflowState,
--                                    cont, availSize, cbSize.width,
--                                    cbSize.height);
+-    nsSize size = aFrame->GetSize();
+-    ViewportFrame* viewport = do_QueryFrame(parentFrame);
+-    nsSize cbSize = viewport ?
+-      viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
+-      : aFrame->GetContainingBlock()->GetSize();
+-    const nsMargin& parentBorder =
+-      parentReflowState.mStyleBorder->GetComputedBorder();
+-    cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
+-    nsHTMLReflowState reflowState(aFrame->PresContext(), parentReflowState,
+-                                  aFrame, availSize, cbSize.width,
+-                                  cbSize.height);
 -
--      // If we're solving for 'left' or 'top', then compute it here, in order to
--      // match the reflow code path.
--      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
--        reflowState.mComputedOffsets.left = cbSize.width -
--                                            reflowState.mComputedOffsets.right -
--                                            reflowState.mComputedMargin.right -
--                                            size.width -
--                                            reflowState.mComputedMargin.left;
--      }
--
--      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
--        reflowState.mComputedOffsets.top = cbSize.height -
--                                           reflowState.mComputedOffsets.bottom -
--                                           reflowState.mComputedMargin.bottom -
--                                           size.height -
--                                           reflowState.mComputedMargin.top;
--      }
--      
--      // Move the frame
--      nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
--                  reflowState.mComputedMargin.left,
--                  parentBorder.top + reflowState.mComputedOffsets.top +
--                  reflowState.mComputedMargin.top);
--      cont->SetPosition(pos);
+-    // If we're solving for 'left' or 'top', then compute it here, in order to
+-    // match the reflow code path.
+-    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
+-      reflowState.mComputedOffsets.left = cbSize.width -
+-                                          reflowState.mComputedOffsets.right -
+-                                          reflowState.mComputedMargin.right -
+-                                          size.width -
+-                                          reflowState.mComputedMargin.left;
 -    }
+-
+-    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
+-      reflowState.mComputedOffsets.top = cbSize.height -
+-                                         reflowState.mComputedOffsets.bottom -
+-                                         reflowState.mComputedMargin.bottom -
+-                                         size.height -
+-                                         reflowState.mComputedMargin.top;
+-    }
+-    
+-    // Move the frame
+-    nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
+-                reflowState.mComputedMargin.left,
+-                parentBorder.top + reflowState.mComputedOffsets.top +
+-                reflowState.mComputedMargin.top);
+-    aFrame->SetPosition(pos);
 -
 -    return true;
 -  }
@@ -3913,7 +3889,7 @@ diff --git a/layout/style/nsHTMLStyleSheet.cpp b/layout/style/nsHTMLStyleSheet.c
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -426,20 +426,19 @@ nsTransitionManager::UpdateAllThrottledS
+@@ -425,20 +425,19 @@ nsTransitionManager::UpdateAllThrottledS
      nsIFrame* primaryFrame;
      if (element &&
          (primaryFrame = nsLayoutUtils::GetStyleFrame(element))) {
