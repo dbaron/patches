@@ -1,0 +1,252 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Create and use ElementRestyler::mVisibleKidsOfHiddenElement.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1935,32 +1935,35 @@ RestyleManager::ReparentStyleContext(nsI
+   }
+   return NS_OK;
+ }
+ 
+ ElementRestyler::ElementRestyler(nsPresContext* aPresContext,
+                                  nsIFrame* aFrame,
+                                  nsStyleChangeList* aChangeList,
+                                  nsChangeHint aMinChange,
+-                                 RestyleTracker& aRestyleTracker)
++                                 RestyleTracker& aRestyleTracker,
++                                 nsTArray<nsIContent*>&
++                                   aVisibleKidsOfHiddenElement)
+   : mPresContext(aPresContext)
+   , mFrame(aFrame)
+   , mParentContent(nullptr)
+     // XXXldb Why does it make sense to use aParentContent?  (See
+     // comment above assertion at start of ElementRestyler::Restyle.)
+   , mContent(mFrame->GetContent() ? mFrame->GetContent() : mParentContent)
+   , mChangeList(aChangeList)
+   , mMinChange(NS_SubtractHint(aMinChange,
+                NS_HintsNotHandledForDescendantsIn(aMinChange)))
+   , mParentFrameHintsNotHandledForDescendants(nsChangeHint(0))
+   , mHintsNotHandledForDescendants(nsChangeHint(0))
+   , mRestyleTracker(aRestyleTracker)
+   , mDesiredA11yNotifications(eSendAllNotifications)
+   , mKidsDesiredA11yNotifications(mDesiredA11yNotifications)
+   , mOurA11yNotification(eDontNotify)
++  , mVisibleKidsOfHiddenElement(aVisibleKidsOfHiddenElement)
+ {
+ }
+ 
+ ElementRestyler::ElementRestyler(const ElementRestyler& aParentRestyler,
+                                  nsIFrame* aFrame)
+   : mPresContext(aParentRestyler.mPresContext)
+   , mFrame(aFrame)
+   , mParentContent(aParentRestyler.mContent)
+@@ -1972,16 +1975,17 @@ ElementRestyler::ElementRestyler(const E
+                NS_HintsNotHandledForDescendantsIn(aParentRestyler.mMinChange)))
+   , mParentFrameHintsNotHandledForDescendants(
+       aParentRestyler.mHintsNotHandledForDescendants)
+   , mHintsNotHandledForDescendants(nsChangeHint(0))
+   , mRestyleTracker(aParentRestyler.mRestyleTracker)
+   , mDesiredA11yNotifications(aParentRestyler.mKidsDesiredA11yNotifications)
+   , mKidsDesiredA11yNotifications(mDesiredA11yNotifications)
+   , mOurA11yNotification(eDontNotify)
++  , mVisibleKidsOfHiddenElement(aParentRestyler.mVisibleKidsOfHiddenElement)
+ {
+ }
+ 
+ ElementRestyler::ElementRestyler(ParentContextFromChildFrame,
+                                  const ElementRestyler& aParentRestyler,
+                                  nsIFrame* aFrame)
+   : mPresContext(aParentRestyler.mPresContext)
+   , mFrame(aFrame)
+@@ -1995,16 +1999,17 @@ ElementRestyler::ElementRestyler(ParentC
+   , mParentFrameHintsNotHandledForDescendants(
+       // assume the worst
+       nsChangeHint_Hints_NotHandledForDescendants)
+   , mHintsNotHandledForDescendants(nsChangeHint(0))
+   , mRestyleTracker(aParentRestyler.mRestyleTracker)
+   , mDesiredA11yNotifications(aParentRestyler.mDesiredA11yNotifications)
+   , mKidsDesiredA11yNotifications(mDesiredA11yNotifications)
+   , mOurA11yNotification(eDontNotify)
++  , mVisibleKidsOfHiddenElement(aParentRestyler.mVisibleKidsOfHiddenElement)
+ {
+ }
+ 
+ void
+ ElementRestyler::CaptureChange(nsStyleContext* aOldContext,
+                                nsStyleContext* aNewContext,
+                                nsChangeHint aChangeToAssume)
+ {
+@@ -2037,17 +2042,16 @@ ElementRestyler::CaptureChange(nsStyleCo
+  * given that mMinChange is already accumulated for an ancestor.
+  * mParentContent is the content node used to resolve the parent style
+  * context.  This means that, for pseudo-elements, it is the content
+  * that should be used for selector matching (rather than the fake
+  * content node attached to the frame).
+  */
+ void
+ ElementRestyler::Restyle(nsRestyleHint aRestyleHint,
+-                         nsTArray<nsIContent*>& aVisibleKidsOfHiddenElement,
+                          TreeMatchContext &aTreeMatchContext)
+ {
+   // It would be nice if we could make stronger assertions here; they
+   // would let us simplify the ?: expressions below setting |content|
+   // and |pseudoContent| in sensible ways as well as making what
+   // |mFrame->GetContent()|, |content|, and |pseudoContent| mean make more
+   // sense.  However, we can't, because of frame trees like the one in
+   // https://bugzilla.mozilla.org/show_bug.cgi?id=472353#c14 .  Once we
+@@ -2123,17 +2127,16 @@ ElementRestyler::Restyle(nsRestyleHint a
+       // nsStyleContext::CalcStyleDifference says. CalcStyleDifference
+       // can't be trusted because it assumes any changes to the parent
+       // style context provider will be automatically propagated to
+       // the frame(s) with child style contexts.
+ 
+       ElementRestyler providerRestyler(PARENT_CONTEXT_FROM_CHILD_FRAME,
+                                        *this, providerFrame);
+       providerRestyler.Restyle(aRestyleHint,
+-                                                   aVisibleKidsOfHiddenElement,
+                                                    aTreeMatchContext);
+       assumeDifferenceHint = providerRestyler.MinChange();
+ 
+       // The provider's new context becomes the parent context of
+       // mFrame's context.
+       parentContext = providerFrame->StyleContext();
+       // Set |resolvedChild| so we don't bother resolving the
+       // provider again.
+@@ -2528,17 +2531,17 @@ ElementRestyler::Restyle(nsRestyleHint a
+               mKidsDesiredA11yNotifications = eNotifyIfShown;
+               mOurA11yNotification = eNotifyHidden;
+             }
+           }
+         } else if (mDesiredA11yNotifications == eNotifyIfShown &&
+                    newContext->StyleVisibility()->IsVisible()) {
+           // Notify a11y that element stayed visible while its parent was
+           // hidden.
+-          aVisibleKidsOfHiddenElement.AppendElement(mFrame->GetContent());
++          mVisibleKidsOfHiddenElement.AppendElement(mFrame->GetContent());
+           mKidsDesiredA11yNotifications = eSkipNotifications;
+         }
+       }
+ #endif
+ 
+       // now do children
+       nsIFrame::ChildListIterator lists(mFrame);
+       for (TreeMatchContext::AutoAncestorPusher
+@@ -2586,32 +2589,29 @@ ElementRestyler::Restyle(nsRestyleHint a
+               // |nsFrame::GetParentStyleContextFrame| checks being out
+               // of flow so that this works correctly.
+               do {
+                 ElementRestyler oofRestyler(*this, outOfFlowFrame);
+                 oofRestyler.mMinChange =
+                   NS_SubtractHint(oofRestyler.mMinChange,
+                                   nsChangeHint_AllReflowHints);
+                 oofRestyler.Restyle(childRestyleHint,
+-                                      aVisibleKidsOfHiddenElement,
+                                       aTreeMatchContext);
+               } while ((outOfFlowFrame = outOfFlowFrame->GetNextContinuation()));
+ 
+               // reresolve placeholder's context under the same parent
+               // as the out-of-flow frame
+               ElementRestyler phRestyler(*this, child);
+               phRestyler.Restyle(childRestyleHint,
+-                                    aVisibleKidsOfHiddenElement,
+                                     aTreeMatchContext);
+             }
+             else {  // regular child frame
+               if (child != resolvedChild) {
+                 ElementRestyler childRestyler(*this, child);
+                 childRestyler.Restyle(childRestyleHint,
+-                                      aVisibleKidsOfHiddenElement,
+                                       aTreeMatchContext);
+               }
+             }
+           }
+         }
+       }
+       // XXX need to do overflow frames???
+ 
+@@ -2630,24 +2630,24 @@ ElementRestyler::Restyle(nsRestyleHint a
+       } else if (mOurA11yNotification == eNotifyHidden) {
+         nsAccessibilityService* accService = nsIPresShell::AccService();
+         if (accService) {
+           nsIPresShell* presShell = mFrame->PresContext()->GetPresShell();
+           nsIContent* content = mFrame->GetContent();
+           accService->ContentRemoved(presShell, content->GetParent(), content);
+ 
+           // Process children staying shown.
+-          uint32_t visibleContentCount = aVisibleKidsOfHiddenElement.Length();
++          uint32_t visibleContentCount = mVisibleKidsOfHiddenElement.Length();
+           for (uint32_t idx = 0; idx < visibleContentCount; idx++) {
+-            nsIContent* childContent = aVisibleKidsOfHiddenElement[idx];
++            nsIContent* childContent = mVisibleKidsOfHiddenElement[idx];
+             accService->ContentRangeInserted(presShell, childContent->GetParent(),
+                                              childContent,
+                                              childContent->GetNextSibling());
+           }
+-          aVisibleKidsOfHiddenElement.Clear();
++          mVisibleKidsOfHiddenElement.Clear();
+         }
+       }
+ #endif
+     }
+   }
+ }
+ 
+ void
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -276,17 +276,18 @@ class ElementRestyler MOZ_FINAL {
+ public:
+   typedef mozilla::dom::Element Element;
+ 
+   // Construct for the root of the subtree that we're restyling.
+   ElementRestyler(nsPresContext* aPresContext,
+                   nsIFrame* aFrame,
+                   nsStyleChangeList* aChangeList,
+                   nsChangeHint aMinChange,
+-                  RestyleTracker& aRestyleTracker);
++                  RestyleTracker& aRestyleTracker,
++                  nsTArray<nsIContent*>& aVisibleKidsOfHiddenElement);
+ 
+   // Construct for an element whose parent is being restyled.
+   ElementRestyler(const ElementRestyler& aParentRestyler,
+                   nsIFrame* aFrame);
+ 
+   // Construct for an frame whose parent is being restyled, but which
+   // provides the parent style context for its parent frame.  (This is
+   // only used for table frames, which are the parent style context for
+@@ -304,17 +305,16 @@ public:
+    *
+    * Use eRestyle_Self for the aRestyleHint argument to mean
+    * "reresolve our style context but not kids", use eRestyle_Subtree
+    * to mean "reresolve our style context and kids", and use
+    * nsRestyleHint(0) to mean recompute a new style context for our
+    * current parent and existing rulenode, and the same for kids.
+    */
+   void Restyle(nsRestyleHint aRestyleHint,
+-               nsTArray<nsIContent*>& aVisibleKidsOfHiddenElement,
+                TreeMatchContext &aTreeMatchContext);
+ 
+   nsChangeHint MinChange() { return mMinChange; }
+ 
+ private:
+   void CaptureChange(nsStyleContext* aOldContext,
+                      nsStyleContext* aNewContext,
+                      nsChangeHint aChangeToAssume);
+@@ -346,13 +346,14 @@ private:
+   // See nsStyleContext::CalcStyleDifference
+   nsChangeHint mParentFrameHintsNotHandledForDescendants;
+   nsChangeHint mHintsNotHandledForDescendants;
+   RestyleTracker& mRestyleTracker;
+ 
+   const DesiredA11yNotifications mDesiredA11yNotifications;
+   DesiredA11yNotifications mKidsDesiredA11yNotifications;
+   A11yNotificationType mOurA11yNotification;
++  nsTArray<nsIContent*>& mVisibleKidsOfHiddenElement;
+ };
+ 
+ } // namespace mozilla
+ 
+ #endif /* mozilla_RestyleManager_h */
