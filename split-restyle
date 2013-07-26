@@ -5,7 +5,7 @@ Bug 898329 patch 3:  Split ElementRestyler::Restyle into multiple functions.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -2056,16 +2056,25 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2056,16 +2056,42 @@ ElementRestyler::Restyle(nsRestyleHint a
    // and |pseudoContent| in sensible ways as well as making what
    // |mFrame->GetContent()|, |content|, and |pseudoContent| mean make more
    // sense.  However, we can't, because of frame trees like the one in
@@ -15,9 +15,26 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                 !mParentContent->GetParent(),
                 "frame must have content (unless at the top of the tree)");
 +
++  if (mContent && mContent->IsElement()) {
++    mContent->OwnerDoc()->FlushPendingLinkUpdates();
++    RestyleTracker::RestyleData restyleData;
++    if (mRestyleTracker.GetRestyleData(mContent->AsElement(), &restyleData)) {
++      if (NS_UpdateHint(mMinChange, restyleData.mChangeHint)) {
++        mChangeList->AppendChange(mFrame, mContent, restyleData.mChangeHint);
++      }
++      aRestyleHint = nsRestyleHint(aRestyleHint | restyleData.mRestyleHint);
++    }
++  }
++
++  nsRestyleHint childRestyleHint = aRestyleHint;
++
++  if (childRestyleHint == eRestyle_Self) {
++    childRestyleHint = nsRestyleHint(0);
++  }
++
 +  RestyleSelf();
 +
-+  RestyleChildren();
++  RestyleChildren(childRestyleHint);
 +}
 +
 +void
@@ -31,7 +48,41 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    // We do need a reference to oldContext for the lifetime of this function, and it's possible
    // that the frame has the last reference to it, so AddRef it here.
  
-@@ -2343,93 +2352,22 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2076,33 +2102,16 @@ ElementRestyler::Restyle(nsRestyleHint a
+ #ifdef ACCESSIBILITY
+     mWasFrameVisible = nsIPresShell::IsAccessibilityActive() ?
+       oldContext->StyleVisibility()->IsVisible() : false;
+ #endif
+ 
+     nsIAtom* const pseudoTag = oldContext->GetPseudo();
+     const nsCSSPseudoElements::Type pseudoType = oldContext->GetPseudoType();
+ 
+-    if (mContent && mContent->IsElement()) {
+-      mContent->OwnerDoc()->FlushPendingLinkUpdates();
+-      RestyleTracker::RestyleData restyleData;
+-      if (mRestyleTracker.GetRestyleData(mContent->AsElement(), &restyleData)) {
+-        if (NS_UpdateHint(mMinChange, restyleData.mChangeHint)) {
+-          mChangeList->AppendChange(mFrame, mContent, restyleData.mChangeHint);
+-        }
+-        aRestyleHint = nsRestyleHint(aRestyleHint | restyleData.mRestyleHint);
+-      }
+-    }
+-
+-    nsRestyleHint childRestyleHint = aRestyleHint;
+-
+-    if (childRestyleHint == eRestyle_Self) {
+-      childRestyleHint = nsRestyleHint(0);
+-    }
+-
+     nsStyleContext* parentContext;
+     nsIFrame* resolvedChild = nullptr;
+     // Get the frame providing the parent style context.  If it is a
+     // child, then resolve the provider first.
+     nsIFrame* providerFrame = mFrame->GetParentStyleContextFrame();
+     bool isChild = providerFrame && providerFrame->GetParent() == mFrame;
+     if (!isChild) {
+       if (providerFrame)
+@@ -2343,19 +2352,56 @@ ElementRestyler::Restyle(nsRestyleHint a
              }
            }
          }
@@ -43,215 +94,240 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +}
  
 -    // now look for undisplayed child content and pseudos
--
--    // When the root element is display:none, we still construct *some*
--    // frames that have the root element as their mContent, down to the
--    // DocElementContainingBlock.
--    bool checkUndisplayed;
--    nsIContent* undisplayedParent;
--    nsCSSFrameConstructor* frameConstructor = mPresContext->FrameConstructor();
--    if (pseudoTag) {
--      checkUndisplayed = mFrame == frameConstructor->
--                                     GetDocElementContainingBlock();
--      undisplayedParent = nullptr;
--    } else {
--      checkUndisplayed = !!mFrame->GetContent();
--      undisplayedParent = mFrame->GetContent();
--    }
--    if (checkUndisplayed) {
--      UndisplayedNode* undisplayed =
--        frameConstructor->GetAllUndisplayedContentIn(undisplayedParent);
--      for (TreeMatchContext::AutoAncestorPusher
--             pushAncestor(undisplayed, mTreeMatchContext,
--                          undisplayedParent ? undisplayedParent->AsElement()
--                                            : nullptr);
--           undisplayed; undisplayed = undisplayed->mNext) {
--        NS_ASSERTION(undisplayedParent ||
--                     undisplayed->mContent ==
--                       mPresContext->Document()->GetRootElement(),
--                     "undisplayed node child of null must be root");
--        NS_ASSERTION(!undisplayed->mStyle->GetPseudo(),
--                     "Shouldn't have random pseudo style contexts in the "
--                     "undisplayed map");
--
--        // Get the parent of the undisplayed content and check if it is a XBL
--        // children element. Push the children element as an ancestor here because it does
--        // not have a frame and would not otherwise be pushed as an ancestor.
--        nsIContent* parent = undisplayed->mContent->GetParent();
--        bool pushInsertionPoint = parent && parent->IsActiveChildrenElement();
--        TreeMatchContext::AutoAncestorPusher
--          insertionPointPusher(pushInsertionPoint,
--                               mTreeMatchContext,
--                               parent && parent->IsElement() ? parent->AsElement() : nullptr);
--
--        nsRestyleHint thisChildHint = childRestyleHint;
--        RestyleTracker::RestyleData undisplayedRestyleData;
--        if (mRestyleTracker.GetRestyleData(undisplayed->mContent->AsElement(),
--                                           &undisplayedRestyleData)) {
--          thisChildHint =
--            nsRestyleHint(thisChildHint | undisplayedRestyleData.mRestyleHint);
--        }
--        nsRefPtr<nsStyleContext> undisplayedContext;
--        if (thisChildHint) {
--          undisplayedContext =
--            styleSet->ResolveStyleFor(undisplayed->mContent->AsElement(),
--                                      newContext,
--                                      mTreeMatchContext);
--        } else {
--          undisplayedContext =
--            styleSet->ReparentStyleContext(undisplayed->mStyle, newContext,
--                                           undisplayed->mContent->AsElement());
--        }
--        if (undisplayedContext) {
--          const nsStyleDisplay* display = undisplayedContext->StyleDisplay();
--          if (display->mDisplay != NS_STYLE_DISPLAY_NONE) {
--            NS_ASSERTION(undisplayed->mContent,
--                         "Must have undisplayed content");
--            mChangeList->AppendChange(nullptr, undisplayed->mContent,
--                                      NS_STYLE_HINT_FRAMECHANGE);
--            // The node should be removed from the undisplayed map when
--            // we reframe it.
--          } else {
--            // update the undisplayed node with the new context
--            undisplayed->mStyle = undisplayedContext;
--          }
--        }
--      }
--    }
 +void
-+ElementRestyler::RestyleChildren()
++ElementRestyler::RestyleChildren(nsRestyleHint aChildRestyleHint)
 +{
-+    RestyleUndisplayedChildren();
++    RestyleUndisplayedChildren(aChildRestyleHint);
  
-     // Check whether we might need to create a new ::before frame.
-     // There's no need to do this if we're planning to reframe already
-     // or if we're not forcing restyles on kids.
-     if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
-         childRestyleHint) {
-       // Make sure not to do this for pseudo-frames or frames that
-       // can't have generated content.
-@@ -2632,16 +2570,121 @@ ElementRestyler::Restyle(nsRestyleHint a
-           mVisibleKidsOfHiddenElement.Clear();
++    // Check whether we might need to create a new ::before frame.
++    // There's no need to do this if we're planning to reframe already
++    // or if we're not forcing restyles on kids.
++    if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
++        aChildRestyleHint) {
++      RestyleBeforePseudo();
++    }
++
++    // Check whether we might need to create a new ::after frame.
++    // There's no need to do this if we're planning to reframe already
++    // or if we're not forcing restyles on kids.
++    if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
++        aChildRestyleHint) {
++      RestyleAfterPseudo();
++    }
++
++    // There is no need to waste time crawling into a frame's children
++    // on a frame change.  The act of reconstructing frames will force
++    // new style contexts to be resolved on all of this frame's
++    // descendants anyway, so we want to avoid wasting time processing
++    // style contexts that we're just going to throw away anyway. - dwh
++    if (!(mMinChange & nsChangeHint_ReconstructFrame)) {
++      InitializeAccessibilityNotifications();
++
++      RestyleContentChildren();
++
++      SendAccessibilityNotifications();
++    }
++}
++
++void
++ElementRestyler::RestyleUndisplayedChildren(nsRestyleHint aChildRestyleHint)
++{
+     // When the root element is display:none, we still construct *some*
+     // frames that have the root element as their mContent, down to the
+     // DocElementContainingBlock.
+     bool checkUndisplayed;
+     nsIContent* undisplayedParent;
+     nsCSSFrameConstructor* frameConstructor = mPresContext->FrameConstructor();
+     if (pseudoTag) {
+       checkUndisplayed = mFrame == frameConstructor->
+@@ -2386,17 +2432,17 @@ ElementRestyler::Restyle(nsRestyleHint a
+         // not have a frame and would not otherwise be pushed as an ancestor.
+         nsIContent* parent = undisplayed->mContent->GetParent();
+         bool pushInsertionPoint = parent && parent->IsActiveChildrenElement();
+         TreeMatchContext::AutoAncestorPusher
+           insertionPointPusher(pushInsertionPoint,
+                                mTreeMatchContext,
+                                parent && parent->IsElement() ? parent->AsElement() : nullptr);
+ 
+-        nsRestyleHint thisChildHint = childRestyleHint;
++        nsRestyleHint thisChildHint = aChildRestyleHint;
+         RestyleTracker::RestyleData undisplayedRestyleData;
+         if (mRestyleTracker.GetRestyleData(undisplayed->mContent->AsElement(),
+                                            &undisplayedRestyleData)) {
+           thisChildHint =
+             nsRestyleHint(thisChildHint | undisplayedRestyleData.mRestyleHint);
+         }
+         nsRefPtr<nsStyleContext> undisplayedContext;
+         if (thisChildHint) {
+@@ -2421,21 +2467,21 @@ ElementRestyler::Restyle(nsRestyleHint a
+           } else {
+             // update the undisplayed node with the new context
+             undisplayed->mStyle = undisplayedContext;
+           }
          }
        }
- #endif
      }
- }
  
- void
-+ElementRestyler::RestyleUndisplayedChildren()
-+{
-+    // When the root element is display:none, we still construct *some*
-+    // frames that have the root element as their mContent, down to the
-+    // DocElementContainingBlock.
-+    bool checkUndisplayed;
-+    nsIContent* undisplayedParent;
-+    nsCSSFrameConstructor* frameConstructor = mPresContext->FrameConstructor();
-+    if (pseudoTag) {
-+      checkUndisplayed = mFrame == frameConstructor->
-+                                     GetDocElementContainingBlock();
-+      undisplayedParent = nullptr;
-+    } else {
-+      checkUndisplayed = !!mFrame->GetContent();
-+      undisplayedParent = mFrame->GetContent();
-+    }
-+    if (checkUndisplayed) {
-+      UndisplayedNode* undisplayed =
-+        frameConstructor->GetAllUndisplayedContentIn(undisplayedParent);
-+      for (TreeMatchContext::AutoAncestorPusher
-+             pushAncestor(undisplayed, mTreeMatchContext,
-+                          undisplayedParent ? undisplayedParent->AsElement()
-+                                            : nullptr);
-+           undisplayed; undisplayed = undisplayed->mNext) {
-+        NS_ASSERTION(undisplayedParent ||
-+                     undisplayed->mContent ==
-+                       mPresContext->Document()->GetRootElement(),
-+                     "undisplayed node child of null must be root");
-+        NS_ASSERTION(!undisplayed->mStyle->GetPseudo(),
-+                     "Shouldn't have random pseudo style contexts in the "
-+                     "undisplayed map");
-+
-+        // Get the parent of the undisplayed content and check if it is a XBL
-+        // children element. Push the children element as an ancestor here because it does
-+        // not have a frame and would not otherwise be pushed as an ancestor.
-+        nsIContent* parent = undisplayed->mContent->GetParent();
-+        bool pushInsertionPoint = parent && parent->IsActiveChildrenElement();
-+        TreeMatchContext::AutoAncestorPusher
-+          insertionPointPusher(pushInsertionPoint,
-+                               mTreeMatchContext,
-+                               parent && parent->IsElement() ? parent->AsElement() : nullptr);
-+
-+        nsRestyleHint thisChildHint = childRestyleHint;
-+        RestyleTracker::RestyleData undisplayedRestyleData;
-+        if (mRestyleTracker.GetRestyleData(undisplayed->mContent->AsElement(),
-+                                           &undisplayedRestyleData)) {
-+          thisChildHint =
-+            nsRestyleHint(thisChildHint | undisplayedRestyleData.mRestyleHint);
-+        }
-+        nsRefPtr<nsStyleContext> undisplayedContext;
-+        if (thisChildHint) {
-+          undisplayedContext =
-+            styleSet->ResolveStyleFor(undisplayed->mContent->AsElement(),
-+                                      newContext,
-+                                      mTreeMatchContext);
-+        } else {
-+          undisplayedContext =
-+            styleSet->ReparentStyleContext(undisplayed->mStyle, newContext,
-+                                           undisplayed->mContent->AsElement());
-+        }
-+        if (undisplayedContext) {
-+          const nsStyleDisplay* display = undisplayedContext->StyleDisplay();
-+          if (display->mDisplay != NS_STYLE_DISPLAY_NONE) {
-+            NS_ASSERTION(undisplayed->mContent,
-+                         "Must have undisplayed content");
-+            mChangeList->AppendChange(nullptr, undisplayed->mContent,
-+                                      NS_STYLE_HINT_FRAMECHANGE);
-+            // The node should be removed from the undisplayed map when
-+            // we reframe it.
-+          } else {
-+            // update the undisplayed node with the new context
-+            undisplayed->mStyle = undisplayedContext;
-+          }
-+        }
-+      }
-+    }
-+
+-    // Check whether we might need to create a new ::before frame.
+-    // There's no need to do this if we're planning to reframe already
+-    // or if we're not forcing restyles on kids.
+-    if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
+-        childRestyleHint) {
 +}
 +
 +void
 +ElementRestyler::RestyleBeforePseudo()
 +{
+       // Make sure not to do this for pseudo-frames or frames that
+       // can't have generated content.
+       if (!pseudoTag &&
+           ((mFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
+            // Our content insertion frame might have gotten flagged
+            (mFrame->GetContentInsertionFrame()->GetStateBits() &
+             NS_FRAME_MAY_HAVE_GENERATED_CONTENT))) {
+         // Check for a new :before pseudo and an existing :before
+@@ -2450,23 +2496,21 @@ ElementRestyler::Restyle(nsRestyleHint a
+                                             mPresContext)) {
+             // Have to create the new :before frame
+             NS_UpdateHint(mMinChange, nsChangeHint_ReconstructFrame);
+             mChangeList->AppendChange(mFrame, mContent,
+                                       nsChangeHint_ReconstructFrame);
+           }
+         }
+       }
+-    }
 +}
-+
+ 
+-    // Check whether we might need to create a new ::after frame.
+-    // There's no need to do this if we're planning to reframe already
+-    // or if we're not forcing restyles on kids.
+-    if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
+-        childRestyleHint) {
 +void
 +ElementRestyler::RestyleAfterPseudo()
 +{
+       // Make sure not to do this for pseudo-frames or frames that
+       // can't have generated content.
+       if (!pseudoTag &&
+           ((mFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
+            // Our content insertion frame might have gotten flagged
+            (mFrame->GetContentInsertionFrame()->GetStateBits() &
+             NS_FRAME_MAY_HAVE_GENERATED_CONTENT))) {
+         // Check for new :after content, but only if the frame is the
+@@ -2482,25 +2526,21 @@ ElementRestyler::Restyle(nsRestyleHint a
+               !nsLayoutUtils::GetAfterFrame(mFrame)) {
+             // have to create the new :after frame
+             NS_UpdateHint(mMinChange, nsChangeHint_ReconstructFrame);
+             mChangeList->AppendChange(mFrame, mContent,
+                                       nsChangeHint_ReconstructFrame);
+           }
+         }
+       }
+-    }
 +}
-+
-+void
-+ElementRestyler::RestyleContentChildren()
-+{
-+}
-+
+ 
+-    // There is no need to waste time crawling into a frame's children
+-    // on a frame change.  The act of reconstructing frames will force
+-    // new style contexts to be resolved on all of this frame's
+-    // descendants anyway, so we want to avoid wasting time processing
+-    // style contexts that we're just going to throw away anyway. - dwh
+-    if (!(mMinChange & nsChangeHint_ReconstructFrame)) {
+-
 +void
 +ElementRestyler::InitializeAccessibilityNotifications()
 +{
+ #ifdef ACCESSIBILITY
+       // Notify a11y for primary frame only if it's a root frame of visibility
+       // changes or its parent frame was hidden while it stays visible and
+       // it is not inside a {ib} split or is the first frame of {ib} split.
+       if (nsIPresShell::IsAccessibilityActive() &&
+           !mFrame->GetPrevContinuation() &&
+           !nsLayoutUtils::FrameIsNonFirstInIBSplit(mFrame)) {
+         if (mDesiredA11yNotifications == eSendAllNotifications) {
+@@ -2526,18 +2566,21 @@ ElementRestyler::Restyle(nsRestyleHint a
+                    newContext->StyleVisibility()->IsVisible()) {
+           // Notify a11y that element stayed visible while its parent was
+           // hidden.
+           mVisibleKidsOfHiddenElement.AppendElement(mFrame->GetContent());
+           mKidsDesiredA11yNotifications = eSkipNotifications;
+         }
+       }
+ #endif
 +}
-+
+ 
+-      // now do children
++void
++ElementRestyler::RestyleContentChildren(nsRestyleHint aChildRestyleHint)
++{
+       nsIFrame::ChildListIterator lists(mFrame);
+       for (TreeMatchContext::AutoAncestorPusher
+              pushAncestor(!lists.IsDone(),
+                           mTreeMatchContext,
+                           mContent && mContent->IsElement()
+                             ? mContent->AsElement() : nullptr);
+            !lists.IsDone(); lists.Next()) {
+         nsFrameList::Enumerator childFrames(lists.CurrentList());
+@@ -2578,35 +2621,39 @@ ElementRestyler::Restyle(nsRestyleHint a
+ 
+               // |nsFrame::GetParentStyleContextFrame| checks being out
+               // of flow so that this works correctly.
+               do {
+                 ElementRestyler oofRestyler(*this, outOfFlowFrame);
+                 oofRestyler.mMinChange =
+                   NS_SubtractHint(oofRestyler.mMinChange,
+                                   nsChangeHint_AllReflowHints);
+-                oofRestyler.Restyle(childRestyleHint);
++                oofRestyler.Restyle(aChildRestyleHint);
+               } while ((outOfFlowFrame = outOfFlowFrame->GetNextContinuation()));
+ 
+               // reresolve placeholder's context under the same parent
+               // as the out-of-flow frame
+               ElementRestyler phRestyler(*this, child);
+-              phRestyler.Restyle(childRestyleHint);
++              phRestyler.Restyle(aChildRestyleHint);
+             }
+             else {  // regular child frame
+               if (child != resolvedChild) {
+                 ElementRestyler childRestyler(*this, child);
+-                childRestyler.Restyle(childRestyleHint);
++                childRestyler.Restyle(aChildRestyleHint);
+               }
+             }
+           }
+         }
+       }
+       // XXX need to do overflow frames???
++}
+ 
 +void
 +ElementRestyler::SendAccessibilityNotifications()
 +{
-+}
-+
-+void
+ #ifdef ACCESSIBILITY
+       // Send notifications about visibility changes.
+       if (mOurA11yNotification == eNotifyShown) {
+         nsAccessibilityService* accService = nsIPresShell::AccService();
+         if (accService) {
+           nsIPresShell* presShell = mFrame->PresContext()->GetPresShell();
+           nsIContent* content = mFrame->GetContent();
+ 
+@@ -2628,17 +2675,16 @@ ElementRestyler::Restyle(nsRestyleHint a
+             accService->ContentRangeInserted(presShell, childContent->GetParent(),
+                                              childContent,
+                                              childContent->GetNextSibling());
+           }
+           mVisibleKidsOfHiddenElement.Clear();
+         }
+       }
+ #endif
+-    }
+ }
+ 
+ void
  RestyleManager::ComputeStyleChangeFor(nsIFrame*          aFrame,
                                        nsStyleChangeList* aChangeList,
                                        nsChangeHint       aMinChange,
                                        RestyleTracker&    aRestyleTracker,
                                        bool               aRestyleDescendants)
- {
-   PROFILER_LABEL("CSS", "ComputeStyleChangeFor");
- 
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
@@ -286,15 +362,15 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 +   *
 +   * Second half of Restyle().
 +   */
-+  void RestyleChildren();
++  void RestyleChildren(nsRestyleHint aChildRestyleHint);
 +
 +  /**
 +   * Helpers for RestyleChildren().
 +   */
-+  void RestyleUndisplayedChildren();
++  void RestyleUndisplayedChildren(nsRestyleHint aChildRestyleHint);
 +  void RestyleBeforePseudo();
 +  void RestyleAfterPseudo();
-+  void RestyleContentChildren();
++  void RestyleContentChildren(nsRestyleHint aChildRestyleHint);
 +  void InitializeAccessibilityNotifications();
 +  void SendAccessibilityNotifications();
 +
