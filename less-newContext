@@ -2,16 +2,36 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 898329 patch 4:  Avoid using newContext outside of what will be in RestyleManager::RestyleSelf.
 
-FIXME: Causes:
-REFTEST TEST-UNEXPECTED-FAIL | file:///builds/slave/talos-slave/test/build/tests/reftest/tests/layout/reftests/bidi/229367-2.html | assertion count 2 is more than expected 0 assertions
-REFTEST TEST-UNEXPECTED-FAIL | file:///builds/slave/talos-slave/test/build/tests/reftest/tests/layout/reftests/bidi/263359-2.html | assertion count 2 is more than expected 0 assertions
-with the assertion:
-###!!! ASSERTION: must be in the same rule tree as parent: 'r1 == r2', file ../../../layout/style/nsStyleContext.cpp, line 67
+This replaces newContext with mFrame->StyleContext(), which is a valid
+replacement since all of the replacements are inside a test that we
+don't have a framechange hint.  If we have a framechange hint, then
+mFrame still has its old style context.
 
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -2397,21 +2397,22 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2362,16 +2362,20 @@ ElementRestyler::Restyle(nsRestyleHint a
+                                      GetDocElementContainingBlock();
+       undisplayedParent = nullptr;
+     } else {
+       checkUndisplayed = !!mFrame->GetContent();
+       undisplayedParent = mFrame->GetContent();
+     }
+     if (checkUndisplayed &&
+         // No need to do this if we're planning to reframe already.
++        // It's also important to check mMinChange since we use
++        // mFrame->StyleContext(), which is out of date if mMinChange
++        // has a ReconstructFrame hint.  Using an out of date style
++        // context could trigger assertions about mismatched rule trees.
+         !(mMinChange & nsChangeHint_ReconstructFrame)) {
+       UndisplayedNode* undisplayed =
+         frameConstructor->GetAllUndisplayedContentIn(undisplayedParent);
+       for (TreeMatchContext::AutoAncestorPusher
+              pushAncestor(undisplayed, mTreeMatchContext,
+                           undisplayedParent ? undisplayedParent->AsElement()
+                                             : nullptr);
+            undisplayed; undisplayed = undisplayed->mNext) {
+@@ -2399,21 +2403,22 @@ ElementRestyler::Restyle(nsRestyleHint a
                                             &undisplayedRestyleData)) {
            thisChildHint =
              nsRestyleHint(thisChildHint | undisplayedRestyleData.mRestyleHint);
@@ -36,7 +56,27 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
              NS_ASSERTION(undisplayed->mContent,
                           "Must have undisplayed content");
              mChangeList->AppendChange(nullptr, undisplayed->mContent,
-@@ -2440,17 +2441,18 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2426,64 +2431,69 @@ ElementRestyler::Restyle(nsRestyleHint a
+           }
+         }
+       }
+     }
+ 
+     // Check whether we might need to create a new ::before frame.
+     // There's no need to do this if we're planning to reframe already
+     // or if we're not forcing restyles on kids.
++    // It's also important to check mMinChange since we use
++    // mFrame->StyleContext(), which is out of date if mMinChange has a
++    // ReconstructFrame hint.  Using an out of date style context could
++    // trigger assertions about mismatched rule trees.
+     if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
+         childRestyleHint) {
+       // Make sure not to do this for pseudo-frames or frames that
+       // can't have generated content.
+       if (!pseudoTag &&
+           ((mFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
+            // Our content insertion frame might have gotten flagged
+            (mFrame->GetContentInsertionFrame()->GetStateBits() &
              NS_FRAME_MAY_HAVE_GENERATED_CONTENT))) {
          // Check for a new :before pseudo and an existing :before
          // frame, but only if the frame is the first continuation.
@@ -56,7 +96,21 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                                        nsChangeHint_ReconstructFrame);
            }
          }
-@@ -2471,17 +2473,18 @@ ElementRestyler::Restyle(nsRestyleHint a
+       }
+     }
+ 
+     // Check whether we might need to create a new ::after frame.
+-    // There's no need to do this if we're planning to reframe already
+-    // or if we're not forcing restyles on kids.
++    // See comments above regarding :before.
+     if (!(mMinChange & nsChangeHint_ReconstructFrame) &&
+         childRestyleHint) {
+       // Make sure not to do this for pseudo-frames or frames that
+       // can't have generated content.
+       if (!pseudoTag &&
+           ((mFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
+            // Our content insertion frame might have gotten flagged
+            (mFrame->GetContentInsertionFrame()->GetStateBits() &
              NS_FRAME_MAY_HAVE_GENERATED_CONTENT))) {
          // Check for new :after content, but only if the frame is the
          // last continuation.
@@ -76,7 +130,21 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
              mChangeList->AppendChange(mFrame, mContent,
                                        nsChangeHint_ReconstructFrame);
            }
-@@ -2499,17 +2502,17 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2491,27 +2501,31 @@ ElementRestyler::Restyle(nsRestyleHint a
+       }
+     }
+ 
+     // There is no need to waste time crawling into a frame's children
+     // on a frame change.  The act of reconstructing frames will force
+     // new style contexts to be resolved on all of this frame's
+     // descendants anyway, so we want to avoid wasting time processing
+     // style contexts that we're just going to throw away anyway. - dwh
++    // It's also important to check mMinChange since reresolving the
++    // kids would use mFrame->StyleContext(), which is out of date if
++    // mMinChange has a ReconstructFrame hint; doing this could trigger
++    // assertions about mismatched rule trees.
+     if (!(mMinChange & nsChangeHint_ReconstructFrame)) {
+ 
  #ifdef ACCESSIBILITY
        // Notify a11y for primary frame only if it's a root frame of visibility
        // changes or its parent frame was hidden while it stays visible and
@@ -95,7 +163,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                mKidsDesiredA11yNotifications = eSkipNotifications;
                mOurA11yNotification = eNotifyShown;
              } else {
-@@ -2518,17 +2521,17 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2520,17 +2534,17 @@ ElementRestyler::Restyle(nsRestyleHint a
                // visible children then we should notify a11y about that as if
                // they were inserted into tree. Notify a11y this element was
                // hidden.
