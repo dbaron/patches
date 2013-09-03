@@ -25,7 +25,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    // want to use the special prevsibling of the special prevsibling of
    // aFrame, which should have the same style context as aFrame itself.
    // In particular, if aFrame is the first continuation of an inline part
-@@ -1702,19 +1705,92 @@ GetPrevContinuationWithPossiblySameStyle
+@@ -1702,19 +1705,94 @@ GetPrevContinuationWithPossiblySameStyle
      // property directly
      prevContinuation = static_cast<nsIFrame*>(
        aFrame->Properties().Get(nsIFrame::IBSplitSpecialPrevSibling()));
@@ -73,7 +73,9 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 + *
 + * Since this is used when deciding to copy the new style context, it
 + * takes as an argument the old style context to check if the style is
-+ * the same.
++ * the same.  When it is used in other contexts (i.e., where the next
++ * continuation would already have the new style context), the current
++ * style context should be passed.
 + */
 +static nsIFrame*
 +GetNextContinuationWithSameStyle(nsIFrame* aFrame,
@@ -118,7 +120,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
      nsIFrame* outOfFlow =
        nsPlaceholderFrame::GetRealFrameForPlaceholder(aFrame);
      NS_ASSERTION(outOfFlow, "no out-of-flow frame");
-@@ -2013,18 +2089,22 @@ ElementRestyler::CaptureChange(nsStyleCo
+@@ -2013,18 +2091,22 @@ ElementRestyler::CaptureChange(nsStyleCo
        mChangeList->AppendChange(mFrame, mContent, ourChange);
      }
    }
@@ -143,7 +145,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  void
  ElementRestyler::Restyle(nsRestyleHint aRestyleHint)
  {
-@@ -2035,16 +2115,19 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2035,16 +2117,19 @@ ElementRestyler::Restyle(nsRestyleHint a
    // |mFrame->GetContent()|, make more sense.  However, we can't,
    // because of frame trees like the one in
    // https://bugzilla.mozilla.org/show_bug.cgi?id=472353#c14 .  Once we
@@ -163,7 +165,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
          mChangeList->AppendChange(mFrame, mContent, restyleData.mChangeHint);
        }
        aRestyleHint = nsRestyleHint(aRestyleHint | restyleData.mRestyleHint);
-@@ -2052,209 +2135,161 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2052,209 +2137,161 @@ ElementRestyler::Restyle(nsRestyleHint a
    }
  
    nsRestyleHint childRestyleHint = aRestyleHint;
@@ -392,7 +394,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
        newContext = styleSet->ResolveStyleFor(element, parentContext,
                                               mTreeMatchContext);
      }
-@@ -2275,34 +2310,34 @@ ElementRestyler::RestyleSelf(nsRestyleHi
+@@ -2275,34 +2312,34 @@ ElementRestyler::RestyleSelf(nsRestyleHi
        // style contexts around.  However, we need to start from the
        // same root.
        newContext = oldContext;
@@ -430,7 +432,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
      NS_ASSERTION(extraPseudoTag &&
                   extraPseudoTag != nsCSSAnonBoxes::mozNonElement,
                   "extra style context is not pseudo element");
-@@ -2319,17 +2354,17 @@ ElementRestyler::RestyleSelf(nsRestyleHi
+@@ -2319,17 +2356,17 @@ ElementRestyler::RestyleSelf(nsRestyleHi
        newExtraContext = styleSet->ResolvePseudoElementStyle(mContent->AsElement(),
                                                              extraPseudoType,
                                                              newContext);
@@ -449,7 +451,122 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  
  void
  ElementRestyler::RestyleChildren(nsRestyleHint aChildRestyleHint)
-@@ -2679,62 +2714,62 @@ RestyleManager::ComputeStyleChangeFor(ns
+@@ -2352,29 +2389,34 @@ ElementRestyler::RestyleChildren(nsResty
+   // on a frame change.  The act of reconstructing frames will force
+   // new style contexts to be resolved on all of this frame's
+   // descendants anyway, so we want to avoid wasting time processing
+   // style contexts that we're just going to throw away anyway. - dwh
+   // It's also important to check mHintsHandled since reresolving the
+   // kids would use mFrame->StyleContext(), which is out of date if
+   // mHintsHandled has a ReconstructFrame hint; doing this could trigger
+   // assertions about mismatched rule trees.
++  nsIFrame *lastContinuation;
+   if (!(mHintsHandled & nsChangeHint_ReconstructFrame)) {
+     InitializeAccessibilityNotifications();
+ 
+-    RestyleContentChildren(aChildRestyleHint);
++    for (nsIFrame* f = mFrame; f;
++         f = GetNextContinuationWithSameStyle(f)) {
++      lastContinuation = f;
++      RestyleContentChildren(f, aChildRestyleHint);
++    }
+ 
+     SendAccessibilityNotifications();
+   }
+ 
+   // Check whether we might need to create a new ::after frame.
+   // See comments above regarding :before.
+   if (!(mHintsHandled & nsChangeHint_ReconstructFrame) &&
+       aChildRestyleHint) {
+-    RestyleAfterPseudo();
++    RestyleAfterPseudo(lastContinuation);
+   }
+ }
+ 
+ void
+ ElementRestyler::RestyleUndisplayedChildren(nsRestyleHint aChildRestyleHint)
+ {
+   // When the root element is display:none, we still construct *some*
+   // frames that have the root element as their mContent, down to the
+@@ -2485,41 +2527,45 @@ ElementRestyler::RestyleBeforePseudo()
+         NS_UpdateHint(mHintsHandled, nsChangeHint_ReconstructFrame);
+         mChangeList->AppendChange(mFrame, mContent,
+                                   nsChangeHint_ReconstructFrame);
+       }
+     }
+   }
+ }
+ 
++/**
++ * aFrame is the last continuation or block-in-inline sibling that this
++ * ElementRestyler is restyling.
++ */
+ void
+-ElementRestyler::RestyleAfterPseudo()
++ElementRestyler::RestyleAfterPseudo(nsIFrame* aFrame)
+ {
+   // Make sure not to do this for pseudo-frames or frames that
+   // can't have generated content.
+-  if (!mFrame->StyleContext()->GetPseudo() &&
+-      ((mFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
++  if (!aFrame->StyleContext()->GetPseudo() &&
++      ((aFrame->GetStateBits() & NS_FRAME_MAY_HAVE_GENERATED_CONTENT) ||
+        // Our content insertion frame might have gotten flagged
+-       (mFrame->GetContentInsertionFrame()->GetStateBits() &
++       (aFrame->GetContentInsertionFrame()->GetStateBits() &
+         NS_FRAME_MAY_HAVE_GENERATED_CONTENT))) {
+     // Check for new :after content, but only if the frame is the
+     // last continuation.
+-    nsIFrame* nextContinuation = mFrame->GetNextContinuation();
++    nsIFrame* nextContinuation = aFrame->GetNextContinuation();
+ 
+     if (!nextContinuation) {
+       // Getting the :after frame is more expensive than getting the pseudo
+       // context, so get the pseudo context first.
+-      if (nsLayoutUtils::HasPseudoStyle(mFrame->GetContent(),
+-                                        mFrame->StyleContext(),
++      if (nsLayoutUtils::HasPseudoStyle(aFrame->GetContent(),
++                                        aFrame->StyleContext(),
+                                         nsCSSPseudoElements::ePseudo_after,
+                                         mPresContext) &&
+-          !nsLayoutUtils::GetAfterFrame(mFrame)) {
++          !nsLayoutUtils::GetAfterFrame(aFrame)) {
+         // have to create the new :after frame
+         NS_UpdateHint(mHintsHandled, nsChangeHint_ReconstructFrame);
+-        mChangeList->AppendChange(mFrame, mContent,
++        mChangeList->AppendChange(aFrame, mContent,
+                                   nsChangeHint_ReconstructFrame);
+       }
+     }
+   }
+ }
+ 
+ void
+ ElementRestyler::InitializeAccessibilityNotifications()
+@@ -2557,19 +2603,20 @@ ElementRestyler::InitializeAccessibility
+       mVisibleKidsOfHiddenElement.AppendElement(mFrame->GetContent());
+       mKidsDesiredA11yNotifications = eSkipNotifications;
+     }
+   }
+ #endif
+ }
+ 
+ void
+-ElementRestyler::RestyleContentChildren(nsRestyleHint aChildRestyleHint)
++ElementRestyler::RestyleContentChildren(nsIFrame* aParent,
++                                        nsRestyleHint aChildRestyleHint)
+ {
+-  nsIFrame::ChildListIterator lists(mFrame);
++  nsIFrame::ChildListIterator lists(aParent);
+   for (TreeMatchContext::AutoAncestorPusher
+          pushAncestor(!lists.IsDone(),
+                       mTreeMatchContext,
+                       mContent && mContent->IsElement()
+                         ? mContent->AsElement() : nullptr);
+        !lists.IsDone(); lists.Next()) {
+     nsFrameList::Enumerator childFrames(lists.CurrentList());
+     for (; !childFrames.AtEnd(); childFrames.Next()) {
+@@ -2679,62 +2726,62 @@ RestyleManager::ComputeStyleChangeFor(ns
    PROFILER_LABEL("CSS", "ComputeStyleChangeFor");
  
    nsIContent *content = aFrame->GetContent();
@@ -563,3 +680,25 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
     */
    void RestyleChildren(nsRestyleHint aChildRestyleHint);
  
+@@ -338,18 +338,19 @@ private:
+                      nsStyleContext* aNewContext,
+                      nsChangeHint aChangeToAssume);
+ 
+   /**
+    * Helpers for RestyleChildren().
+    */
+   void RestyleUndisplayedChildren(nsRestyleHint aChildRestyleHint);
+   void RestyleBeforePseudo();
+-  void RestyleAfterPseudo();
+-  void RestyleContentChildren(nsRestyleHint aChildRestyleHint);
++  void RestyleAfterPseudo(nsIFrame* aFrame);
++  void RestyleContentChildren(nsIFrame* aParent,
++                              nsRestyleHint aChildRestyleHint);
+   void InitializeAccessibilityNotifications();
+   void SendAccessibilityNotifications();
+ 
+   enum DesiredA11yNotifications {
+     eSkipNotifications,
+     eSendAllNotifications,
+     eNotifyIfShown
+   };
