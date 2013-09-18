@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 828312 patch 9:  Make handling of RecomputePosition hint check continuations.  r=bzbarsky
+Bug 828312 patch 9:  Make handling of RecomputePosition hint check continuations.
 
 This is part of the patch stack making change hints apply across all
 continuations and block-in-inline siblings.
@@ -8,7 +8,7 @@ continuations and block-in-inline siblings.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -340,41 +340,44 @@ RestyleManager::RecomputePosition(nsIFra
+@@ -340,48 +340,49 @@ RestyleManager::RecomputePosition(nsIFra
          // We don't currently support relative positioning of inner
          // table elements.  If we apply offsets to things we haven't
          // previously offset, we'll get confused.  So bail.
@@ -19,24 +19,32 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  
 -    nsIFrame* cb = aFrame->GetContainingBlock();
 -    nsMargin newOffsets;
-+    for (nsIFrame *cont = aFrame; cont;
-+         cont = nsLayoutUtils::GetNextContinuationOrSpecialSibling(cont)) {
-+      nsIFrame* cb = cont->GetContainingBlock();
-+      nsMargin newOffsets;
  
--    // Move the frame
--    if (display->mPosition == NS_STYLE_POSITION_STICKY) {
--      StickyScrollContainer::ComputeStickyOffsets(aFrame);
--    } else {
--      MOZ_ASSERT(NS_STYLE_POSITION_RELATIVE == display->mPosition,
--                 "Unexpected type of positioning");
+     // Move the frame
+     if (display->mPosition == NS_STYLE_POSITION_STICKY) {
+       // Update sticky positioning for an entire element at once when
+       // RecomputePosition is called with the first continuation in a chain.
+-      if (!aFrame->GetPrevContinuation()) {
+-        StickyScrollContainer::ComputeStickyOffsets(aFrame);
+-        StickyScrollContainer* ssc =
+-          StickyScrollContainer::GetStickyScrollContainerForFrame(aFrame);
+-        if (ssc) {
+-          ssc->PositionContinuations(aFrame);
+-        }
++      StickyScrollContainer::ComputeStickyOffsets(aFrame);
++      StickyScrollContainer* ssc =
++        StickyScrollContainer::GetStickyScrollContainerForFrame(aFrame);
++      if (ssc) {
++        ssc->PositionContinuations(aFrame);
+       }
+     } else {
+       MOZ_ASSERT(NS_STYLE_POSITION_RELATIVE == display->mPosition,
+                  "Unexpected type of positioning");
 -      const nsSize size = cb->GetContentRectRelativeToSelf().Size();
-+      // Move the frame
-+      if (display->mPosition == NS_STYLE_POSITION_STICKY) {
-+        StickyScrollContainer::ComputeStickyOffsets(cont);
-+      } else {
-+        MOZ_ASSERT(NS_STYLE_POSITION_RELATIVE == display->mPosition,
-+                   "Unexpected type of positioning");
++      for (nsIFrame *cont = aFrame; cont;
++           cont = nsLayoutUtils::GetNextContinuationOrSpecialSibling(cont)) {
++        nsIFrame* cb = aFrame->GetContainingBlock();
++        nsMargin newOffsets;
 +        const nsSize size = cb->GetContentRectRelativeToSelf().Size();
  
 -      nsHTMLReflowState::ComputeRelativeOffsets(
@@ -47,165 +55,99 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 -                   "ComputeRelativeOffsets should return valid results");
 +        nsHTMLReflowState::ComputeRelativeOffsets(
 +            cb->StyleVisibility()->mDirection,
-+            cont, size.width, size.height, newOffsets);
++            aFrame, size.width, size.height, newOffsets);
 +        NS_ASSERTION(newOffsets.left == -newOffsets.right &&
 +                     newOffsets.top == -newOffsets.bottom,
 +                     "ComputeRelativeOffsets should return valid results");
+ 
+-      // nsHTMLReflowState::ApplyRelativePositioning would work here, but
+-      // since we've already checked mPosition and aren't changing the frame's
+-      // normal position, go ahead and add the offsets directly.
+-      aFrame->SetPosition(aFrame->GetNormalPosition() +
+-                          nsPoint(newOffsets.left, newOffsets.top));
++        // nsHTMLReflowState::ApplyRelativePositioning would work here, but
++        // since we've already checked mPosition and aren't changing the frame's
++        // normal position, go ahead and add the offsets directly.
++        aFrame->SetPosition(aFrame->GetNormalPosition() +
++                            nsPoint(newOffsets.left, newOffsets.top));
 +      }
-+
-+      nsPoint position = cont->GetNormalPosition();
-+
-+      // This handles both relative and sticky positioning.
-+      nsHTMLReflowState::ApplyRelativePositioning(cont, newOffsets, &position);
-+      cont->SetPosition(position);
      }
  
--    nsPoint position = aFrame->GetNormalPosition();
--
--    // This handles both relative and sticky positioning.
--    nsHTMLReflowState::ApplyRelativePositioning(aFrame, newOffsets, &position);
--    aFrame->SetPosition(position);
--
      return true;
    }
  
    // For absolute positioning, the width can potentially change if width is
    // auto and either of left or right are not.  The height can also potentially
    // change if height is auto and either of top or bottom are not.  In these
-   // cases we fall back to a reflow, and in all other cases, we attempt to
-   // move the frame here.
-@@ -384,78 +387,80 @@ RestyleManager::RecomputePosition(nsIFra
-   const nsStylePosition* position = aFrame->StylePosition();
-   if (position->mWidth.GetUnit() != eStyleUnit_Auto &&
-       position->mHeight.GetUnit() != eStyleUnit_Auto) {
-     // For the absolute positioning case, set up a fake HTML reflow state for
-     // the frame, and then get the offsets from it.
-     nsRefPtr<nsRenderingContext> rc = aFrame->PresContext()->GetPresShell()->
-       GetReferenceRenderingContext();
- 
--    // Construct a bogus parent reflow state so that there's a usable
--    // containing block reflow state.
--    nsIFrame* parentFrame = aFrame->GetParent();
--    nsSize parentSize = parentFrame->GetSize();
-+    for (nsIFrame *cont = aFrame; cont; cont = cont->GetNextContinuation()) {
-+      // Construct a bogus parent reflow state so that there's a usable
-+      // containing block reflow state.
-+      nsIFrame* parentFrame = cont->GetParent();
-+      nsSize parentSize = parentFrame->GetSize();
- 
--    nsFrameState savedState = parentFrame->GetStateBits();
--    nsHTMLReflowState parentReflowState(aFrame->PresContext(), parentFrame,
--                                        rc, parentSize);
--    parentFrame->RemoveStateBits(~nsFrameState(0));
--    parentFrame->AddStateBits(savedState);
-+      nsFrameState savedState = parentFrame->GetStateBits();
-+      nsHTMLReflowState parentReflowState(cont->PresContext(), parentFrame,
-+                                          rc, parentSize);
-+      parentFrame->RemoveStateBits(~nsFrameState(0));
-+      parentFrame->AddStateBits(savedState);
- 
--    NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
--                     parentSize.height != NS_INTRINSICSIZE,
--                     "parentSize should be valid");
--    parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
--    parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
--    parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
--    parentSize.height = NS_AUTOHEIGHT;
-+      NS_WARN_IF_FALSE(parentSize.width != NS_INTRINSICSIZE &&
-+                       parentSize.height != NS_INTRINSICSIZE,
-+                       "parentSize should be valid");
-+      parentReflowState.SetComputedWidth(std::max(parentSize.width, 0));
-+      parentReflowState.SetComputedHeight(std::max(parentSize.height, 0));
-+      parentReflowState.mComputedMargin.SizeTo(0, 0, 0, 0);
-+      parentSize.height = NS_AUTOHEIGHT;
- 
--    parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
--    parentReflowState.mComputedBorderPadding =
--      parentFrame->GetUsedBorderAndPadding();
-+      parentReflowState.mComputedPadding = parentFrame->GetUsedPadding();
-+      parentReflowState.mComputedBorderPadding =
-+        parentFrame->GetUsedBorderAndPadding();
- 
--    nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
-+      nsSize availSize(parentSize.width, NS_INTRINSICSIZE);
- 
--    nsSize size = aFrame->GetSize();
--    ViewportFrame* viewport = do_QueryFrame(parentFrame);
--    nsSize cbSize = viewport ?
--      viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
--      : aFrame->GetContainingBlock()->GetSize();
--    const nsMargin& parentBorder =
--      parentReflowState.mStyleBorder->GetComputedBorder();
--    cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
--    nsHTMLReflowState reflowState(aFrame->PresContext(), parentReflowState,
--                                  aFrame, availSize, cbSize.width,
--                                  cbSize.height);
-+      nsSize size = cont->GetSize();
-+      ViewportFrame* viewport = do_QueryFrame(parentFrame);
-+      nsSize cbSize = viewport ?
-+        viewport->AdjustReflowStateAsContainingBlock(&parentReflowState).Size()
-+        : cont->GetContainingBlock()->GetSize();
-+      const nsMargin& parentBorder =
-+        parentReflowState.mStyleBorder->GetComputedBorder();
-+      cbSize -= nsSize(parentBorder.LeftRight(), parentBorder.TopBottom());
-+      nsHTMLReflowState reflowState(cont->PresContext(), parentReflowState,
-+                                    cont, availSize, cbSize.width,
-+                                    cbSize.height);
- 
--    // If we're solving for 'left' or 'top', then compute it here, in order to
--    // match the reflow code path.
--    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
--      reflowState.mComputedOffsets.left = cbSize.width -
--                                          reflowState.mComputedOffsets.right -
--                                          reflowState.mComputedMargin.right -
--                                          size.width -
--                                          reflowState.mComputedMargin.left;
-+      // If we're solving for 'left' or 'top', then compute it here, in order to
-+      // match the reflow code path.
-+      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.left) {
-+        reflowState.mComputedOffsets.left = cbSize.width -
-+                                            reflowState.mComputedOffsets.right -
-+                                            reflowState.mComputedMargin.right -
-+                                            size.width -
-+                                            reflowState.mComputedMargin.left;
-+      }
-+
-+      if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
-+        reflowState.mComputedOffsets.top = cbSize.height -
-+                                           reflowState.mComputedOffsets.bottom -
-+                                           reflowState.mComputedMargin.bottom -
-+                                           size.height -
-+                                           reflowState.mComputedMargin.top;
-+      }
-+
-+      // Move the frame
-+      nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
-+                  reflowState.mComputedMargin.left,
-+                  parentBorder.top + reflowState.mComputedOffsets.top +
-+                  reflowState.mComputedMargin.top);
-+      cont->SetPosition(pos);
-     }
- 
--    if (NS_AUTOOFFSET == reflowState.mComputedOffsets.top) {
--      reflowState.mComputedOffsets.top = cbSize.height -
--                                         reflowState.mComputedOffsets.bottom -
--                                         reflowState.mComputedMargin.bottom -
--                                         size.height -
--                                         reflowState.mComputedMargin.top;
--    }
--
--    // Move the frame
--    nsPoint pos(parentBorder.left + reflowState.mComputedOffsets.left +
--                reflowState.mComputedMargin.left,
--                parentBorder.top + reflowState.mComputedOffsets.top +
--                reflowState.mComputedMargin.top);
--    aFrame->SetPosition(pos);
--
-     return true;
+diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScrollContainer.cpp
+--- a/layout/generic/StickyScrollContainer.cpp
++++ b/layout/generic/StickyScrollContainer.cpp
+@@ -124,17 +124,17 @@ StickyScrollContainer::ComputeStickyOffs
+               new nsMargin(computedOffsets));
    }
- 
-   // Fall back to a reflow
-   StyleChangeReflow(aFrame, nsChangeHint_NeedReflow);
-   return false;
  }
  
+ void
+ StickyScrollContainer::ComputeStickyLimits(nsIFrame* aFrame, nsRect* aStick,
+                                            nsRect* aContain) const
+ {
+-  NS_ASSERTION(!aFrame->GetPrevContinuation(),
++  NS_ASSERTION(!nsLayoutUtils::GetPrevContinuationOrSpecialSibling(aFrame),
+                "Can't sticky position individual continuations");
+ 
+   aStick->SetRect(nscoord_MIN/2, nscoord_MIN/2, nscoord_MAX, nscoord_MAX);
+   aContain->SetRect(nscoord_MIN/2, nscoord_MIN/2, nscoord_MAX, nscoord_MAX);
+ 
+   const nsMargin* computedOffsets = static_cast<nsMargin*>(
+     aFrame->Properties().Get(nsIFrame::ComputedOffsetProperty()));
+   if (!computedOffsets) {
+@@ -259,25 +259,23 @@ StickyScrollContainer::GetScrollRanges(n
+     aInner->SetRightEdge(normalPosition.x - stick.x);
+     aOuter->SetRightEdge(contain.XMost() - stick.x);
+   }
+ }
+ 
+ void
+ StickyScrollContainer::PositionContinuations(nsIFrame* aFrame)
+ {
+-  NS_ASSERTION(!aFrame->GetPrevContinuation(),
++  NS_ASSERTION(!nsLayoutUtils::GetPrevContinuationOrSpecialSibling(aFrame),
+                "Should be starting from the first continuation");
+-  nsPoint newPosition = ComputePosition(aFrame);
+-  nsPoint translation = newPosition - aFrame->GetPosition();
+-  aFrame->SetPosition(newPosition);
++  nsPoint translation = ComputePosition(aFrame) - aFrame->GetPosition();
+ 
+   // Move all continuation frames by the same amount.
+-  for (nsIFrame* cont = aFrame->GetNextContinuation(); cont;
+-       cont = cont->GetNextContinuation()) {
++  for (nsIFrame* cont = aFrame; cont;
++       cont = nsLayoutUtils::GetNextContinuationOrSpecialSibling(cont)) {
+     cont->SetPosition(cont->GetPosition() + translation);
+   }
+ }
+ 
+ void
+ StickyScrollContainer::UpdatePositions(nsPoint aScrollPosition,
+                                        nsIFrame* aSubtreeRoot)
+ {
+@@ -298,17 +296,18 @@ StickyScrollContainer::UpdatePositions(n
+     if (aSubtreeRoot) {
+       // Reflowing the scroll frame, so recompute offsets.
+       ComputeStickyOffsets(f);
+     }
+     // mFrames will only contain first continuations, because we filter in
+     // nsIFrame::Init.
+     PositionContinuations(f);
+ 
+-    for (nsIFrame* cont = f; cont; cont = cont->GetNextContinuation()) {
++    for (nsIFrame* cont = f; cont;
++         cont = nsLayoutUtils::GetNextContinuationOrSpecialSibling(cont)) {
+       oct.AddFrame(cont);
+     }
+   }
+   oct.Flush();
+ }
+ 
+ void
+ StickyScrollContainer::ScrollPositionWillChange(nscoord aX, nscoord aY)
