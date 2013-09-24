@@ -7,10 +7,71 @@ block-in-inline splits matches the specification for position:relative,
 in other words, matches
 http://www.w3.org/TR/CSS21/visuren.html#anonymous-block-level .
 
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -2540,16 +2540,30 @@ nsLayoutUtils::GetFirstContinuationOrSpe
+         break;
+       result = f;
+     }
+   }
+ 
+   return result;
+ }
+ 
++nsIFrame*
++nsLayoutUtils::IsFirstContinuationOrSpecialSibling(nsIFrame *aFrame)
++{
++  if (aFrame->GetPrevContinuation()) {
++    return false;
++  }
++  if ((aFrame->GetStateBits() & NS_FRAME_IS_SPECIAL) &&
++      result->Properties().Get(nsIFrame::IBSplitSpecialPrevSibling())) {
++    return false;
++  }
++
++  return true;
++}
++
+ bool
+ nsLayoutUtils::IsViewportScrollbarFrame(nsIFrame* aFrame)
+ {
+   if (!aFrame)
+     return false;
+ 
+   nsIFrame* rootScrollFrame =
+     aFrame->PresContext()->PresShell()->GetRootScrollFrame();
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -940,16 +940,23 @@ public:
+   /**
+    * Get the first frame in the continuation-plus-special-sibling chain
+    * containing aFrame.
+    */
+   static nsIFrame*
+   GetFirstContinuationOrSpecialSibling(nsIFrame *aFrame);
+ 
+   /**
++   * Is GetFirstContinuationOrSpecialSibling(aFrame) going to return
++   * aFrame?
++   */
++  static bool
++  IsFirstContinuationOrSpecialSibling(nsIFrame *aFrame);
++
++  /**
+    * Check whether aFrame is a part of the scrollbar or scrollcorner of
+    * the root content.
+    * @param aFrame the checking frame
+    * @return if TRUE, the frame is a part of the scrollbar or scrollcorner of
+    *         the root content.
+    */
+   static bool IsViewportScrollbarFrame(nsIFrame* aFrame);
+ 
 diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScrollContainer.cpp
 --- a/layout/generic/StickyScrollContainer.cpp
 +++ b/layout/generic/StickyScrollContainer.cpp
-@@ -124,17 +124,18 @@ StickyScrollContainer::ComputeStickyOffs
+@@ -124,17 +124,17 @@ StickyScrollContainer::ComputeStickyOffs
                new nsMargin(computedOffsets));
    }
  }
@@ -20,8 +81,7 @@ diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScr
                                             nsRect* aContain) const
  {
 -  NS_ASSERTION(!aFrame->GetPrevContinuation(),
-+  NS_ASSERTION(nsLayoutUtils::GetFirstContinuationOrSpecialSibling(aFrame) ==
-+               aFrame,
++  NS_ASSERTION(nsLayoutUtils::IsFirstContinuationOrSpecialSibling(aFrame),
                 "Can't sticky position individual continuations");
  
    aStick->SetRect(nscoord_MIN/2, nscoord_MIN/2, nscoord_MAX, nscoord_MAX);
@@ -30,7 +90,7 @@ diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScr
    const nsMargin* computedOffsets = static_cast<nsMargin*>(
      aFrame->Properties().Get(nsIFrame::ComputedOffsetProperty()));
    if (!computedOffsets) {
-@@ -259,25 +260,24 @@ StickyScrollContainer::GetScrollRanges(n
+@@ -259,25 +259,23 @@ StickyScrollContainer::GetScrollRanges(n
      aInner->SetRightEdge(normalPosition.x - stick.x);
      aOuter->SetRightEdge(contain.XMost() - stick.x);
    }
@@ -40,8 +100,7 @@ diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScr
  StickyScrollContainer::PositionContinuations(nsIFrame* aFrame)
  {
 -  NS_ASSERTION(!aFrame->GetPrevContinuation(),
-+  NS_ASSERTION(nsLayoutUtils::GetFirstContinuationOrSpecialSibling(aFrame) ==
-+               aFrame,
++  NS_ASSERTION(nsLayoutUtils::IsFirstContinuationOrSpecialSibling(aFrame),
                 "Should be starting from the first continuation");
 -  nsPoint newPosition = ComputePosition(aFrame);
 -  nsPoint translation = newPosition - aFrame->GetPosition();
@@ -61,7 +120,23 @@ diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScr
  StickyScrollContainer::UpdatePositions(nsPoint aScrollPosition,
                                         nsIFrame* aSubtreeRoot)
  {
-@@ -298,17 +298,18 @@ StickyScrollContainer::UpdatePositions(n
+@@ -289,26 +287,34 @@ StickyScrollContainer::UpdatePositions(n
+   }
+ #endif
+   mScrollPosition = aScrollPosition;
+ 
+   OverflowChangedTracker oct;
+   oct.SetSubtreeRoot(aSubtreeRoot);
+   for (nsTArray<nsIFrame*>::size_type i = 0; i < mFrames.Length(); i++) {
+     nsIFrame* f = mFrames[i];
++    if (!nsLayoutUtils::IsFirstContinuationOrSpecialSibling(f)) {
++      // This frame was added in nsFrame::Init before we knew it wasn't
++      // the first special-sibling.
++      mFrames.RemoveElementAt(i);
++      --i;
++      continue;
++    }
+ 
      if (aSubtreeRoot) {
        // Reflowing the scroll frame, so recompute offsets.
        ComputeStickyOffsets(f);
@@ -81,6 +156,31 @@ diff --git a/layout/generic/StickyScrollContainer.cpp b/layout/generic/StickyScr
  
  void
  StickyScrollContainer::ScrollPositionWillChange(nscoord aX, nscoord aY)
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -509,16 +509,21 @@ nsFrame::Init(nsIContent*      aContent,
+   if (disp->HasTransform(this)) {
+     // The frame gets reconstructed if we toggle the -moz-transform
+     // property, so we can set this bit here and then ignore it.
+     mState |= NS_FRAME_MAY_BE_TRANSFORMED;
+   }
+   if (disp->mPosition == NS_STYLE_POSITION_STICKY &&
+       !aPrevInFlow &&
+       !(mState & NS_FRAME_IS_NONDISPLAY)) {
++    // Note that we only add first continuations, but we really only
++    // want to add first continuation-or-special-siblings.  But since we
++    // don't yet know if we're a later part of a block-in-inline split,
++    // we'll just add later members of a block-in-inline split here, and
++    // then StickyScrollContainer will remove them later.
+     StickyScrollContainer* ssc =
+       StickyScrollContainer::GetStickyScrollContainerForFrame(this);
+     if (ssc) {
+       ssc->AddFrame(this);
+     }
+   }
+ 
+   if (nsLayoutUtils::FontSizeInflationEnabled(PresContext()) || !GetParent()
 diff --git a/layout/generic/nsHTMLReflowState.cpp b/layout/generic/nsHTMLReflowState.cpp
 --- a/layout/generic/nsHTMLReflowState.cpp
 +++ b/layout/generic/nsHTMLReflowState.cpp
