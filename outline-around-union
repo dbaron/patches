@@ -28,7 +28,8 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
                               nsIFrame* aForFrame,
                               const nsRect& aDirtyRect,
                               const nsRect& aBorderArea,
-@@ -783,17 +781,17 @@ nsCSSRendering::PaintOutline(nsPresConte
+@@ -782,48 +780,17 @@ nsCSSRendering::PaintOutline(nsPresConte
+   }
  
    nsIFrame* bgFrame = nsCSSRendering::FindNonTransparentBackgroundFrame
      (aForFrame, false);
@@ -36,17 +37,47 @@ diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
    nscolor bgColor =
      bgContext->GetVisitedDependentColor(eCSSProperty_background_color);
  
-   // When the outline property is set on :-moz-anonymous-block or
+-  // When the outline property is set on :-moz-anonymous-block or
 -  // :-moz-anonyomus-positioned-block pseudo-elements, it inherited that
-+  // :-moz-anonymous-positioned-block pseudo-elements, it inherited that
-   // outline from the inline that was broken because it contained a
-   // block.  In that case, we don't want a really wide outline if the
-   // block inside the inline is narrow, so union the actual contents of
-   // the anonymous blocks.
-   nsIFrame *frameForArea = aForFrame;
-   do {
-     nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
-     if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
+-  // outline from the inline that was broken because it contained a
+-  // block.  In that case, we don't want a really wide outline if the
+-  // block inside the inline is narrow, so union the actual contents of
+-  // the anonymous blocks.
+-  nsIFrame *frameForArea = aForFrame;
+-  do {
+-    nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
+-    if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
+-        pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
+-      break;
+-    // If we're done, we really want it and all its later siblings.
+-    frameForArea = frameForArea->GetFirstPrincipalChild();
+-    NS_ASSERTION(frameForArea, "anonymous block with no children?");
+-  } while (frameForArea);
+-  nsRect innerRect; // relative to aBorderArea.TopLeft()
+-  if (frameForArea == aForFrame) {
+-    innerRect = GetOutlineInnerRect(aForFrame);
+-  } else {
+-    for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
+-      // The outline has already been included in aForFrame's overflow
+-      // area, but not in those of its descendants, so we have to
+-      // include it.  Otherwise we'll end up drawing the outline inside
+-      // the border.
+-      nsRect r(GetOutlineInnerRect(frameForArea) +
+-               frameForArea->GetOffsetTo(aForFrame));
+-      innerRect.UnionRect(innerRect, r);
+-    }
+-  }
+-
+-  innerRect += aBorderArea.TopLeft();
++  nsRect innerRect = GetOutlineInnerRect(aForFrame) + aBorderArea.TopLeft();
+   nscoord offset = ourOutline->mOutlineOffset;
+   innerRect.Inflate(offset, offset);
+   // If the dirty rect is completely inside the border area (e.g., only the
+   // content is being painted), then we can skip out now
+   // XXX this isn't exactly true for rounded borders, where the inside curves may
+   // encroach into the content area.  A safer calculation would be to
+   // shorten insideRect by the radius one each side before performing this test.
+   if (innerRect.Contains(aDirtyRect))
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
@@ -153,7 +184,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
                   (GetStateBits() & NS_FRAME_IS_NONDISPLAY)),
                 "Don't call - overflow rects not maintained on these SVG frames");
  
-@@ -6948,16 +6969,45 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+@@ -6948,16 +6969,72 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
      if (presContext->GetTheme()->
            GetWidgetOverflow(presContext->DeviceContext(), this,
                              disp->mAppearance, &r)) {
@@ -168,11 +199,38 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +    DebugOnly<bool> result = outline->GetOutlineWidth(width);
 +    NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
 +    if (width > 0) {
-+      // Find the union of the border boxes of all descendants.
-+      nsRect innerRect(bounds);
-+      if (!bounds.IsEqualEdges(aOverflowAreas.VisualOverflow()) &&
-+          !bounds.IsEqualEdges(aOverflowAreas.ScrollableOverflow())) {
-+        UnionDescendantBorderBoxes(this, bounds);
++      // When the outline property is set on :-moz-anonymous-block or
++      // :-moz-anonymous-positioned-block pseudo-elements, it inherited
++      // that outline from the inline that was broken because it
++      // contained a block.  In that case, we don't want a really wide
++      // outline if the block inside the inline is narrow, so union the
++      // actual contents of the anonymous blocks.
++      nsIFrame *frameForArea = this;
++      do {
++        nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
++        if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
++            pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
++          break;
++        // If we're done, we really want it and all its later siblings.
++        frameForArea = frameForArea->GetFirstPrincipalChild();
++        NS_ASSERTION(frameForArea, "anonymous block with no children?");
++      } while (frameForArea);
++
++      // Find the union of the border boxes of all descendants, or in
++      // the block-in-inline case, all descendants we care about.
++      nsRect innerRect;
++      if (frameForArea == this) {
++        innerRect = bounds;
++        if (!bounds.IsEqualEdges(aOverflowAreas.VisualOverflow()) &&
++            !bounds.IsEqualEdges(aOverflowAreas.ScrollableOverflow())) {
++          UnionDescendantBorderBoxes(this, bounds);
++        }
++      } else {
++        for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
++          nsRect r(UnionBorderBoxes(frameForArea) +
++                   frameForArea->GetOffsetTo(this));
++          innerRect.UnionRect(innerRect, r);
++        }
 +      }
 +
 +      Properties().Set(nsIFrame::OutlineInnerRectProperty(),
