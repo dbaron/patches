@@ -124,7 +124,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    //     since the style hint for a change in border image doesn't cause
    //     reflow, and that's probably more important than optimizing the
    //     overflow areas for the silly case of border-image-outset without
-@@ -6849,16 +6828,113 @@ nsIFrame::SetOverflowAreas(const nsOverf
+@@ -6849,16 +6828,145 @@ nsIFrame::SetOverflowAreas(const nsOverf
  
  inline bool
  IsInlineFrame(nsIFrame *aFrame)
@@ -135,12 +135,14 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  
 +/**
 + * Compute the union of the border boxes of aFrame and its descendants,
-+ * in aFrame's coordinate space.
++ * in aFrame's post-transform coordinate space.
 + */
 +static nsRect
 +UnionBorderBoxes(nsIFrame* aFrame, const nsSize* aSizeOverride = nullptr)
 +{
-+  nsRect u(nsPoint(0, 0), aSizeOverride ? *aSizeOverride : aFrame->GetSize());
++  const nsRect bounds(nsPoint(0, 0),
++                      aSizeOverride ? *aSizeOverride : aFrame->GetSize());
++  nsRect u(bounds);
 +
 +  // Only iterate through the children if the overflow areas suggest
 +  // that we might need to.
@@ -160,7 +162,18 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +      nsFrameList children = childLists.CurrentList();
 +      for (nsFrameList::Enumerator e(children); !e.AtEnd(); e.Next()) {
 +        nsIFrame* child = e.get();
-+        u.UnionRectEdges(u, UnionBorderBoxes(child) + child->GetPosition());
++        nsRect childRect = UnionBorderBoxes(child) + child->GetPosition();
++        // Note that we transform each child separately according to
++        // aFrame's transform, and then union, which gives a different
++        // (smaller) result from unioning and then transforming the
++        // union.  This doesn't match the way we handle overflow areas
++        // with 2-D transforms, though it does match the way we handle
++        // overflow areas in preserve-3d 3-D scenes.
++        if (!child->Preserves3D()) {
++          childRect = nsDisplayTransform::TransformRect(childRect, aFrame,
++                                                        nsPoint(0, 0), &bounds);
++        }
++        u.UnionRectEdges(u, childRect);
 +      }
 +    }
 +  }
@@ -206,12 +219,31 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +      if (frameForArea == aFrame) {
 +        innerRect = UnionBorderBoxes(aFrame, &aNewSize);
 +      } else {
++        const nsRect bounds(nsPoint(0, 0), aNewSize);
 +        for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
 +          nsRect r(UnionBorderBoxes(frameForArea) +
 +                   frameForArea->GetOffsetTo(aFrame));
++
++          // Adjust for transforms up to aFrame's post-transform
++          // coordinate space; see comment in UnionBorderBoxes.
++          for (nsIFrame* f = frameForArea; f != aFrame; f = f->GetParent()) {
++            if (!f->Preserves3D()) {
++              r = nsDisplayTransform::TransformRect(r, f->GetParent(),
++                                                    nsPoint(0, 0),
++                                                    f == aFrame ? &bounds
++                                                                : nullptr);
++            }
++          }
++
 +          innerRect.UnionRect(innerRect, r);
 +        }
 +      }
++
++      // Now we have innerRect in aFrame's post-transform coordinate
++      // space (which might include the transforms up to the root of the
++      // 3-d scene), but we want it back in aFrame's pre-transform
++      // coordinate space.
++      // FIXME: WRITE!
 +
 +      aFrame->Properties().Set(nsIFrame::OutlineInnerRectProperty(),
 +                               new nsRect(innerRect));
@@ -238,7 +270,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
                 "Don't call - overflow rects not maintained on these SVG frames");
  
    nsRect bounds(nsPoint(0, 0), aNewSize);
-@@ -6928,16 +7004,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+@@ -6928,16 +7036,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
      if (presContext->GetTheme()->
            GetWidgetOverflow(presContext->DeviceContext(), this,
                              disp->mAppearance, &r)) {
