@@ -7,9 +7,6 @@ blocks earlier, so that we factor it into the stored frame property (and
 thus have the stored frame property) and so that we include it
 accurately in the overflow calculation.
 
-FIXME: Replace the Invert() business with a boolean.  Invert doesn't work
-since we're transforming rects.
-
 diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
 --- a/layout/base/nsCSSRendering.cpp
 +++ b/layout/base/nsCSSRendering.cpp
@@ -127,7 +124,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    //     since the style hint for a change in border image doesn't cause
    //     reflow, and that's probably more important than optimizing the
    //     overflow areas for the silly case of border-image-outset without
-@@ -6849,16 +6828,160 @@ nsIFrame::SetOverflowAreas(const nsOverf
+@@ -6849,16 +6828,163 @@ nsIFrame::SetOverflowAreas(const nsOverf
  
  inline bool
  IsInlineFrame(nsIFrame *aFrame)
@@ -138,18 +135,25 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
  
 +/**
 + * Compute the union of the border boxes of aFrame and its descendants,
-+ * in aFrame's post-transform coordinate space.
++ * in aFrame's coordinate space (if aApplyTransform is false) or its
++ * post-transform coordinate space (if aApplyTransform is true).
 + */
 +static nsRect
-+UnionBorderBoxes(nsIFrame* aFrame, const nsSize* aSizeOverride = nullptr)
++UnionBorderBoxes(nsIFrame* aFrame, bool aApplyTransform,
++                 const nsSize* aSizeOverride = nullptr)
 +{
 +  const nsRect bounds(nsPoint(0, 0),
 +                      aSizeOverride ? *aSizeOverride : aFrame->GetSize());
 +
 +  // Start from our border-box, transformed.  See comment below about
 +  // transform of children.
-+  nsRect u = nsDisplayTransform::TransformRect(bounds, aFrame,
-+                                               nsPoint(0, 0), &bounds);
++  nsRect u;
++  if (aApplyTransform) {
++    u = nsDisplayTransform::TransformRect(bounds, aFrame,
++                                          nsPoint(0, 0), &bounds);
++  } else {
++    u = bounds;
++  }
 +
 +  // Only iterate through the children if the overflow areas suggest
 +  // that we might need to.
@@ -169,14 +173,24 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +      nsFrameList children = childLists.CurrentList();
 +      for (nsFrameList::Enumerator e(children); !e.AtEnd(); e.Next()) {
 +        nsIFrame* child = e.get();
-+        nsRect childRect = UnionBorderBoxes(child) + child->GetPosition();
++        // Note that passing |true| for aApplyTransform when
++        // child->Preserves3D() is incorrect if our aApplyTransform is
++        // false... but the opposite would be as well.  This is because
++        // elements within a preserve-3d scene are always transformed up
++        // to the top of the scene.  This means we don't have a
++        // mechanism for getting a transform up to an intermediate point
++        // within the scene.  We choose to over-transform rather than
++        // under-transform because this is consistent with other
++        // overflow areas.
++        nsRect childRect = UnionBorderBoxes(child, true) +
++                           child->GetPosition();
 +        // Note that we transform each child separately according to
 +        // aFrame's transform, and then union, which gives a different
 +        // (smaller) result from unioning and then transforming the
 +        // union.  This doesn't match the way we handle overflow areas
 +        // with 2-D transforms, though it does match the way we handle
 +        // overflow areas in preserve-3d 3-D scenes.
-+        if (!child->Preserves3D()) {
++        if (!child->Preserves3D() && aApplyTransform) {
 +          childRect = nsDisplayTransform::TransformRect(childRect, aFrame,
 +                                                        nsPoint(0, 0), &bounds);
 +        }
@@ -215,8 +229,6 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +        NS_ASSERTION(frameForArea, "anonymous block with no children?");
 +      } while (frameForArea);
 +
-+      const nsRect bounds(nsPoint(0, 0), aNewSize);
-+
 +      // Find the union of the border boxes of all descendants, or in
 +      // the block-in-inline case, all descendants we care about.
 +      //
@@ -226,41 +238,29 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +      // function again.  We still need to deal with preserve-3d a bit.
 +      nsRect innerRect;
 +      if (frameForArea == aFrame) {
-+        innerRect = UnionBorderBoxes(aFrame, &aNewSize);
++        innerRect = UnionBorderBoxes(aFrame, false, &aNewSize);
 +      } else {
-+        for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
-+          nsRect r(UnionBorderBoxes(frameForArea) +
-+                   frameForArea->GetOffsetTo(aFrame));
++        const nsRect bounds(nsPoint(0, 0), aNewSize);
 +
-+          // Adjust for transforms up to aFrame's post-transform
-+          // coordinate space; see comment in UnionBorderBoxes.
++        for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
++          nsRect r(UnionBorderBoxes(frameForArea, true));
++
++          // Adjust for offsets transforms up to aFrame's pre-transform
++          // coordinate space; see comments in UnionBorderBoxes for some
++          // of the subtlety here.
 +          for (nsIFrame* f = frameForArea; f != aFrame; f = f->GetParent()) {
++            r += f->GetPosition();
 +            if (!f->Preserves3D()) {
++              const nsRect* overrideBounds =
++                f->GetParent() == aFrame ? &bounds : nullptr;
 +              r = nsDisplayTransform::TransformRect(r, f->GetParent(),
 +                                                    nsPoint(0, 0),
-+                                                    f == aFrame ? &bounds
-+                                                                : nullptr);
++                                                    overrideBounds);
 +            }
 +          }
 +
 +          innerRect.UnionRect(innerRect, r);
 +        }
-+      }
-+
-+      // Now we have innerRect in aFrame's post-transform coordinate
-+      // space (which might include the transforms up to the root of the
-+      // 3-d scene), but we want it back in aFrame's pre-transform
-+      // coordinate space.
-+      float factor = aFrame->PresContext()->AppUnitsPerDevPixel();
-+      gfx3DMatrix matrix = nsDisplayTransform::GetResultingTransformMatrix(
-+                             aFrame, nsPoint(0, 0), factor, &bounds);
-+      if (matrix.IsSingular()) {
-+        // Who cares?  We're in a frame that's never going to paint
-+        // anything, since it's in a singular transform.
-+      } else {
-+        matrix.Invert();
-+        innerRect =
-+          nsLayoutUtils::MatrixTransformRect(innerRect, matrix, factor);
 +      }
 +
 +      aFrame->Properties().Set(nsIFrame::OutlineInnerRectProperty(),
@@ -288,7 +288,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
                 "Don't call - overflow rects not maintained on these SVG frames");
  
    nsRect bounds(nsPoint(0, 0), aNewSize);
-@@ -6928,16 +7051,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+@@ -6928,16 +7054,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
      if (presContext->GetTheme()->
            GetWidgetOverflow(presContext->DeviceContext(), this,
                              disp->mAppearance, &r)) {
