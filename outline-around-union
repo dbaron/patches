@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 480888 patch 4:  Draw outline around the union of border boxes, SVG, and text, rather than the visual overflow area.
+Bug 480888 patch 4:  Draw outline around the union of border boxes, SVG, and text, rather than the visual overflow area.  r=roc
 
 At the same time, move the handling of outlines on inlines that contain
 blocks earlier, so that we factor it into the stored frame property (and
@@ -124,7 +124,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
    //     since the style hint for a change in border image doesn't cause
    //     reflow, and that's probably more important than optimizing the
    //     overflow areas for the silly case of border-image-outset without
-@@ -6849,16 +6828,178 @@ nsIFrame::SetOverflowAreas(const nsOverf
+@@ -6849,16 +6828,182 @@ nsIFrame::SetOverflowAreas(const nsOverf
  
  inline bool
  IsInlineFrame(nsIFrame *aFrame)
@@ -223,76 +223,80 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 +                             const nsSize& aNewSize)
 +{
 +  const nsStyleOutline* outline = aFrame->StyleOutline();
-+  if (outline->GetOutlineStyle() != NS_STYLE_BORDER_STYLE_NONE) {
-+    nscoord width;
-+    DebugOnly<bool> result = outline->GetOutlineWidth(width);
-+    NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
-+    if (width > 0) {
-+      // When the outline property is set on :-moz-anonymous-block or
-+      // :-moz-anonymous-positioned-block pseudo-elements, it inherited
-+      // that outline from the inline that was broken because it
-+      // contained a block.  In that case, we don't want a really wide
-+      // outline if the block inside the inline is narrow, so union the
-+      // actual contents of the anonymous blocks.
-+      nsIFrame *frameForArea = aFrame;
-+      do {
-+        nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
-+        if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
-+            pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
++  if (outline->GetOutlineStyle() == NS_STYLE_BORDER_STYLE_NONE) {
++    return;
++  }
++
++  nscoord width;
++  DebugOnly<bool> result = outline->GetOutlineWidth(width);
++  NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
++  if (width <= 0) {
++    return;
++  }
++
++  // When the outline property is set on :-moz-anonymous-block or
++  // :-moz-anonymous-positioned-block pseudo-elements, it inherited
++  // that outline from the inline that was broken because it
++  // contained a block.  In that case, we don't want a really wide
++  // outline if the block inside the inline is narrow, so union the
++  // actual contents of the anonymous blocks.
++  nsIFrame *frameForArea = aFrame;
++  do {
++    nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
++    if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
++        pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
++      break;
++    // If we're done, we really want it and all its later siblings.
++    frameForArea = frameForArea->GetFirstPrincipalChild();
++    NS_ASSERTION(frameForArea, "anonymous block with no children?");
++  } while (frameForArea);
++
++  // Find the union of the border boxes of all descendants, or in
++  // the block-in-inline case, all descendants we care about.
++  //
++  // Note that the interesting perspective-related cases are taken
++  // care of by the code that handles those issues for overflow
++  // calling FinishAndStoreOverflow again, which in turn calls this
++  // function again.  We still need to deal with preserve-3d a bit.
++  nsRect innerRect;
++  if (frameForArea == aFrame) {
++    innerRect = UnionBorderBoxes(aFrame, false, &aNewSize);
++  } else {
++    for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
++      nsRect r(UnionBorderBoxes(frameForArea, true));
++
++      // Adjust for offsets transforms up to aFrame's pre-transform
++      // (i.e., normal) coordinate space; see comments in
++      // UnionBorderBoxes for some of the subtlety here.
++      for (nsIFrame *f = frameForArea, *parent = f->GetParent();
++           /* see middle of loop */;
++           f = parent, parent = f->GetParent()) {
++        r += f->GetPosition();
++        if (parent == aFrame) {
 +          break;
-+        // If we're done, we really want it and all its later siblings.
-+        frameForArea = frameForArea->GetFirstPrincipalChild();
-+        NS_ASSERTION(frameForArea, "anonymous block with no children?");
-+      } while (frameForArea);
-+
-+      // Find the union of the border boxes of all descendants, or in
-+      // the block-in-inline case, all descendants we care about.
-+      //
-+      // Note that the interesting perspective-related cases are taken
-+      // care of by the code that handles those issues for overflow
-+      // calling FinishAndStoreOverflow again, which in turn calls this
-+      // function again.  We still need to deal with preserve-3d a bit.
-+      nsRect innerRect;
-+      if (frameForArea == aFrame) {
-+        innerRect = UnionBorderBoxes(aFrame, false, &aNewSize);
-+      } else {
-+        for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
-+          nsRect r(UnionBorderBoxes(frameForArea, true));
-+
-+          // Adjust for offsets transforms up to aFrame's pre-transform
-+          // (i.e., normal) coordinate space; see comments in
-+          // UnionBorderBoxes for some of the subtlety here.
-+          for (nsIFrame *f = frameForArea, *parent = f->GetParent();
-+               /* see middle of loop */;
-+               f = parent, parent = f->GetParent()) {
-+            r += f->GetPosition();
-+            if (parent == aFrame) {
-+              break;
-+            }
-+            if (parent->IsTransformed() && !f->Preserves3D()) {
-+              r = nsDisplayTransform::TransformRect(r, parent, nsPoint(0, 0));
-+            }
-+          }
-+
-+          innerRect.UnionRect(innerRect, r);
++        }
++        if (parent->IsTransformed() && !f->Preserves3D()) {
++          r = nsDisplayTransform::TransformRect(r, parent, nsPoint(0, 0));
 +        }
 +      }
 +
-+      aFrame->Properties().Set(nsIFrame::OutlineInnerRectProperty(),
-+                               new nsRect(innerRect));
-+
-+      nscoord offset = outline->mOutlineOffset;
-+      nscoord inflateBy = std::max(width + offset, 0);
-+
-+      // Keep this code (and the storing of properties just above) in
-+      // sync with GetOutlineInnerRect in nsCSSRendering.cpp.
-+      nsRect outerRect(innerRect);
-+      outerRect.Inflate(inflateBy, inflateBy);
-+
-+      nsRect& vo = aOverflowAreas.VisualOverflow();
-+      vo.UnionRectEdges(vo, outerRect);
++      innerRect.UnionRect(innerRect, r);
 +    }
 +  }
++
++  aFrame->Properties().Set(nsIFrame::OutlineInnerRectProperty(),
++                           new nsRect(innerRect));
++
++  nscoord offset = outline->mOutlineOffset;
++  nscoord inflateBy = std::max(width + offset, 0);
++
++  // Keep this code (and the storing of properties just above) in
++  // sync with GetOutlineInnerRect in nsCSSRendering.cpp.
++  nsRect outerRect(innerRect);
++  outerRect.Inflate(inflateBy, inflateBy);
++
++  nsRect& vo = aOverflowAreas.VisualOverflow();
++  vo.UnionRectEdges(vo, outerRect);
 +}
 +
  bool
@@ -303,7 +307,7 @@ diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
                 "Don't call - overflow rects not maintained on these SVG frames");
  
    nsRect bounds(nsPoint(0, 0), aNewSize);
-@@ -6928,16 +7069,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+@@ -6928,16 +7073,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
      if (presContext->GetTheme()->
            GetWidgetOverflow(presContext->DeviceContext(), this,
                              disp->mAppearance, &r)) {
