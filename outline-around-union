@@ -1,0 +1,611 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 480888 patch 4:  Draw outline around the union of border boxes, SVG, and text, rather than the visual overflow area.  r=roc
+
+At the same time, move the handling of outlines on inlines that contain
+blocks earlier, so that we factor it into the stored frame property (and
+thus have the stored frame property) and so that we include it
+accurately in the overflow calculation.
+
+diff --git a/layout/base/nsCSSRendering.cpp b/layout/base/nsCSSRendering.cpp
+--- a/layout/base/nsCSSRendering.cpp
++++ b/layout/base/nsCSSRendering.cpp
+@@ -570,20 +570,18 @@ nsCSSRendering::PaintBorderWithStyleBord
+ 
+ static nsRect
+ GetOutlineInnerRect(nsIFrame* aFrame)
+ {
+   nsRect* savedOutlineInnerRect = static_cast<nsRect*>
+     (aFrame->Properties().Get(nsIFrame::OutlineInnerRectProperty()));
+   if (savedOutlineInnerRect)
+     return *savedOutlineInnerRect;
+-  // FIXME (bug 599652): We probably want something narrower than either
+-  // overflow rect here, but for now use the visual overflow in order to
+-  // be consistent with ComputeEffectsRect in nsFrame.cpp.
+-  return aFrame->GetVisualOverflowRect();
++  NS_NOTREACHED("we should have saved a frame property");
++  return nsRect(nsPoint(0, 0), aFrame->GetSize());
+ }
+ 
+ void
+ nsCSSRendering::PaintOutline(nsPresContext* aPresContext,
+                              nsRenderingContext& aRenderingContext,
+                              nsIFrame* aForFrame,
+                              const nsRect& aDirtyRect,
+                              const nsRect& aBorderArea,
+@@ -603,47 +601,32 @@ nsCSSRendering::PaintOutline(nsPresConte
+   }
+ 
+   nsIFrame* bgFrame = nsCSSRendering::FindNonTransparentBackgroundFrame
+     (aForFrame, false);
+   nsStyleContext* bgContext = bgFrame->StyleContext();
+   nscolor bgColor =
+     bgContext->GetVisitedDependentColor(eCSSProperty_background_color);
+ 
+-  // When the outline property is set on :-moz-anonymous-block or
+-  // :-moz-anonyomus-positioned-block pseudo-elements, it inherited that
+-  // outline from the inline that was broken because it contained a
+-  // block.  In that case, we don't want a really wide outline if the
+-  // block inside the inline is narrow, so union the actual contents of
+-  // the anonymous blocks.
+-  nsIFrame *frameForArea = aForFrame;
+-  do {
+-    nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
+-    if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
+-        pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
+-      break;
+-    // If we're done, we really want it and all its later siblings.
+-    frameForArea = frameForArea->GetFirstPrincipalChild();
+-    NS_ASSERTION(frameForArea, "anonymous block with no children?");
+-  } while (frameForArea);
+-  nsRect innerRect; // relative to aBorderArea.TopLeft()
+-  if (frameForArea == aForFrame) {
++  nsRect innerRect;
++  if (
++#ifdef MOZ_XUL
++      aStyleContext->GetPseudoType() == nsCSSPseudoElements::ePseudo_XULTree
++#else
++      false
++#endif
++     ) {
++    // FIXME: This behavior doesn't make sense; we should switch back to
++    // using aBorderArea.  But since this has been broken since bug
++    // 133165 in August of 2004, that switch should be made in its own
++    // patch changing only that behavior.
++    innerRect = aForFrame->GetVisualOverflowRect();
++  } else {
+     innerRect = GetOutlineInnerRect(aForFrame);
+-  } else {
+-    for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
+-      // The outline has already been included in aForFrame's overflow
+-      // area, but not in those of its descendants, so we have to
+-      // include it.  Otherwise we'll end up drawing the outline inside
+-      // the border.
+-      nsRect r(GetOutlineInnerRect(frameForArea) +
+-               frameForArea->GetOffsetTo(aForFrame));
+-      innerRect.UnionRect(innerRect, r);
+-    }
+   }
+-
+   innerRect += aBorderArea.TopLeft();
+   nscoord offset = ourOutline->mOutlineOffset;
+   innerRect.Inflate(offset, offset);
+   // If the dirty rect is completely inside the border area (e.g., only the
+   // content is being painted), then we can skip out now
+   // XXX this isn't exactly true for rounded borders, where the inside curves may
+   // encroach into the content area.  A safer calculation would be to
+   // shorten insideRect by the radius one each side before performing this test.
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -4971,37 +4971,16 @@ ComputeEffectsRect(nsIFrame* aFrame, con
+       r = nsSVGUtils::GetPostFilterVisualOverflowRect(aFrame, aOverflowRect);
+     }
+     return r;
+   }
+ 
+   // box-shadow
+   r.UnionRect(r, nsLayoutUtils::GetBoxShadowRectForFrame(aFrame, aNewSize));
+ 
+-  const nsStyleOutline* outline = aFrame->StyleOutline();
+-  uint8_t outlineStyle = outline->GetOutlineStyle();
+-  if (outlineStyle != NS_STYLE_BORDER_STYLE_NONE) {
+-    nscoord width;
+-    DebugOnly<bool> result = outline->GetOutlineWidth(width);
+-    NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
+-    if (width > 0) {
+-      aFrame->Properties().
+-        Set(nsIFrame::OutlineInnerRectProperty(), new nsRect(r));
+-
+-      nscoord offset = outline->mOutlineOffset;
+-      nscoord inflateBy = std::max(width + offset, 0);
+-      // FIXME (bug 599652): We probably want outline to be drawn around
+-      // something smaller than the visual overflow rect (perhaps the
+-      // scrollable overflow rect is correct).  When we change that, we
+-      // need to keep this code (and the storing of properties just
+-      // above) in sync with GetOutlineInnerRect in nsCSSRendering.cpp.
+-      r.Inflate(inflateBy, inflateBy);
+-    }
+-  }
+-
+   // border-image-outset.
+   // We need to include border-image-outset because it can cause the
+   // border image to be drawn beyond the border box.
+ 
+   // (1) It's important we not check whether there's a border-image
+   //     since the style hint for a change in border image doesn't cause
+   //     reflow, and that's probably more important than optimizing the
+   //     overflow areas for the silly case of border-image-outset without
+@@ -6849,16 +6828,182 @@ nsIFrame::SetOverflowAreas(const nsOverf
+ 
+ inline bool
+ IsInlineFrame(nsIFrame *aFrame)
+ {
+   nsIAtom *type = aFrame->GetType();
+   return type == nsGkAtoms::inlineFrame;
+ }
+ 
++/**
++ * Compute the union of the border boxes of aFrame and its descendants,
++ * in aFrame's coordinate space (if aApplyTransform is false) or its
++ * post-transform coordinate space (if aApplyTransform is true).
++ */
++static nsRect
++UnionBorderBoxes(nsIFrame* aFrame, bool aApplyTransform,
++                 const nsSize* aSizeOverride = nullptr)
++{
++  const nsRect bounds(nsPoint(0, 0),
++                      aSizeOverride ? *aSizeOverride : aFrame->GetSize());
++
++  // Start from our border-box, transformed.  See comment below about
++  // transform of children.
++  nsRect u;
++  bool doTransform = aApplyTransform && aFrame->IsTransformed();
++  if (doTransform) {
++    u = nsDisplayTransform::TransformRect(bounds, aFrame,
++                                          nsPoint(0, 0), &bounds);
++  } else {
++    u = bounds;
++  }
++
++  // Only iterate through the children if the overflow areas suggest
++  // that we might need to, and if the frame doesn't clip its overflow
++  // anyway.
++  const nsStyleDisplay* disp = aFrame->StyleDisplay();
++  nsIAtom* fType = aFrame->GetType();
++  if (!u.IsEqualEdges(aFrame->GetVisualOverflowRect()) &&
++      !u.IsEqualEdges(aFrame->GetScrollableOverflowRect()) &&
++      !nsFrame::ShouldApplyOverflowClipping(aFrame, disp) &&
++      fType != nsGkAtoms::scrollFrame &&
++      fType != nsGkAtoms::svgOuterSVGFrame) {
++
++    nsRect clipPropClipRect;
++    bool hasClipPropClip =
++      aFrame->GetClipPropClipRect(disp, &clipPropClipRect, bounds.Size());
++
++    // Iterate over all children except pop-ups.
++    const nsIFrame::ChildListIDs skip(nsIFrame::kPopupList |
++                                      nsIFrame::kSelectPopupList);
++    for (nsIFrame::ChildListIterator childLists(aFrame);
++         !childLists.IsDone(); childLists.Next()) {
++      if (skip.Contains(childLists.CurrentID())) {
++        continue;
++      }
++
++      nsFrameList children = childLists.CurrentList();
++      for (nsFrameList::Enumerator e(children); !e.AtEnd(); e.Next()) {
++        nsIFrame* child = e.get();
++        // Note that passing |true| for aApplyTransform when
++        // child->Preserves3D() is incorrect if our aApplyTransform is
++        // false... but the opposite would be as well.  This is because
++        // elements within a preserve-3d scene are always transformed up
++        // to the top of the scene.  This means we don't have a
++        // mechanism for getting a transform up to an intermediate point
++        // within the scene.  We choose to over-transform rather than
++        // under-transform because this is consistent with other
++        // overflow areas.
++        nsRect childRect = UnionBorderBoxes(child, true) +
++                           child->GetPosition();
++
++        if (hasClipPropClip) {
++          // Intersect with the clip before transforming.
++          childRect.IntersectRect(childRect, clipPropClipRect);
++        }
++
++        // Note that we transform each child separately according to
++        // aFrame's transform, and then union, which gives a different
++        // (smaller) result from unioning and then transforming the
++        // union.  This doesn't match the way we handle overflow areas
++        // with 2-D transforms, though it does match the way we handle
++        // overflow areas in preserve-3d 3-D scenes.
++        if (doTransform && !child->Preserves3D()) {
++          childRect = nsDisplayTransform::TransformRect(childRect, aFrame,
++                                                        nsPoint(0, 0), &bounds);
++        }
++        u.UnionRectEdges(u, childRect);
++      }
++    }
++  }
++
++  return u;
++}
++
++static void
++ComputeAndIncludeOutlineArea(nsIFrame* aFrame, nsOverflowAreas& aOverflowAreas,
++                             const nsSize& aNewSize)
++{
++  const nsStyleOutline* outline = aFrame->StyleOutline();
++  if (outline->GetOutlineStyle() == NS_STYLE_BORDER_STYLE_NONE) {
++    return;
++  }
++
++  nscoord width;
++  DebugOnly<bool> result = outline->GetOutlineWidth(width);
++  NS_ASSERTION(result, "GetOutlineWidth had no cached outline width");
++  if (width <= 0) {
++    return;
++  }
++
++  // When the outline property is set on :-moz-anonymous-block or
++  // :-moz-anonymous-positioned-block pseudo-elements, it inherited
++  // that outline from the inline that was broken because it
++  // contained a block.  In that case, we don't want a really wide
++  // outline if the block inside the inline is narrow, so union the
++  // actual contents of the anonymous blocks.
++  nsIFrame *frameForArea = aFrame;
++  do {
++    nsIAtom *pseudoType = frameForArea->StyleContext()->GetPseudo();
++    if (pseudoType != nsCSSAnonBoxes::mozAnonymousBlock &&
++        pseudoType != nsCSSAnonBoxes::mozAnonymousPositionedBlock)
++      break;
++    // If we're done, we really want it and all its later siblings.
++    frameForArea = frameForArea->GetFirstPrincipalChild();
++    NS_ASSERTION(frameForArea, "anonymous block with no children?");
++  } while (frameForArea);
++
++  // Find the union of the border boxes of all descendants, or in
++  // the block-in-inline case, all descendants we care about.
++  //
++  // Note that the interesting perspective-related cases are taken
++  // care of by the code that handles those issues for overflow
++  // calling FinishAndStoreOverflow again, which in turn calls this
++  // function again.  We still need to deal with preserve-3d a bit.
++  nsRect innerRect;
++  if (frameForArea == aFrame) {
++    innerRect = UnionBorderBoxes(aFrame, false, &aNewSize);
++  } else {
++    for (; frameForArea; frameForArea = frameForArea->GetNextSibling()) {
++      nsRect r(UnionBorderBoxes(frameForArea, true));
++
++      // Adjust for offsets transforms up to aFrame's pre-transform
++      // (i.e., normal) coordinate space; see comments in
++      // UnionBorderBoxes for some of the subtlety here.
++      for (nsIFrame *f = frameForArea, *parent = f->GetParent();
++           /* see middle of loop */;
++           f = parent, parent = f->GetParent()) {
++        r += f->GetPosition();
++        if (parent == aFrame) {
++          break;
++        }
++        if (parent->IsTransformed() && !f->Preserves3D()) {
++          r = nsDisplayTransform::TransformRect(r, parent, nsPoint(0, 0));
++        }
++      }
++
++      innerRect.UnionRect(innerRect, r);
++    }
++  }
++
++  aFrame->Properties().Set(nsIFrame::OutlineInnerRectProperty(),
++                           new nsRect(innerRect));
++
++  nscoord offset = outline->mOutlineOffset;
++  nscoord inflateBy = std::max(width + offset, 0);
++
++  // Keep this code (and the storing of properties just above) in
++  // sync with GetOutlineInnerRect in nsCSSRendering.cpp.
++  nsRect outerRect(innerRect);
++  outerRect.Inflate(inflateBy, inflateBy);
++
++  nsRect& vo = aOverflowAreas.VisualOverflow();
++  vo.UnionRectEdges(vo, outerRect);
++}
++
+ bool
+ nsIFrame::FinishAndStoreOverflow(nsOverflowAreas& aOverflowAreas,
+                                  nsSize aNewSize, nsSize* aOldSize)
+ {
+   NS_ASSERTION(FrameMaintainsOverflow(this),
+                "Don't call - overflow rects not maintained on these SVG frames");
+ 
+   nsRect bounds(nsPoint(0, 0), aNewSize);
+@@ -6928,16 +7073,18 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+     if (presContext->GetTheme()->
+           GetWidgetOverflow(presContext->DeviceContext(), this,
+                             disp->mAppearance, &r)) {
+       nsRect& vo = aOverflowAreas.VisualOverflow();
+       vo.UnionRectEdges(vo, r);
+     }
+   }
+ 
++  ComputeAndIncludeOutlineArea(this, aOverflowAreas, aNewSize);
++
+   // Nothing in here should affect scrollable overflow.
+   aOverflowAreas.VisualOverflow() =
+     ComputeEffectsRect(this, aOverflowAreas.VisualOverflow(), aNewSize);
+ 
+   // Absolute position clipping
+   nsRect clipPropClipRect;
+   bool hasClipPropClip = GetClipPropClipRect(disp, &clipPropClipRect, aNewSize);
+   if (hasClipPropClip) {
+diff --git a/layout/reftests/outline/outline-and-3d-transform-1-ref.html b/layout/reftests/outline/outline-and-3d-transform-1-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-3d-transform-1-ref.html
+@@ -0,0 +1,28 @@
++<!DOCTYPE HTML>
++<title>Testcase for outline around 3-D transform</title>
++<style>
++
++html, body { margin: 0; padding: 0; border: none }
++
++div {
++  width: 100px;
++  height: 100px;
++}
++
++body > div {
++  margin-top: 200px;
++  margin-left: 200px;
++  transform-style: flat;
++  position: relative;
++}
++
++body > div > div {
++  position: absolute; top: 0; left: 0;
++  height: 150px; width: 150px; top: -25px; left: -25px;
++  background: rgba(255, 255, 0, 0.4);
++  outline: 2px dashed blue;
++}
++
++</style>
++
++<div><div></div></div>
+diff --git a/layout/reftests/outline/outline-and-3d-transform-1a.html b/layout/reftests/outline/outline-and-3d-transform-1a.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-3d-transform-1a.html
+@@ -0,0 +1,40 @@
++<!DOCTYPE HTML>
++<title>Testcase for outline around 3-D transform</title>
++<style>
++
++html, body { margin: 0; padding: 0; border: none }
++
++div {
++  width: 100px;
++  height: 100px;
++}
++
++body > div {
++  margin-top: 200px;
++  margin-left: 200px;
++  transform-style: flat;
++  outline: 2px dashed blue;
++}
++
++body > div > div {
++  transform: rotateX(30deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++}
++
++body > div > div > div {
++  transform: rotateX(30deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++}
++
++body > div > div > div > div {
++  transform: scale(1.5, 3);
++  transform-origin: 50% 50%;
++  background: rgba(255, 255, 0, 0.4);
++}
++
++
++</style>
++
++<div><div><div><div></div></div></div></div>
+diff --git a/layout/reftests/outline/outline-and-3d-transform-1b.html b/layout/reftests/outline/outline-and-3d-transform-1b.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-3d-transform-1b.html
+@@ -0,0 +1,40 @@
++<!DOCTYPE HTML>
++<title>Testcase for outline around 3-D transform</title>
++<style>
++
++html, body { margin: 0; padding: 0; border: none }
++
++div {
++  width: 100px;
++  height: 100px;
++}
++
++body > div {
++  margin-top: 200px;
++  margin-left: 200px;
++  transform-style: flat;
++  outline: 2px dashed blue;
++}
++
++body > div > div {
++  transform: rotateX(90deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++}
++
++body > div > div > div {
++  transform: rotateX(-30deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++}
++
++body > div > div > div > div {
++  transform: scale(1.5, 3);
++  transform-origin: 50% 50%;
++  background: rgba(255, 255, 0, 0.4);
++}
++
++
++</style>
++
++<div><div><div><div></div></div></div></div>
+diff --git a/layout/reftests/outline/outline-and-3d-transform-2-ref.html b/layout/reftests/outline/outline-and-3d-transform-2-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-3d-transform-2-ref.html
+@@ -0,0 +1,36 @@
++<!DOCTYPE HTML>
++<title>Testcase for outline around 3-D transform</title>
++<style>
++
++html, body { margin: 0; padding: 0; border: none }
++
++div {
++  width: 100px;
++  height: 100px;
++}
++
++body > div {
++  margin-top: 200px;
++  margin-left: 200px;
++  transform-style: flat;
++}
++
++body > div > div {
++  transform: rotateX(30deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++  border: 5px solid green;
++  margin: -5px;
++}
++
++body > div > div > div {
++  transform: rotateX(30deg);
++  width: 50px; margin-left: 20px; margin-top: -5px;
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++  border: 5px solid blue;
++}
++
++</style>
++
++<div><div><div></div></div></div>
+diff --git a/layout/reftests/outline/outline-and-3d-transform-2.html b/layout/reftests/outline/outline-and-3d-transform-2.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-3d-transform-2.html
+@@ -0,0 +1,35 @@
++<!DOCTYPE HTML>
++<title>Testcase for outline around 3-D transform</title>
++<style>
++
++html, body { margin: 0; padding: 0; border: none }
++
++div {
++  width: 100px;
++  height: 100px;
++}
++
++body > div {
++  margin-top: 200px;
++  margin-left: 200px;
++  transform-style: flat;
++}
++
++body > div > div {
++  transform: rotateX(30deg);
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++  outline: 5px solid green;
++}
++
++body > div > div > div {
++  transform: rotateX(30deg);
++  width: 50px; margin-left: 25px;
++  transform-origin: 50% 50%;
++  transform-style: preserve-3d;
++  outline: 5px solid blue;
++}
++
++</style>
++
++<div><div><div></div></div></div>
+diff --git a/layout/reftests/outline/outline-and-box-shadow-ref.html b/layout/reftests/outline/outline-and-box-shadow-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-box-shadow-ref.html
+@@ -0,0 +1,13 @@
++<!DOCTYPE HTML>
++<title>outline and box-shadow</title>
++<style>
++html, body { margin: 0; padding: 0 }
++p {
++  margin: 48px;
++  border: 2px solid blue;
++  padding: 5px; /* ensure no font overhang */
++  background: yellow; color: black;
++  box-shadow: 10px 10px 10px 0px black;
++}
++</style>
++<p>The outline should be adjacent to the background.</p>
+diff --git a/layout/reftests/outline/outline-and-box-shadow.html b/layout/reftests/outline/outline-and-box-shadow.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/outline-and-box-shadow.html
+@@ -0,0 +1,13 @@
++<!DOCTYPE HTML>
++<title>outline and box-shadow</title>
++<style>
++html, body { margin: 0; padding: 0 }
++p {
++  margin: 50px;
++  outline: 2px solid blue;
++  padding: 5px; /* ensure no font overhang */
++  background: yellow; color: black;
++  box-shadow: 10px 10px 10px 2px black;
++}
++</style>
++<p>The outline should be adjacent to the background.</p>
+diff --git a/layout/reftests/outline/reftest.list b/layout/reftests/outline/reftest.list
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/outline/reftest.list
+@@ -0,0 +1,4 @@
++== outline-and-box-shadow.html outline-and-box-shadow-ref.html
++== outline-and-3d-transform-1a.html outline-and-3d-transform-1-ref.html
++== outline-and-3d-transform-1b.html outline-and-3d-transform-1-ref.html
++== outline-and-3d-transform-2.html outline-and-3d-transform-2-ref.html
+diff --git a/layout/reftests/reftest.list b/layout/reftests/reftest.list
+--- a/layout/reftests/reftest.list
++++ b/layout/reftests/reftest.list
+@@ -214,16 +214,18 @@ skip-if(B2G) include margin-collapsing/r
+ skip-if(B2G) include marquee/reftest.list
+ 
+ # native-theme/
+ skip-if(Android||B2G) include native-theme/reftest.list
+ 
+ # netwerk/
+ skip-if(B2G) include ../../netwerk/test/reftest/reftest.list
+ 
++include outline/reftest.list
++
+ # object/
+ skip-if(B2G) include object/reftest.list
+ 
+ # ogg-video/
+ include ogg-video/reftest.list
+ 
+ # webm-video/
+ include webm-video/reftest.list
