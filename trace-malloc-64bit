@@ -1,0 +1,175 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Improve trace-malloc memory dumps and their handling on 64-bit.
+
+There are three categories of improvements:
+
+ (1) using size_t* rather than unsigned long* (and "%zX" rather than
+     "%lX"), to better support platforms where sizeof(long) !=
+     sizeof(void*), such as Win64 (untested, though).  This is a
+     non-issue for 64-bit Linux (where I tested) and Mac.
+
+ (2) Using the correct amount of 0-padding when printing addresses to
+     show how much memory space is being printed.  In other words, using
+     "%16zX" on 64-bit platforms instead of "%08zX".  This change is
+     cosmetic-only, though it makes the logs much more understandable.
+
+ (3) [in leaksoup.cpp only] Fixing an occurrence of assuming that
+     sizeof(int) == sizeof(void*).  This occurrence led to printing only
+     the lower half of each word in the output, after doing a correct
+     analysis of the memory graph.
+
+This patch is patching three files:
+
+ (A) nsTraceMalloc.cpp, which is the in-process Gecko trace-malloc code
+     that generates the memory dumps.
+
+ (B) adreader.cpp, which is shared utility code for reading such a
+     memory dump (currently used only by leaksoup.cpp)
+
+ (C) leaksoup.cpp, which reads in such a memory dump, performs a
+     strongly connected components analysis of the memory graph, and
+     writes it back out, HTML-ized, with the roots listed at the top.
+
+A fourth file appears to need no modification since it only looks at the
+stack part of the dump and not the contents of the memory:
+
+ (D) diffbloatdump.pl, which diffs two bloat dumps and produces a stack
+     tree showing the change in allocations between them
+
+diff --git a/tools/trace-malloc/adreader.cpp b/tools/trace-malloc/adreader.cpp
+--- a/tools/trace-malloc/adreader.cpp
++++ b/tools/trace-malloc/adreader.cpp
+@@ -48,20 +48,20 @@ ADLog::Read(const char* aFileName)
+         if (res != 3) {
+             return false;
+         }
+ 
+         size_t data_mem_size = ((datasize + sizeof(unsigned long) - 1) /
+                                sizeof(unsigned long)) * sizeof(unsigned long);
+         char *data = (char*)malloc(data_mem_size);
+ 
+-        for (unsigned long *cur_data = (unsigned long*) data,
+-                       *cur_data_end = (unsigned long*) ((char*)data + data_mem_size);
++        for (void **cur_data = (void **) data,
++              **cur_data_end = (void **) ((char*)data + data_mem_size);
+              cur_data != cur_data_end; ++cur_data) {
+-            res = fscanf(in, " %lX\n", cur_data);
++            res = fscanf(in, " %zX\n", cur_data);
+             if (res != 1) {
+                 return false;
+             }
+         }
+ 
+         char stackbuf[100000];
+         stackbuf[0] = '\0';
+ 
+diff --git a/tools/trace-malloc/leaksoup.cpp b/tools/trace-malloc/leaksoup.cpp
+--- a/tools/trace-malloc/leaksoup.cpp
++++ b/tools/trace-malloc/leaksoup.cpp
+@@ -87,16 +87,21 @@ static void print_escaped(FILE *aStream,
+             fputs(buf, aStream);
+             p = buf;
+         }
+     }
+     *p = '\0';
+     fputs(buf, aStream);
+ }
+ 
++static const char allocation_format[] =
++  (sizeof(ADLog::Pointer) == 4) ? "0x%08zX" :
++  (sizeof(ADLog::Pointer) == 8) ? "0x%16zX" :
++  "UNEXPECTED sizeof(void*)";
++
+ int main(int argc, char **argv)
+ {
+     if (argc != 2) {
+         fprintf(stderr,
+                 "Expected usage:  %s <sd-leak-file>\n"
+                 "  sd-leak-file: Output of --shutdown-leaks=<file> option.\n",
+                 argv[0]);
+         return 1;
+@@ -347,27 +352,31 @@ int main(int argc, char **argv)
+                 printf("<pre>\n");
+                 printf("%p &lt;%s&gt; (%d)\n",
+                        e->address, e->type, e->datasize);
+                 for (size_t d = 0; d < e->datasize;
+                      d += sizeof(ADLog::Pointer)) {
+                     AllocationNode *target = (AllocationNode*)
+                         PL_HashTableLookup(memory_map, *(void**)(e->data + d));
+                     if (target) {
+-                        printf("        <a href=\"#o%d\">0x%08X</a> &lt;%s&gt;",
+-                               target - nodes,
+-                               *(unsigned int*)(e->data + d),
++                        printf("        <a href=\"#o%d\">",
++                               target - nodes);
++                        printf(allocation_format,
++                               *(size_t*)(e->data + d));
++                        printf("</a> &lt;%s&gt;",
+                                target->entry->type);
+                         if (target->index != n->index) {
+                             printf(", component %d", target->index);
+                         }
+                         printf("\n");
+                     } else {
+-                        printf("        0x%08X\n",
+-                               *(unsigned int*)(e->data + d));
++                        printf("        ");
++                        printf(allocation_format,
++                               *(size_t*)(e->data + d));
++                        printf("\n");
+                     }
+                 }
+ 
+                 if (n->pointers_from.Length()) {
+                     printf("\nPointers from:\n");
+                     for (uint32_t i = 0, i_end = n->pointers_from.Length();
+                          i != i_end; ++i) {
+                         AllocationNode *t = n->pointers_from[i];
+diff --git a/tools/trace-malloc/lib/nsTraceMalloc.c b/tools/trace-malloc/lib/nsTraceMalloc.c
+--- a/tools/trace-malloc/lib/nsTraceMalloc.c
++++ b/tools/trace-malloc/lib/nsTraceMalloc.c
+@@ -1717,34 +1717,39 @@ print_stack(FILE *ofp, callsite *site)
+         if (site->name || site->parent) {
+             fprintf(ofp, "%s[%s +0x%X]\n",
+                     site->name, site->library, site->offset);
+         }
+         site = site->parent;
+     }
+ }
+ 
++static const char allocation_format[] =
++  (sizeof(void*) == 4) ? "\t0x%08zX\n" :
++  (sizeof(void*) == 8) ? "\t0x%16zX\n" :
++  "UNEXPECTED sizeof(void*)";
++
+ static int
+ allocation_enumerator(PLHashEntry *he, int i, void *arg)
+ {
+     allocation *alloc = (allocation*) he;
+     FILE *ofp = (FILE*) arg;
+     callsite *site = (callsite*) he->value;
+ 
+-    unsigned long *p, *end;
++    size_t *p, *end;
+ 
+     fprintf(ofp, "%p <%s> (%lu)\n",
+             he->key,
+             nsGetTypeName(he->key),
+             (unsigned long) alloc->size);
+ 
+-    for (p   = (unsigned long*) he->key,
+-         end = (unsigned long*) ((char*)he->key + alloc->size);
++    for (p   = (size_t*) he->key,
++         end = (size_t*) ((char*)he->key + alloc->size);
+          p < end; ++p) {
+-        fprintf(ofp, "\t0x%08lX\n", *p);
++        fprintf(ofp, allocation_format, *p);
+     }
+ 
+     print_stack(ofp, site);
+     fputc('\n', ofp);
+     return HT_ENUMERATE_NEXT;
+ }
+ 
+ PR_IMPLEMENT(void)
