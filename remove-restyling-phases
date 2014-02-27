@@ -1,0 +1,598 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 960465 patch 1:  Remove separate animation and non-animation phases of restyling.
+
+Note that this breaks CSS transitions until the later patches in this
+bug make them work again.
+
+diff --git a/content/base/public/Element.h b/content/base/public/Element.h
+--- a/content/base/public/Element.h
++++ b/content/base/public/Element.h
+@@ -70,36 +70,22 @@ enum {
+   // Set if the element has a pending style change.
+   ELEMENT_HAS_PENDING_RESTYLE =                 ELEMENT_FLAG_BIT(0),
+ 
+   // Set if the element is a potential restyle root (that is, has a style
+   // change pending _and_ that style change will attempt to restyle
+   // descendants).
+   ELEMENT_IS_POTENTIAL_RESTYLE_ROOT =           ELEMENT_FLAG_BIT(1),
+ 
+-  // Set if the element has a pending animation style change.
+-  ELEMENT_HAS_PENDING_ANIMATION_RESTYLE =       ELEMENT_FLAG_BIT(2),
+-
+-  // Set if the element is a potential animation restyle root (that is,
+-  // has an animation style change pending _and_ that style change
+-  // will attempt to restyle descendants).
+-  ELEMENT_IS_POTENTIAL_ANIMATION_RESTYLE_ROOT = ELEMENT_FLAG_BIT(3),
+-
+   // All of those bits together, for convenience.
+   ELEMENT_ALL_RESTYLE_FLAGS = ELEMENT_HAS_PENDING_RESTYLE |
+-                              ELEMENT_IS_POTENTIAL_RESTYLE_ROOT |
+-                              ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
+-                              ELEMENT_IS_POTENTIAL_ANIMATION_RESTYLE_ROOT,
+-
+-  // Just the HAS_PENDING bits, for convenience
+-  ELEMENT_PENDING_RESTYLE_FLAGS = ELEMENT_HAS_PENDING_RESTYLE |
+-                                  ELEMENT_HAS_PENDING_ANIMATION_RESTYLE,
++                              ELEMENT_IS_POTENTIAL_RESTYLE_ROOT,
+ 
+   // Remaining bits are for subclasses
+-  ELEMENT_TYPE_SPECIFIC_BITS_OFFSET = NODE_TYPE_SPECIFIC_BITS_OFFSET + 4
++  ELEMENT_TYPE_SPECIFIC_BITS_OFFSET = NODE_TYPE_SPECIFIC_BITS_OFFSET + 2
+ };
+ 
+ #undef ELEMENT_FLAG_BIT
+ 
+ // Make sure we have space for our bits
+ ASSERT_NODE_FLAGS_SPACE(ELEMENT_TYPE_SPECIFIC_BITS_OFFSET);
+ 
+ namespace mozilla {
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -44,23 +44,19 @@ namespace mozilla {
+ RestyleManager::RestyleManager(nsPresContext* aPresContext)
+   : mPresContext(aPresContext)
+   , mRebuildAllStyleData(false)
+   , mObservingRefreshDriver(false)
+   , mInStyleRefresh(false)
+   , mHoverGeneration(0)
+   , mRebuildAllExtraHint(nsChangeHint(0))
+   , mAnimationGeneration(0)
+-  , mPendingRestyles(ELEMENT_HAS_PENDING_RESTYLE |
+-                     ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
+-  , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
+-                              ELEMENT_IS_POTENTIAL_ANIMATION_RESTYLE_ROOT)
++  , mPendingRestyles()
+ {
+   mPendingRestyles.Init(this);
+-  mPendingAnimationRestyles.Init(this);
+ }
+ 
+ void
+ RestyleManager::NotifyDestroyingFrame(nsIFrame* aFrame)
+ {
+   mOverflowChangedTracker.RemoveFrame(aFrame);
+ }
+ 
+@@ -1379,49 +1375,31 @@ RestyleManager::ProcessPendingRestyles()
+   NS_PRECONDITION(!nsContentUtils::IsSafeToRunScript(),
+                   "Missing a script blocker!");
+ 
+   // Process non-animation restyles...
+   NS_ABORT_IF_FALSE(!mPresContext->IsProcessingRestyles(),
+                     "Nesting calls to ProcessPendingRestyles?");
+   mPresContext->SetProcessingRestyles(true);
+ 
++  // FIXME: ADD NEW CODE FOR TRANSITIONS STARTING HERE.
+   // Before we process any restyles, we need to ensure that style
+   // resulting from any throttled animations (animations that we're
+   // running entirely on the compositor thread) is up-to-date, so that
+   // if any style changes we cause trigger transitions, we have the
+   // correct old style for starting the transition.
+   if (nsLayoutUtils::AreAsyncAnimationsEnabled() &&
+       mPendingRestyles.Count() > 0) {
+     ++mAnimationGeneration;
+     mPresContext->TransitionManager()->UpdateAllThrottledStyles();
+   }
+ 
+   mPendingRestyles.ProcessRestyles();
+ 
+-#ifdef DEBUG
+-  uint32_t oldPendingRestyleCount = mPendingRestyles.Count();
+-#endif
+-
+-  // ...and then process animation restyles.  This needs to happen
+-  // second because we need to start animations that resulted from the
+-  // first set of restyles (e.g., CSS transitions with negative
+-  // transition-delay), and because we need to immediately
+-  // restyle-with-animation any just-restyled elements that are
+-  // mid-transition (since processing the non-animation restyle ignores
+-  // the running transition so it can check for a new change on the same
+-  // property, and then posts an immediate animation style change).
+-  mPresContext->SetProcessingAnimationStyleChange(true);
+-  mPendingAnimationRestyles.ProcessRestyles();
+-  mPresContext->SetProcessingAnimationStyleChange(false);
+-
+   mPresContext->SetProcessingRestyles(false);
+-  NS_POSTCONDITION(mPendingRestyles.Count() == oldPendingRestyleCount,
+-                   "We should not have posted new non-animation restyles while "
+-                   "processing animation restyles");
+ 
+   if (mRebuildAllStyleData) {
+     // We probably wasted a lot of work up above, but this seems safest
+     // and it should be rarely used.
+     // This might add us as a refresh observer again; that's ok.
+     RebuildAllStyleData(nsChangeHint(0));
+   }
+ }
+@@ -1448,33 +1426,31 @@ RestyleManager::EndProcessingRestyles()
+   mPresContext->FrameConstructor()->EndUpdate();
+ 
+ #ifdef DEBUG
+   mPresContext->PresShell()->VerifyStyleTree();
+ #endif
+ }
+ 
+ void
+-RestyleManager::PostRestyleEventCommon(Element* aElement,
+-                                       nsRestyleHint aRestyleHint,
+-                                       nsChangeHint aMinChangeHint,
+-                                       bool aForAnimation)
++RestyleManager::PostRestyleEvent(Element* aElement,
++                                 nsRestyleHint aRestyleHint,
++                                 nsChangeHint aMinChangeHint)
+ {
+-  if (MOZ_UNLIKELY(mPresContext->PresShell()->IsDestroying())) {
++  if (MOZ_UNLIKELY(!mPresContext) ||
++      MOZ_UNLIKELY(mPresContext->PresShell()->IsDestroying())) {
+     return;
+   }
+ 
+   if (aRestyleHint == 0 && !aMinChangeHint) {
+     // Nothing to do here
+     return;
+   }
+ 
+-  RestyleTracker& tracker =
+-    aForAnimation ? mPendingAnimationRestyles : mPendingRestyles;
+-  tracker.AddPendingRestyle(aElement, aRestyleHint, aMinChangeHint);
++  mPendingRestyles.AddPendingRestyle(aElement, aRestyleHint, aMinChangeHint);
+ 
+   PostRestyleEventInternal(false);
+ }
+ 
+ void
+ RestyleManager::PostRestyleEventInternal(bool aForLazyConstruction)
+ {
+   // Make sure we're not in a style refresh; if we are, we still have
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -156,65 +156,40 @@ public:
+   // must not contain nsChangeHint_ReconstructFrame) to the root frame.
+   void RebuildAllStyleData(nsChangeHint aExtraHint);
+ 
+   // Helper that does part of the work of RebuildAllStyleData, shared by
+   // RestyleElement for 'rem' handling.
+   void DoRebuildAllStyleData(RestyleTracker& aRestyleTracker,
+                              nsChangeHint aExtraHint);
+ 
+-  // See PostRestyleEventCommon below.
++  /**
++   * Notify the frame constructor that an element needs to have its
++   * style recomputed.
++   * @param aElement: The element to be restyled.
++   * @param aRestyleHint: Which nodes need to have selector matching run
++   *                      on them.
++   * @param aMinChangeHint: A minimum change hint for aContent and its
++   *                        descendants.
++   */
+   void PostRestyleEvent(Element* aElement,
+                         nsRestyleHint aRestyleHint,
+-                        nsChangeHint aMinChangeHint)
+-  {
+-    if (mPresContext) {
+-      PostRestyleEventCommon(aElement, aRestyleHint, aMinChangeHint,
+-                             mPresContext->IsProcessingAnimationStyleChange());
+-    }
+-  }
+-
+-  // See PostRestyleEventCommon below.
+-  void PostAnimationRestyleEvent(Element* aElement,
+-                                 nsRestyleHint aRestyleHint,
+-                                 nsChangeHint aMinChangeHint)
+-  {
+-    PostRestyleEventCommon(aElement, aRestyleHint, aMinChangeHint, true);
+-  }
++                        nsChangeHint aMinChangeHint);
+ 
+   void PostRestyleEventForLazyConstruction()
+   {
+     PostRestyleEventInternal(true);
+   }
+ 
+   void FlushOverflowChangedTracker()
+   {
+     mOverflowChangedTracker.Flush();
+   }
+ 
+ private:
+-  /**
+-   * Notify the frame constructor that an element needs to have its
+-   * style recomputed.
+-   * @param aElement: The element to be restyled.
+-   * @param aRestyleHint: Which nodes need to have selector matching run
+-   *                      on them.
+-   * @param aMinChangeHint: A minimum change hint for aContent and its
+-   *                        descendants.
+-   * @param aForAnimation: Whether the style should be computed with or
+-   *                       without animation data.  Animation code
+-   *                       sometimes needs to pass true; other code
+-   *                       should generally pass the the pres context's
+-   *                       IsProcessingAnimationStyleChange() value
+-   *                       (which is the default value).
+-   */
+-  void PostRestyleEventCommon(Element* aElement,
+-                              nsRestyleHint aRestyleHint,
+-                              nsChangeHint aMinChangeHint,
+-                              bool aForAnimation);
+   void PostRestyleEventInternal(bool aForLazyConstruction);
+ 
+ public:
+   /**
+    * Asynchronously clear style data from the root frame downwards and ensure
+    * it will all be rebuilt. This is safe to call anytime; it will schedule
+    * a restyle and take effect next time style changes are flushed.
+    * This method is used to recompute the style data when some change happens
+@@ -254,17 +229,16 @@ private:
+ 
+   OverflowChangedTracker mOverflowChangedTracker;
+ 
+   // The total number of animation flushes by this frame constructor.
+   // Used to keep the layer and animation manager in sync.
+   uint64_t mAnimationGeneration;
+ 
+   RestyleTracker mPendingRestyles;
+-  RestyleTracker mPendingAnimationRestyles;
+ };
+ 
+ /**
+  * An ElementRestyler is created for *each* element in a subtree that we
+  * recompute styles for.
+  */
+ class ElementRestyler MOZ_FINAL {
+ public:
+diff --git a/layout/base/RestyleTracker.cpp b/layout/base/RestyleTracker.cpp
+--- a/layout/base/RestyleTracker.cpp
++++ b/layout/base/RestyleTracker.cpp
+@@ -36,17 +36,17 @@ CollectLaterSiblings(nsISupports* aEleme
+     static_cast<dom::Element*>(aElement);
+   LaterSiblingCollector* collector =
+     static_cast<LaterSiblingCollector*>(aSiblingCollector);
+   // Only collect the entries that actually need restyling by us (and
+   // haven't, for example, already been restyled).
+   // It's important to not mess with the flags on entries not in our
+   // document.
+   if (element->GetCurrentDoc() == collector->tracker->Document() &&
+-      element->HasFlag(collector->tracker->RestyleBit()) &&
++      element->HasFlag(ELEMENT_HAS_PENDING_RESTYLE) &&
+       (aData.mRestyleHint & eRestyle_LaterSiblings)) {
+     collector->elements->AppendElement(element);
+   }
+ 
+   return PL_DHASH_NEXT;
+ }
+ 
+ struct RestyleCollector {
+@@ -63,38 +63,37 @@ CollectRestyles(nsISupports* aElement,
+     static_cast<dom::Element*>(aElement);
+   RestyleCollector* collector =
+     static_cast<RestyleCollector*>(aRestyleCollector);
+   // Only collect the entries that actually need restyling by us (and
+   // haven't, for example, already been restyled).
+   // It's important to not mess with the flags on entries not in our
+   // document.
+   if (element->GetCurrentDoc() != collector->tracker->Document() ||
+-      !element->HasFlag(collector->tracker->RestyleBit())) {
++      !element->HasFlag(ELEMENT_HAS_PENDING_RESTYLE)) {
+     return PL_DHASH_NEXT;
+   }
+ 
+-  NS_ASSERTION(!element->HasFlag(collector->tracker->RootBit()) ||
++  NS_ASSERTION(!element->HasFlag(ELEMENT_IS_POTENTIAL_RESTYLE_ROOT) ||
+                // Maybe we're just not reachable via the frame tree?
+                (element->GetFlattenedTreeParent() &&
+                 (!element->GetFlattenedTreeParent()->GetPrimaryFrame()||
+                  element->GetFlattenedTreeParent()->GetPrimaryFrame()->IsLeaf())) ||
+                // Or not reachable due to an async reinsert we have
+                // pending?  If so, we'll have a reframe hint around.
+                // That incidentally makes it safe that we still have
+                // the bit, since any descendants that didn't get added
+                // to the roots list because we had the bits will be
+                // completely restyled in a moment.
+                (aData.mChangeHint & nsChangeHint_ReconstructFrame),
+                "Why did this not get handled while processing mRestyleRoots?");
+ 
+   // Unset the restyle bits now, so if they get readded later as we
+   // process we won't clobber that adding of the bit.
+-  element->UnsetFlags(collector->tracker->RestyleBit() |
+-                      collector->tracker->RootBit());
++  element->UnsetFlags(ELEMENT_ALL_RESTYLE_FLAGS);
+ 
+   RestyleTracker::RestyleEnumerateData** restyleArrayPtr =
+     collector->restyleArrayPtr;
+   RestyleTracker::RestyleEnumerateData* currentRestyle =
+     *restyleArrayPtr;
+   currentRestyle->mElement = element;
+   currentRestyle->mRestyleHint = aData.mRestyleHint;
+   currentRestyle->mChangeHint = aData.mChangeHint;
+@@ -158,17 +157,18 @@ RestyleTracker::DoProcessRestyles()
+             break;
+           }
+         }
+       }
+ 
+       // Now remove all those eRestyle_LaterSiblings bits
+       for (uint32_t i = 0; i < laterSiblingArr.Length(); ++i) {
+         Element* element = laterSiblingArr[i];
+-        NS_ASSERTION(element->HasFlag(RestyleBit()), "How did that happen?");
++        NS_ASSERTION(element->HasFlag(ELEMENT_HAS_PENDING_RESTYLE),
++                     "How did that happen?");
+         RestyleData data;
+ #ifdef DEBUG
+         bool found =
+ #endif
+           mPendingRestyles.Get(element, &data);
+         NS_ASSERTION(found, "Where did our entry go?");
+         data.mRestyleHint =
+           nsRestyleHint(data.mRestyleHint & ~eRestyle_LaterSiblings);
+@@ -240,18 +240,19 @@ RestyleTracker::DoProcessRestyles()
+ }
+ 
+ bool
+ RestyleTracker::GetRestyleData(Element* aElement, RestyleData* aData)
+ {
+   NS_PRECONDITION(aElement->GetCurrentDoc() == Document(),
+                   "Unexpected document; this will lead to incorrect behavior!");
+ 
+-  if (!aElement->HasFlag(RestyleBit())) {
+-    NS_ASSERTION(!aElement->HasFlag(RootBit()), "Bogus root bit?");
++  if (!aElement->HasFlag(ELEMENT_HAS_PENDING_RESTYLE)) {
++    NS_ASSERTION(!aElement->HasFlag(ELEMENT_IS_POTENTIAL_RESTYLE_ROOT),
++                 "Bogus root bit?");
+     return false;
+   }
+ 
+ #ifdef DEBUG
+   bool gotData =
+ #endif
+   mPendingRestyles.Get(aElement, aData);
+   NS_ASSERTION(gotData, "Must have data if restyle bit is set");
+@@ -260,21 +261,21 @@ RestyleTracker::GetRestyleData(Element* 
+     // Someone readded the eRestyle_LaterSiblings hint for this
+     // element.  Leave it around for now, but remove the other restyle
+     // hints and the change hint for it.  Also unset its root bit,
+     // since it's no longer a root with the new restyle data.
+     RestyleData newData;
+     newData.mChangeHint = nsChangeHint(0);
+     newData.mRestyleHint = eRestyle_LaterSiblings;
+     mPendingRestyles.Put(aElement, newData);
+-    aElement->UnsetFlags(RootBit());
++    aElement->UnsetFlags(ELEMENT_IS_POTENTIAL_RESTYLE_ROOT);
+     aData->mRestyleHint =
+       nsRestyleHint(aData->mRestyleHint & ~eRestyle_LaterSiblings);
+   } else {
+     mPendingRestyles.Remove(aElement);
+-    aElement->UnsetFlags(mRestyleBits);
++    aElement->UnsetFlags(ELEMENT_ALL_RESTYLE_FLAGS);
+   }
+ 
+   return true;
+ }
+ 
+ } // namespace mozilla
+ 
+diff --git a/layout/base/RestyleTracker.h b/layout/base/RestyleTracker.h
+--- a/layout/base/RestyleTracker.h
++++ b/layout/base/RestyleTracker.h
+@@ -198,32 +198,19 @@ private:
+   /* Don't update overflow of this frame or its ancestors. */
+   const nsIFrame* mSubtreeRoot;
+ };
+ 
+ class RestyleTracker {
+ public:
+   typedef mozilla::dom::Element Element;
+ 
+-  RestyleTracker(uint32_t aRestyleBits) :
+-    mRestyleBits(aRestyleBits),
++  RestyleTracker() :
+     mHaveLaterSiblingRestyles(false)
+   {
+-    NS_PRECONDITION((mRestyleBits & ~ELEMENT_ALL_RESTYLE_FLAGS) == 0,
+-                    "Why do we have these bits set?");
+-    NS_PRECONDITION((mRestyleBits & ELEMENT_PENDING_RESTYLE_FLAGS) != 0,
+-                    "Must have a restyle flag");
+-    NS_PRECONDITION((mRestyleBits & ELEMENT_PENDING_RESTYLE_FLAGS) !=
+-                      ELEMENT_PENDING_RESTYLE_FLAGS,
+-                    "Shouldn't have both restyle flags set");
+-    NS_PRECONDITION((mRestyleBits & ~ELEMENT_PENDING_RESTYLE_FLAGS) != 0,
+-                    "Must have root flag");
+-    NS_PRECONDITION((mRestyleBits & ~ELEMENT_PENDING_RESTYLE_FLAGS) !=
+-                    (ELEMENT_ALL_RESTYLE_FLAGS & ~ELEMENT_PENDING_RESTYLE_FLAGS),
+-                    "Shouldn't have both root flags");
+   }
+ 
+   void Init(RestyleManager* aRestyleManager) {
+     mRestyleManager = aRestyleManager;
+   }
+ 
+   uint32_t Count() const {
+     return mPendingRestyles.Count();
+@@ -242,26 +229,16 @@ public:
+   void ProcessRestyles() {
+     // Fast-path the common case (esp. for the animation restyle
+     // tracker) of not having anything to do.
+     if (mPendingRestyles.Count()) {
+       DoProcessRestyles();
+     }
+   }
+ 
+-  // Return our ELEMENT_HAS_PENDING_(ANIMATION_)RESTYLE bit
+-  uint32_t RestyleBit() const {
+-    return mRestyleBits & ELEMENT_PENDING_RESTYLE_FLAGS;
+-  }
+-
+-  // Return our ELEMENT_IS_POTENTIAL_(ANIMATION_)RESTYLE_ROOT bit
+-  uint32_t RootBit() const {
+-    return mRestyleBits & ~ELEMENT_PENDING_RESTYLE_FLAGS;
+-  }
+-  
+   struct RestyleData {
+     nsRestyleHint mRestyleHint;  // What we want to restyle
+     nsChangeHint  mChangeHint;   // The minimal change hint for "self"
+   };
+ 
+   /**
+    * If the given Element has a restyle pending for it, return the
+    * relevant restyle data.  This function will clear everything other
+@@ -296,24 +273,20 @@ private:
+ 
+   /**
+    * The guts of our restyle processing.
+    */
+   void DoProcessRestyles();
+ 
+   typedef nsDataHashtable<nsISupportsHashKey, RestyleData> PendingRestyleTable;
+   typedef nsAutoTArray< nsRefPtr<Element>, 32> RestyleRootArray;
+-  // Our restyle bits.  These will be a subset of ELEMENT_ALL_RESTYLE_FLAGS, and
+-  // will include one flag from ELEMENT_PENDING_RESTYLE_FLAGS and one flag
+-  // that's not in ELEMENT_PENDING_RESTYLE_FLAGS.
+-  uint32_t mRestyleBits;
+   RestyleManager* mRestyleManager; // Owns us
+   // A hashtable that maps elements to RestyleData structs.  The
+   // values only make sense if the element's current document is our
+-  // document and it has our RestyleBit() flag set.  In particular,
++  // document and it has ELEMENT_HAS_PENDING_RESTYLE set.  In particular,
+   // said bit might not be set if the element had a restyle posted and
+   // then was moved around in the DOM.
+   PendingRestyleTable mPendingRestyles;
+   // An array that keeps track of our possible restyle roots.  This
+   // maintains the invariant that if A and B are both restyle roots
+   // and A is an ancestor of B then A will come after B in the array.
+   // We maintain this invariant by checking whether an element has an
+   // ancestor with the restyle root bit set before appending it to the
+@@ -328,39 +301,40 @@ private:
+ inline bool RestyleTracker::AddPendingRestyle(Element* aElement,
+                                                 nsRestyleHint aRestyleHint,
+                                                 nsChangeHint aMinChangeHint)
+ {
+   RestyleData existingData;
+   existingData.mRestyleHint = nsRestyleHint(0);
+   existingData.mChangeHint = NS_STYLE_HINT_NONE;
+ 
+-  // Check the RestyleBit() flag before doing the hashtable Get, since
+-  // it's possible that the data in the hashtable isn't actually
++  // Check ELEMENT_HAS_PENDING_RESTYLE before doing the hashtable Get,
++  // since it's possible that the data in the hashtable isn't actually
+   // relevant anymore (if the flag is not set).
+-  if (aElement->HasFlag(RestyleBit())) {
++  if (aElement->HasFlag(ELEMENT_HAS_PENDING_RESTYLE)) {
+     mPendingRestyles.Get(aElement, &existingData);
+   } else {
+-    aElement->SetFlags(RestyleBit());
++    aElement->SetFlags(ELEMENT_HAS_PENDING_RESTYLE);
+   }
+ 
+   bool hadRestyleLaterSiblings =
+     (existingData.mRestyleHint & eRestyle_LaterSiblings) != 0;
+   existingData.mRestyleHint =
+     nsRestyleHint(existingData.mRestyleHint | aRestyleHint);
+   NS_UpdateHint(existingData.mChangeHint, aMinChangeHint);
+ 
+   mPendingRestyles.Put(aElement, existingData);
+ 
+   // We can only treat this element as a restyle root if we would
+   // actually restyle its descendants (so either call
+   // ReResolveStyleContext on it or just reframe it).
+   if ((aRestyleHint & (eRestyle_Self | eRestyle_Subtree)) ||
+       (aMinChangeHint & nsChangeHint_ReconstructFrame)) {
+-    for (const Element* cur = aElement; !cur->HasFlag(RootBit()); ) {
++    for (const Element* cur = aElement;
++         !cur->HasFlag(ELEMENT_IS_POTENTIAL_RESTYLE_ROOT); ) {
+       nsIContent* parent = cur->GetFlattenedTreeParent();
+       // Stop if we have no parent or the parent is not an element or
+       // we're part of the viewport scrollbars (because those are not
+       // frametree descendants of the primary frame of the root
+       // element).
+       // XXXbz maybe the primary frame of the root should be the root scrollframe?
+       if (!parent || !parent->IsElement() ||
+           // If we've hit the root via a native anonymous kid and that
+@@ -375,17 +349,17 @@ inline bool RestyleTracker::AddPendingRe
+         mRestyleRoots.AppendElement(aElement);
+         break;
+       }
+       cur = parent->AsElement();
+     }
+     // At this point some ancestor of aElement (possibly aElement
+     // itself) is in mRestyleRoots.  Set the root bit on aElement, to
+     // speed up searching for an existing root on its descendants.
+-    aElement->SetFlags(RootBit());
++    aElement->SetFlags(ELEMENT_IS_POTENTIAL_RESTYLE_ROOT);
+   }
+ 
+   mHaveLaterSiblingRestyles =
+     mHaveLaterSiblingRestyles || (aRestyleHint & eRestyle_LaterSiblings) != 0;
+   return hadRestyleLaterSiblings;
+ }
+ 
+ } // namespace mozilla
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -897,26 +897,16 @@ public:
+   }
+ 
+   void SetProcessingRestyles(bool aProcessing) {
+     NS_ASSERTION(aProcessing != bool(mProcessingRestyles),
+                  "should never nest");
+     mProcessingRestyles = aProcessing;
+   }
+ 
+-  bool IsProcessingAnimationStyleChange() const {
+-    return mProcessingAnimationStyleChange;
+-  }
+-
+-  void SetProcessingAnimationStyleChange(bool aProcessing) {
+-    NS_ASSERTION(aProcessing != bool(mProcessingAnimationStyleChange),
+-                 "should never nest");
+-    mProcessingAnimationStyleChange = aProcessing;
+-  }
+-
+   /**
+    * Notify the prescontext that the presshell is about to reflow a reflow root.
+    * The single argument indicates whether this reflow should be interruptible.
+    * If aInterruptible is false then CheckForInterrupt and HasPendingInterrupt
+    * will always return false. If aInterruptible is true then CheckForInterrupt
+    * will return true when a pending event is detected.  This is for use by the
+    * presshell only.  Reflow code wanting to prevent interrupts should use
+    * InterruptPreventer.
+@@ -1317,17 +1307,16 @@ protected:
+ 
+   // resize reflow is suppressed when the only change has been to zoom
+   // the document rather than to change the document's dimensions
+   unsigned              mSupressResizeReflow : 1;
+ 
+   unsigned              mIsVisual : 1;
+ 
+   unsigned              mProcessingRestyles : 1;
+-  unsigned              mProcessingAnimationStyleChange : 1;
+ 
+   unsigned              mBelowSomethingDirty : 1;
+ 
+   unsigned              mFireAfterPaintEvents : 1;
+ 
+   unsigned              mIsChrome : 1;
+ 
+   // Should we paint flash in this context? Do not use this variable directly.
