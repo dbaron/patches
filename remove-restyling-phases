@@ -47,6 +47,61 @@ diff --git a/content/base/public/Element.h b/content/base/public/Element.h
  ASSERT_NODE_FLAGS_SPACE(ELEMENT_TYPE_SPECIFIC_BITS_OFFSET);
  
  namespace mozilla {
+diff --git a/content/svg/content/src/nsSVGElement.cpp b/content/svg/content/src/nsSVGElement.cpp
+--- a/content/svg/content/src/nsSVGElement.cpp
++++ b/content/svg/content/src/nsSVGElement.cpp
+@@ -908,42 +908,25 @@ nsSVGElement::WalkContentStyleRules(nsRu
+     UpdateContentStyleRule();
+ 
+   if (mContentStyleRule) {
+     mContentStyleRule->RuleMatched();
+     aRuleWalker->Forward(mContentStyleRule);
+   }
+ 
+   // Update & walk the animated content style rule, to include style from
+-  // animated mapped attributes.  But first, get nsPresContext to check
+-  // whether this is a "no-animation restyle". (This should match the check
+-  // in nsHTMLCSSStyleSheet::RulesMatching(), where we determine whether to
+-  // apply the SMILOverrideStyle.)
+-  nsIDocument* doc = OwnerDoc();
+-  nsIPresShell* shell = doc->GetShell();
+-  nsPresContext* context = shell ? shell->GetPresContext() : nullptr;
+-  if (context && context->IsProcessingRestyles() &&
+-      !context->IsProcessingAnimationStyleChange()) {
+-    // Any style changes right now could trigger CSS Transitions. We don't
+-    // want that to happen from SMIL-animated value of mapped attrs, so
+-    // ignore animated value for now, and request an animation restyle to
+-    // get our animated value noticed.
+-    shell->RestyleForAnimation(this, eRestyle_Self);
+-  } else {
+-    // Ok, this is an animation restyle -- go ahead and update/walk the
+-    // animated content style rule.
+-    css::StyleRule* animContentStyleRule = GetAnimatedContentStyleRule();
+-    if (!animContentStyleRule) {
+-      UpdateAnimatedContentStyleRule();
+-      animContentStyleRule = GetAnimatedContentStyleRule();
+-    }
+-    if (animContentStyleRule) {
+-      animContentStyleRule->RuleMatched();
+-      aRuleWalker->Forward(animContentStyleRule);
+-    }
++  // animated mapped attributes.
++  css::StyleRule* animContentStyleRule = GetAnimatedContentStyleRule();
++  if (!animContentStyleRule) {
++    UpdateAnimatedContentStyleRule();
++    animContentStyleRule = GetAnimatedContentStyleRule();
++  }
++  if (animContentStyleRule) {
++    animContentStyleRule->RuleMatched();
++    aRuleWalker->Forward(animContentStyleRule);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP_(bool)
+ nsSVGElement::IsAttributeMapped(const nsIAtom* name) const
+ {
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
@@ -596,3 +651,445 @@ diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
    unsigned              mIsChrome : 1;
  
    // Should we paint flash in this context? Do not use this variable directly.
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -545,121 +545,119 @@ nsAnimationManager::SizeOfIncludingThis(
+ {
+   return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+ }
+ 
+ nsIStyleRule*
+ nsAnimationManager::CheckAnimationRule(nsStyleContext* aStyleContext,
+                                        mozilla::dom::Element* aElement)
+ {
+-  if (!mPresContext->IsProcessingAnimationStyleChange()) {
+-    if (!mPresContext->IsDynamic()) {
+-      // For print or print preview, ignore animations.
+-      return nullptr;
++  if (!mPresContext->IsDynamic()) {
++    // For print or print preview, ignore animations.
++    return nullptr;
++  }
++
++  // Everything that causes our animation data to change triggers a
++  // style change, which in turn triggers a non-animation restyle.
++  // Likewise, when we initially construct frames, we're not in a
++  // style change, but also not in an animation restyle.
++
++  const nsStyleDisplay *disp = aStyleContext->StyleDisplay();
++  ElementAnimations *ea =
++    GetElementAnimations(aElement, aStyleContext->GetPseudoType(), false);
++  if (!ea &&
++      disp->mAnimationNameCount == 1 &&
++      disp->mAnimations[0].GetName().IsEmpty()) {
++    return nullptr;
++  }
++
++  // build the animations list
++  InfallibleTArray<ElementAnimation> newAnimations;
++  BuildAnimations(aStyleContext, newAnimations);
++
++  if (newAnimations.IsEmpty()) {
++    if (ea) {
++      ea->Destroy();
+     }
++    return nullptr;
++  }
+ 
+-    // Everything that causes our animation data to change triggers a
+-    // style change, which in turn triggers a non-animation restyle.
+-    // Likewise, when we initially construct frames, we're not in a
+-    // style change, but also not in an animation restyle.
++  TimeStamp refreshTime = mPresContext->RefreshDriver()->MostRecentRefresh();
+ 
+-    const nsStyleDisplay *disp = aStyleContext->StyleDisplay();
+-    ElementAnimations *ea =
+-      GetElementAnimations(aElement, aStyleContext->GetPseudoType(), false);
+-    if (!ea &&
+-        disp->mAnimationNameCount == 1 &&
+-        disp->mAnimations[0].GetName().IsEmpty()) {
+-      return nullptr;
+-    }
++  if (ea) {
++    ea->mStyleRule = nullptr;
++    ea->mStyleRuleRefreshTime = TimeStamp();
++    ea->UpdateAnimationGeneration(mPresContext);
+ 
+-    // build the animations list
+-    InfallibleTArray<ElementAnimation> newAnimations;
+-    BuildAnimations(aStyleContext, newAnimations);
++    // Copy over the start times and (if still paused) pause starts
++    // for each animation (matching on name only) that was also in the
++    // old list of animations.
++    // This means that we honor dynamic changes, which isn't what the
++    // spec says to do, but WebKit seems to honor at least some of
++    // them.  See
++    // http://lists.w3.org/Archives/Public/www-style/2011Apr/0079.html
++    // In order to honor what the spec said, we'd copy more data over
++    // (or potentially optimize BuildAnimations to avoid rebuilding it
++    // in the first place).
++    if (!ea->mAnimations.IsEmpty()) {
++      for (uint32_t newIdx = 0, newEnd = newAnimations.Length();
++           newIdx != newEnd; ++newIdx) {
++        ElementAnimation *newAnim = &newAnimations[newIdx];
+ 
+-    if (newAnimations.IsEmpty()) {
+-      if (ea) {
+-        ea->Destroy();
+-      }
+-      return nullptr;
+-    }
++        // Find the matching animation with this name in the old list
++        // of animations.  Because of this code, they must all have
++        // the same start time, though they might differ in pause
++        // state.  So if a page uses multiple copies of the same
++        // animation in one element's animation list, and gives them
++        // different pause states, they, well, get what they deserve.
++        // We'll use the last one since it's more likely to be the one
++        // doing something.
++        const ElementAnimation *oldAnim = nullptr;
++        for (uint32_t oldIdx = ea->mAnimations.Length(); oldIdx-- != 0; ) {
++          const ElementAnimation *a = &ea->mAnimations[oldIdx];
++          if (a->mName == newAnim->mName) {
++            oldAnim = a;
++            break;
++          }
++        }
++        if (!oldAnim) {
++          continue;
++        }
+ 
+-    TimeStamp refreshTime = mPresContext->RefreshDriver()->MostRecentRefresh();
++        newAnim->mStartTime = oldAnim->mStartTime;
++        newAnim->mLastNotification = oldAnim->mLastNotification;
++        newAnim->mForcedPause = oldAnim->mForcedPause;
+ 
+-    if (ea) {
+-      ea->mStyleRule = nullptr;
+-      ea->mStyleRuleRefreshTime = TimeStamp();
+-      ea->UpdateAnimationGeneration(mPresContext);
+-
+-      // Copy over the start times and (if still paused) pause starts
+-      // for each animation (matching on name only) that was also in the
+-      // old list of animations.
+-      // This means that we honor dynamic changes, which isn't what the
+-      // spec says to do, but WebKit seems to honor at least some of
+-      // them.  See
+-      // http://lists.w3.org/Archives/Public/www-style/2011Apr/0079.html
+-      // In order to honor what the spec said, we'd copy more data over
+-      // (or potentially optimize BuildAnimations to avoid rebuilding it
+-      // in the first place).
+-      if (!ea->mAnimations.IsEmpty()) {
+-        for (uint32_t newIdx = 0, newEnd = newAnimations.Length();
+-             newIdx != newEnd; ++newIdx) {
+-          ElementAnimation *newAnim = &newAnimations[newIdx];
+-
+-          // Find the matching animation with this name in the old list
+-          // of animations.  Because of this code, they must all have
+-          // the same start time, though they might differ in pause
+-          // state.  So if a page uses multiple copies of the same
+-          // animation in one element's animation list, and gives them
+-          // different pause states, they, well, get what they deserve.
+-          // We'll use the last one since it's more likely to be the one
+-          // doing something.
+-          const ElementAnimation *oldAnim = nullptr;
+-          for (uint32_t oldIdx = ea->mAnimations.Length(); oldIdx-- != 0; ) {
+-            const ElementAnimation *a = &ea->mAnimations[oldIdx];
+-            if (a->mName == newAnim->mName) {
+-              oldAnim = a;
+-              break;
+-            }
+-          }
+-          if (!oldAnim) {
+-            continue;
+-          }
+-
+-          newAnim->mStartTime = oldAnim->mStartTime;
+-          newAnim->mLastNotification = oldAnim->mLastNotification;
+-          newAnim->mForcedPause = oldAnim->mForcedPause;
+-
+-          if (oldAnim->IsPaused()) {
+-            if (newAnim->IsPaused()) {
+-              // Copy pause start just like start time.
+-              newAnim->mPauseStart = oldAnim->mPauseStart;
+-            } else {
+-              // Handle change in pause state by adjusting start
+-              // time to unpause.
+-              newAnim->mStartTime += refreshTime - oldAnim->mPauseStart;
+-            }
++        if (oldAnim->IsPaused()) {
++          if (newAnim->IsPaused()) {
++            // Copy pause start just like start time.
++            newAnim->mPauseStart = oldAnim->mPauseStart;
++          } else {
++            // Handle change in pause state by adjusting start
++            // time to unpause.
++            newAnim->mStartTime += refreshTime - oldAnim->mPauseStart;
+           }
+         }
+       }
+-    } else {
+-      ea = GetElementAnimations(aElement, aStyleContext->GetPseudoType(),
+-                                true);
+     }
+-    ea->mAnimations.SwapElements(newAnimations);
+-    ea->mNeedsRefreshes = true;
++  } else {
++    ea = GetElementAnimations(aElement, aStyleContext->GetPseudoType(),
++                              true);
++  }
++  ea->mAnimations.SwapElements(newAnimations);
++  ea->mNeedsRefreshes = true;
+ 
+-    ea->EnsureStyleRuleFor(refreshTime, mPendingEvents, false);
+-    CheckNeedsRefresh();
+-    // We don't actually dispatch the mPendingEvents now.  We'll either
+-    // dispatch them the next time we get a refresh driver notification
+-    // or the next time somebody calls
+-    // nsPresShell::FlushPendingNotifications.
+-    if (!mPendingEvents.IsEmpty()) {
+-      mPresContext->Document()->SetNeedStyleFlush();
+-    }
++  ea->EnsureStyleRuleFor(refreshTime, mPendingEvents, false);
++  CheckNeedsRefresh();
++  // We don't actually dispatch the mPendingEvents now.  We'll either
++  // dispatch them the next time we get a refresh driver notification
++  // or the next time somebody calls
++  // nsPresShell::FlushPendingNotifications.
++  if (!mPendingEvents.IsEmpty()) {
++    mPresContext->Document()->SetNeedStyleFlush();
+   }
+ 
+   return GetAnimationRule(aElement, aStyleContext->GetPseudoType());
+ }
+ 
+ class PercentageHashKey : public PLDHashEntryHdr
+ {
+ public:
+@@ -977,28 +975,16 @@ nsAnimationManager::GetAnimationRule(moz
+   }
+ 
+   ElementAnimations *ea =
+     GetElementAnimations(aElement, aPseudoType, false);
+   if (!ea) {
+     return nullptr;
+   }
+ 
+-  if (mPresContext->IsProcessingRestyles() &&
+-      !mPresContext->IsProcessingAnimationStyleChange()) {
+-    // During the non-animation part of processing restyles, we don't
+-    // add the animation rule.
+-
+-    if (ea->mStyleRule) {
+-      ea->PostRestyleForAnimation(mPresContext);
+-    }
+-
+-    return nullptr;
+-  }
+-
+   NS_WARN_IF_FALSE(!ea->mNeedsRefreshes ||
+                    ea->mStyleRuleRefreshTime ==
+                      mPresContext->RefreshDriver()->MostRecentRefresh(),
+                    "should already have refreshed style rule");
+ 
+   return ea->mStyleRule;
+ }
+ 
+diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
+--- a/layout/style/nsHTMLCSSStyleSheet.cpp
++++ b/layout/style/nsHTMLCSSStyleSheet.cpp
+@@ -60,29 +60,19 @@ nsHTMLCSSStyleSheet::RulesMatching(Eleme
+   css::StyleRule* rule = element->GetInlineStyleRule();
+   if (rule) {
+     rule->RuleMatched();
+     aData->mRuleWalker->Forward(rule);
+   }
+ 
+   rule = element->GetSMILOverrideStyleRule();
+   if (rule) {
+-    if (aData->mPresContext->IsProcessingRestyles() &&
+-        !aData->mPresContext->IsProcessingAnimationStyleChange()) {
+-      // Non-animation restyle -- don't process SMIL override style, because we
+-      // don't want SMIL animation to trigger new CSS transitions. Instead,
+-      // request an Animation restyle, so we still get noticed.
+-      aData->mPresContext->PresShell()->RestyleForAnimation(element,
+-                                                            eRestyle_Self);
+-    } else {
+-      // Animation restyle (or non-restyle traversal of rules)
+-      // Now we can walk SMIL overrride style, without triggering transitions.
+-      rule->RuleMatched();
+-      aData->mRuleWalker->Forward(rule);
+-    }
++    // walk SMIL overrride style
++    rule->RuleMatched();
++    aData->mRuleWalker->Forward(rule);
+   }
+ }
+ 
+ /* virtual */ void
+ nsHTMLCSSStyleSheet::RulesMatching(PseudoElementRuleProcessorData* aData)
+ {
+   if (nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(aData->mPseudoType)) {
+     MOZ_ASSERT(aData->mPseudoElement,
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1743,51 +1743,16 @@ nsStyleSet::GCRuleTrees()
+       // It was deleted, as it should be.
+       mOldRuleTrees.RemoveElementAt(i);
+     } else {
+       NS_NOTREACHED("old rule tree still referenced");
+     }
+   }
+ }
+ 
+-/**
+- * Return an equivalent to aRuleNode with both animation and transition
+- * rules removed, and post a restyle if needed.
+- */
+-static inline nsRuleNode*
+-SkipAnimationRules(nsRuleNode* aRuleNode, Element* aElement, bool isPseudo)
+-{
+-  nsRuleNode* ruleNode = aRuleNode;
+-  // The transition rule must be at the top of the cascade.
+-  if (!ruleNode->IsRoot() &&
+-      ruleNode->GetLevel() == nsStyleSet::eTransitionSheet) {
+-    ruleNode = ruleNode->GetParent();
+-  }
+-  NS_ABORT_IF_FALSE(ruleNode->IsRoot() ||
+-                    ruleNode->GetLevel() != nsStyleSet::eTransitionSheet,
+-                    "can't have more than one transition rule");
+-
+-  // Use our existing ReplaceAnimationRule function to replace the
+-  // animation rule, if present.
+-  nsIStyleRule* animationRule = GetAnimationRule(ruleNode);
+-  if (animationRule) {
+-    ruleNode = ReplaceAnimationRule(ruleNode, animationRule, nullptr);
+-  }
+-
+-  if (ruleNode != aRuleNode) {
+-    NS_ASSERTION(aElement, "How can we have transition rules but no element?");
+-    // Need to do an animation restyle, just like
+-    // nsTransitionManager::WalkTransitionRule and
+-    // nsAnimationManager::GetAnimationRule would.
+-    nsRestyleHint hint = isPseudo ? eRestyle_Subtree : eRestyle_Self;
+-    aRuleNode->PresContext()->PresShell()->RestyleForAnimation(aElement, hint);
+-  }
+-  return ruleNode;
+-}
+-
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ReparentStyleContext(nsStyleContext* aStyleContext,
+                                  nsStyleContext* aNewParentContext,
+                                  Element* aElement)
+ {
+   MOZ_ASSERT(aStyleContext, "aStyleContext must not be null");
+ 
+   // This short-circuit is OK because we don't call TryStartingTransition
+@@ -1796,46 +1761,24 @@ nsStyleSet::ReparentStyleContext(nsStyle
+     nsRefPtr<nsStyleContext> ret = aStyleContext;
+     return ret.forget();
+   }
+ 
+   nsIAtom* pseudoTag = aStyleContext->GetPseudo();
+   nsCSSPseudoElements::Type pseudoType = aStyleContext->GetPseudoType();
+   nsRuleNode* ruleNode = aStyleContext->RuleNode();
+ 
+-  // Skip transition rules as needed just like
+-  // nsTransitionManager::WalkTransitionRule would.
+-  bool skipAnimationRules = PresContext()->IsProcessingRestyles() &&
+-    !PresContext()->IsProcessingAnimationStyleChange();
+-  if (skipAnimationRules) {
+-    // Make sure that we're not using transition rules or animation rules for
+-    // our new style context.  If we need them, an animation restyle will
+-    // provide.
+-    ruleNode =
+-      SkipAnimationRules(ruleNode, aElement,
+-                         pseudoType !=
+-                           nsCSSPseudoElements::ePseudo_NotPseudoElement);
+-  }
+-
+   nsRuleNode* visitedRuleNode = nullptr;
+   nsStyleContext* visitedContext = aStyleContext->GetStyleIfVisited();
+   // Reparenting a style context just changes where we inherit from,
+   // not what rules we match or what our DOM looks like.  In
+   // particular, it doesn't change whether this is a style context for
+   // a link.
+   if (visitedContext) {
+-     visitedRuleNode = visitedContext->RuleNode();
+-     // Again, skip transition rules as needed
+-     if (skipAnimationRules) {
+-      // FIXME do something here for animations?
+-       visitedRuleNode =
+-         SkipAnimationRules(visitedRuleNode, aElement,
+-                            pseudoType !=
+-                              nsCSSPseudoElements::ePseudo_NotPseudoElement);
+-     }
++    visitedRuleNode = visitedContext->RuleNode();
+   }
+ 
+   uint32_t flags = eNoFlags;
+   if (aStyleContext->IsLinkContext()) {
+     flags |= eIsLink;
+   }
+ 
+   // If we're a style context for a link, then we already know whether
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -339,20 +339,17 @@ nsTransitionManager::StyleContextChanged
+       GetElementTransitions(aElement, pseudoType, false);
+   if (!et &&
+       disp->mTransitionPropertyCount == 1 &&
+       disp->mTransitions[0].GetDelay() == 0.0f &&
+       disp->mTransitions[0].GetDuration() == 0.0f) {
+     return nullptr;
+   }
+ 
+-
+-  if (aNewStyleContext->PresContext()->IsProcessingAnimationStyleChange()) {
+-    return nullptr;
+-  }
++  // FIXME: ADD NEW TRANSITION STARTING CODE
+ 
+   if (aNewStyleContext->GetParent() &&
+       aNewStyleContext->GetParent()->HasPseudoElementData()) {
+     // Ignore transitions on things that inherit properties from
+     // pseudo-elements.
+     // FIXME (Bug 522599): Add tests for this.
+     return nullptr;
+   }
+@@ -757,32 +754,16 @@ nsTransitionManager::WalkTransitionRule(
+     return;
+   }
+ 
+   if (!mPresContext->IsDynamic()) {
+     // For print or print preview, ignore animations.
+     return;
+   }
+ 
+-  if (aData->mPresContext->IsProcessingRestyles() &&
+-      !aData->mPresContext->IsProcessingAnimationStyleChange()) {
+-    // If we're processing a normal style change rather than one from
+-    // animation, don't add the transition rule.  This allows us to
+-    // compute the new style value rather than having the transition
+-    // override it, so that we can start transitioning differently.
+-
+-    // We need to immediately restyle with animation
+-    // after doing this.
+-    nsRestyleHint hint =
+-      aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement ?
+-      eRestyle_Self : eRestyle_Subtree;
+-    mPresContext->PresShell()->RestyleForAnimation(aData->mElement, hint);
+-    return;
+-  }
+-
+   et->EnsureStyleRuleFor(
+     aData->mPresContext->RefreshDriver()->MostRecentRefresh());
+ 
+   aData->mRuleWalker->Forward(et->mStyleRule);
+ }
+ 
+ /* virtual */ void
+ nsTransitionManager::RulesMatching(ElementRuleProcessorData* aData)
