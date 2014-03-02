@@ -1,0 +1,204 @@
+# HG changeset patch
+# User Kearwood (Kip) Gilbert <kgilbert@mozilla.com>
+# Date 1393355267 28800
+#      Tue Feb 25 11:07:47 2014 -0800
+# Node ID 5f05d0479aed417dae5f2a5eb85d4c2ce00ff6c7
+# Parent aa54ebb903ee9c974be41b4a9277108ecc31b435
+Bug 687297 - The per-presentation base minimum font size is now propagated without being max’ed with the language-specific global minimum font size preference, r=dbaron
+
+A separate accessor has been added to nsPresContext to enable TransferZoomLevels and nsDocumentViewer::GetMinFontSize to access the minimum font size that has not been max’ed against the language specific minimum font size preset.
+
+nsPresContext::mMinFontSize, its getter, and its setter have been renamed to more clearly distinguish them from minFontSize used elsewhere.
+
+diff --git a/content/base/src/nsDocument.cpp b/content/base/src/nsDocument.cpp
+--- a/content/base/src/nsDocument.cpp
++++ b/content/base/src/nsDocument.cpp
+@@ -958,17 +958,17 @@ TransferZoomLevels(nsIDocument* aFromDoc
+   if (!toShell)
+     return;
+ 
+   nsPresContext* toCtxt = toShell->GetPresContext();
+   if (!toCtxt)
+     return;
+ 
+   toCtxt->SetFullZoom(fromCtxt->GetFullZoom());
+-  toCtxt->SetMinFontSize(fromCtxt->MinFontSize(nullptr));
++  toCtxt->SetBaseMinFontSize(fromCtxt->BaseMinFontSize());
+   toCtxt->SetTextZoom(fromCtxt->TextZoom());
+ }
+ 
+ void
+ TransferShowingState(nsIDocument* aFromDoc, nsIDocument* aToDoc)
+ {
+   NS_ABORT_IF_FALSE(aFromDoc && aToDoc,
+                     "transferring showing state from/to null doc");
+diff --git a/layout/base/nsDocumentViewer.cpp b/layout/base/nsDocumentViewer.cpp
+--- a/layout/base/nsDocumentViewer.cpp
++++ b/layout/base/nsDocumentViewer.cpp
+@@ -677,17 +677,17 @@ nsDocumentViewer::InitPresentationStuff(
+   int32_t p2a = mPresContext->AppUnitsPerDevPixel();
+   MOZ_ASSERT(p2a == mPresContext->DeviceContext()->UnscaledAppUnitsPerDevPixel());
+   nscoord width = p2a * mBounds.width;
+   nscoord height = p2a * mBounds.height;
+ 
+   mViewManager->SetWindowDimensions(width, height);
+   mPresContext->SetTextZoom(mTextZoom);
+   mPresContext->SetFullZoom(mPageZoom);
+-  mPresContext->SetMinFontSize(mMinFontSize);
++  mPresContext->SetBaseMinFontSize(mMinFontSize);
+ 
+   p2a = mPresContext->AppUnitsPerDevPixel();  // zoom may have changed it
+   width = p2a * mBounds.width;
+   height = p2a * mBounds.height;
+   if (aDoInitialReflow) {
+     nsCOMPtr<nsIPresShell> shellGrip = mPresShell;
+     // Initial reflow
+     mPresShell->Initialize(width, height);
+@@ -2794,17 +2794,17 @@ SetExtResourceTextZoom(nsIDocument* aDoc
+ 
+ static bool
+ SetExtResourceMinFontSize(nsIDocument* aDocument, void* aClosure)
+ {
+   nsIPresShell* shell = aDocument->GetShell();
+   if (shell) {
+     nsPresContext* ctxt = shell->GetPresContext();
+     if (ctxt) {
+-      ctxt->SetMinFontSize(NS_PTR_TO_INT32(aClosure));
++      ctxt->SetBaseMinFontSize(NS_PTR_TO_INT32(aClosure));
+     }
+   }
+ 
+   return true;
+ }
+ 
+ static bool
+ SetExtResourceFullZoom(nsIDocument* aDocument, void* aClosure)
+@@ -2886,32 +2886,32 @@ nsDocumentViewer::SetMinFontSize(int32_t
+   // change, our children's min font may be different, though it would be unusual).
+   // Do this first, in case kids are auto-sizing and post reflow commands on
+   // our presshell (which should be subsumed into our own style change reflow).
+   CallChildren(SetChildMinFontSize, NS_INT32_TO_PTR(aMinFontSize));
+ 
+   // Now change our own min font
+   nsPresContext* pc = GetPresContext();
+   if (pc && aMinFontSize != mPresContext->MinFontSize(nullptr)) {
+-    pc->SetMinFontSize(aMinFontSize);
++    pc->SetBaseMinFontSize(aMinFontSize);
+   }
+ 
+   // And do the external resources
+   mDocument->EnumerateExternalResources(SetExtResourceMinFontSize,
+                                         NS_INT32_TO_PTR(aMinFontSize));
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocumentViewer::GetMinFontSize(int32_t* aMinFontSize)
+ {
+   NS_ENSURE_ARG_POINTER(aMinFontSize);
+   nsPresContext* pc = GetPresContext();
+-  *aMinFontSize = pc ? pc->MinFontSize(nullptr) : 0;
++  *aMinFontSize = pc ? pc->BaseMinFontSize() : 0;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocumentViewer::SetFullZoom(float aFullZoom)
+ {
+ #ifdef NS_PRINT_PREVIEW
+   if (GetIsPrintPreview()) {
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -241,17 +241,17 @@ IsVisualCharset(const nsCString& aCharse
+   }
+ }
+ #endif // IBMBIDI
+ 
+   // NOTE! nsPresContext::operator new() zeroes out all members, so don't
+   // bother initializing members to 0.
+ 
+ nsPresContext::nsPresContext(nsIDocument* aDocument, nsPresContextType aType)
+-  : mType(aType), mDocument(aDocument), mMinFontSize(0),
++  : mType(aType), mDocument(aDocument), mBaseMinFontSize(0),
+     mTextZoom(1.0), mFullZoom(1.0), mLastFontInflationScreenWidth(-1.0),
+     mPageSize(-1, -1), mPPScale(1.0f),
+     mViewportStyleOverflow(NS_STYLE_OVERFLOW_AUTO, NS_STYLE_OVERFLOW_AUTO),
+     mImageAnimationModePref(imgIContainer::kNormalAnimMode),
+     mAllInvalidated(false),
+     mPaintFlashing(false), mPaintFlashingInitialized(false)
+ {
+   // NOTE! nsPresContext::operator new() zeroes out all members, so don't
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -530,28 +530,42 @@ public:
+       // Media queries could have changed, since we changed the meaning
+       // of 'em' units in them.
+       MediaFeatureValuesChanged(eAlwaysRebuildStyle, NS_STYLE_HINT_REFLOW);
+     }
+   }
+ 
+   /**
+    * Get the minimum font size for the specified language. If aLanguage
+-   * is nullptr, then the document's language is used.
++   * is nullptr, then the document's language is used.  This combines
++   * the language-specific global preference with the per-presentation
++   * base minimum font size.
+    */
+   int32_t MinFontSize(nsIAtom *aLanguage) const {
+     const LangGroupFontPrefs *prefs = GetFontPrefsForLang(aLanguage);
+-    return std::max(mMinFontSize, prefs->mMinimumFontSize);
++    return std::max(mBaseMinFontSize, prefs->mMinimumFontSize);
+   }
+-
+-  void SetMinFontSize(int32_t aMinFontSize) {
+-    if (aMinFontSize == mMinFontSize)
++  
++  /**
++   * Get the per-presentation base minimum font size.  This size is
++   * independent of the language-specific global preference.
++   */
++  int32_t BaseMinFontSize() const {
++    return mBaseMinFontSize;
++  }
++  
++  /**
++   * Set the per-presentation base minimum font size.  This size is
++   * independent of the language-specific global preference.
++   */
++  void SetBaseMinFontSize(int32_t aMinFontSize) {
++    if (aMinFontSize == mBaseMinFontSize)
+       return;
+ 
+-    mMinFontSize = aMinFontSize;
++    mBaseMinFontSize = aMinFontSize;
+     if (HasCachedStyleData()) {
+       // Media queries could have changed, since we changed the meaning
+       // of 'em' units in them.
+       MediaFeatureValuesChanged(eAlwaysRebuildStyle, NS_STYLE_HINT_REFLOW);
+     }
+   }
+ 
+   float GetFullZoom() { return mFullZoom; }
+@@ -1174,17 +1188,18 @@ public:
+   bool                  mInflationDisabledForShrinkWrap;
+ 
+ protected:
+ 
+   mozilla::WeakPtr<nsDocShell>             mContainer;
+ 
+   PRCList               mDOMMediaQueryLists;
+ 
+-  int32_t               mMinFontSize;   // Min font size, defaults to 0
++  // Base minimum font size, independent of the language-specific global preference. Defaults to 0
++  int32_t               mBaseMinFontSize;
+   float                 mTextZoom;      // Text zoom, defaults to 1.0
+   float                 mFullZoom;      // Page zoom, defaults to 1.0
+ 
+   float                 mLastFontInflationScreenWidth;
+ 
+   int32_t               mCurAppUnitsPerDevPixel;
+   int32_t               mAutoQualityMinFontSizePixelsPref;
+ 
