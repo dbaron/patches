@@ -2,3 +2,158 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 978648 patch 2:  Give a keyframe rule a new identity when it changes, so that it gets a new path in the rule tree when the animation manager builds a path in the rule tree with it.
 
+diff --git a/layout/style/nsCSSRules.cpp b/layout/style/nsCSSRules.cpp
+--- a/layout/style/nsCSSRules.cpp
++++ b/layout/style/nsCSSRules.cpp
+@@ -32,16 +32,17 @@
+ #include "mozilla/css/Declaration.h"
+ #include "nsCSSParser.h"
+ #include "nsPrintfCString.h"
+ #include "nsDOMClassInfoID.h"
+ #include "mozilla/dom/CSSStyleDeclarationBinding.h"
+ #include "StyleRule.h"
+ #include "nsFont.h"
+ #include "nsIURI.h"
++#include "mozilla/Move.h"
+ 
+ using namespace mozilla;
+ 
+ #define IMPL_STYLE_RULE_INHERIT_GET_DOM_RULE_WEAK(class_, super_) \
+   /* virtual */ nsIDOMCSSRule* class_::GetDOMRule()               \
+   { return this; }                                                \
+   /* virtual */ nsIDOMCSSRule* class_::GetExistingDOMRule()       \
+   { return this; }
+@@ -2206,17 +2207,23 @@ nsCSSKeyframeStyleDeclaration::GetParent
+   NS_IF_ADDREF(*aParent = mRule);
+   return NS_OK;
+ }
+ 
+ nsresult
+ nsCSSKeyframeStyleDeclaration::SetCSSDeclaration(css::Declaration* aDecl)
+ {
+   NS_ABORT_IF_FALSE(aDecl, "must be non-null");
+-  mRule->ChangeDeclaration(aDecl);
++
++  mRule = new nsCSSKeyframeRule(Move(mRule), aDecl);
++
++  nsCSSStyleSheet* sheet = mRule->GetStyleSheet();
++  if (sheet) {
++    sheet->SetModifiedByChildRule();
++  }
+   return NS_OK;
+ }
+ 
+ nsIDocument*
+ nsCSSKeyframeStyleDeclaration::DocToUpdate()
+ {
+   return nullptr;
+ }
+@@ -2234,16 +2241,34 @@ nsCSSKeyframeStyleDeclaration::GetParent
+ nsCSSKeyframeRule::nsCSSKeyframeRule(const nsCSSKeyframeRule& aCopy)
+   // copy everything except our reference count and mDOMDeclaration
+   : Rule(aCopy)
+   , mKeys(aCopy.mKeys)
+   , mDeclaration(new css::Declaration(*aCopy.mDeclaration))
+ {
+ }
+ 
++// Used only by the dom declaration
++nsCSSKeyframeRule::nsCSSKeyframeRule(nsCSSKeyframeRule&& aMove,
++                                     mozilla::css::Declaration* aNewDeclaration)
++  : Rule(Move(aMove))
++{
++  mKeys.SwapElements(aMove.mKeys);
++  if (aNewDeclaration == aMove.mDeclaration) {
++    // If we haven't yet marked the declaration immutable, the new
++    // declaration might be the same as the old one.
++    aMove.mDeclaration.forget();
++  } else {
++    mDeclaration = aNewDeclaration;
++  }
++  MOZ_ASSERT(mDOMDeclaration,
++             "should only happen with non-null mDOMDeclaration");
++  mDOMDeclaration.swap(aMove.mDOMDeclaration);
++}
++
+ nsCSSKeyframeRule::~nsCSSKeyframeRule()
+ {
+   if (mDOMDeclaration) {
+     mDOMDeclaration->DropReference();
+   }
+ }
+ 
+ /* virtual */ already_AddRefed<css::Rule>
+@@ -2403,31 +2428,16 @@ nsCSSKeyframeRule::GetStyle(nsIDOMCSSSty
+ {
+   if (!mDOMDeclaration) {
+     mDOMDeclaration = new nsCSSKeyframeStyleDeclaration(this);
+   }
+   NS_ADDREF(*aStyle = mDOMDeclaration);
+   return NS_OK;
+ }
+ 
+-void
+-nsCSSKeyframeRule::ChangeDeclaration(css::Declaration* aDeclaration)
+-{
+-  // Be careful to not assign to an nsAutoPtr if we would be assigning
+-  // the thing it already holds.
+-  if (aDeclaration != mDeclaration) {
+-    mDeclaration = aDeclaration;
+-  }
+-
+-  nsCSSStyleSheet* sheet = GetStyleSheet();
+-  if (sheet) {
+-    sheet->SetModifiedByChildRule();
+-  }
+-}
+-
+ /* virtual */ size_t
+ nsCSSKeyframeRule::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const
+ {
+   return aMallocSizeOf(this);
+ 
+   // Measurement of the following members may be added later if DMD finds it is
+   // worthwhile:
+   // - mKeys
+diff --git a/layout/style/nsCSSRules.h b/layout/style/nsCSSRules.h
+--- a/layout/style/nsCSSRules.h
++++ b/layout/style/nsCSSRules.h
+@@ -422,16 +422,19 @@ class nsCSSKeyframeRule MOZ_FINAL : publ
+ public:
+   // WARNING: Steals the contents of aKeys *and* aDeclaration
+   nsCSSKeyframeRule(InfallibleTArray<float>& aKeys,
+                     nsAutoPtr<mozilla::css::Declaration> aDeclaration)
+     : mDeclaration(aDeclaration)
+   {
+     mKeys.SwapElements(aKeys);
+   }
++
++  nsCSSKeyframeRule(nsCSSKeyframeRule&& aMove,
++                    mozilla::css::Declaration* aNewDeclaration);
+ private:
+   nsCSSKeyframeRule(const nsCSSKeyframeRule& aCopy);
+   ~nsCSSKeyframeRule();
+ public:
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+   NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsCSSKeyframeRule, nsIStyleRule)
+ 
+   // nsIStyleRule methods
+@@ -452,18 +455,16 @@ public:
+ 
+   const nsTArray<float>& GetKeys() const     { return mKeys; }
+   mozilla::css::Declaration* Declaration()   { return mDeclaration; }
+ 
+   void RuleMatched() {
+     mDeclaration->SetImmutable();
+   }
+ 
+-  void ChangeDeclaration(mozilla::css::Declaration* aDeclaration);
+-
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const MOZ_OVERRIDE;
+ 
+   void DoGetKeyText(nsAString &aKeyText) const;
+ 
+ private:
+   nsTArray<float>                            mKeys;
+   nsAutoPtr<mozilla::css::Declaration>       mDeclaration;
+   // lazily created when needed:
