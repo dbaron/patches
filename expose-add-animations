@@ -2,10 +2,167 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 828173 patch 3:  Expose AddAnimationsAndTransitionsToLayer and allow it to be called from style change handling.
 
+diff --git a/gfx/layers/Layers.cpp b/gfx/layers/Layers.cpp
+--- a/gfx/layers/Layers.cpp
++++ b/gfx/layers/Layers.cpp
+@@ -181,30 +181,23 @@ Layer::Layer(LayerManager* aManager, voi
+   mDebugColorIndex(0),
+   mAnimationGeneration(0)
+ {}
+ 
+ Layer::~Layer()
+ {}
+ 
+ Animation*
+-Layer::AddAnimation(TimeStamp aStart, TimeDuration aDuration, float aIterations,
+-                    int aDirection, nsCSSProperty aProperty, const AnimationData& aData)
++Layer::AddAnimation()
+ {
+   MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) AddAnimation", this));
+ 
+   MOZ_ASSERT(!mPendingAnimations, "should have called ClearAnimations first");
+ 
+   Animation* anim = mAnimations.AppendElement();
+-  anim->startTime() = aStart;
+-  anim->duration() = aDuration;
+-  anim->numIterations() = aIterations;
+-  anim->direction() = aDirection;
+-  anim->property() = aProperty;
+-  anim->data() = aData;
+ 
+   Mutated();
+   return anim;
+ }
+ 
+ void
+ Layer::ClearAnimations()
+ {
+@@ -216,31 +209,22 @@ Layer::ClearAnimations()
+ 
+   MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) ClearAnimations", this));
+   mAnimations.Clear();
+   mAnimationData.Clear();
+   Mutated();
+ }
+ 
+ Animation*
+-Layer::AddAnimationForNextTransaction(TimeStamp aStart, TimeDuration aDuration,
+-                                      float aIterations, int aDirection,
+-                                      nsCSSProperty aProperty,
+-                                      const AnimationData& aData)
++Layer::AddAnimationForNextTransaction()
+ {
+   MOZ_ASSERT(mPendingAnimations,
+              "should have called ClearAnimationsForNextTransaction first");
+ 
+   Animation* anim = mPendingAnimations->AppendElement();
+-  anim->startTime() = aStart;
+-  anim->duration() = aDuration;
+-  anim->numIterations() = aIterations;
+-  anim->direction() = aDirection;
+-  anim->property() = aProperty;
+-  anim->data() = aData;
+ 
+   return anim;
+ }
+ 
+ void
+ Layer::ClearAnimationsForNextTransaction()
+ {
+   // Ensure we have a non-null mPendingAnimations to mark a future clear.
+diff --git a/gfx/layers/Layers.h b/gfx/layers/Layers.h
+--- a/gfx/layers/Layers.h
++++ b/gfx/layers/Layers.h
+@@ -937,36 +937,29 @@ public:
+     if (mIsFixedPosition != aFixedPosition) {
+       MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) IsFixedPosition", this));
+       mIsFixedPosition = aFixedPosition;
+       Mutated();
+     }
+   }
+ 
+   // Call AddAnimation to add a new animation to this layer from layout code.
+-  // Caller must add segments to the returned animation.
+-  // aStart represents the time at the *end* of the delay.
+-  Animation* AddAnimation(mozilla::TimeStamp aStart, mozilla::TimeDuration aDuration,
+-                          float aIterations, int aDirection,
+-                          nsCSSProperty aProperty, const AnimationData& aData);
++  // Caller must fill in all the properties of the returned animation.
++  Animation* AddAnimation();
+   // ClearAnimations clears animations on this layer.
+   void ClearAnimations();
+   // This is only called when the layer tree is updated. Do not call this from
+   // layout code.  To add an animation to this layer, use AddAnimation.
+   void SetAnimations(const AnimationArray& aAnimations);
+ 
+   // These are a parallel to AddAnimation and clearAnimations, except
+   // they add pending animations that apply only when the next
+   // transaction is begun.  (See also
+   // SetBaseTransformForNextTransaction.)
+-  Animation* AddAnimationForNextTransaction(mozilla::TimeStamp aStart,
+-                                            mozilla::TimeDuration aDuration,
+-                                            float aIterations, int aDirection,
+-                                            nsCSSProperty aProperty,
+-                                            const AnimationData& aData);
++  Animation* AddAnimationForNextTransaction();
+   void ClearAnimationsForNextTransaction();
+ 
+   /**
+    * CONSTRUCTION PHASE ONLY
+    * If a layer is "fixed position", this determines which point on the layer
+    * is considered the "anchor" point, that is, the point which remains in the
+    * same position when compositing the layer tree with a transformation
+    * (such as when asynchronously scrolling and zooming).
 diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 --- a/layout/base/nsDisplayList.cpp
 +++ b/layout/base/nsDisplayList.cpp
-@@ -356,76 +356,97 @@ AddAnimationsForProperty(nsIFrame* aFram
+@@ -303,34 +303,35 @@ ToTimingFunction(css::ComputedTimingFunc
+ 
+   uint32_t type = aCTF.GetType() == nsTimingFunction::StepStart ? 1 : 2;
+   return TimingFunction(StepFunction(aCTF.GetSteps(), type));
+ }
+ 
+ static void
+ AddAnimationsForProperty(nsIFrame* aFrame, nsCSSProperty aProperty,
+                          ElementAnimation* ea, Layer* aLayer,
+-                         AnimationData& aData)
++                         AnimationData& aData, bool aPending)
+ {
+   NS_ASSERTION(aLayer->AsContainerLayer(), "Should only animate ContainerLayer");
+   nsStyleContext* styleContext = aFrame->StyleContext();
+   nsPresContext* presContext = aFrame->PresContext();
+   nsRect bounds = nsDisplayTransform::GetFrameBoundsForTransform(aFrame);
+   // all data passed directly to the compositor should be in css pixels
+   float scale = nsDeviceContext::AppUnitsPerCSSPixel();
+ 
+-  TimeStamp startTime = ea->mStartTime + ea->mDelay;
+-  TimeDuration duration = ea->mIterationDuration;
+-  float iterations = ea->mIterationCount != NS_IEEEPositiveInfinity()
+-                     ? ea->mIterationCount : -1;
+-  int direction = ea->mDirection;
+-
+-  Animation* animation = aLayer->AddAnimation(startTime, duration,
+-                                              iterations, direction,
+-                                              aProperty, aData);
++  Animation* animation = aPending ? aLayer->AddPendingAnimation()
++                                  : aLayer->AddAnimation();
++
++  animation->startTime() = ea->mStartTime + ea->mDelay;
++  animation->duration() = ea->mIterationDuration;
++  animation->numIterations() =
++    ea->mIterationCount != NS_IEEEPositiveInfinity() ? ea->mIterationCount : -1;
++  animation->direction() = ea->mDirection;
++  animation->property() = aProperty;
++  animation->data() = aData;
+ 
+   for (uint32_t propIdx = 0; propIdx < ea->mProperties.Length(); propIdx++) {
+     AnimationProperty* property = &ea->mProperties[propIdx];
+ 
+     if (aProperty != property->mProperty) {
+       continue;
+     }
+ 
+@@ -356,76 +357,103 @@ AddAnimationsForProperty(nsIFrame* aFram
  
        animSegment->startPortion() = segment->mFromKey;
        animSegment->endPortion() = segment->mToKey;
@@ -24,6 +181,11 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 +                                                         nsIFrame* aFrame,
 +                                                         nsCSSProperty aProperty)
  {
+-  aLayer->ClearAnimations();
+-
+-  nsIFrame* frame = aItem->Frame();
+-
+-  nsIContent* content = frame->GetContent();
 +  // This function can be called in two ways:  from
 +  // nsDisplay*::BuildLayer while constructing a layer (with all
 +  // pointers non-null), or from RestyleManager's handling of
@@ -33,11 +195,14 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
 +             "aBuilder and aItem, or with neither");
 +  MOZ_ASSERT(!aItem || aFrame == aItem->Frame(), "frame mismatch");
 +
-   aLayer->ClearAnimations();
- 
--  nsIFrame* frame = aItem->Frame();
--
--  nsIContent* content = frame->GetContent();
++  bool pending = !aBuilder;
++
++  if (pending) {
++    aLayer->ClearAnimations();
++  } else {
++    aLayer->ClearPendingAnimations();
++  }
++
 +  nsIContent* content = aFrame->GetContent();
    if (!content) {
      return;
@@ -119,7 +284,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
      for (uint32_t tranIdx = 0; tranIdx < et->mPropertyTransitions.Length(); tranIdx++) {
        ElementPropertyTransition* pt = &et->mPropertyTransitions[tranIdx];
        if (pt->mProperty != aProperty || !pt->IsRunningAt(currentTime)) {
-@@ -447,32 +468,32 @@ AddAnimationsAndTransitionsToLayer(Layer
+@@ -447,33 +475,33 @@ AddAnimationsAndTransitionsToLayer(Layer
  
        AnimationPropertySegment& segment = *prop.mSegments.AppendElement();
        segment.mFromKey = 0;
@@ -129,8 +294,9 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
        segment.mTimingFunction = pt->mTimingFunction;
  
 -      AddAnimationsForProperty(frame, aProperty, &anim,
+-                               aLayer, data);
 +      AddAnimationsForProperty(aFrame, aProperty, &anim,
-                                aLayer, data);
++                               aLayer, data, pending);
  
        pt->mIsRunningOnCompositor = true;
      }
@@ -145,8 +311,9 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
          continue;
        }
 -      AddAnimationsForProperty(frame, aProperty, anim,
+-                               aLayer, data);
 +      AddAnimationsForProperty(aFrame, aProperty, anim,
-                                aLayer, data);
++                               aLayer, data, pending);
      }
      aLayer->SetAnimationGeneration(ea->mAnimationGeneration);
    }
@@ -154,7 +321,8 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
  
  nsDisplayListBuilder::nsDisplayListBuilder(nsIFrame* aReferenceFrame,
      Mode aMode, bool aBuildCaret)
-@@ -3166,18 +3187,19 @@ nsDisplayOpacity::BuildLayer(nsDisplayLi
+     : mReferenceFrame(aReferenceFrame),
+@@ -3166,18 +3194,19 @@ nsDisplayOpacity::BuildLayer(nsDisplayLi
    }
    nsRefPtr<Layer> container = aManager->GetLayerBuilder()->
      BuildContainerLayerFor(aBuilder, aManager, mFrame, this, mList,
@@ -176,7 +344,7 @@ diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
   * rendered at a higher (or lower) resolution, affecting the retained layer
   * size --- but this should be good enough.
   */
-@@ -4633,18 +4655,19 @@ already_AddRefed<Layer> nsDisplayTransfo
+@@ -4633,18 +4662,19 @@ already_AddRefed<Layer> nsDisplayTransfo
    // Add the preserve-3d flag for this layer, BuildContainerLayerFor clears all flags,
    // so we never need to explicitely unset this flag.
    if (mFrame->Preserves3D() || mFrame->Preserves3DChildren()) {
@@ -237,7 +405,7 @@ diff --git a/layout/base/nsDisplayList.h b/layout/base/nsDisplayList.h
     * determine which frame is under the mouse position
     * @param aBuildCaret whether or not we should include the caret in any
     * display lists that we make.
-@@ -477,16 +479,27 @@ public:
+@@ -477,16 +479,28 @@ public:
  
    /**
     * Allocate a new DisplayListClip in the arena. Will be cleaned up
@@ -249,7 +417,8 @@ diff --git a/layout/base/nsDisplayList.h b/layout/base/nsDisplayList.h
 +   * Transfer off main thread animations to the layer.  May be called
 +   * with aBuilder and aItem both null, but only if the caller has
 +   * already checked that off main thread animations should be sent to
-+   * the layer.
++   * the layer.  When they are both null, the animations are added to
++   * the layer as pending animations.
 +   */
 +  static void AddAnimationsAndTransitionsToLayer(Layer* aLayer,
 +                                                 nsDisplayListBuilder* aBuilder,
