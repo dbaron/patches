@@ -1,0 +1,158 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 828173 patch 2:  Add a concept of pending animations to Layer, like pending transform.
+
+diff --git a/gfx/layers/Layers.cpp b/gfx/layers/Layers.cpp
+--- a/gfx/layers/Layers.cpp
++++ b/gfx/layers/Layers.cpp
+@@ -186,41 +186,76 @@ Layer::~Layer()
+ {}
+ 
+ Animation*
+ Layer::AddAnimation(TimeStamp aStart, TimeDuration aDuration, float aIterations,
+                     int aDirection, nsCSSProperty aProperty, const AnimationData& aData)
+ {
+   MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) AddAnimation", this));
+ 
++  MOZ_ASSERT(!mPendingAnimations, "should have called ClearAnimations first");
++
+   Animation* anim = mAnimations.AppendElement();
+   anim->startTime() = aStart;
+   anim->duration() = aDuration;
+   anim->numIterations() = aIterations;
+   anim->direction() = aDirection;
+   anim->property() = aProperty;
+   anim->data() = aData;
+ 
+   Mutated();
+   return anim;
+ }
+ 
+ void
+ Layer::ClearAnimations()
+ {
++  mPendingAnimations = nullptr;
++
+   if (mAnimations.IsEmpty() && mAnimationData.IsEmpty()) {
+     return;
+   }
+ 
+   MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) ClearAnimations", this));
+   mAnimations.Clear();
+   mAnimationData.Clear();
+   Mutated();
+ }
+ 
++Animation*
++Layer::AddAnimationForNextTransaction(TimeStamp aStart, TimeDuration aDuration,
++                                      float aIterations, int aDirection,
++                                      nsCSSProperty aProperty,
++                                      const AnimationData& aData)
++{
++  MOZ_ASSERT(mPendingAnimations,
++             "should have called ClearAnimationsForNextTransaction first");
++
++  Animation* anim = mPendingAnimations->AppendElement();
++  anim->startTime() = aStart;
++  anim->duration() = aDuration;
++  anim->numIterations() = aIterations;
++  anim->direction() = aDirection;
++  anim->property() = aProperty;
++  anim->data() = aData;
++
++  return anim;
++}
++
++void
++Layer::ClearAnimationsForNextTransaction()
++{
++  // Ensure we have a non-null mPendingAnimations to mark a future clear.
++  if (!mPendingAnimations) {
++    mPendingAnimations = new AnimationArray;
++  }
++
++  mPendingAnimations->Clear();
++}
++
+ static nsCSSValueSharedList*
+ CreateCSSValueList(const InfallibleTArray<TransformFunction>& aFunctions)
+ {
+   nsAutoPtr<nsCSSValueList> result;
+   nsCSSValueList** resultTail = getter_Transfers(result);
+   for (uint32_t i = 0; i < aFunctions.Length(); i++) {
+     nsRefPtr<nsCSSValue::Array> arr;
+     switch (aFunctions[i].type()) {
+@@ -643,16 +678,23 @@ void
+ Layer::ApplyPendingUpdatesForThisTransaction()
+ {
+   if (mPendingTransform && *mPendingTransform != mTransform) {
+     MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) PendingUpdatesForThisTransaction", this));
+     mTransform = *mPendingTransform;
+     Mutated();
+   }
+   mPendingTransform = nullptr;
++
++  if (mPendingAnimations) {
++    MOZ_LAYERS_LOG_IF_SHADOWABLE(this, ("Layer::Mutated(%p) PendingUpdatesForThisTransaction", this));
++    mPendingAnimations->SwapElements(mAnimations);
++    mPendingAnimations = nullptr;
++    Mutated();
++  }
+ }
+ 
+ const float
+ Layer::GetLocalOpacity()
+ {
+    if (LayerComposite* shadow = AsLayerComposite())
+     return shadow->GetShadowOpacity();
+   return mOpacity;
+diff --git a/gfx/layers/Layers.h b/gfx/layers/Layers.h
+--- a/gfx/layers/Layers.h
++++ b/gfx/layers/Layers.h
+@@ -948,16 +948,27 @@ public:
+                           float aIterations, int aDirection,
+                           nsCSSProperty aProperty, const AnimationData& aData);
+   // ClearAnimations clears animations on this layer.
+   void ClearAnimations();
+   // This is only called when the layer tree is updated. Do not call this from
+   // layout code.  To add an animation to this layer, use AddAnimation.
+   void SetAnimations(const AnimationArray& aAnimations);
+ 
++  // These are a parallel to AddAnimation and clearAnimations, except
++  // they add pending animations that apply only when the next
++  // transaction is begun.  (See also
++  // SetBaseTransformForNextTransaction.)
++  Animation* AddAnimationForNextTransaction(mozilla::TimeStamp aStart,
++                                            mozilla::TimeDuration aDuration,
++                                            float aIterations, int aDirection,
++                                            nsCSSProperty aProperty,
++                                            const AnimationData& aData);
++  void ClearAnimationsForNextTransaction();
++
+   /**
+    * CONSTRUCTION PHASE ONLY
+    * If a layer is "fixed position", this determines which point on the layer
+    * is considered the "anchor" point, that is, the point which remains in the
+    * same position when compositing the layer tree with a transformation
+    * (such as when asynchronously scrolling and zooming).
+    */
+   void SetFixedPositionAnchor(const LayerPoint& aAnchor)
+@@ -1408,16 +1419,18 @@ protected:
+   // A mutation of |mTransform| that we've queued to be applied at the
+   // end of the next transaction (if nothing else overrides it in the
+   // meantime).
+   nsAutoPtr<gfx::Matrix4x4> mPendingTransform;
+   float mPostXScale;
+   float mPostYScale;
+   gfx::Matrix4x4 mEffectiveTransform;
+   AnimationArray mAnimations;
++  // See mPendingTransform above.
++  nsAutoPtr<AnimationArray> mPendingAnimations;
+   InfallibleTArray<AnimData> mAnimationData;
+   float mOpacity;
+   gfx::CompositionOp mMixBlendMode;
+   bool mForceIsolatedGroup;
+   nsIntRect mClipRect;
+   nsIntRect mTileSourceRect;
+   nsIntRegion mInvalidRegion;
+   uint32_t mContentFlags;
