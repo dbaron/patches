@@ -1,30 +1,11 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 828173 patch 3:  Call AddAnimationsAndTransitionsToLayer when we choose not to repaint when handling an UpdateTransformLayer hint, so that any new animations resulting from the style change get sent to the layer.
+Bug 828173 patch 4:  Call AddAnimationsAndTransitionsToLayer when we choose not to repaint when handling an UpdateTransformLayer hint, so that any new animations resulting from the style change get sent to the layer.
 
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -29,16 +29,17 @@
- #include "nsViewportFrame.h"
- #include "SVGTextFrame.h"
- #include "StickyScrollContainer.h"
- #include "nsIRootBox.h"
- #include "nsIDOMMutationEvent.h"
- #include "nsContentUtils.h"
- #include "nsIFrameInlines.h"
- #include "ActiveLayerTracker.h"
-+#include "nsDisplayList.h"
- 
- #ifdef ACCESSIBILITY
- #include "nsAccessibilityService.h"
- #endif
- 
- namespace mozilla {
- 
- RestyleManager::RestyleManager(nsPresContext* aPresContext)
-@@ -232,17 +233,26 @@ DoApplyRenderingChangeToTree(nsIFrame* a
-     if ((aChange & nsChangeHint_UpdateTransformLayer) &&
+@@ -233,16 +233,22 @@ DoApplyRenderingChangeToTree(nsIFrame* a
          aFrame->IsTransformed()) {
        ActiveLayerTracker::NotifyRestyle(aFrame, eCSSProperty_transform);
        // If we're not already going to do an invalidating paint, see
@@ -32,16 +13,12 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
        // layer for this frame, and not scheduling an invalidating
        // paint.
        if (!needInvalidatingPaint) {
--        needInvalidatingPaint |= !aFrame->TryUpdateTransformOnly();
-+        Layer* layer;
-+        needInvalidatingPaint |= !aFrame->TryUpdateTransformOnly(&layer);
+         needInvalidatingPaint |= !aFrame->TryUpdateTransformOnly();
 +
 +        if (!needInvalidatingPaint) {
 +          // Since we're not going to paint, we need to resend animation
 +          // data to the layer.
-+          MOZ_ASSERT(layer, "this can't happen if there's no layer");
-+          nsDisplayListBuilder::AddAnimationsAndTransitionsToLayer(layer,
-+            nullptr, nullptr, aFrame, eCSSProperty_transform);
++          aFrame->ScheduleAnimationUpdate(eCSSProperty_transform);
 +        }
        }
      }
@@ -51,69 +28,207 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
          GetFrameForChildrenOnlyTransformHint(aFrame)->GetFirstPrincipalChild();
        for ( ; childFrame; childFrame = childFrame->GetNextSibling()) {
          ActiveLayerTracker::NotifyRestyle(childFrame, eCSSProperty_transform);
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -1221,16 +1221,27 @@ public:
+   /**
+    * Keep track of how many times this presshell has been rendered to
+    * a window.
+    */
+   uint64_t GetPaintCount() { return mPaintCount; }
+   void IncrementPaintCount() { ++mPaintCount; }
+ 
+   /**
++   * Add or remove frames from the set that need animations of transform
++   * shipped to their layer.
++   */
++  void AddFrameToAnimationUpdates(nsIFrame* aFrame) {
++    mAnimationUpdates.PutEntry(aFrame);
++  }
++  void RemoveFrameFromAnimationUpdates(nsIFrame* aFrame) {
++    mAnimationUpdates.RemoveEntry(aFrame);
++  }
++
++  /**
+    * Get the root DOM window of this presShell.
+    */
+   virtual already_AddRefed<nsPIDOMWindow> GetRootWindow() = 0;
+ 
+   /**
+    * Get the layer manager for the widget of the root view, if it has
+    * one.
+    */
+@@ -1612,16 +1623,20 @@ protected:
+   // When a change to a scoped style sheet is made, we add the style scope
+   // root to this array rather than setting mStylesHaveChanged = true, since
+   // we know we don't need to restyle the whole document.  However, if in the
+   // same update block we have already had other changes that require
+   // the whole document to be restyled (i.e., mStylesHaveChanged is already
+   // true), then we don't bother adding the scope root here.
+   nsAutoTArray<nsRefPtr<mozilla::dom::Element>,1> mChangedScopeStyleRoots;
+ 
++  // Set of frames that need their animations shipped to their transform
++  // layer the next time we paint.
++  nsTHashtable<nsPtrHashKey<nsIFrame> > mAnimationUpdates;
++
+   static nsIContent*        gKeyDownTarget;
+ 
+   // Cached font inflation values. This is done to prevent changing of font
+   // inflation until a page is reloaded.
+   uint32_t mFontSizeInflationEmPerLine;
+   uint32_t mFontSizeInflationMinTwips;
+   uint32_t mFontSizeInflationLineThreshold;
+   bool mFontSizeInflationForceEnabled;
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -2111,16 +2111,22 @@ PresShell::NotifyDestroyingFrame(nsIFram
+   } else {
+     // We must delete this property in situ so that its destructor removes the
+     // frame from FrameLayerBuilder::DisplayItemData::mFrameList -- otherwise
+     // the DisplayItemData destructor will use the destroyed frame when it
+     // tries to remove it from the (array) value of this property.
+     mPresContext->PropertyTable()->
+       Delete(aFrame, FrameLayerBuilder::LayerManagerDataProperty());
+   }
++
++
++  // Need to do this without considering mIgnoreFrameDestruction because
++  // it might be on a different pres shell.
++  mPresContext->GetRootPresContext()->PresShell()->
++    RemoveFrameFromAnimationUpdates(aFrame);
+ }
+ 
+ already_AddRefed<nsCaret> PresShell::GetCaret() const
+ {
+   nsRefPtr<nsCaret> caret = mCaret;
+   return caret.forget();
+ }
+ 
+@@ -5806,16 +5812,27 @@ PresShell::RestyleShadowRoot(ShadowRoot*
+        child;
+        child = iterator.GetNextChild()) {
+     if (child->IsElement()) {
+       mChangedScopeStyleRoots.AppendElement(child->AsElement());
+     }
+   }
+ }
+ 
++static PLDHashOperator
++UpdateAnimationsOnCompositor(nsPtrHashKey<nsIFrame>* aKey, void* aClosure)
++{
++  nsIFrame* frame = aKey->GetKey();
++  Layer* layer =
++    FrameLayerBuilder::GetDedicatedLayer(frame, nsDisplayItem::TYPE_TRANSFORM);
++  nsDisplayListBuilder::AddAnimationsAndTransitionsToLayer(layer,
++    nullptr, nullptr, frame, eCSSProperty_transform);
++  return PL_DHASH_NEXT;
++}
++
+ void
+ PresShell::Paint(nsView*        aViewToPaint,
+                  const nsRegion& aDirtyRegion,
+                  uint32_t        aFlags)
+ {
+   PROFILER_LABEL("Paint", "PresShell::Paint");
+   NS_ASSERTION(!mIsDestroying, "painting a destroyed PresShell");
+   NS_ASSERTION(aViewToPaint, "null view");
+@@ -5859,16 +5876,19 @@ PresShell::Paint(nsView*        aViewToP
+   if (frame && isRetainingManager) {
+     // Try to do an empty transaction, if the frame tree does not
+     // need to be updated. Do not try to do an empty transaction on
+     // a non-retained layer manager (like the BasicLayerManager that
+     // draws the window title bar on Mac), because a) it won't work
+     // and b) below we don't want to clear NS_FRAME_UPDATE_LAYER_TREE,
+     // that will cause us to forget to update the real layer manager!
+ 
++    mAnimationUpdates.EnumerateEntries(UpdateAnimationsOnCompositor, nullptr);
++    mAnimationUpdates.Clear();
++
+     if (!(aFlags & PAINT_LAYERS)) {
+       if (layerManager->EndEmptyTransaction()) {
+         return;
+       }
+       NS_WARNING("Must complete empty transaction when compositing!");
+     }
+ 
+     if (!(frame->GetStateBits() & NS_FRAME_UPDATE_LAYER_TREE) &&
+@@ -5911,16 +5931,20 @@ PresShell::Paint(nsView*        aViewToP
+       }
+     }
+     frame->RemoveStateBits(NS_FRAME_UPDATE_LAYER_TREE);
+   }
+   if (frame) {
+     frame->ClearPresShellsFromLastPaint();
+   }
+ 
++  // We're painting, so the animation updates will be made during layer
++  // construction.
++  mAnimationUpdates.Clear();
++
+   nscolor bgcolor = ComputeBackstopColor(aViewToPaint);
+   uint32_t flags = nsLayoutUtils::PAINT_WIDGET_LAYERS | nsLayoutUtils::PAINT_EXISTING_TRANSACTION;
+   if (!(aFlags & PAINT_COMPOSITE)) {
+     flags |= nsLayoutUtils::PAINT_NO_COMPOSITE;
+   }
+   if (mNextPaintCompressed) {
+     flags |= nsLayoutUtils::PAINT_COMPRESSED;
+     mNextPaintCompressed = false;
 diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
 --- a/layout/generic/nsFrame.cpp
 +++ b/layout/generic/nsFrame.cpp
-@@ -4845,17 +4845,17 @@ nsIFrame::InvalidateFrameWithRect(const 
+@@ -4937,16 +4937,25 @@ nsIFrame::SchedulePaint(PaintType aType)
+     displayRoot->AddStateBits(NS_FRAME_UPDATE_LAYER_TREE);
    }
- 
-   *rect = rect->Union(aRect);
+   nsIPresShell* shell = PresContext()->PresShell();
+   if (shell) {
+     shell->AddInvalidateHiddenPresShellObserver(pres->RefreshDriver());
+   }
  }
  
- /*static*/ uint8_t nsIFrame::sLayerIsPrerenderedDataKey;
- 
- bool
--nsIFrame::TryUpdateTransformOnly()
-+nsIFrame::TryUpdateTransformOnly(Layer** aLayerResult)
++void
++nsIFrame::ScheduleAnimationUpdate(nsCSSProperty aProperty)
++{
++  MOZ_ASSERT(aProperty == eCSSProperty_transform,
++             "currently only transform is supported");
++  PresContext()->GetRootPresContext()->PresShell()->
++    AddFrameToAnimationUpdates(this);
++}
++
+ Layer*
+ nsIFrame::InvalidateLayer(uint32_t aDisplayItemKey,
+                           const nsIntRect* aDamageRect,
+                           uint32_t aFlags /* = 0 */)
  {
-   Layer* layer = FrameLayerBuilder::GetDedicatedLayer(
-     this, nsDisplayItem::TYPE_TRANSFORM);
-   if (!layer || !layer->HasUserData(LayerIsPrerenderedDataKey())) {
-     // If this layer isn't prerendered or we clip composites to our OS
-     // window, then we can't correctly optimize to an empty
-     // transaction in general.
-     return false;
-@@ -4884,16 +4884,17 @@ nsIFrame::TryUpdateTransformOnly()
-       !gfx::FuzzyEqual(transform.yy, previousTransform._22, kError) ||
-       !gfx::FuzzyEqual(transform.xy, previousTransform._21, kError) ||
-       !gfx::FuzzyEqual(transform.yx, previousTransform._12, kError)) {
-     return false;
-   }
-   gfx::Matrix4x4 matrix;
-   gfx::ToMatrix4x4(transform3d, matrix);
-   layer->SetBaseTransformForNextTransaction(matrix);
-+  *aLayerResult = layer;
-   return true;
- }
+   NS_ASSERTION(aDisplayItemKey > 0, "Need a key");
  
- bool 
- nsIFrame::IsInvalid(nsRect& aRect)
- {
-   if (!HasAnyStateBits(NS_FRAME_NEEDS_PAINT)) {
-     return false;
+   Layer* layer = FrameLayerBuilder::GetDedicatedLayer(this, aDisplayItemKey);
 diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
 --- a/layout/generic/nsIFrame.h
 +++ b/layout/generic/nsIFrame.h
-@@ -2084,18 +2084,21 @@ public:
-     return &sLayerIsPrerenderedDataKey;
-   }
-   static uint8_t sLayerIsPrerenderedDataKey;
- 
-    /**
-    * Try to update this frame's transform without invalidating any
-    * content.  Return true iff successful.  If unsuccessful, the
-    * caller is responsible for scheduling an invalidating paint.
-+   *
-+   * If the result is true, aLayerResult will be filled in with the
-+   * transform layer for the frame.
-    */
--  bool TryUpdateTransformOnly();
-+  bool TryUpdateTransformOnly(Layer** aLayerResult);
+@@ -2141,16 +2141,24 @@ public:
+   enum PaintType {
+     PAINT_DEFAULT = 0,
+     PAINT_COMPOSITE_ONLY,
+     PAINT_DELAYED_COMPRESS
+   };
+   void SchedulePaint(PaintType aType = PAINT_DEFAULT);
  
    /**
-    * Checks if a frame has had InvalidateFrame() called on it since the
-    * last paint.
++   * In a case where a frame can schedule a paint with
++   * PAINT_COMPOSITE_ONLY but also needs to give updated animation
++   * information to its layer, ScheduleAnimationUpdate will add it to
++   * the set of frames to have such updates done.
++   */
++  void ScheduleAnimationUpdate(nsCSSProperty aProperty);
++
++  /**
+    * Checks if the layer tree includes a dedicated layer for this 
+    * frame/display item key pair, and invalidates at least aDamageRect
+    * area within that layer.
     *
-    * If true, then the invalid rect is returned in aRect, with an
-    * empty rect meaning all pixels drawn by this frame should be
-    * invalidated.
+    * If no layer is found, calls InvalidateFrame() instead.
+    *
+    * @param aDamageRect Area of the layer to invalidate.
+    * @param aDisplayItemKey Display item type.
