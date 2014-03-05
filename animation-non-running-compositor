@@ -1,0 +1,100 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 978712 - Prevent non-running transitions and animations (animations or transitions during their delay period, and animations after they finish) from repeatedly poking layer activity because we think we can run them on the compositor.
+
+This changes the behavior of the CanPerformOnCompositorThread methods of
+both ElementAnimations and ElementTransitions to check that the
+respective animations or transitions are actually running.  This is ok
+because:
+ - The main caller is nsLayoutUtils::HasAnimationsForCompositor, and all
+   of its callers pretty clearly want the more restricted behavior (they're
+   concerned with layer activity)
+ - The only other callers of these functions are
+   nsAnimationManager::FlushAnimations and
+   nsTransitionManager::FlushTransitions (determining when to do
+   throttling), nsAnimationManager::GetAnimationsForCompositor (whose
+   only caller,
+   nsDisplayListBuilder::AddAnimationsAndTransitionsToLayer, also checks
+   IsRunningAt).  I think these also all want or are fine with having
+   the IsRunningAt check.
+
+As to the actual changes:
+ - In the animation manager, I think it's a mistake that
+   ElementAnimation::IsRunningAt didn't already check
+   mIterationDuration, since we throw out animations with a bad
+   iteration-duration in ElementAnimations::EnsureStyleRuleFor.  So this
+   makes that change as well.
+ - In the transition manager, IsRunningAt already checks
+   !IsRemovedSentinel().
+
+I've confirmed in gdb on a device that this fixes the repeated
+nsIFrame::SchedulePaint calls that were the symptom of this bug.
+
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -322,17 +322,17 @@ ElementAnimations::EnsureStyleRuleFor(Ti
+       }
+     }
+   }
+ }
+ 
+ bool
+ ElementAnimation::IsRunningAt(TimeStamp aTime) const
+ {
+-  if (IsPaused()) {
++  if (IsPaused() || mIterationDuration.ToMilliseconds() <= 0.0) {
+     return false;
+   }
+ 
+   double iterationsElapsed = ElapsedDurationAt(aTime) / mIterationDuration;
+   return 0.0 <= iterationsElapsed && iterationsElapsed < mIterationCount;
+ }
+ 
+ 
+@@ -393,18 +393,17 @@ ElementAnimations::CanPerformOnComposito
+       }
+     }
+   }
+ 
+   bool hasOpacity = false;
+   bool hasTransform = false;
+   for (uint32_t animIdx = mAnimations.Length(); animIdx-- != 0; ) {
+     const ElementAnimation& anim = mAnimations[animIdx];
+-    if (anim.mIterationDuration.ToMilliseconds() <= 0.0) {
+-      // No animation data
++    if (!anim.IsRunningAt(now)) {
+       continue;
+     }
+ 
+     for (uint32_t propIdx = 0, propEnd = anim.mProperties.Length();
+          propIdx != propEnd; ++propIdx) {
+       const AnimationProperty& prop = anim.mProperties[propIdx];
+       if (!CanAnimatePropertyOnCompositor(mElement,
+                                           prop.mProperty,
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -166,20 +166,20 @@ ElementTransitions::CanPerformOnComposit
+     }
+   }
+ 
+   bool hasOpacity = false;
+   bool hasTransform = false;
+   bool existsProperty = false;
+   for (uint32_t i = 0, i_end = mPropertyTransitions.Length(); i < i_end; ++i) {
+     const ElementPropertyTransition& pt = mPropertyTransitions[i];
+-    if (pt.IsRemovedSentinel()) {
++    if (!pt.IsRunningAt(now)) {
+       continue;
+     }
+-    
++
+     existsProperty = true;
+ 
+     if (!css::CommonElementAnimationData::CanAnimatePropertyOnCompositor(mElement,
+                                                                          pt.mProperty,
+                                                                          aFlags) ||
+         css::CommonElementAnimationData::IsCompositorAnimationDisabledForFrame(frame)) {
+       return false;
+     }
