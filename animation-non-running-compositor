@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 978712 - Prevent non-running transitions and animations (animations or transitions during their delay period, and animations after they finish) from repeatedly poking layer activity because we think we can run them on the compositor.
+Bug 978712 - Prevent non-running transitions and animations (animations or transitions during their delay period, and animations after they finish) from repeatedly poking layer activity because we think we can run them on the compositor.  r=heycam
 
 This changes the behavior of the CanPerformOnCompositorThread methods of
 both ElementAnimations and ElementTransitions to check that the
@@ -29,6 +29,11 @@ As to the actual changes:
 
 I've confirmed in gdb on a device that this fixes the repeated
 nsIFrame::SchedulePaint calls that were the symptom of this bug.
+
+I believe this patch also makes it so that a short animation of a
+property that can't be animated on the compositor doesn't prevent the
+entire duration of the animation of a property that can from being
+throttled (having the main thread style updates suppressed).
 
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
@@ -72,6 +77,42 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
        const AnimationProperty& prop = anim.mProperties[propIdx];
        if (!CanAnimatePropertyOnCompositor(mElement,
                                            prop.mProperty,
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -172,18 +172,31 @@ struct ElementAnimations MOZ_FINAL
+                NS_LITERAL_STRING("::after");
+   }
+ 
+   void PostRestyleForAnimation(nsPresContext *aPresContext) {
+     nsRestyleHint styleHint = IsForElement() ? eRestyle_Self : eRestyle_Subtree;
+     aPresContext->PresShell()->RestyleForAnimation(mElement, styleHint);
+   }
+ 
+-  // True if this animation can be performed on the compositor thread.
++  // If aFlags contains CanAnimate_AllowPartial, returns whether the
++  // state of this element's animations at the current refresh driver
++  // time contains animation data that can be done on the compositor
++  // thread.  (This is useful for determining whether a layer should be
++  // active, or whether to send data to the layer.)
++  // If aFlags does not contain CanAnimate_AllowPartial, returns whether
++  // the state of this element's animations at the current refresh driver
++  // time can be fully represented by data sent to the compositor.
++  // (This is useful for determining whether throttle the animation
++  // (suppress main-thread style updates).)
++  // Note that when CanPerformOnCompositorThread returns true, it also,
++  // as a side-effect, notifies the ActiveLayerTracker.  FIXME:  This
++  // should probably move to the relevant callers.
+   virtual bool CanPerformOnCompositorThread(CanAnimateFlags aFlags) const MOZ_OVERRIDE;
++
+   virtual bool HasAnimationOfProperty(nsCSSProperty aProperty) const MOZ_OVERRIDE;
+ 
+   // False when we know that our current style rule is valid
+   // indefinitely into the future (because all of our animations are
+   // either completed or paused).  May be invalidated by a style change.
+   bool mNeedsRefreshes;
+ 
+   InfallibleTArray<ElementAnimation> mAnimations;
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
@@ -98,3 +139,37 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
          css::CommonElementAnimationData::IsCompositorAnimationDisabledForFrame(frame)) {
        return false;
      }
+diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
+--- a/layout/style/nsTransitionManager.h
++++ b/layout/style/nsTransitionManager.h
+@@ -82,16 +82,30 @@ struct ElementTransitions MOZ_FINAL
+ {
+   ElementTransitions(mozilla::dom::Element *aElement, nsIAtom *aElementProperty,
+                      nsTransitionManager *aTransitionManager,
+                      mozilla::TimeStamp aNow);
+ 
+   void EnsureStyleRuleFor(mozilla::TimeStamp aRefreshTime);
+ 
+   virtual bool HasAnimationOfProperty(nsCSSProperty aProperty) const MOZ_OVERRIDE;
++
++  // If aFlags contains CanAnimate_AllowPartial, returns whether the
++  // state of this element's transitions at the current refresh driver
++  // time contains transition data that can be done on the compositor
++  // thread.  (This is useful for determining whether a layer should be
++  // active, or whether to send data to the layer.)
++  // If aFlags does not contain CanAnimate_AllowPartial, returns whether
++  // the state of this element's transitions at the current refresh driver
++  // time can be fully represented by data sent to the compositor.
++  // (This is useful for determining whether throttle the transition
++  // (suppress main-thread style updates).)
++  // Note that when CanPerformOnCompositorThread returns true, it also,
++  // as a side-effect, notifies the ActiveLayerTracker.  FIXME:  This
++  // should probably move to the relevant callers.
+   virtual bool CanPerformOnCompositorThread(CanAnimateFlags aFlags) const MOZ_OVERRIDE;
+ 
+   // Either zero or one for each CSS property:
+   nsTArray<ElementPropertyTransition> mPropertyTransitions;
+ };
+ 
+ 
+ 
