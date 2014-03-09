@@ -3,12 +3,161 @@ From: L. David Baron <dbaron@dbaron.org>
 Bug 960465 patch N - Use a RestyleTracker for the coalescing in the miniflush (animation-only style flush).
 
 This changes the coalescing behavior during the animation-only style
-flush in multiple ways:
+flush by doing tree-based coalescing between the style updates required
+by animations and those required by transitions, rather than doing
+animations and transitions separately.
 
- (1) It does tree-based coalescing between the style updates required by
-     animations and those required by transitions, rather than doing
-     animations and transitions separately.
-
- (2) It does not rebuild the rule tree path for elements with animations
-     or transitions that are not throttled.
-
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1470,18 +1470,22 @@ void
+ RestyleManager::UpdateOnlySuppressedAnimationStyles()
+ {
+   TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
+   if (mLastUpdateForThrottledAnimations == now) {
+     return;
+   }
+   mLastUpdateForThrottledAnimations = now;
+ 
+-  mPresContext->TransitionManager()->UpdateAllThrottledStyles();
+-  mPresContext->AnimationManager()->UpdateAllThrottledStyles();
++  RestyleTracker tracker;
++
++  mPresContext->TransitionManager()->AddThrottledStyleUpdatesTo(tracker);
++  mPresContext->AnimationManager()->AddThrottledStyleUpdatesTo(tracker);
++
++  tracker.ProcessRestyles();
+ }
+ 
+ void
+ RestyleManager::PostRestyleEventCommon(Element* aElement,
+                                        nsRestyleHint aRestyleHint,
+                                        nsChangeHint aMinChangeHint,
+                                        bool aForAnimation)
+ {
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -1187,8 +1187,30 @@ nsAnimationManager::UpdateAllThrottledSt
+   if (PR_CLIST_IS_EMPTY(&mElementData)) {
+     // no throttled animations, leave early
+     return;
+   }
+ 
+   UpdateAllThrottledStylesInternal();
+ }
+ 
++void
++nsAnimationManager::AddThrottledStyleUpdatesTo(RestyleTracker& aTracker)
++{
++  PRCList *next = PR_LIST_HEAD(&mElementData);
++  while (next != &mElementData) {
++    ElementAnimations *et = static_cast<ElementAnimations*>(next);
++    next = PR_NEXT_LINK(next);
++
++    // FIXME: This should only add transitions that are being throttled.
++    // (The old code didn't do that, though; it updated everything.)
++
++    if (et->mElementProperty != nsGkAtoms::animationsProperty) {
++      // We don't support compositor-driven animation of :before/:after
++      // transitions, so at least skip those.
++      continue;
++    }
++
++    aTracker.AddPendingRestyle(et->mElement, eRestyle_CSSAnimations,
++                               nsChangeHint(0));
++  }
++}
++
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -286,16 +286,21 @@ public:
+       DoDispatchEvents();
+     }
+   }
+ 
+   ElementAnimations* GetElementAnimations(mozilla::dom::Element *aElement,
+                                           nsCSSPseudoElements::Type aPseudoType,
+                                           bool aCreateIfNeeded);
+ 
++  // Tell the restyle tracker about all the styles that we're currently
++  // throttling, i.e., suppressing updates of on the main thread, so
++  // that it can update those styles.
++  void AddThrottledStyleUpdatesTo(RestyleTracker& aTracker);
++
+   // Updates styles on throttled animations. See note on nsTransitionManager
+   void UpdateAllThrottledStyles();
+ 
+ protected:
+   virtual void ElementDataRemoved() MOZ_OVERRIDE
+   {
+     CheckNeedsRefresh();
+   }
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -256,16 +256,38 @@ nsTransitionManager::UpdateAllThrottledS
+     // no throttled transitions, leave early
+     return;
+   }
+ 
+   UpdateAllThrottledStylesInternal();
+ }
+ 
+ void
++nsTransitionManager::AddThrottledStyleUpdatesTo(RestyleTracker& aTracker)
++{
++  PRCList *next = PR_LIST_HEAD(&mElementData);
++  while (next != &mElementData) {
++    ElementTransitions *et = static_cast<ElementTransitions*>(next);
++    next = PR_NEXT_LINK(next);
++
++    // FIXME: This should only add transitions that are being throttled.
++    // (The old code didn't do that, though; it updated everything.)
++
++    if (et->mElementProperty != nsGkAtoms::transitionsProperty) {
++      // We don't support compositor-driven animation of :before/:after
++      // transitions, so at least skip those.
++      continue;
++    }
++
++    aTracker.AddPendingRestyle(et->mElement, eRestyle_CSSTransitions,
++                               nsChangeHint(0));
++  }
++}
++
++void
+ nsTransitionManager::ElementDataRemoved()
+ {
+   // If we have no transitions or animations left, remove ourselves from
+   // the refresh driver.
+   if (PR_CLIST_IS_EMPTY(&mElementData)) {
+     mPresContext->RefreshDriver()->RemoveRefreshObserver(this, Flush_Style);
+   }
+ }
+diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
+--- a/layout/style/nsTransitionManager.h
++++ b/layout/style/nsTransitionManager.h
+@@ -186,16 +186,21 @@ public:
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+     MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+ 
+   // nsARefreshObserver
+   virtual void WillRefresh(mozilla::TimeStamp aTime) MOZ_OVERRIDE;
+ 
+   void FlushTransitions(FlushFlags aFlags);
+ 
++  // Tell the restyle tracker about all the styles that we're currently
++  // throttling, i.e., suppressing updates of on the main thread, so
++  // that it can update those styles.
++  void AddThrottledStyleUpdatesTo(RestyleTracker& aTracker);
++
+   // Performs a 'mini-flush' to make styles from throttled transitions
+   // up-to-date prior to processing an unrelated style change, so that
+   // any transitions triggered by that style change produce correct
+   // results.
+   //
+   // In more detail:  when we're able to run animations on the
+   // compositor, we sometimes "throttle" these animations by skipping
+   // updating style data on the main thread.  However, whenever we
