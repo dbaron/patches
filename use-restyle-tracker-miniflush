@@ -2,6 +2,16 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 960465 patch N - Use a RestyleTracker for the coalescing in the miniflush (animation-only style flush).
 
+This changes the coalescing behavior during the animation-only style
+flush in multiple ways:
+
+ (1) It does tree-based coalescing between the style updates required by
+     animations and those required by transitions, rather than doing
+     animations and transitions separately.
+
+ (2) It does not rebuild the rule tree path for elements with animations
+     or transitions that are not throttled.
+
 diff --git a/content/base/public/Element.h b/content/base/public/Element.h
 --- a/content/base/public/Element.h
 +++ b/content/base/public/Element.h
@@ -51,3 +61,386 @@ diff --git a/content/base/public/Element.h b/content/base/public/Element.h
  ASSERT_NODE_FLAGS_SPACE(ELEMENT_TYPE_SPECIFIC_BITS_OFFSET);
  
  namespace mozilla {
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1470,18 +1470,57 @@ void
+ RestyleManager::UpdateOnlySuppressedAnimationStyles()
+ {
+   TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
+   if (mLastUpdateForThrottledAnimations == now) {
+     return;
+   }
+   mLastUpdateForThrottledAnimations = now;
+ 
+-  mPresContext->TransitionManager()->UpdateAllThrottledStyles();
+-  mPresContext->AnimationManager()->UpdateAllThrottledStyles();
++  nsStyleChangeList changeList;
++
++  /* update each transitioning element by finding its root-most ancestor
++     with a transition, and flushing the style on that ancestor and all
++     its descendants*/
++  PRCList *next = PR_LIST_HEAD(&mElementData);
++  while (next != &mElementData) {
++    CommonElementAnimationData* ea =
++      static_cast<CommonElementAnimationData*>(next);
++    next = PR_NEXT_LINK(next);
++
++    /* element is initialised to the starting element (i.e., one we know has
++       an animation) and ends up with the root-most animated ancestor,
++       that is, the element where we begin updates. */
++    dom::Element* element = ea->mElement;
++    /* make a list of ancestors */
++    nsTArray<dom::Element*> ancestors;
++    do {
++      ancestors.AppendElement(element);
++    } while ((element = element->GetParentElement()));
++
++    /* walk down the ancestors until we find one with a throttled transition */
++    for (int32_t i = ancestors.Length() - 1; i >= 0; --i) {
++      if (animations_getter_(ancestors[i],
++                            nsCSSPseudoElements::ePseudo_NotPseudoElement,
++                            false)) {
++        element = ancestors[i];
++        break;
++      }
++    }
++
++    nsIFrame* primaryFrame;
++    if (element &&
++        (primaryFrame = nsLayoutUtils::GetStyleFrame(element))) {
++      UpdateThrottledStylesForSubtree(element,
++        primaryFrame->StyleContext()->GetParent(), changeList);
++    }
++  }
++
++  ProcessRestyledFrames(changeList);
++  FlushOverflowChangedTracker();
+ }
+ 
+ void
+ RestyleManager::PostRestyleEventCommon(Element* aElement,
+                                        nsRestyleHint aRestyleHint,
+                                        nsChangeHint aMinChangeHint,
+                                        bool aForAnimation)
+ {
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -150,16 +150,36 @@ public:
+   // and end of its work.
+   void BeginProcessingRestyles();
+   void EndProcessingRestyles();
+ 
+   // Update styles for animations that are running on the compositor and
+   // whose updating is suppressed on the main thread (to save
+   // unnecessary work), while leaving all other aspects of style
+   // out-of-date.
++  //
++  // Performs a 'mini-flush' to make styles from throttled transitions
++  // up-to-date prior to processing an unrelated style change, so that
++  // any transitions triggered by that style change produce correct
++  // results.
++  //
++  // In more detail:  when we're able to run animations on the
++  // compositor, we sometimes "throttle" these animations by skipping
++  // updating style data on the main thread.  However, whenever we
++  // process a normal (non-animation) style change, any changes in
++  // computed style on elements that have transition-* properties set
++  // may need to trigger new transitions; this process requires knowing
++  // both the old and new values of the property.  To do this correctly,
++  // we need to have an up-to-date *old* value of the property on the
++  // primary frame.  So the purpose of the mini-flush is to update the
++  // style for all throttled transitions and animations to the current
++  // animation state without making any other updates, so that when we
++  // process the queued style updates we'll have correct old data to
++  // compare against.  When we do this, we don't bother touching frames
++  // other than primary frames.
+   void UpdateOnlySuppressedAnimationStyles();
+ 
+   // Rebuilds all style data by throwing out the old rule tree and
+   // building a new one, and additionally applying aExtraHint (which
+   // must not contain nsChangeHint_ReconstructFrame) to the root frame.
+   void RebuildAllStyleData(nsChangeHint aExtraHint);
+ 
+   // Helper that does part of the work of RebuildAllStyleData, shared by
+diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
+--- a/layout/style/AnimationCommon.h
++++ b/layout/style/AnimationCommon.h
+@@ -86,73 +86,16 @@ protected:
+                                      nsIFrame* aPrimaryFrame,
+                                      nsStyleContext* aNewStyle,
+                                      nsStyleSet* aStyleSet);
+ 
+   PRCList mElementData;
+   nsPresContext *mPresContext; // weak (non-null from ctor to Disconnect)
+ };
+ 
+-// The internals of UpdateAllThrottledStyles, used by nsAnimationManager and
+-// nsTransitionManager, see the comments in the declaration of the latter.
+-#define IMPL_UPDATE_ALL_THROTTLED_STYLES_INTERNAL(class_, animations_getter_)  \
+-void                                                                           \
+-class_::UpdateAllThrottledStylesInternal()                                     \
+-{                                                                              \
+-  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();          \
+-                                                                               \
+-  nsStyleChangeList changeList;                                                \
+-                                                                               \
+-  /* update each transitioning element by finding its root-most ancestor
+-     with a transition, and flushing the style on that ancestor and all
+-     its descendants*/                                                         \
+-  PRCList *next = PR_LIST_HEAD(&mElementData);                                 \
+-  while (next != &mElementData) {                                              \
+-    CommonElementAnimationData* ea =                                           \
+-      static_cast<CommonElementAnimationData*>(next);                          \
+-    next = PR_NEXT_LINK(next);                                                 \
+-                                                                               \
+-    if (ea->mFlushGeneration == now) {                                         \
+-      /* this element has been ticked already */                               \
+-      continue;                                                                \
+-    }                                                                          \
+-                                                                               \
+-    /* element is initialised to the starting element (i.e., one we know has
+-       an animation) and ends up with the root-most animated ancestor,
+-       that is, the element where we begin updates. */                         \
+-    dom::Element* element = ea->mElement;                                      \
+-    /* make a list of ancestors */                                             \
+-    nsTArray<dom::Element*> ancestors;                                         \
+-    do {                                                                       \
+-      ancestors.AppendElement(element);                                        \
+-    } while ((element = element->GetParentElement()));                         \
+-                                                                               \
+-    /* walk down the ancestors until we find one with a throttled transition */\
+-    for (int32_t i = ancestors.Length() - 1; i >= 0; --i) {                    \
+-      if (animations_getter_(ancestors[i],                                     \
+-                            nsCSSPseudoElements::ePseudo_NotPseudoElement,     \
+-                            false)) {                                          \
+-        element = ancestors[i];                                                \
+-        break;                                                                 \
+-      }                                                                        \
+-    }                                                                          \
+-                                                                               \
+-    nsIFrame* primaryFrame;                                                    \
+-    if (element &&                                                             \
+-        (primaryFrame = nsLayoutUtils::GetStyleFrame(element))) {              \
+-      UpdateThrottledStylesForSubtree(element,                                 \
+-        primaryFrame->StyleContext()->GetParent(), changeList);                \
+-    }                                                                          \
+-  }                                                                            \
+-                                                                               \
+-  RestyleManager* restyleManager = mPresContext->RestyleManager();             \
+-  restyleManager->ProcessRestyledFrames(changeList);                           \
+-  restyleManager->FlushOverflowChangedTracker();                               \
+-}
+-
+ /**
+  * A style rule that maps property-nsStyleAnimation::Value pairs.
+  */
+ class AnimValuesStyleRule MOZ_FINAL : public nsIStyleRule
+ {
+ public:
+   // nsISupports implementation
+   NS_DECL_ISUPPORTS
+@@ -289,16 +232,17 @@ struct CommonElementAnimationData : publ
+   void UpdateAnimationGeneration(nsPresContext* aPresContext);
+ 
+   // The refresh time associated with mStyleRule.
+   TimeStamp mStyleRuleRefreshTime;
+ 
+   // Generation counter for flushes of throttled animations.
+   // Used to prevent updating the styles twice for a given element during
+   // UpdateAllThrottledStyles.
++  // FIXME: Remove in later patch!
+   TimeStamp mFlushGeneration;
+ 
+ #ifdef DEBUG
+   bool mCalledPropertyDtor;
+ #endif
+ };
+ 
+ }
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -1158,37 +1158,20 @@ nsAnimationManager::UpdateThrottledStyle
+ 
+   ElementAnimations* ea;
+   if (element &&
+       (ea = GetElementAnimations(element,
+                                  nsCSSPseudoElements::ePseudo_NotPseudoElement,
+                                  false))) {
+     // re-resolve our style
+     newStyle = UpdateThrottledStyle(element, aParentStyle, aChangeList);
+-    // remove the current transition from the working set
+-    ea->mFlushGeneration = mPresContext->RefreshDriver()->MostRecentRefresh();
+   } else {
+     newStyle = ReparentContent(aContent, aParentStyle);
+   }
+ 
+   // walk the children
+   if (newStyle) {
+     for (nsIContent *child = aContent->GetFirstChild(); child;
+          child = child->GetNextSibling()) {
+       UpdateThrottledStylesForSubtree(child, newStyle, aChangeList);
+     }
+   }
+ }
+-
+-IMPL_UPDATE_ALL_THROTTLED_STYLES_INTERNAL(nsAnimationManager,
+-                                          GetElementAnimations)
+-
+-void
+-nsAnimationManager::UpdateAllThrottledStyles()
+-{
+-  if (PR_CLIST_IS_EMPTY(&mElementData)) {
+-    // no throttled animations, leave early
+-    return;
+-  }
+-
+-  UpdateAllThrottledStylesInternal();
+-}
+-
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -286,19 +286,16 @@ public:
+       DoDispatchEvents();
+     }
+   }
+ 
+   ElementAnimations* GetElementAnimations(mozilla::dom::Element *aElement,
+                                           nsCSSPseudoElements::Type aPseudoType,
+                                           bool aCreateIfNeeded);
+ 
+-  // Updates styles on throttled animations. See note on nsTransitionManager
+-  void UpdateAllThrottledStyles();
+-
+ protected:
+   virtual void ElementDataRemoved() MOZ_OVERRIDE
+   {
+     CheckNeedsRefresh();
+   }
+   virtual void AddElementData(mozilla::css::CommonElementAnimationData* aData) MOZ_OVERRIDE;
+ 
+   /**
+@@ -331,17 +328,16 @@ private:
+                                  nsCSSPseudoElements::Type aPseudoType);
+ 
+   // Update the animated styles of an element and its descendants.
+   // If the element has an animation, it is flushed back to its primary frame.
+   // If the element does not have an animation, then its style is reparented.
+   void UpdateThrottledStylesForSubtree(nsIContent* aContent,
+                                        nsStyleContext* aParentStyle,
+                                        nsStyleChangeList &aChangeList);
+-  void UpdateAllThrottledStylesInternal();
+ 
+   // The guts of DispatchEvents
+   void DoDispatchEvents();
+ 
+   EventArray mPendingEvents;
+ 
+   bool mObservingRefreshDriver;
+ };
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -226,45 +226,29 @@ nsTransitionManager::UpdateThrottledStyl
+ 
+   ElementTransitions* et;
+   if (element &&
+       (et = GetElementTransitions(element,
+                                   nsCSSPseudoElements::ePseudo_NotPseudoElement,
+                                   false))) {
+     // re-resolve our style
+     newStyle = UpdateThrottledStyle(element, aParentStyle, aChangeList);
+-    // remove the current transition from the working set
+-    et->mFlushGeneration = mPresContext->RefreshDriver()->MostRecentRefresh();
+   } else {
+     newStyle = ReparentContent(aContent, aParentStyle);
+   }
+ 
+   // walk the children
+   if (newStyle) {
+     for (nsIContent *child = aContent->GetFirstChild(); child;
+          child = child->GetNextSibling()) {
+       UpdateThrottledStylesForSubtree(child, newStyle, aChangeList);
+     }
+   }
+ }
+ 
+-IMPL_UPDATE_ALL_THROTTLED_STYLES_INTERNAL(nsTransitionManager,
+-                                          GetElementTransitions)
+-
+-void
+-nsTransitionManager::UpdateAllThrottledStyles()
+-{
+-  if (PR_CLIST_IS_EMPTY(&mElementData)) {
+-    // no throttled transitions, leave early
+-    return;
+-  }
+-
+-  UpdateAllThrottledStylesInternal();
+-}
+-
+ void
+ nsTransitionManager::ElementDataRemoved()
+ {
+   // If we have no transitions or animations left, remove ourselves from
+   // the refresh driver.
+   if (PR_CLIST_IS_EMPTY(&mElementData)) {
+     mPresContext->RefreshDriver()->RemoveRefreshObserver(this, Flush_Style);
+   }
+diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
+--- a/layout/style/nsTransitionManager.h
++++ b/layout/style/nsTransitionManager.h
+@@ -186,37 +186,16 @@ public:
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+     MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+ 
+   // nsARefreshObserver
+   virtual void WillRefresh(mozilla::TimeStamp aTime) MOZ_OVERRIDE;
+ 
+   void FlushTransitions(FlushFlags aFlags);
+ 
+-  // Performs a 'mini-flush' to make styles from throttled transitions
+-  // up-to-date prior to processing an unrelated style change, so that
+-  // any transitions triggered by that style change produce correct
+-  // results.
+-  //
+-  // In more detail:  when we're able to run animations on the
+-  // compositor, we sometimes "throttle" these animations by skipping
+-  // updating style data on the main thread.  However, whenever we
+-  // process a normal (non-animation) style change, any changes in
+-  // computed style on elements that have transition-* properties set
+-  // may need to trigger new transitions; this process requires knowing
+-  // both the old and new values of the property.  To do this correctly,
+-  // we need to have an up-to-date *old* value of the property on the
+-  // primary frame.  So the purpose of the mini-flush is to update the
+-  // style for all throttled transitions and animations to the current
+-  // animation state without making any other updates, so that when we
+-  // process the queued style updates we'll have correct old data to
+-  // compare against.  When we do this, we don't bother touching frames
+-  // other than primary frames.
+-  void UpdateAllThrottledStyles();
+-
+   ElementTransitions* GetElementTransitions(mozilla::dom::Element *aElement,
+                                           nsCSSPseudoElements::Type aPseudoType,
+                                           bool aCreateIfNeeded);
+ 
+ protected:
+   virtual void ElementDataRemoved() MOZ_OVERRIDE;
+   virtual void AddElementData(mozilla::css::CommonElementAnimationData* aData) MOZ_OVERRIDE;
+ 
+@@ -232,12 +211,11 @@ private:
+   void WalkTransitionRule(ElementDependentRuleProcessorData* aData,
+                           nsCSSPseudoElements::Type aPseudoType);
+   // Update the animated styles of an element and its descendants.
+   // If the element has a transition, it is flushed back to its primary frame.
+   // If the element does not have a transition, then its style is reparented.
+   void UpdateThrottledStylesForSubtree(nsIContent* aContent,
+                                        nsStyleContext* aParentStyle,
+                                        nsStyleChangeList &aChangeList);
+-  void UpdateAllThrottledStylesInternal();
+ };
+ 
+ #endif /* !defined(nsTransitionManager_h_) */
