@@ -1,0 +1,351 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 960465 patch N - Move miniflush code from AnimationCommon to RestyleManager.
+
+This contains no changes other than moving the code and updating the
+callers.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1474,16 +1474,139 @@ RestyleManager::UpdateOnlySuppressedAnim
+     return;
+   }
+   mLastUpdateForThrottledAnimations = now;
+ 
+   mPresContext->TransitionManager()->UpdateAllThrottledStyles();
+   mPresContext->AnimationManager()->UpdateAllThrottledStyles();
+ }
+ 
++already_AddRefed<nsStyleContext>
++RestyleManager::ReparentContent(nsIContent* aContent,
++                                nsStyleContext* aParentStyle)
++{
++  nsStyleSet* styleSet = mPresContext->PresShell()->StyleSet();
++  nsIFrame* primaryFrame = nsLayoutUtils::GetStyleFrame(aContent);
++  if (!primaryFrame) {
++    return nullptr;
++  }
++
++  dom::Element* element = aContent->IsElement()
++                          ? aContent->AsElement()
++                          : nullptr;
++
++  nsRefPtr<nsStyleContext> newStyle =
++    styleSet->ReparentStyleContext(primaryFrame->StyleContext(),
++                                   aParentStyle, element);
++  primaryFrame->SetStyleContext(newStyle);
++  ReparentBeforeAndAfter(element, primaryFrame, newStyle, styleSet);
++
++  return newStyle.forget();
++}
++
++/* static */ void
++RestyleManager::ReparentBeforeAndAfter(dom::Element* aElement,
++                                       nsIFrame* aPrimaryFrame,
++                                       nsStyleContext* aNewStyle,
++                                       nsStyleSet* aStyleSet)
++{
++  if (nsIFrame* before = nsLayoutUtils::GetBeforeFrame(aPrimaryFrame)) {
++    nsRefPtr<nsStyleContext> beforeStyle =
++      aStyleSet->ReparentStyleContext(before->StyleContext(),
++                                     aNewStyle, aElement);
++    before->SetStyleContext(beforeStyle);
++  }
++  if (nsIFrame* after = nsLayoutUtils::GetBeforeFrame(aPrimaryFrame)) {
++    nsRefPtr<nsStyleContext> afterStyle =
++      aStyleSet->ReparentStyleContext(after->StyleContext(),
++                                     aNewStyle, aElement);
++    after->SetStyleContext(afterStyle);
++  }
++}
++
++nsStyleContext*
++RestyleManager::UpdateThrottledStyle(dom::Element* aElement,
++                                     nsStyleContext* aParentStyle,
++                                     nsStyleChangeList& aChangeList)
++{
++  NS_ASSERTION(mPresContext->TransitionManager()->GetElementTransitions(
++                 aElement,
++                 nsCSSPseudoElements::ePseudo_NotPseudoElement,
++                 false) ||
++               mPresContext->AnimationManager()->GetElementAnimations(
++                 aElement,
++                 nsCSSPseudoElements::ePseudo_NotPseudoElement,
++                 false), "element not animated");
++
++  nsIFrame* primaryFrame = nsLayoutUtils::GetStyleFrame(aElement);
++  if (!primaryFrame) {
++    return nullptr;
++  }
++
++  nsStyleContext* oldStyle = primaryFrame->StyleContext();
++  nsRuleNode* ruleNode = oldStyle->RuleNode();
++  nsTArray<nsStyleSet::RuleAndLevel> rules;
++  do {
++    if (ruleNode->IsRoot()) {
++      break;
++    }
++
++    nsStyleSet::RuleAndLevel curRule;
++    curRule.mLevel = ruleNode->GetLevel();
++
++    if (curRule.mLevel == nsStyleSet::eAnimationSheet) {
++      ElementAnimations* ea =
++        mPresContext->AnimationManager()->GetElementAnimations(
++          aElement,
++          oldStyle->GetPseudoType(),
++          false);
++      NS_ASSERTION(ea,
++        "Rule has level eAnimationSheet without animation on manager");
++
++      mPresContext->AnimationManager()->EnsureStyleRuleFor(ea);
++      curRule.mRule = ea->mStyleRule;
++    } else if (curRule.mLevel == nsStyleSet::eTransitionSheet) {
++      ElementTransitions *et =
++        mPresContext->TransitionManager()->GetElementTransitions(
++          aElement,
++          oldStyle->GetPseudoType(),
++          false);
++      NS_ASSERTION(et,
++        "Rule has level eTransitionSheet without transition on manager");
++
++      et->EnsureStyleRuleFor(mPresContext->RefreshDriver()->MostRecentRefresh());
++      curRule.mRule = et->mStyleRule;
++    } else {
++      curRule.mRule = ruleNode->GetRule();
++    }
++
++    if (curRule.mRule) {
++      rules.AppendElement(curRule);
++    }
++  } while ((ruleNode = ruleNode->GetParent()));
++
++  nsRefPtr<nsStyleContext> newStyle = mPresContext->PresShell()->StyleSet()->
++    ResolveStyleForRules(aParentStyle, oldStyle, rules);
++
++  // We absolutely must call CalcStyleDifference in order to ensure the
++  // new context has all the structs cached that the old context had.
++  // We also need it for processing of the changes.
++  nsChangeHint styleChange =
++    oldStyle->CalcStyleDifference(newStyle, nsChangeHint(0));
++  aChangeList.AppendChange(primaryFrame, primaryFrame->GetContent(),
++                           styleChange);
++
++  primaryFrame->SetStyleContext(newStyle);
++
++  ReparentBeforeAndAfter(aElement, primaryFrame, newStyle,
++                         mPresContext->PresShell()->StyleSet());
++
++  return newStyle;
++}
++
+ void
+ RestyleManager::PostRestyleEventCommon(Element* aElement,
+                                        nsRestyleHint aRestyleHint,
+                                        nsChangeHint aMinChangeHint,
+                                        bool aForAnimation)
+ {
+   if (MOZ_UNLIKELY(mPresContext->PresShell()->IsDestroying())) {
+     return;
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -143,139 +143,16 @@ CommonAnimationManager::ExtractComputedV
+                         nsStyleAnimation::eUnit_Enumerated,
+                       "unexpected unit");
+     aComputedValue.SetIntValue(aComputedValue.GetIntValue(),
+                                nsStyleAnimation::eUnit_Visibility);
+   }
+   return result;
+ }
+ 
+-already_AddRefed<nsStyleContext>
+-CommonAnimationManager::ReparentContent(nsIContent* aContent,
+-                                        nsStyleContext* aParentStyle)
+-{
+-  nsStyleSet* styleSet = mPresContext->PresShell()->StyleSet();
+-  nsIFrame* primaryFrame = nsLayoutUtils::GetStyleFrame(aContent);
+-  if (!primaryFrame) {
+-    return nullptr;
+-  }
+-
+-  dom::Element* element = aContent->IsElement()
+-                          ? aContent->AsElement()
+-                          : nullptr;
+-
+-  nsRefPtr<nsStyleContext> newStyle =
+-    styleSet->ReparentStyleContext(primaryFrame->StyleContext(),
+-                                   aParentStyle, element);
+-  primaryFrame->SetStyleContext(newStyle);
+-  ReparentBeforeAndAfter(element, primaryFrame, newStyle, styleSet);
+-
+-  return newStyle.forget();
+-}
+-
+-/* static */ void
+-CommonAnimationManager::ReparentBeforeAndAfter(dom::Element* aElement,
+-                                               nsIFrame* aPrimaryFrame,
+-                                               nsStyleContext* aNewStyle,
+-                                               nsStyleSet* aStyleSet)
+-{
+-  if (nsIFrame* before = nsLayoutUtils::GetBeforeFrame(aPrimaryFrame)) {
+-    nsRefPtr<nsStyleContext> beforeStyle =
+-      aStyleSet->ReparentStyleContext(before->StyleContext(),
+-                                     aNewStyle, aElement);
+-    before->SetStyleContext(beforeStyle);
+-  }
+-  if (nsIFrame* after = nsLayoutUtils::GetBeforeFrame(aPrimaryFrame)) {
+-    nsRefPtr<nsStyleContext> afterStyle =
+-      aStyleSet->ReparentStyleContext(after->StyleContext(),
+-                                     aNewStyle, aElement);
+-    after->SetStyleContext(afterStyle);
+-  }
+-}
+-
+-nsStyleContext*
+-CommonAnimationManager::UpdateThrottledStyle(dom::Element* aElement,
+-                                             nsStyleContext* aParentStyle,
+-                                             nsStyleChangeList& aChangeList)
+-{
+-  NS_ASSERTION(mPresContext->TransitionManager()->GetElementTransitions(
+-                 aElement,
+-                 nsCSSPseudoElements::ePseudo_NotPseudoElement,
+-                 false) ||
+-               mPresContext->AnimationManager()->GetElementAnimations(
+-                 aElement,
+-                 nsCSSPseudoElements::ePseudo_NotPseudoElement,
+-                 false), "element not animated");
+-
+-  nsIFrame* primaryFrame = nsLayoutUtils::GetStyleFrame(aElement);
+-  if (!primaryFrame) {
+-    return nullptr;
+-  }
+-
+-  nsStyleContext* oldStyle = primaryFrame->StyleContext();
+-  nsRuleNode* ruleNode = oldStyle->RuleNode();
+-  nsTArray<nsStyleSet::RuleAndLevel> rules;
+-  do {
+-    if (ruleNode->IsRoot()) {
+-      break;
+-    }
+-
+-    nsStyleSet::RuleAndLevel curRule;
+-    curRule.mLevel = ruleNode->GetLevel();
+-
+-    if (curRule.mLevel == nsStyleSet::eAnimationSheet) {
+-      ElementAnimations* ea =
+-        mPresContext->AnimationManager()->GetElementAnimations(
+-          aElement,
+-          oldStyle->GetPseudoType(),
+-          false);
+-      NS_ASSERTION(ea,
+-        "Rule has level eAnimationSheet without animation on manager");
+-
+-      mPresContext->AnimationManager()->EnsureStyleRuleFor(ea);
+-      curRule.mRule = ea->mStyleRule;
+-    } else if (curRule.mLevel == nsStyleSet::eTransitionSheet) {
+-      ElementTransitions *et =
+-        mPresContext->TransitionManager()->GetElementTransitions(
+-          aElement,
+-          oldStyle->GetPseudoType(),
+-          false);
+-      NS_ASSERTION(et,
+-        "Rule has level eTransitionSheet without transition on manager");
+-
+-      et->EnsureStyleRuleFor(mPresContext->RefreshDriver()->MostRecentRefresh());
+-      curRule.mRule = et->mStyleRule;
+-    } else {
+-      curRule.mRule = ruleNode->GetRule();
+-    }
+-
+-    if (curRule.mRule) {
+-      rules.AppendElement(curRule);
+-    }
+-  } while ((ruleNode = ruleNode->GetParent()));
+-
+-  nsRefPtr<nsStyleContext> newStyle = mPresContext->PresShell()->StyleSet()->
+-    ResolveStyleForRules(aParentStyle, oldStyle, rules);
+-
+-  // We absolutely must call CalcStyleDifference in order to ensure the
+-  // new context has all the structs cached that the old context had.
+-  // We also need it for processing of the changes.
+-  nsChangeHint styleChange =
+-    oldStyle->CalcStyleDifference(newStyle, nsChangeHint(0));
+-  aChangeList.AppendChange(primaryFrame, primaryFrame->GetContent(),
+-                           styleChange);
+-
+-  primaryFrame->SetStyleContext(newStyle);
+-
+-  ReparentBeforeAndAfter(aElement, primaryFrame, newStyle,
+-                         mPresContext->PresShell()->StyleSet());
+-
+-  return newStyle;
+-}
+-
+ NS_IMPL_ISUPPORTS1(AnimValuesStyleRule, nsIStyleRule)
+ 
+ /* virtual */ void
+ AnimValuesStyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   nsStyleContext *contextParent = aRuleData->mStyleContext->GetParent();
+   if (contextParent && contextParent->HasPseudoElementData()) {
+     // Don't apply transitions or animations to things inside of
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -1157,21 +1157,23 @@ nsAnimationManager::UpdateThrottledStyle
+   nsRefPtr<nsStyleContext> newStyle;
+ 
+   ElementAnimations* ea;
+   if (element &&
+       (ea = GetElementAnimations(element,
+                                  nsCSSPseudoElements::ePseudo_NotPseudoElement,
+                                  false))) {
+     // re-resolve our style
+-    newStyle = UpdateThrottledStyle(element, aParentStyle, aChangeList);
++    newStyle = mPresContext->RestyleManager()->
++      UpdateThrottledStyle(element, aParentStyle, aChangeList);
+     // remove the current transition from the working set
+     ea->mFlushGeneration = mPresContext->RefreshDriver()->MostRecentRefresh();
+   } else {
+-    newStyle = ReparentContent(aContent, aParentStyle);
++    newStyle =
++      mPresContext->RestyleManager()->ReparentContent(aContent, aParentStyle);
+   }
+ 
+   // walk the children
+   if (newStyle) {
+     for (nsIContent *child = aContent->GetFirstChild(); child;
+          child = child->GetNextSibling()) {
+       UpdateThrottledStylesForSubtree(child, newStyle, aChangeList);
+     }
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -225,21 +225,23 @@ nsTransitionManager::UpdateThrottledStyl
+   nsRefPtr<nsStyleContext> newStyle;
+ 
+   ElementTransitions* et;
+   if (element &&
+       (et = GetElementTransitions(element,
+                                   nsCSSPseudoElements::ePseudo_NotPseudoElement,
+                                   false))) {
+     // re-resolve our style
+-    newStyle = UpdateThrottledStyle(element, aParentStyle, aChangeList);
++    newStyle = mPresContext->RestyleManager()->
++      UpdateThrottledStyle(element, aParentStyle, aChangeList);
+     // remove the current transition from the working set
+     et->mFlushGeneration = mPresContext->RefreshDriver()->MostRecentRefresh();
+   } else {
+-    newStyle = ReparentContent(aContent, aParentStyle);
++    newStyle =
++      mPresContext->RestyleManager()->ReparentContent(aContent, aParentStyle);
+   }
+ 
+   // walk the children
+   if (newStyle) {
+     for (nsIContent *child = aContent->GetFirstChild(); child;
+          child = child->GetNextSibling()) {
+       UpdateThrottledStylesForSubtree(child, newStyle, aChangeList);
+     }
