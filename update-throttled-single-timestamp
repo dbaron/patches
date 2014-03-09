@@ -1,0 +1,263 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 960465 patch N - Move the knowledge of when we last updated main-thread-suppressed animation styles into the restyle manager rather than have two separate but always equal timestamps for animations and transitions.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -46,16 +46,18 @@ using namespace layers;
+ 
+ RestyleManager::RestyleManager(nsPresContext* aPresContext)
+   : mPresContext(aPresContext)
+   , mRebuildAllStyleData(false)
+   , mObservingRefreshDriver(false)
+   , mInStyleRefresh(false)
+   , mHoverGeneration(0)
+   , mRebuildAllExtraHint(nsChangeHint(0))
++  , mLastUpdateForThrottledAnimations(aPresContext->RefreshDriver()->
++                                        MostRecentRefresh())
+   , mAnimationGeneration(0)
+   , mPendingRestyles(ELEMENT_HAS_PENDING_RESTYLE |
+                      ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
+   , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
+                               ELEMENT_IS_POTENTIAL_ANIMATION_RESTYLE_ROOT)
+ {
+   mPendingRestyles.Init(this);
+   mPendingAnimationRestyles.Init(this);
+@@ -1462,16 +1464,22 @@ RestyleManager::EndProcessingRestyles()
+ #ifdef DEBUG
+   mPresContext->PresShell()->VerifyStyleTree();
+ #endif
+ }
+ 
+ void
+ RestyleManager::UpdateOnlySuppressedAnimationStyles()
+ {
++  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
++  if (mLastUpdateForThrottledAnimations == now) {
++    return;
++  }
++  mLastUpdateForThrottledAnimations = now;
++
+   mPresContext->TransitionManager()->UpdateAllThrottledStyles();
+   mPresContext->AnimationManager()->UpdateAllThrottledStyles();
+ }
+ 
+ void
+ RestyleManager::PostRestyleEventCommon(Element* aElement,
+                                        nsRestyleHint aRestyleHint,
+                                        nsChangeHint aMinChangeHint,
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -253,16 +253,18 @@ private:
+   bool mRebuildAllStyleData : 1;
+   // True if we're already waiting for a refresh notification
+   bool mObservingRefreshDriver : 1;
+   // True if we're in the middle of a nsRefreshDriver refresh
+   bool mInStyleRefresh : 1;
+   uint32_t mHoverGeneration;
+   nsChangeHint mRebuildAllExtraHint;
+ 
++  mozilla::TimeStamp mLastUpdateForThrottledAnimations;
++
+   OverflowChangedTracker mOverflowChangedTracker;
+ 
+   // The total number of animation flushes by this frame constructor.
+   // Used to keep the layer and animation manager in sync.
+   uint64_t mAnimationGeneration;
+ 
+   RestyleTracker mPendingRestyles;
+   RestyleTracker mPendingAnimationRestyles;
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -1004,19 +1004,16 @@ nsPresContext::Init(nsDeviceContext* aDe
+   mCurAppUnitsPerDevPixel = AppUnitsPerDevPixel();
+ 
+   mEventManager = new nsEventStateManager();
+ 
+   mTransitionManager = new nsTransitionManager(this);
+ 
+   mAnimationManager = new nsAnimationManager(this);
+ 
+-  // FIXME: Why is mozilla:: needed?
+-  mRestyleManager = new mozilla::RestyleManager(this);
+-
+   if (mDocument->GetDisplayDocument()) {
+     NS_ASSERTION(mDocument->GetDisplayDocument()->GetShell() &&
+                  mDocument->GetDisplayDocument()->GetShell()->GetPresContext(),
+                  "Why are we being initialized?");
+     mRefreshDriver = mDocument->GetDisplayDocument()->GetShell()->
+       GetPresContext()->RefreshDriver();
+   } else {
+     nsIDocument* parent = mDocument->GetParentDocument();
+@@ -1050,19 +1047,21 @@ nsPresContext::Init(nsDeviceContext* aDe
+     }
+ 
+     if (!mRefreshDriver) {
+       mRefreshDriver = new nsRefreshDriver(this);
+     }
+   }
+ 
+   // Initialise refresh tick counters for OMTA
+-  mLastStyleUpdateForAllAnimations =
+-    mLastUpdateThrottledAnimationStyle =
+-    mLastUpdateThrottledTransitionStyle = mRefreshDriver->MostRecentRefresh();
++  mLastStyleUpdateForAllAnimations = mRefreshDriver->MostRecentRefresh();
++
++  // Initialize after initializing the refresh driver.
++  // FIXME: Why is mozilla:: needed?
++  mRestyleManager = new mozilla::RestyleManager(this);
+ 
+   mLangService = do_GetService(NS_LANGUAGEATOMSERVICE_CONTRACTID);
+ 
+   // Register callbacks so we're notified when the preferences change
+   Preferences::RegisterCallback(nsPresContext::PrefChangedCallback,
+                                 "font.",
+                                 this);
+   Preferences::RegisterCallback(nsPresContext::PrefChangedCallback,
+@@ -1594,42 +1593,16 @@ nsPresContext::Detach()
+   SetContainer(nullptr);
+   SetLinkHandler(nullptr);
+   if (mShell) {
+     mShell->CancelInvalidatePresShellIfHidden();
+   }
+ }
+ 
+ bool
+-nsPresContext::ThrottledTransitionStyleIsUpToDate() const
+-{
+-  return
+-    mLastUpdateThrottledTransitionStyle == mRefreshDriver->MostRecentRefresh();
+-}
+-
+-void
+-nsPresContext::TickLastUpdateThrottledTransitionStyle()
+-{
+-  mLastUpdateThrottledTransitionStyle = mRefreshDriver->MostRecentRefresh();
+-}
+-
+-bool
+-nsPresContext::ThrottledAnimationStyleIsUpToDate() const
+-{
+-  return
+-    mLastUpdateThrottledAnimationStyle == mRefreshDriver->MostRecentRefresh();
+-}
+-
+-void
+-nsPresContext::TickLastUpdateThrottledAnimationStyle()
+-{
+-  mLastUpdateThrottledAnimationStyle = mRefreshDriver->MostRecentRefresh();
+-}
+-
+-bool
+ nsPresContext::StyleUpdateForAllAnimationsIsUpToDate()
+ {
+   return mLastStyleUpdateForAllAnimations == mRefreshDriver->MostRecentRefresh();
+ }
+ 
+ void
+ nsPresContext::TickLastStyleUpdateForAllAnimations()
+ {
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -680,20 +680,16 @@ public:
+   void   SetBackgroundColorDraw(bool aCanDraw)
+   {
+     mDrawColorBackground = aCanDraw;
+   }
+   
+   /**
+    * Getter and setter for OMTA time counters
+    */
+-  bool ThrottledTransitionStyleIsUpToDate() const;
+-  void TickLastUpdateThrottledTransitionStyle();
+-  bool ThrottledAnimationStyleIsUpToDate() const;
+-  void TickLastUpdateThrottledAnimationStyle();
+   bool StyleUpdateForAllAnimationsIsUpToDate();
+   void TickLastStyleUpdateForAllAnimations();
+ 
+ #ifdef IBMBIDI
+   /**
+    *  Check if bidi enabled (set depending on the presence of RTL
+    *  characters or when default directionality is RTL).
+    *  If enabled, we should apply the Unicode Bidi Algorithm
+@@ -1256,20 +1252,16 @@ protected:
+   LangGroupFontPrefs    mLangGroupFontPrefs;
+ 
+   nscoord               mBorderWidthTable[3];
+ 
+   uint32_t              mInterruptChecksToSkip;
+ 
+   mozilla::TimeStamp    mReflowStartTime;
+ 
+-  // last time animations styles were flushed to their primary frames
+-  mozilla::TimeStamp    mLastUpdateThrottledAnimationStyle;
+-  // last time transition styles were flushed to their primary frames
+-  mozilla::TimeStamp    mLastUpdateThrottledTransitionStyle;
+   // last time we did a full style flush
+   mozilla::TimeStamp    mLastStyleUpdateForAllAnimations;
+ 
+   unsigned              mHasPendingInterrupt : 1;
+   unsigned              mInterruptsEnabled : 1;
+   unsigned              mUseDocumentFonts : 1;
+   unsigned              mUseDocumentColors : 1;
+   unsigned              mUnderlineLinks : 1;
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -1181,22 +1181,14 @@ nsAnimationManager::UpdateThrottledStyle
+ IMPL_UPDATE_ALL_THROTTLED_STYLES_INTERNAL(nsAnimationManager,
+                                           GetElementAnimations)
+ 
+ void
+ nsAnimationManager::UpdateAllThrottledStyles()
+ {
+   if (PR_CLIST_IS_EMPTY(&mElementData)) {
+     // no throttled animations, leave early
+-    mPresContext->TickLastUpdateThrottledAnimationStyle();
+     return;
+   }
+ 
+-  if (mPresContext->ThrottledAnimationStyleIsUpToDate()) {
+-    // throttled transitions are up to date, leave early
+-    return;
+-  }
+-
+-  mPresContext->TickLastUpdateThrottledAnimationStyle();
+-
+   UpdateAllThrottledStylesInternal();
+ }
+ 
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -249,26 +249,19 @@ nsTransitionManager::UpdateThrottledStyl
+ IMPL_UPDATE_ALL_THROTTLED_STYLES_INTERNAL(nsTransitionManager,
+                                           GetElementTransitions)
+ 
+ void
+ nsTransitionManager::UpdateAllThrottledStyles()
+ {
+   if (PR_CLIST_IS_EMPTY(&mElementData)) {
+     // no throttled transitions, leave early
+-    mPresContext->TickLastUpdateThrottledTransitionStyle();
+     return;
+   }
+ 
+-  if (mPresContext->ThrottledTransitionStyleIsUpToDate()) {
+-    // throttled transitions are up to date, leave early
+-    return;
+-  }
+-
+-  mPresContext->TickLastUpdateThrottledTransitionStyle();
+   UpdateAllThrottledStylesInternal();
+ }
+ 
+ void
+ nsTransitionManager::ElementDataRemoved()
+ {
+   // If we have no transitions or animations left, remove ourselves from
+   // the refresh driver.
