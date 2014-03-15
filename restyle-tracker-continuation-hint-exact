@@ -52,7 +52,28 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  RestyleManager::ReparentStyleContext(nsIFrame* aFrame)
  {
    if (nsGkAtoms::placeholderFrame == aFrame->GetType()) {
-@@ -2275,20 +2279,36 @@ ElementRestyler::Restyle(nsRestyleHint a
+@@ -2256,39 +2260,51 @@ ElementRestyler::Restyle(nsRestyleHint a
+   // fix bug 242277 we should be able to make this make more sense.
+   NS_ASSERTION(mFrame->GetContent() || !mParentContent ||
+                !mParentContent->GetParent(),
+                "frame must have content (unless at the top of the tree)");
+ 
+   NS_ASSERTION(!GetPrevContinuationWithSameStyle(mFrame),
+                "should not be trying to restyle this frame separately");
+ 
++  nsRestyleHint hintToRestore = nsRestyleHint(0);
+   if (mContent && mContent->IsElement()) {
+     mContent->OwnerDoc()->FlushPendingLinkUpdates();
+     RestyleTracker::RestyleData restyleData;
+     if (mRestyleTracker.GetRestyleData(mContent->AsElement(), &restyleData)) {
+       if (NS_UpdateHint(mHintsHandled, restyleData.mChangeHint)) {
+         mChangeList->AppendChange(mFrame, mContent, restyleData.mChangeHint);
+       }
++      hintToRestore = restyleData.mRestyleHint;
+       aRestyleHint = nsRestyleHint(aRestyleHint | restyleData.mRestyleHint);
+     }
+   }
+ 
    nsRestyleHint childRestyleHint = nsRestyleHint(aRestyleHint & eRestyle_Subtree);
  
    {
@@ -69,18 +90,12 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
        RestyleSelf(f, aRestyleHint);
      }
 +
-+    if (haveMoreContinuations) {
++    if (haveMoreContinuations && hintToRestore) {
 +      // If we have more continuations with different style (e.g., because
 +      // we're inside a ::first-letter or ::first-line), put the restyle
 +      // hint back.
-+
-+      // FIXME: WRITE ME
-+      // FIXME: It seems like the above GetRestyleData call might be
-+      // broken for calls in the second ProcessOneRestyle loop in
-+      // RestyleTracker::DoProcessRestyles, because CollectRestyles will
-+      // clear the restyle tracker.  It also seems like that means our
-+      // ancestor-descendant coalescing is broken for everything other
-+      // than eRestyle_Subtree.
++      AddPendingRestyleToTable(mContent->AsElement(), hintToRestore,
++                               nsChangeHint(0));
 +    }
    }
  
@@ -90,7 +105,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  void
  ElementRestyler::RestyleSelf(nsIFrame* aSelf, nsRestyleHint aRestyleHint)
  {
-@@ -2373,27 +2393,17 @@ ElementRestyler::RestyleSelf(nsIFrame* a
+@@ -2373,27 +2389,17 @@ ElementRestyler::RestyleSelf(nsIFrame* a
      // continuation.
      newContext = prevContinuationContext;
    }
@@ -119,3 +134,97 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
        newContext =
          styleSet->ResolveStyleWithReplacement(element, parentContext, oldContext,
                                                aRestyleHint);
+diff --git a/layout/base/RestyleTracker.h b/layout/base/RestyleTracker.h
+--- a/layout/base/RestyleTracker.h
++++ b/layout/base/RestyleTracker.h
+@@ -229,17 +229,17 @@ public:
+     return mPendingRestyles.Count();
+   }
+ 
+   /**
+    * Add a restyle for the given element to the tracker.  Returns true
+    * if the element already had eRestyle_LaterSiblings set on it.
+    */
+   bool AddPendingRestyle(Element* aElement, nsRestyleHint aRestyleHint,
+-                           nsChangeHint aMinChangeHint);
++                         nsChangeHint aMinChangeHint);
+ 
+   /**
+    * Process the restyles we've been tracking.
+    */
+   void ProcessRestyles() {
+     // Fast-path the common case (esp. for the animation restyle
+     // tracker) of not having anything to do.
+     if (mPendingRestyles.Count()) {
+@@ -280,16 +280,19 @@ public:
+    */
+   inline nsIDocument* Document() const;
+ 
+   struct RestyleEnumerateData : public RestyleData {
+     nsRefPtr<Element> mElement;
+   };
+ 
+ private:
++  bool AddPendingRestyleToTable(Element* aElement, nsRestyleHint aRestyleHint,
++                                nsChangeHint aMinChangeHint);
++
+   /**
+    * Handle a single mPendingRestyles entry.  aRestyleHint must not
+    * include eRestyle_LaterSiblings; that needs to be dealt with
+    * before calling this function.
+    */
+   inline void ProcessOneRestyle(Element* aElement,
+                                 nsRestyleHint aRestyleHint,
+                                 nsChangeHint aChangeHint);
+@@ -320,19 +323,20 @@ private:
+   // array.
+   RestyleRootArray mRestyleRoots;
+   // True if we have some entries with the eRestyle_LaterSiblings
+   // flag.  We need this to avoid enumerating the hashtable looking
+   // for such entries when we can't possibly have any.
+   bool mHaveLaterSiblingRestyles;
+ };
+ 
+-inline bool RestyleTracker::AddPendingRestyle(Element* aElement,
+-                                                nsRestyleHint aRestyleHint,
+-                                                nsChangeHint aMinChangeHint)
++inline bool
++RestyleTracker::AddPendingRestyleToTable(Element* aElement,
++                                         nsRestyleHint aRestyleHint,
++                                         nsChangeHint aMinChangeHint)
+ {
+   RestyleData existingData;
+   existingData.mRestyleHint = nsRestyleHint(0);
+   existingData.mChangeHint = NS_STYLE_HINT_NONE;
+ 
+   // Check the RestyleBit() flag before doing the hashtable Get, since
+   // it's possible that the data in the hashtable isn't actually
+   // relevant anymore (if the flag is not set).
+@@ -345,16 +349,27 @@ inline bool RestyleTracker::AddPendingRe
+   bool hadRestyleLaterSiblings =
+     (existingData.mRestyleHint & eRestyle_LaterSiblings) != 0;
+   existingData.mRestyleHint =
+     nsRestyleHint(existingData.mRestyleHint | aRestyleHint);
+   NS_UpdateHint(existingData.mChangeHint, aMinChangeHint);
+ 
+   mPendingRestyles.Put(aElement, existingData);
+ 
++  return hadRestyleLaterSiblings;
++}
++
++inline bool
++RestyleTracker::AddPendingRestyle(Element* aElement,
++                                  nsRestyleHint aRestyleHint,
++                                  nsChangeHint aMinChangeHint)
++{
++  bool hadRestyleLaterSiblings =
++    AddPendingRestyleToTable(aElement, aRestyleHint, aChangeHint);
++
+   // We can only treat this element as a restyle root if we would
+   // actually restyle its descendants (so either call
+   // ReResolveStyleContext on it or just reframe it).
+   if ((aRestyleHint & ~eRestyle_LaterSiblings) ||
+       (aMinChangeHint & nsChangeHint_ReconstructFrame)) {
+     for (const Element* cur = aElement; !cur->HasFlag(RootBit()); ) {
+       nsIContent* parent = cur->GetFlattenedTreeParent();
+       // Stop if we have no parent or the parent is not an element or
