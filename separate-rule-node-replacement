@@ -1,0 +1,133 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 960465 patch N - Separate the rule node replacement code from the style context handling so that we can make visited handling correct.
+
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1306,28 +1306,28 @@ static const CascadeLevel gCascadeLevels
+   { eDocSheet,        true,  nsRestyleHint(0) },
+   { eStyleAttrSheet,  true,  nsRestyleHint(0) },
+   { eOverrideSheet,   true,  nsRestyleHint(0) },
+   { eUserSheet,       true,  nsRestyleHint(0) },
+   { eAgentSheet,      true,  nsRestyleHint(0) },
+   { eTransitionSheet, false, eRestyleHint_CSSTransitions },
+ };
+ 
+-already_AddRefed<nsStyleContext>
+-nsStyleSet::ResolveStyleWithReplacement(Element* aElement,
+-                                        nsStyleContext* aParentStyleContext,
+-                                        nsStyleContext* aOldStyleContext,
+-                                        nsRestyleHint aReplacements)
++nsRuleNode*
++nsStyleSet::RuleNodeWithReplacement(Element* aElement,
++                                    nsRuleNode* aOldRuleNode,
++                                    nsIAtom* aPseudoType,
++                                    nsRestyleHint aReplacements)
+ {
+   MOZ_ASSERT(!(~aReplacements & (eRestyle_CSSTransitions |
+                                  eRestyle_CSSAnimations)),
+              "unexpected replacement bits");
+ 
+   nsTArray<RuleNodeInfo> rules;
+-  for (nsRuleNode* ruleNode = aOldStyleContext->RuleNode(); !ruleNode->IsRoot();
++  for (nsRuleNode* ruleNode = aOldRuleNode; !ruleNode->IsRoot();
+        ruleNode = ruleNode->GetParent()) {
+     RuleNodeInfo* curRule = rules.AppendElement();
+     curRule->mRule = ruleNode->GetRule();
+     curRule->mLevel = ruleNode->GetLevel();
+     curRule->mIsImportant = ruleNode->IsImportantRule();
+   }
+ 
+   nsRuleWalker ruleWalker(mRuleTree, mAuthorStyleDisabled);
+@@ -1339,32 +1339,30 @@ nsStyleSet::ResolveStyleWithReplacement(
+     ruleWalker.SetLevel(level->mLevel, level->mIsImportant, false);
+     if (level->mLevelReplacementHint & aReplacements) {
+       switch (level->mLevelReplacementHint) {
+       case nsStyleSet::eAnimationSheet:
+         if (aReplacements & eRestyle_CSSAnimations) {
+           nsAnimationManager* animationManager =
+             PresContext()->AnimationManager();
+           ElementAnimations* ea = animationManager->GetElementAnimations(
+-            aElement, aOldStyleContext->GetPseudoType(), false);
++            aElement, aPseudoType, false);
+           NS_ASSERTION(ea,
+             "Rule has level eAnimationSheet without animation on manager");
+ 
+           animationManager->EnsureStyleRuleFor(ea);
+           curRule.mRule = ea->mStyleRule;
+         }
+         break;
+       case nsStyleSet::eTransitionSheet:
+         if (aReplacements & eRestyle_CSSTransitions) {
+           nsPresContext* presContext = PresContext();
+           ElementTransitions *et =
+             presContext->TransitionManager()->GetElementTransitions(
+-              aElement,
+-              aOldStyleContext->GetPseudoType(),
+-              false);
++              aElement, aPseudoType, false);
+           NS_ASSERTION(et,
+             "Rule has level eTransitionSheet without transition on manager");
+ 
+           et->EnsureStyleRuleFor(presContext->RefreshDriver()->MostRecentRefresh());
+           curRule.mRule = et->mStyleRule;
+         }
+         break;
+       default:
+@@ -1381,16 +1379,29 @@ nsStyleSet::ResolveStyleWithReplacement(
+           break;
+         }
+ 
+         ruleWalker.ForwardOnPossiblyCSSRule(ruleInfo.mRule);
+       }
+     }
+   }
+ 
++  return ruleWalker.CurrentNode();
++}
++
++already_AddRefed<nsStyleContext>
++nsStyleSet::ResolveStyleWithReplacement(Element* aElement,
++                                        nsStyleContext* aParentStyleContext,
++                                        nsStyleContext* aOldStyleContext,
++                                        nsRestyleHint aReplacements)
++{
++  nsRuleNode* ruleNode =
++    RuleNodeWithReplacement(aElement, aOldStyleContext->GetRuleNode(),
++                            aOldStyleContext->GetPseudoType(), aReplacements);
++
+   // FIXME: Does this handle visited contexts correctly???
+ 
+   uint32_t flags = eNoFlags;
+   if (aOldStyle->IsLinkContext()) {
+     flags |= eIsLink;
+   }
+   if (aOldStyle->RelevantLinkVisited()) {
+     flags |= eIsVisitedLink;
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -373,16 +373,22 @@ class nsStyleSet
+                  nsRuleWalker* aRuleWalker);
+ 
+   // Enumerate all the rules in a way that doesn't care about the order
+   // of the rules and break out if the enumeration is halted.
+   void WalkRuleProcessors(nsIStyleRuleProcessor::EnumFunc aFunc,
+                           ElementDependentRuleProcessorData* aData,
+                           bool aWalkAllXBLStylesheets);
+ 
++  // Helper for ResolveStyleWithReplacement
++  nsRuleNode* RuleNodeWithReplacement(mozilla::dom::Element* aElement,
++                                      nsStyleContext* aOldRuleNode,
++                                      nsIAtom* aPseudoType,
++                                      nsRestyleHint aReplacements);
++
+   /**
+    * Bit-flags that can be passed to GetContext() in its parameter 'aFlags'.
+    */
+   enum {
+     eNoFlags =          0,
+     eIsLink =           1 << 0,
+     eIsVisitedLink =    1 << 1,
+     eDoAnimation =      1 << 2,
