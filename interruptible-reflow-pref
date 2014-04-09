@@ -1,0 +1,135 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 992324 patch 1 - Add a pref to disable interruptible reflow.
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -113,16 +113,17 @@ typedef FrameMetrics::ViewID ViewID;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationMinTwips;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationLineThreshold;
+ /* static */ int32_t  nsLayoutUtils::sFontSizeInflationMappingIntercept;
+ /* static */ uint32_t nsLayoutUtils::sFontSizeInflationMaxRatio;
+ /* static */ bool nsLayoutUtils::sFontSizeInflationForceEnabled;
+ /* static */ bool nsLayoutUtils::sFontSizeInflationDisabledInMasterProcess;
+ /* static */ bool nsLayoutUtils::sInvalidationDebuggingIsEnabled;
+ /* static */ bool nsLayoutUtils::sCSSVariablesEnabled;
++/* static */ bool nsLayoutUtils::sInterruptibleReflowEnabled;
+ 
+ static ViewID sScrollIdCounter = FrameMetrics::START_SCROLL_ID;
+ 
+ typedef nsDataHashtable<nsUint64HashKey, nsIContent*> ContentMap;
+ static ContentMap* sContentMap = nullptr;
+ static ContentMap& GetContentMap() {
+   if (!sContentMap) {
+     sContentMap = new ContentMap();
+@@ -5673,16 +5674,18 @@ nsLayoutUtils::Initialize()
+   Preferences::AddBoolVarCache(&sFontSizeInflationForceEnabled,
+                                "font.size.inflation.forceEnabled");
+   Preferences::AddBoolVarCache(&sFontSizeInflationDisabledInMasterProcess,
+                                "font.size.inflation.disabledInMasterProcess");
+   Preferences::AddBoolVarCache(&sInvalidationDebuggingIsEnabled,
+                                "nglayout.debug.invalidation");
+   Preferences::AddBoolVarCache(&sCSSVariablesEnabled,
+                                "layout.css.variables.enabled");
++  Preferences::AddBoolVarCache(&sInterruptibleReflowEnabled,
++                               "layout.interruptible-reflow.enabled");
+ 
+   Preferences::RegisterCallback(GridEnabledPrefChangeCallback,
+                                 GRID_ENABLED_PREF_NAME);
+   GridEnabledPrefChangeCallback(GRID_ENABLED_PREF_NAME, nullptr);
+   Preferences::RegisterCallback(StickyEnabledPrefChangeCallback,
+                                 STICKY_ENABLED_PREF_NAME);
+   StickyEnabledPrefChangeCallback(STICKY_ENABLED_PREF_NAME, nullptr);
+   Preferences::RegisterCallback(TextAlignTrueEnabledPrefChangeCallback,
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -1865,16 +1865,21 @@ public:
+   /**
+    * Checks if CSS variables are currently enabled.
+    */
+   static bool CSSVariablesEnabled()
+   {
+     return sCSSVariablesEnabled;
+   }
+ 
++  static bool InterruptibleReflowEnabled()
++  {
++    return sInterruptibleReflowEnabled;
++  }
++
+   /**
+    * Unions the overflow areas of all non-popup children of aFrame with
+    * aOverflowAreas.
+    */
+   static void UnionChildOverflow(nsIFrame* aFrame,
+                                  nsOverflowAreas& aOverflowAreas);
+ 
+   /**
+@@ -2125,16 +2130,17 @@ private:
+   static uint32_t sFontSizeInflationMinTwips;
+   static uint32_t sFontSizeInflationLineThreshold;
+   static int32_t  sFontSizeInflationMappingIntercept;
+   static uint32_t sFontSizeInflationMaxRatio;
+   static bool sFontSizeInflationForceEnabled;
+   static bool sFontSizeInflationDisabledInMasterProcess;
+   static bool sInvalidationDebuggingIsEnabled;
+   static bool sCSSVariablesEnabled;
++  static bool sInterruptibleReflowEnabled;
+ };
+ 
+ template<typename PointType, typename RectType, typename CoordType>
+ /* static */ bool
+ nsLayoutUtils::PointIsCloserToRect(PointType aPoint, const RectType& aRect,
+                                    CoordType& aClosestXDistance,
+                                    CoordType& aClosestYDistance)
+ {
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -2554,17 +2554,18 @@ nsPresContext::ReflowStarted(bool aInter
+ {
+ #ifdef NOISY_INTERRUPTIBLE_REFLOW
+   if (!aInterruptible) {
+     printf("STARTING NONINTERRUPTIBLE REFLOW\n");
+   }
+ #endif
+   // We don't support interrupting in paginated contexts, since page
+   // sequences only handle initial reflow
+-  mInterruptsEnabled = aInterruptible && !IsPaginated();
++  mInterruptsEnabled = aInterruptible && !IsPaginated() &&
++                       nsLayoutUtils::InterruptibleReflowEnabled();
+ 
+   // Don't set mHasPendingInterrupt based on HavePendingInputEvent() here.  If
+   // we ever change that, then we need to update the code in
+   // PresShell::DoReflow to only add the just-reflown root to dirty roots if
+   // it's actually dirty.  Otherwise we can end up adding a root that has no
+   // interruptible descendants, just because we detected an interrupt at reflow
+   // start.
+   mHasPendingInterrupt = false;
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -1899,16 +1899,21 @@ pref("layout.css.overflow-clip-box.enabl
+ // 1 = end-side in document/content direction
+ // 2 = right
+ // 3 = left
+ pref("layout.scrollbar.side", 0);
+ 
+ // pref to stop overlay scrollbars from fading out, for testing purposes
+ pref("layout.testing.overlay-scrollbars.always-visible", false);
+ 
++// Enable/disable interruptible reflow, which allows reflows to stop
++// before completion (and display the partial results) when user events
++// are pending.
++pref("layout.interruptible-reflow.enabled", true);
++
+ // pref to control browser frame rate, in Hz. A value <= 0 means choose
+ // automatically based on knowledge of the platform (or 60Hz if no platform-
+ // specific information is available).
+ pref("layout.frame_rate", -1);
+ 
+ // pref to control precision of the frame rate timer. When true,
+ // we use a "precise" timer, which means each notification fires
+ // Nms after the start of the last notification. That means if the
