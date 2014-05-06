@@ -1,0 +1,334 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 879275:  Warn once about use of deprecated XUL display types.
+
+diff --git a/content/base/public/nsDeprecatedOperationList.h b/content/base/public/nsDeprecatedOperationList.h
+--- a/content/base/public/nsDeprecatedOperationList.h
++++ b/content/base/public/nsDeprecatedOperationList.h
+@@ -34,8 +34,9 @@ DEPRECATED_OPERATION(MozGetAsFile)
+ DEPRECATED_OPERATION(UseOfCaptureEvents)
+ DEPRECATED_OPERATION(UseOfReleaseEvents)
+ DEPRECATED_OPERATION(UseOfDOM3LoadMethod)
+ DEPRECATED_OPERATION(ShowModalDialog)
+ DEPRECATED_OPERATION(Window_Content)
+ DEPRECATED_OPERATION(SyncXMLHttpRequest)
+ DEPRECATED_OPERATION(DataContainerEvent)
+ DEPRECATED_OPERATION(SendAsBinary)
++DEPRECATED_OPERATION(XULDisplayType)
+diff --git a/dom/locales/en-US/chrome/dom/dom.properties b/dom/locales/en-US/chrome/dom/dom.properties
+--- a/dom/locales/en-US/chrome/dom/dom.properties
++++ b/dom/locales/en-US/chrome/dom/dom.properties
+@@ -142,8 +142,10 @@ ShowModalDialogWarning=Use of window.sho
+ Window_ContentWarning=window._content is deprecated.  Please use window.content instead.
+ # LOCALIZATION NOTE: Do not translate "XMLHttpRequest"
+ SyncXMLHttpRequestWarning=Synchronous XMLHttpRequest on the main thread is deprecated because of its detrimental effects to the end user's experience. For more help http://xhr.spec.whatwg.org/
+ ImplicitMetaViewportTagFallback=No meta-viewport tag found. Please explicitly specify one to prevent unexpected behavioural changes in future versions. For more help https://developer.mozilla.org/en/docs/Mozilla/Mobile/Viewport_meta_tag
+ # LOCALIZATION NOTE: Do not translate "DataContainerEvent" or "CustomEvent"
+ DataContainerEventWarning=Use of DataContainerEvent is deprecated. Use CustomEvent instead.
+ # LOCALIZATION NOTE: Do not translate "sendAsBinary" or "send(Blob data)"
+ SendAsBinaryWarning=The non-standard sendAsBinary method is deprecated and will soon be removed. Use the standard send(Blob data) method instead.
++# LOCALIZATION NOTE: Do not translate "-moz-box", "-moz-inline-box", "-moz-grid", "-moz-inline-grid", "-moz-grid-group", "-moz-grid-line", "-moz-stack", "-moz-inline-stack", "-moz-deck", "-moz-popup", or "-moz-groupbox
++XULDisplayTypeWarning=The non-standard XUL display types (-moz-box, -moz-inline-box, -moz-grid, -moz-inline-grid, -moz-grid-group, -moz-grid-line, -moz-stack, -moz-inline-stack, -moz-deck, -moz-popup, and -moz-groupbox) are deprecated and will soon be removed. Use the standard flex display types instead.  For more help see https://developer.mozilla.org/en-US/docs/Web/Guide/CSS/Flexible_boxes
+diff --git a/layout/style/StyleRule.cpp b/layout/style/StyleRule.cpp
+--- a/layout/style/StyleRule.cpp
++++ b/layout/style/StyleRule.cpp
+@@ -914,16 +914,45 @@ nsCSSSelectorList::SizeOfIncludingThis(m
+   while (s) {
+     n += aMallocSizeOf(s);
+     n += s->mSelectors ? s->mSelectors->SizeOfIncludingThis(aMallocSizeOf) : 0;
+     s = s->mNext;
+   }
+   return n;
+ }
+ 
++static void
++WarnForMozBox(mozilla::css::Rule* aRule)
++{
++  nsIStyleSheet* warnSheet = nullptr;
++
++  nsCSSStyleSheet* cssSheet = aRule->GetStyleSheet();
++  if (cssSheet) {
++    if (!cssSheet->AllowUnsafeRules()) {
++      warnSheet = cssSheet;
++    }
++  } else {
++    nsHTMLCSSStyleSheet* styleAttrSheet = aRule->GetHTMLCSSStyleSheet();
++    if (styleAttrSheet) {
++      warnSheet = styleAttrSheet;
++    } else {
++      NS_NOTREACHED("what, no sheet during rule mapping?");
++    }
++  }
++
++  if (warnSheet) {
++    nsIDocument* doc = warnSheet->GetOwningDocument();
++    if (doc) {
++      doc->WarnOnceAbout(nsIDocument::XULDisplayType);
++    } else {
++      NS_NOTREACHED("what, no document during rule mapping?");
++    }
++  }
++}
++
+ // -- ImportantRule ----------------------------------
+ 
+ namespace mozilla {
+ namespace css {
+ 
+ ImportantRule::ImportantRule(Declaration* aDeclaration)
+   : mDeclaration(aDeclaration)
+ {
+@@ -934,16 +963,20 @@ ImportantRule::~ImportantRule()
+ }
+ 
+ NS_IMPL_ISUPPORTS(ImportantRule, nsIStyleRule)
+ 
+ /* virtual */ void
+ ImportantRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   mDeclaration->MapImportantRuleInfoInto(aRuleData);
++  if (aRuleData->mWarnForMozBox) {
++    WarnForMozBox(this);
++    aRuleData->mWarnForMozBox = false;
++  }
+ }
+ 
+ #ifdef DEBUG
+ /* virtual */ void
+ ImportantRule::List(FILE* out, int32_t aIndent) const
+ {
+   // Indent
+   for (int32_t index = aIndent; --index >= 0; ) fputs("  ", out);
+@@ -1438,16 +1471,23 @@ StyleRule::DeclarationChanged(Declaratio
+ }
+ 
+ /* virtual */ void
+ StyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   NS_ABORT_IF_FALSE(mWasMatched,
+                     "somebody forgot to call css::StyleRule::RuleMatched");
+   mDeclaration->MapNormalRuleInfoInto(aRuleData);
++  if (aRuleData->mWarnForMozBox) {
++    // We have useful line number and column number information here,
++    // but ImportantRule doesn't, and nsIDocument::WarnOnce doesn't
++    // handle it.
++    WarnForMozBox(this);
++    aRuleData->mWarnForMozBox = false;
++  }
+ }
+ 
+ #ifdef DEBUG
+ /* virtual */ void
+ StyleRule::List(FILE* out, int32_t aIndent) const
+ {
+   // Indent
+   for (int32_t index = aIndent; --index >= 0; ) fputs("  ", out);
+diff --git a/layout/style/nsCSSDataBlock.cpp b/layout/style/nsCSSDataBlock.cpp
+--- a/layout/style/nsCSSDataBlock.cpp
++++ b/layout/style/nsCSSDataBlock.cpp
+@@ -156,16 +156,22 @@ MapSinglePropertyInto(nsCSSProperty aPro
+                 aTarget->SetColorValue(aRuleData->mPresContext->
+                                        DefaultBackgroundColor());
+             }
+         } else {
+             // Ignore 'color', 'border-*-color', etc.
+             *aTarget = nsCSSValue();
+         }
+     }
++    if (aProp == eCSSProperty_display &&
++        aTarget->GetUnit() == eCSSUnit_Enumerated &&
++        nsStyleDisplay::IsDisplayTypeXUL(aTarget->GetIntValue()))
++    {
++        aRuleData->mWarnForMozBox = true;
++    }
+ }
+ 
+ void
+ nsCSSCompressedDataBlock::MapRuleInfoInto(nsRuleData *aRuleData) const
+ {
+     // If we have no data for these structs, then return immediately.
+     // This optimization should make us return most of the time, so we
+     // have to worry much less (although still some) about the speed of
+diff --git a/layout/style/nsCSSStyleSheet.cpp b/layout/style/nsCSSStyleSheet.cpp
+--- a/layout/style/nsCSSStyleSheet.cpp
++++ b/layout/style/nsCSSStyleSheet.cpp
+@@ -1211,16 +1211,23 @@ nsCSSStyleSheet::SetPrincipal(nsIPrincip
+   if (aPrincipal) {
+     mInner->mPrincipal = aPrincipal;
+ #ifdef DEBUG
+     mInner->mPrincipalSet = true;
+ #endif
+   }
+ }
+ 
++bool
++nsCSSStyleSheet::AllowUnsafeRules() const
++{
++  // allow unsafe rules if the style sheet's principal is the system principal
++  return nsContentUtils::IsSystemPrincipal(mInner->mPrincipal);
++}
++
+ /* virtual */ nsIURI*
+ nsCSSStyleSheet::GetSheetURI() const
+ {
+   return mInner->mSheetURI;
+ }
+ 
+ /* virtual */ nsIURI*
+ nsCSSStyleSheet::GetBaseURI() const
+@@ -2154,22 +2161,19 @@ nsCSSStyleSheet::ParseSheet(const nsAStr
+   for (nsCSSStyleSheet* child = mInner->mFirstChild; child; child = child->mNext) {
+     NS_ASSERTION(child->mParent == this, "Child sheet is not parented to this!");
+     child->mParent = nullptr;
+     child->mDocument = nullptr;
+   }
+   mInner->mFirstChild = nullptr;
+   mInner->mNameSpaceMap = nullptr;
+ 
+-  // allow unsafe rules if the style sheet's principal is the system principal
+-  bool allowUnsafeRules = nsContentUtils::IsSystemPrincipal(mInner->mPrincipal);
+-
+   nsCSSParser parser(loader, this);
+   nsresult rv = parser.ParseSheet(aInput, mInner->mSheetURI, mInner->mBaseURI,
+-                                  mInner->mPrincipal, 1, allowUnsafeRules);
++                                  mInner->mPrincipal, 1, AllowUnsafeRules());
+   DidDirty(); // we are always 'dirty' here since we always remove rules first
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // notify document of all new rules
+   if (mDocument) {
+     for (int32_t index = 0; index < mInner->mOrderedRules.Count(); ++index) {
+       nsRefPtr<css::Rule> rule = mInner->mOrderedRules.ObjectAt(index);
+       if (rule->GetType() == css::Rule::IMPORT_RULE &&
+diff --git a/layout/style/nsCSSStyleSheet.h b/layout/style/nsCSSStyleSheet.h
+--- a/layout/style/nsCSSStyleSheet.h
++++ b/layout/style/nsCSSStyleSheet.h
+@@ -168,16 +168,18 @@ public:
+    * This can only be called once with a non-null principal.  Calling this with
+    * a null pointer is allowed and is treated as a no-op.
+    */
+   void SetPrincipal(nsIPrincipal* aPrincipal);
+ 
+   // Principal() never returns a null pointer.
+   nsIPrincipal* Principal() const { return mInner->mPrincipal; }
+ 
++  bool AllowUnsafeRules() const;
++
+   // The document this style sheet is associated with.  May be null
+   nsIDocument* GetDocument() const { return mDocument; }
+ 
+   void SetTitle(const nsAString& aTitle) { mTitle = aTitle; }
+   void SetMedia(nsMediaList* aMedia);
+   void SetOwningNode(nsINode* aOwningNode) { mOwningNode = aOwningNode; /* Not ref counted */ }
+ 
+   void SetOwnerRule(mozilla::css::ImportRule* aOwnerRule) { mOwnerRule = aOwnerRule; /* Not ref counted */ }
+diff --git a/layout/style/nsRuleData.cpp b/layout/style/nsRuleData.cpp
+--- a/layout/style/nsRuleData.cpp
++++ b/layout/style/nsRuleData.cpp
+@@ -24,31 +24,33 @@ nsRuleData::GetPoisonOffset()
+   return size_t(framePoisonValue - uintptr_t(mValueStorage)) /
+          sizeof(nsCSSValue);
+ }
+ 
+ nsRuleData::nsRuleData(uint32_t aSIDs, nsCSSValue* aValueStorage,
+                        nsPresContext* aContext, nsStyleContext* aStyleContext)
+   : mSIDs(aSIDs),
+     mCanStoreInRuleTree(true),
++    mWarnForMozBox(false),
+     mPresContext(aContext),
+     mStyleContext(aStyleContext),
+     mValueStorage(aValueStorage)
+ {
+ #ifndef MOZ_VALGRIND
+   size_t framePoisonOffset = GetPoisonOffset();
+   for (size_t i = 0; i < nsStyleStructID_Length; ++i) {
+     mValueOffsets[i] = framePoisonOffset;
+   }
+ #endif
+ }
+ 
+ #ifdef DEBUG
+ nsRuleData::~nsRuleData()
+ {
++  NS_ASSERTION(!mWarnForMozBox, "failed to issue warning");
+ #ifndef MOZ_VALGRIND
+   // assert nothing in mSIDs has poison value
+   size_t framePoisonOffset = GetPoisonOffset();
+   for (size_t i = 0; i < nsStyleStructID_Length; ++i) {
+     NS_ABORT_IF_FALSE(!(mSIDs & (1 << i)) ||
+                       mValueOffsets[i] != framePoisonOffset,
+                       "value in SIDs was left with poison offset");
+   }
+diff --git a/layout/style/nsRuleData.h b/layout/style/nsRuleData.h
+--- a/layout/style/nsRuleData.h
++++ b/layout/style/nsRuleData.h
+@@ -21,17 +21,18 @@ class nsStyleContext;
+ struct nsRuleData;
+ 
+ typedef void (*nsPostResolveFunc)(void* aStyleStruct, nsRuleData* aData);
+ 
+ struct nsRuleData
+ {
+   const uint32_t mSIDs;
+   bool mCanStoreInRuleTree;
+-  bool mIsImportantRule;
++  bool mIsImportantRule : 1;
++  bool mWarnForMozBox : 1;
+   uint16_t mLevel; // an nsStyleSet::sheetType
+   nsPresContext* const mPresContext;
+   nsStyleContext* const mStyleContext;
+ 
+   // We store nsCSSValues needed to compute the data for one or more
+   // style structs (specified by the bitfield mSIDs).  These are stored
+   // in a single array allocation (which our caller allocates; see
+   // AutoCSSValueArray)   The offset of each property |prop| in
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -2008,16 +2008,30 @@ struct nsStyleDisplay {
+   bool IsInlineOutsideStyle() const {
+     return IsDisplayTypeInlineOutside(mDisplay);
+   }
+ 
+   bool IsOriginalDisplayInlineOutsideStyle() const {
+     return IsDisplayTypeInlineOutside(mOriginalDisplay);
+   }
+ 
++  static bool IsDisplayTypeXUL(uint8_t aDisplay) {
++    return aDisplay == NS_STYLE_DISPLAY_BOX ||
++           aDisplay == NS_STYLE_DISPLAY_INLINE_BOX ||
++           aDisplay == NS_STYLE_DISPLAY_XUL_GRID ||
++           aDisplay == NS_STYLE_DISPLAY_INLINE_XUL_GRID ||
++           aDisplay == NS_STYLE_DISPLAY_XUL_GRID_GROUP ||
++           aDisplay == NS_STYLE_DISPLAY_XUL_GRID_LINE ||
++           aDisplay == NS_STYLE_DISPLAY_STACK ||
++           aDisplay == NS_STYLE_DISPLAY_INLINE_STACK ||
++           aDisplay == NS_STYLE_DISPLAY_DECK ||
++           aDisplay == NS_STYLE_DISPLAY_POPUP ||
++           aDisplay == NS_STYLE_DISPLAY_GROUPBOX;
++  }
++
+   bool IsInnerTableStyle() const {
+     return NS_STYLE_DISPLAY_TABLE_CAPTION == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_CELL == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_ROW == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_ROW_GROUP == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_HEADER_GROUP == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_FOOTER_GROUP == mDisplay ||
+            NS_STYLE_DISPLAY_TABLE_COLUMN == mDisplay ||
+diff --git a/webapprt/locales/en-US/webapprt/overrides/dom.properties b/webapprt/locales/en-US/webapprt/overrides/dom.properties
+--- a/webapprt/locales/en-US/webapprt/overrides/dom.properties
++++ b/webapprt/locales/en-US/webapprt/overrides/dom.properties
+@@ -139,8 +139,12 @@ UseOfDOM3LoadMethodWarning=Use of docume
+ # LOCALIZATION NOTE: Do not translate "window.showModalDialog()" or "window.open()" 
+ ShowModalDialogWarning=Use of window.showModalDialog() is deprecated. Use window.open() instead. For more help https://developer.mozilla.org/en-US/docs/Web/API/Window.open
+ # LOCALIZATION NOTE: Do not translate "window._content" or "window.content"
+ Window_ContentWarning=window._content is deprecated. Please use window.content instead.
+ # LOCALIZATION NOTE: Do not translate "XMLHttpRequest"
+ SyncXMLHttpRequestWarning=Synchronous XMLHttpRequest on the main thread is deprecated because of its detrimental effects to the end user's experience. For more help http://xhr.spec.whatwg.org/
+ # LOCALIZATION NOTE: Do not translate "DataContainerEvent" or "CustomEvent"
+ DataContainerEventWarning=Use of DataContainerEvent is deprecated. Use CustomEvent instead.
++# LOCALIZATION NOTE: Do not translate "sendAsBinary" or "send(Blob data)"
++SendAsBinaryWarning=The non-standard sendAsBinary method is deprecated and will soon be removed. Use the standard send(Blob data) method instead.
++# LOCALIZATION NOTE: Do not translate "-moz-box", "-moz-inline-box", "-moz-grid", "-moz-inline-grid", "-moz-grid-group", "-moz-grid-line", "-moz-stack", "-moz-inline-stack", "-moz-deck", "-moz-popup", or "-moz-groupbox
++XULDisplayTypeWarning=The non-standard XUL display types (-moz-box, -moz-inline-box, -moz-grid, -moz-inline-grid, -moz-grid-group, -moz-grid-line, -moz-stack, -moz-inline-stack, -moz-deck, -moz-popup, and -moz-groupbox) are deprecated and will soon be removed. Use the standard flex display types instead.  For more help see https://developer.mozilla.org/en-US/docs/Web/Guide/CSS/Flexible_boxes
