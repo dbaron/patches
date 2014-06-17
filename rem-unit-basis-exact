@@ -1,0 +1,108 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 996796 patch N - Make restyling exact - Avoid rerunning selector matching on everything when the basis of rem units changes.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -847,17 +847,18 @@ RestyleManager::RestyleElement(Element* 
+     nsStyleContext *oldContext = aPrimaryFrame->StyleContext();
+     if (!oldContext->GetParent()) { // check that we're the root element
+       nsRefPtr<nsStyleContext> newContext = mPresContext->StyleSet()->
+         ResolveStyleFor(aElement, nullptr /* == oldContext->GetParent() */);
+       if (oldContext->StyleFont()->mFont.size !=
+           newContext->StyleFont()->mFont.size) {
+         // The basis for 'rem' units has changed.
+         newContext = nullptr;
+-        DoRebuildAllStyleData(aRestyleTracker, nsChangeHint(0));
++        DoRebuildAllStyleData(aRestyleTracker, nsChangeHint(0),
++                              nsRestyleHint(0));
+         if (aMinHint == 0) {
+           return;
+         }
+         aPrimaryFrame = aElement->GetPrimaryFrame();
+       }
+     }
+   }
+ 
+@@ -1363,30 +1364,36 @@ RestyleManager::RebuildAllStyleData(nsCh
+   // We may reconstruct frames below and hence process anything that is in the
+   // tree. We don't want to get notified to process those items again after.
+   presShell->GetDocument()->FlushPendingNotifications(Flush_ContentAndNotify);
+ 
+   nsAutoScriptBlocker scriptBlocker;
+ 
+   mPresContext->SetProcessingRestyles(true);
+ 
+-  DoRebuildAllStyleData(mPendingRestyles, aExtraHint);
++  // FIXME: Many of the callers probably don't need eRestyle_Subtree
++  // because they're changing things that affect data computation rather
++  // than selector matching; we could have a restyle hint passed in, and
++  // substantially improve the performance of things like pref changes
++  // and the restyling that we do for downloadable font loads.
++  DoRebuildAllStyleData(mPendingRestyles, aExtraHint, eRestyle_Subtree);
+ 
+   mPresContext->SetProcessingRestyles(false);
+ 
+   // Make sure that we process any pending animation restyles from the
+   // above style change.  Note that we can *almost* implement the above
+   // by just posting a style change -- except we really need to restyle
+   // the root frame rather than the root element's primary frame.
+   ProcessPendingRestyles();
+ }
+ 
+ void
+ RestyleManager::DoRebuildAllStyleData(RestyleTracker& aRestyleTracker,
+-                                      nsChangeHint aExtraHint)
++                                      nsChangeHint aExtraHint,
++                                      nsRestyleHint aRestyleHint)
+ {
+   // Tell the style set to get the old rule tree out of the way
+   // so we can recalculate while maintaining rule tree immutability
+   nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
+   if (NS_FAILED(rv)) {
+     return;
+   }
+ 
+@@ -1397,17 +1404,17 @@ RestyleManager::DoRebuildAllStyleData(Re
+   // (but note that nsPresShell::SetPreferenceStyleRules currently depends
+   // on us re-running rule matching here
+   nsStyleChangeList changeList;
+   // XXX Does it matter that we're passing aExtraHint to the real root
+   // frame and not the root node's primary frame?
+   // Note: The restyle tracker we pass in here doesn't matter.
+   ComputeStyleChangeFor(mPresContext->PresShell()->GetRootFrame(),
+                         &changeList, aExtraHint,
+-                        aRestyleTracker, eRestyle_Subtree);
++                        aRestyleTracker, aRestyleHint);
+   // Process the required changes
+   ProcessRestyledFrames(changeList);
+   FlushOverflowChangedTracker();
+ 
+   // Tell the style set it's safe to destroy the old rule tree.  We
+   // must do this after the ProcessRestyledFrames call in case the
+   // change list has frame reconstructs in it (since frames to be
+   // reconstructed will still have their old style context pointers
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -174,17 +174,18 @@ public:
+   // Rebuilds all style data by throwing out the old rule tree and
+   // building a new one, and additionally applying aExtraHint (which
+   // must not contain nsChangeHint_ReconstructFrame) to the root frame.
+   void RebuildAllStyleData(nsChangeHint aExtraHint);
+ 
+   // Helper that does part of the work of RebuildAllStyleData, shared by
+   // RestyleElement for 'rem' handling.
+   void DoRebuildAllStyleData(RestyleTracker& aRestyleTracker,
+-                             nsChangeHint aExtraHint);
++                             nsChangeHint aExtraHint,
++                             nsRestyleHint aRestyleHint);
+ 
+   // See PostRestyleEventCommon below.
+   void PostRestyleEvent(Element* aElement,
+                         nsRestyleHint aRestyleHint,
+                         nsChangeHint aMinChangeHint)
+   {
+     if (mPresContext) {
+       PostRestyleEventCommon(aElement, aRestyleHint, aMinChangeHint,
