@@ -2,9 +2,6 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 996796 patch N - Make restyling exact - Avoid rerunning selector matching on everything when the basis of rem units changes.
 
-FIXME: Use ResolveStyleWithReplacement for all 3 cases that check if we're
-reconstructing the rule tree.
-
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
@@ -139,45 +136,78 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                                                aRestyleHint);
      }
    } else if (pseudoType == nsCSSPseudoElements::ePseudo_AnonBox) {
-@@ -2562,17 +2581,18 @@ ElementRestyler::RestyleSelf(nsIFrame* a
-        ++contextIndex) {
-     nsRefPtr<nsStyleContext> newExtraContext;
-     nsIAtom* const extraPseudoTag = oldExtraContext->GetPseudo();
+@@ -2565,18 +2584,25 @@ ElementRestyler::RestyleSelf(nsIFrame* a
      const nsCSSPseudoElements::Type extraPseudoType =
        oldExtraContext->GetPseudoType();
      NS_ASSERTION(extraPseudoTag &&
                   extraPseudoTag != nsCSSAnonBoxes::mozNonElement,
                   "extra style context is not pseudo element");
--    if (!(aRestyleHint & (eRestyle_Self | eRestyle_Subtree))) {
-+    if (!(aRestyleHint & (eRestyle_Self | eRestyle_Subtree)) &&
-+        !styleSet->IsInRuleTreeReconstruct()) {
+     if (!(aRestyleHint & (eRestyle_Self | eRestyle_Subtree))) {
        Element* element = extraPseudoType != nsCSSPseudoElements::ePseudo_AnonBox
                             ? mContent->AsElement() : nullptr;
-       newExtraContext =
-         styleSet->ReparentStyleContext(oldExtraContext, newContext, element);
+-      newExtraContext =
+-        styleSet->ReparentStyleContext(oldExtraContext, newContext, element);
++      if (styleSet->IsInRuleTreeReconstruct()) {
++        newExtraContext =
++          styleSet->ResolveStyleWithReplacement(element, newContext,
++                                                oldExtraContext,
++                                                nsRestyleHint(0));
++      } else {
++        newExtraContext =
++          styleSet->ReparentStyleContext(oldExtraContext, newContext, element);
++      }
      } else if (extraPseudoType == nsCSSPseudoElements::ePseudo_AnonBox) {
        newExtraContext = styleSet->ResolveAnonymousBoxStyle(extraPseudoTag,
                                                             newContext);
      } else {
-@@ -2697,17 +2717,17 @@ ElementRestyler::RestyleUndisplayedChild
+       // Don't expect XUL tree stuff here, since it needs a comparator and
+       // all.
+       NS_ASSERTION(extraPseudoType <
+                      nsCSSPseudoElements::ePseudo_PseudoElementCount,
+@@ -2690,33 +2716,40 @@ ElementRestyler::RestyleUndisplayedChild
+       nsIContent* parent = undisplayed->mContent->GetParent();
+       TreeMatchContext::AutoAncestorPusher insertionPointPusher(mTreeMatchContext);
+       if (parent && nsContentUtils::IsContentInsertionPoint(parent)) {
+         insertionPointPusher.PushAncestorAndStyleScope(parent);
+       }
+ 
+       nsRestyleHint thisChildHint = aChildRestyleHint;
        RestyleTracker::RestyleData undisplayedRestyleData;
-       if (mRestyleTracker.GetRestyleData(undisplayed->mContent->AsElement(),
+-      if (mRestyleTracker.GetRestyleData(undisplayed->mContent->AsElement(),
++      Element* element = undisplayed->mContent->AsElement();
++      if (mRestyleTracker.GetRestyleData(element,
                                           &undisplayedRestyleData)) {
          thisChildHint =
            nsRestyleHint(thisChildHint | undisplayedRestyleData.mRestyleHint);
        }
        nsRefPtr<nsStyleContext> undisplayedContext;
        nsStyleSet* styleSet = mPresContext->StyleSet();
--      if (thisChildHint) {
-+      if (thisChildHint || styleSet->IsInRuleTreeReconstruct()) {
+       if (thisChildHint) {
          undisplayedContext =
-           styleSet->ResolveStyleFor(undisplayed->mContent->AsElement(),
+-          styleSet->ResolveStyleFor(undisplayed->mContent->AsElement(),
++          styleSet->ResolveStyleFor(element,
                                      mFrame->StyleContext(),
                                      mTreeMatchContext);
++      } else if (styleSet->IsInRuleTreeReconstruct()) {
++        undisplayedContext =
++          styleSet->ResolveStyleWithReplacement(element,
++                                                mFrame->StyleContext(),
++                                                undisplayed->mStyle,
++                                                nsRestyleHint(0));
        } else {
          undisplayedContext =
            styleSet->ReparentStyleContext(undisplayed->mStyle,
                                           mFrame->StyleContext(),
+-                                         undisplayed->mContent->AsElement());
++                                         element);
+       }
+       const nsStyleDisplay* display = undisplayedContext->StyleDisplay();
+       if (display->mDisplay != NS_STYLE_DISPLAY_NONE) {
+         NS_ASSERTION(undisplayed->mContent,
+                      "Must have undisplayed content");
+         mChangeList->AppendChange(nullptr, undisplayed->mContent,
+                                   NS_STYLE_HINT_FRAMECHANGE);
+         // The node should be removed from the undisplayed map when
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
