@@ -4,12 +4,12 @@ Bug 960465 patch N - Make AddStyleUpdatesTo handle pseudo-elements.
 
 FIXME: Will this approach even work?  Is more needed?
 
-diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
---- a/layout/style/nsAnimationManager.cpp
-+++ b/layout/style/nsAnimationManager.cpp
-@@ -284,16 +284,42 @@ ElementAnimations::HasAnimationOfPropert
-     const ElementAnimation* anim = mAnimations[animIdx];
-     if (anim->HasAnimationOfProperty(aProperty)) {
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -602,16 +602,42 @@ CommonElementAnimationData::HasAnimation
+     if (anim->HasAnimationOfProperty(aProperty) &&
+         !anim->IsFinishedTransition()) {
        return true;
      }
    }
@@ -17,9 +17,9 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
  }
  
 +mozilla::dom::Element*
-+ElementAnimations::ElementToRestyle() const
++CommonElementAnimationData::ElementToRestyle() const
 +{
-+  if (mElementProperty == nsGkAtoms::animationsProperty) {
++  if (IsForElement()) {
 +    return mElement;
 +  }
 +
@@ -28,9 +28,9 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 +    return nullptr;
 +  }
 +  nsIFrame* pseudoFrame;
-+  if (mElementProperty == nsGkAtoms::animationsOfBeforeProperty) {
++  if (IsForBeforePseudo()) {
 +    pseudoFrame = nsLayoutUtils::GetBeforeFrame(primaryFrame);
-+  } else if (mElementProperty == nsGkAtoms::animationsOfAfterProperty) {
++  } else if (IsForAfterPseudo()) {
 +    pseudoFrame = nsLayoutUtils::GetAfterFrame(primaryFrame);
 +  } else {
 +    MOZ_ASSERT("unknown mElementProperty");
@@ -42,21 +42,69 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 +  return pseudoFrame->GetContent()->AsElement();
 +}
 +
- bool
- ElementAnimations::CanPerformOnCompositorThread(CanAnimateFlags aFlags) const
+ /* static */ void
+ CommonElementAnimationData::LogAsyncAnimationFailure(nsCString& aMessage,
+                                                      const nsIContent* aContent)
  {
-   nsIFrame* frame = nsLayoutUtils::GetStyleFrame(mElement);
-   if (!frame) {
-     return false;
+   if (aContent) {
+     aMessage.AppendLiteral(" [");
+     aMessage.Append(nsAtomCString(aContent->Tag()));
+ 
+diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
+--- a/layout/style/AnimationCommon.h
++++ b/layout/style/AnimationCommon.h
+@@ -412,28 +412,39 @@ struct CommonElementAnimationData : publ
+   bool CanPerformOnCompositorThread(CanAnimateFlags aFlags) const;
+   bool HasAnimationOfProperty(nsCSSProperty aProperty) const;
+ 
+   bool IsForElement() const { // rather than for a pseudo-element
+     return mElementProperty == nsGkAtoms::animationsProperty ||
+            mElementProperty == nsGkAtoms::transitionsProperty;
    }
  
-@@ -1080,20 +1106,15 @@ nsAnimationManager::StopAllAnimations()
++  bool IsForBeforePseudo() const {
++    return mElementProperty == nsGkAtoms::animationsOfBeforeProperty ||
++           mElementProperty == nsGkAtoms::transitionsOfBeforeProperty;
++  }
++
++  bool IsForAfterPseudo() const {
++    return mElementProperty == nsGkAtoms::animationsOfAfterProperty ||
++           mElementProperty == nsGkAtoms::transitionsOfAfterProperty;
++  }
++
+   nsString PseudoElement()
+   {
+     if (IsForElement()) {
+       return EmptyString();
+-    } else if (mElementProperty == nsGkAtoms::animationsOfBeforeProperty ||
+-               mElementProperty == nsGkAtoms::transitionsOfBeforeProperty) {
++    } else if (IsForBeforePseudo()) {
+       return NS_LITERAL_STRING("::before");
+     } else {
+       return NS_LITERAL_STRING("::after");
+     }
+   }
+ 
++  mozilla::dom::Element* ElementToRestyle() const;
++
+   void PostRestyleForAnimation(nsPresContext *aPresContext) {
+     nsRestyleHint styleHint = IsForElement() ? eRestyle_Self : eRestyle_Subtree;
+     aPresContext->PresShell()->RestyleForAnimation(mElement, styleHint);
+   }
+ 
+   static void LogAsyncAnimationFailure(nsCString& aMessage,
+                                        const nsIContent* aContent = nullptr);
+ 
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -788,20 +788,15 @@ nsAnimationManager::StopAllAnimations()
  void
  nsAnimationManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
  {
    PRCList *next = PR_LIST_HEAD(&mElementData);
    while (next != &mElementData) {
-     ElementAnimations *ea = static_cast<ElementAnimations*>(next);
+     CommonElementAnimationData *ea = static_cast<CommonElementAnimationData*>(next);
      next = PR_NEXT_LINK(next);
  
 -    if (ea->mElementProperty != nsGkAtoms::animationsProperty) {
@@ -75,81 +123,16 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 -                               nsChangeHint(0));
    }
  }
-diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
---- a/layout/style/nsAnimationManager.h
-+++ b/layout/style/nsAnimationManager.h
-@@ -74,16 +74,18 @@ struct ElementAnimations MOZ_FINAL
-   {
-     return mElementProperty == nsGkAtoms::animationsProperty ?
-              EmptyString() :
-              mElementProperty == nsGkAtoms::animationsOfBeforeProperty ?
-                NS_LITERAL_STRING("::before") :
-                NS_LITERAL_STRING("::after");
-   }
- 
-+  mozilla::dom::Element* ElementToRestyle() const;
-+
-   void PostRestyleForAnimation(nsPresContext *aPresContext) {
-     nsRestyleHint styleHint = IsForElement() ? eRestyle_Self : eRestyle_Subtree;
-     aPresContext->PresShell()->RestyleForAnimation(mElement, styleHint);
-   }
- 
-   // If aFlags contains CanAnimate_AllowPartial, returns whether the
-   // state of this element's animations at the current refresh driver
-   // time contains animation data that can be done on the compositor
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -139,16 +139,42 @@ ElementTransitions::HasAnimationOfProper
-     const ElementPropertyTransition* pt = mAnimations[animIdx]->AsTransition();
-     if (pt->HasAnimationOfProperty(aProperty) && !pt->IsRemovedSentinel()) {
-       return true;
-     }
-   }
-   return false;
- }
- 
-+mozilla::dom::Element*
-+ElementTransitions::ElementToRestyle() const
-+{
-+  if (mElementProperty == nsGkAtoms::transitionsProperty) {
-+    return mElement;
-+  }
-+
-+  nsIFrame* primaryFrame = mElement->GetPrimaryFrame();
-+  if (!primaryFrame) {
-+    return nullptr;
-+  }
-+  nsIFrame* pseudoFrame;
-+  if (mElementProperty == nsGkAtoms::transitionsOfBeforeProperty) {
-+    pseudoFrame = nsLayoutUtils::GetBeforeFrame(primaryFrame);
-+  } else if (mElementProperty == nsGkAtoms::transitionsOfAfterProperty) {
-+    pseudoFrame = nsLayoutUtils::GetAfterFrame(primaryFrame);
-+  } else {
-+    MOZ_ASSERT("unknown mElementProperty");
-+    return nullptr;
-+  }
-+  if (!pseudoFrame) {
-+    return nullptr;
-+  }
-+  return pseudoFrame->GetContent()->AsElement();
-+}
-+
- bool
- ElementTransitions::CanPerformOnCompositorThread(CanAnimateFlags aFlags) const
- {
-   nsIFrame* frame = nsLayoutUtils::GetStyleFrame(mElement);
-   if (!frame) {
-     return false;
-   }
- 
-@@ -224,26 +250,21 @@ ElementTransitions::CanPerformOnComposit
+@@ -74,26 +74,21 @@ ElementPropertyTransition::ValuePortionF
  void
  nsTransitionManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
  {
    PRCList *next = PR_LIST_HEAD(&mElementData);
    while (next != &mElementData) {
-     ElementTransitions *et = static_cast<ElementTransitions*>(next);
+     CommonElementAnimationData *et = static_cast<CommonElementAnimationData*>(next);
      next = PR_NEXT_LINK(next);
  
 -    if (et->mElementProperty != nsGkAtoms::transitionsProperty) {
@@ -174,25 +157,3 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
  {
    // If we have no transitions or animations left, remove ourselves from
    // the refresh driver.
-diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
---- a/layout/style/nsTransitionManager.h
-+++ b/layout/style/nsTransitionManager.h
-@@ -74,16 +74,18 @@ struct ElementTransitions MOZ_FINAL
-   ElementTransitions(mozilla::dom::Element *aElement, nsIAtom *aElementProperty,
-                      nsTransitionManager *aTransitionManager,
-                      mozilla::TimeStamp aNow);
- 
-   void EnsureStyleRuleFor(mozilla::TimeStamp aRefreshTime);
- 
-   virtual bool HasAnimationOfProperty(nsCSSProperty aProperty) const MOZ_OVERRIDE;
- 
-+  mozilla::dom::Element* ElementToRestyle() const;
-+
-   // If aFlags contains CanAnimate_AllowPartial, returns whether the
-   // state of this element's transitions at the current refresh driver
-   // time contains transition data that can be done on the compositor
-   // thread.  (This is useful for determining whether a layer should be
-   // active, or whether to send data to the layer.)
-   // If aFlags does not contain CanAnimate_AllowPartial, returns whether
-   // the state of this element's transitions at the current refresh driver
-   // time can be fully represented by data sent to the compositor.
