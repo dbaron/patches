@@ -1,0 +1,206 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1030604 - Use nsChangeHint_UpdateOverflow for clip-path and mask changes so we update the PreEffectsBBoxProperty and run the effect on the correct area.
+
+diff --git a/layout/reftests/svg/dynamic-mask-pre-effects-bbox-ref.html b/layout/reftests/svg/dynamic-mask-pre-effects-bbox-ref.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/svg/dynamic-mask-pre-effects-bbox-ref.html
+@@ -0,0 +1,40 @@
++<!DOCTYPE html>
++<html>
++  <head>
++    <style>
++      #container {
++        border: 3px dotted black;
++        background: yellow;
++        overflow: hidden;
++        width: 400px;
++        max-height: 25px;
++      }
++
++      #container.masked {
++        mask: url('#fade_mask_bottom');
++      }
++      .item {
++        font-size: 30px;
++      }
++    </style>
++  </head>
++  <body>
++    <div id='container' class="masked"><div class="item">PASS</div></div>
++
++    <!-- BEGIN SVG MASK: -->
++    <svg xmlns="http://www.w3.org/2000/svg" version="1.1">
++      <mask id="fade_mask_bottom"
++            maskUnits="objectBoundingBox" maskContentUnits="objectBoundingBox">
++        <linearGradient id="fade_gradient_bottom"
++                        gradientUnits="objectBoundingBox" x2="0" y2="1">
++          <stop stop-color="white" stop-opacity="1" offset="0.7"></stop>
++          <stop stop-color="white" stop-opacity="0" offset="1"></stop>
++        </linearGradient>
++        <rect x="0" y="0" width="1" height="1"
++              fill="url(#fade_gradient_bottom)"></rect>
++      </mask>
++    </svg>
++  <!-- END SVG MASK -->
++
++  </body>
++</html>
+diff --git a/layout/reftests/svg/dynamic-mask-pre-effects-bbox.html b/layout/reftests/svg/dynamic-mask-pre-effects-bbox.html
+new file mode 100644
+--- /dev/null
++++ b/layout/reftests/svg/dynamic-mask-pre-effects-bbox.html
+@@ -0,0 +1,71 @@
++<!DOCTYPE html>
++<html class="reftest-wait">
++  <head>
++    <style>
++      #container {
++        border: 3px dotted black;
++        background: yellow;
++        overflow: hidden;
++        width: 400px;
++        max-height: 25px;
++      }
++
++      #container.masked {
++        mask: url('#fade_mask_bottom');
++      }
++      .item {
++        font-size: 30px;
++      }
++    </style>
++    <script>
++      function go() {
++        clear();
++        insert();
++      }
++
++      function clear() {
++        // Force reflow:
++        container.offsetHeight;
++
++        // Remove mask:
++        container.classList.remove('masked');
++      }
++
++      function insert() {
++        // Add new child:
++        var notificationNode = document.createElement('div');
++        notificationNode.classList.add('item');
++        notificationNode.appendChild(document.createTextNode("PASS"));
++        var container = document.getElementById('container');
++        container.appendChild(notificationNode);
++
++        // Force reflow:
++        container.offsetHeight;
++
++        // Add back mask:
++        container.classList.add('masked');
++
++        document.documentElement.classList.remove('reftest-wait');
++      }
++    </script>
++  </head>
++  <body onload="go();">
++    <div id='container' class="masked"></div>
++
++    <!-- BEGIN SVG MASK: -->
++    <svg xmlns="http://www.w3.org/2000/svg" version="1.1">
++      <mask id="fade_mask_bottom"
++            maskUnits="objectBoundingBox" maskContentUnits="objectBoundingBox">
++        <linearGradient id="fade_gradient_bottom"
++                        gradientUnits="objectBoundingBox" x2="0" y2="1">
++          <stop stop-color="white" stop-opacity="1" offset="0.7"></stop>
++          <stop stop-color="white" stop-opacity="0" offset="1"></stop>
++        </linearGradient>
++        <rect x="0" y="0" width="1" height="1"
++              fill="url(#fade_gradient_bottom)"></rect>
++      </mask>
++    </svg>
++  <!-- END SVG MASK -->
++
++  </body>
++</html>
+diff --git a/layout/reftests/svg/reftest.list b/layout/reftests/svg/reftest.list
+--- a/layout/reftests/svg/reftest.list
++++ b/layout/reftests/svg/reftest.list
+@@ -84,16 +84,17 @@ skip-if(B2G) == dynamic-gradient-content
+ skip-if(B2G) == dynamic-gradient-contents-02.svg pass.svg
+ skip-if(B2G) == dynamic-inner-svg-01.svg pass.svg
+ == dynamic-link-style-01.svg pass.svg
+ skip-if(B2G) == dynamic-marker-01.svg pass.svg
+ skip-if(B2G) == dynamic-marker-02.svg dynamic-marker-02-ref.svg
+ skip-if(B2G) == dynamic-marker-03.svg pass.svg
+ == dynamic-mask-01.svg pass.svg
+ skip-if(B2G) == dynamic-mask-contents-01.svg pass.svg
++== dynamic-mask-pre-effects-bbox.html dynamic-mask-pre-effects-bbox-ref.html
+ == dynamic-opacity-property-01.svg pass.svg
+ skip-if(B2G) == dynamic-pattern-01.svg pass.svg
+ skip-if(B2G) == dynamic-pattern-02.svg pass.svg
+ skip-if(B2G) == dynamic-pattern-contents-01.svg pass.svg
+ skip-if(B2G) == dynamic-pattern-contents-02.svg pass.svg
+ == dynamic-rect-01.svg dynamic-rect-01-ref.svg
+ fuzzy-if(d2d&&layersGPUAccelerated,3,1200) == dynamic-rect-02.svg dynamic-rect-02-ref.svg # bug 776038 for Win7, Win8
+ == dynamic-rect-03.svg dynamic-rect-03-ref.svg
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1129,27 +1129,26 @@ nsStyleSVGReset::nsStyleSVGReset(const n
+   mVectorEffect = aSource.mVectorEffect;
+   mMaskType = aSource.mMaskType;
+ }
+ 
+ nsChangeHint nsStyleSVGReset::CalcDifference(const nsStyleSVGReset& aOther) const
+ {
+   nsChangeHint hint = nsChangeHint(0);
+ 
+-  bool equalFilters = (mFilters == aOther.mFilters);
+-
+-  if (!equalFilters) {
+-    NS_UpdateHint(hint, nsChangeHint_UpdateOverflow);
+-  }
+-
+   if (!EqualURIs(mClipPath, aOther.mClipPath) ||
+       !EqualURIs(mMask, aOther.mMask) ||
+-      !equalFilters) {
++      mFilters != aOther.mFilters) {
+     NS_UpdateHint(hint, nsChangeHint_UpdateEffects);
+     NS_UpdateHint(hint, nsChangeHint_RepaintFrame);
++    // We only actually need to update the overflow area for filter
++    // changes.  However, mask and clip-path changes require that we
++    // update the PreEffectsBBoxProperty, which is done during overflow
++    // computation.
++    NS_UpdateHint(hint, nsChangeHint_UpdateOverflow);
+   }
+ 
+   if (mDominantBaseline != aOther.mDominantBaseline) {
+     // XXXjwatt: why NS_STYLE_HINT_REFLOW? Isn't that excessive?
+     NS_UpdateHint(hint, NS_STYLE_HINT_REFLOW);
+   } else if (mVectorEffect  != aOther.mVectorEffect) {
+     // Stroke currently affects nsSVGPathGeometryFrame::mRect, and
+     // vector-effect affect stroke. As a result we need to reflow if
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -2762,16 +2762,19 @@ struct nsStyleSVG {
+ struct nsStyleFilter {
+   nsStyleFilter();
+   nsStyleFilter(const nsStyleFilter& aSource);
+   ~nsStyleFilter();
+ 
+   nsStyleFilter& operator=(const nsStyleFilter& aOther);
+ 
+   bool operator==(const nsStyleFilter& aOther) const;
++  bool operator!=(const nsStyleFilter& aOther) const {
++    return !(*this == aOther);
++  }
+ 
+   int32_t GetType() const {
+     return mType;
+   }
+ 
+   const nsStyleCoord& GetFilterParameter() const {
+     NS_ASSERTION(mType != NS_STYLE_FILTER_DROP_SHADOW &&
+                  mType != NS_STYLE_FILTER_URL &&
