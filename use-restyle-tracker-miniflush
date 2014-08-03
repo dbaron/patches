@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 996796 patch 24 - Use a RestyleTracker for the coalescing in the animation-only style flush (miniflush).
+Bug 996796 patch 24 - Use a RestyleTracker for the coalescing in the animation-only style flush (miniflush).  r=heycam
 
 This changes the coalescing behavior during the animation-only style
 flush by doing tree-based coalescing between the style updates required
@@ -57,162 +57,117 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
  RestyleManager::PostRestyleEventCommon(Element* aElement,
                                         nsRestyleHint aRestyleHint,
                                         nsChangeHint aMinChangeHint,
-diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
---- a/layout/style/nsAnimationManager.cpp
-+++ b/layout/style/nsAnimationManager.cpp
-@@ -823,8 +823,28 @@ nsAnimationManager::UpdateAllThrottledSt
-   if (PR_CLIST_IS_EMPTY(&mElementCollections)) {
-     // no throttled animations, leave early
-     return;
-   }
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -161,16 +161,38 @@ CommonAnimationManager::SizeOfExcludingT
+ }
  
-   UpdateAllThrottledStylesInternal();
+ /* virtual */ size_t
+ CommonAnimationManager::SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+ {
+   return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
  }
  
 +void
-+nsAnimationManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
++CommonAnimationManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
 +{
-+  PRCList *next = PR_LIST_HEAD(&mElementCollections);
++  PRCList* next = PR_LIST_HEAD(&mElementCollections);
 +  while (next != &mElementCollections) {
-+    ElementAnimationCollection *collection = static_cast<ElementAnimationCollection*>(next);
++    ElementAnimationCollection* collection = static_cast<ElementAnimationCollection*>(next);
 +    next = PR_NEXT_LINK(next);
 +
-+    if (collection->mElementProperty != nsGkAtoms::animationsProperty) {
++    if (!collection->IsForElement()) {
 +      // We don't support compositor-driven animation of :before/:after
-+      // transitions, so at least skip those.
++      // transitions or animations, so at least skip those.
 +      // FIXME: We'll need to handle this before using this for the
 +      // transitions redesign.
 +      continue;
 +    }
 +
-+    aTracker.AddPendingRestyle(collection->mElement, eRestyle_CSSAnimations,
-+                               nsChangeHint(0));
++    nsRestyleHint rshint = collection->IsForTransitions()
++      ? eRestyle_CSSTransitions : eRestyle_CSSAnimations;
++    aTracker.AddPendingRestyle(collection->mElement, rshint, nsChangeHint(0));
 +  }
 +}
-diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
---- a/layout/style/nsAnimationManager.h
-+++ b/layout/style/nsAnimationManager.h
-@@ -11,16 +11,17 @@
- #include "nsCSSPseudoElements.h"
- #include "mozilla/MemoryReporting.h"
- #include "mozilla/TimeStamp.h"
++
+ /* static */ bool
+ CommonAnimationManager::ExtractComputedValueForTransition(
+                           nsCSSProperty aProperty,
+                           nsStyleContext* aStyleContext,
+                           StyleAnimationValue& aComputedValue)
+ {
+   bool result = StyleAnimationValue::ExtractComputedValue(aProperty,
+                                                           aStyleContext,
+diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
+--- a/layout/style/AnimationCommon.h
++++ b/layout/style/AnimationCommon.h
+@@ -29,16 +29,17 @@ class nsStyleChangeList;
  
- class nsCSSKeyframesRule;
- class nsStyleContext;
+ // X11 has a #define for CurrentTime.
+ #ifdef CurrentTime
+ #undef CurrentTime
+ #endif
  
  namespace mozilla {
+ 
 +class RestyleTracker;
+ class StyleAnimationValue;
+ struct ElementPropertyTransition;
+ struct ElementAnimationCollection;
+ 
  namespace css {
- class Declaration;
- }
- }
  
- struct AnimationEventInfo {
-   nsRefPtr<mozilla::dom::Element> mElement;
-   mozilla::InternalAnimationEvent mEvent;
-@@ -127,16 +128,21 @@ public:
-     }
-   }
+ bool IsGeometricProperty(nsCSSProperty aProperty);
  
-   mozilla::ElementAnimationCollection*
-   GetElementAnimations(mozilla::dom::Element *aElement,
-                        nsCSSPseudoElements::Type aPseudoType,
-                        bool aCreateIfNeeded);
+@@ -62,16 +63,21 @@ public:
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+     const MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+ 
+   /**
+    * Notify the manager that the pres context is going away.
+    */
+   void Disconnect();
  
 +  // Tell the restyle tracker about all the styles that we're currently
 +  // animating, so that it can update the animation rule for these
 +  // elements.
 +  void AddStyleUpdatesTo(mozilla::RestyleTracker& aTracker);
 +
-   // Updates styles on throttled animations. See note on nsTransitionManager
-   void UpdateAllThrottledStyles();
+   enum FlushFlags {
+     Can_Throttle,
+     Cannot_Throttle
+   };
  
- protected:
-   virtual void ElementCollectionRemoved() MOZ_OVERRIDE
-   {
-     CheckNeedsRefresh();
+   static bool ExtractComputedValueForTransition(
+                   nsCSSProperty aProperty,
+                   nsStyleContext* aStyleContext,
+@@ -524,16 +530,28 @@ struct ElementAnimationCollection : publ
+   bool CanPerformOnCompositorThread(CanAnimateFlags aFlags) const;
+   bool HasAnimationOfProperty(nsCSSProperty aProperty) const;
+ 
+   bool IsForElement() const { // rather than for a pseudo-element
+     return mElementProperty == nsGkAtoms::animationsProperty ||
+            mElementProperty == nsGkAtoms::transitionsProperty;
    }
-diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
---- a/layout/style/nsTransitionManager.cpp
-+++ b/layout/style/nsTransitionManager.cpp
-@@ -120,16 +120,37 @@ nsTransitionManager::UpdateAllThrottledS
-     // no throttled transitions, leave early
-     return;
-   }
  
-   UpdateAllThrottledStylesInternal();
- }
- 
- void
-+nsTransitionManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
-+{
-+  PRCList *next = PR_LIST_HEAD(&mElementCollections);
-+  while (next != &mElementCollections) {
-+    ElementAnimationCollection *collection = static_cast<ElementAnimationCollection*>(next);
-+    next = PR_NEXT_LINK(next);
-+
-+    if (collection->mElementProperty != nsGkAtoms::transitionsProperty) {
-+      // We don't support compositor-driven animation of :before/:after
-+      // transitions, so at least skip those.
-+      // FIXME: We'll need to handle this before using this for the
-+      // transitions redesign.
-+      continue;
-+    }
-+
-+    aTracker.AddPendingRestyle(collection->mElement, eRestyle_CSSTransitions,
-+                               nsChangeHint(0));
++  bool IsForTransitions() const {
++    return mElementProperty == nsGkAtoms::transitionsProperty ||
++           mElementProperty == nsGkAtoms::transitionsOfBeforeProperty ||
++           mElementProperty == nsGkAtoms::transitionsOfAfterProperty;
 +  }
-+}
 +
-+void
- nsTransitionManager::ElementCollectionRemoved()
- {
-   // If we have no transitions or animations left, remove ourselves from
-   // the refresh driver.
-   if (PR_CLIST_IS_EMPTY(&mElementCollections)) {
-     mPresContext->RefreshDriver()->RemoveRefreshObserver(this, Flush_Style);
-   }
- }
-diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
---- a/layout/style/nsTransitionManager.h
-+++ b/layout/style/nsTransitionManager.h
-@@ -15,16 +15,17 @@
- 
- class nsStyleContext;
- class nsPresContext;
- class nsCSSPropertySet;
- struct ElementDependentRuleProcessorData;
- 
- namespace mozilla {
- struct StyleTransition;
-+class RestyleTracker;
- }
- 
- /*****************************************************************************
-  * Per-Element data                                                          *
-  *****************************************************************************/
- 
- namespace mozilla {
- 
-@@ -134,16 +135,21 @@ public:
-   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
-     MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
- 
-   // nsARefreshObserver
-   virtual void WillRefresh(mozilla::TimeStamp aTime) MOZ_OVERRIDE;
- 
-   void FlushTransitions(FlushFlags aFlags);
- 
-+  // Tell the restyle tracker about all the styles that we're currently
-+  // transitioning, so that it can update the animation rule for these
-+  // elements.
-+  void AddStyleUpdatesTo(mozilla::RestyleTracker& aTracker);
++  bool IsForAnimations() const {
++    return mElementProperty == nsGkAtoms::animationsProperty ||
++           mElementProperty == nsGkAtoms::animationsOfBeforeProperty ||
++           mElementProperty == nsGkAtoms::animationsOfAfterProperty;
++  }
 +
-   // Performs a 'mini-flush' to make styles from throttled transitions
-   // up-to-date prior to processing an unrelated style change, so that
-   // any transitions triggered by that style change produce correct
-   // results.
-   //
-   // In more detail:  when we're able to run animations on the
-   // compositor, we sometimes "throttle" these animations by skipping
-   // updating style data on the main thread.  However, whenever we
+   nsString PseudoElement()
+   {
+     if (IsForElement()) {
+       return EmptyString();
+     } else if (mElementProperty == nsGkAtoms::animationsOfBeforeProperty ||
+                mElementProperty == nsGkAtoms::transitionsOfBeforeProperty) {
+       return NS_LITERAL_STRING("::before");
+     } else {

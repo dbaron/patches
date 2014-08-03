@@ -4,6 +4,55 @@ Bug 960465 patch N - Make AddStyleUpdatesTo only add updates that need to be don
 
 FIXME: This needs reexamination of what happened when merging!
 
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -164,21 +164,45 @@ CommonAnimationManager::SizeOfExcludingT
+ CommonAnimationManager::SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+ {
+   return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+ }
+ 
+ void
+ CommonAnimationManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
+ {
++  // FIXME: Do we need to do something with events like FlushTransitions
++  // does?  (maybe transitions only?)
++
++  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
++
+   PRCList* next = PR_LIST_HEAD(&mElementCollections);
+   while (next != &mElementCollections) {
+     ElementAnimationCollection* collection = static_cast<ElementAnimationCollection*>(next);
+     next = PR_NEXT_LINK(next);
+ 
++    nsRefPtr<css::AnimValuesStyleRule> oldStyleRule = collection->mStyleRule;
++    collection->EnsureStyleRuleFor(now);
++    // FIXME: For animations, need:
++//    GetEventsForCurrentTime(collection, mPendingEvents);
++
++#if 0
++    // FIXME: It would be nice to check this; it would allow us to skip
++    // a good bit of duplication of work.  Unfortunately it's the norm
++    // that we have already updated the style rule, but not yet
++    // restyled.  (Is that because of the FlushAnimations/FlushTransitions
++    // calls in PresShell::FlushPendingNotifications, which post updates
++    // before the animation-only style flush in ProcessPendingRestyles
++    // but aren't processed until later in ProcessPendingRestyles?)
++    if (oldStyleRule == collection->mStyleRule) {
++      // No style to update.
++      continue;
++    }
++#endif
++
+     dom::Element* elementToRestyle = collection->ElementToRestyle();
+     if (elementToRestyle) {
+       nsRestyleHint rshint = collection->IsForTransitions()
+         ? eRestyle_CSSTransitions : eRestyle_CSSAnimations;
+       aTracker.AddPendingRestyle(elementToRestyle, rshint, nsChangeHint(0));
+     }
+   }
+ }
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
 +++ b/layout/style/nsAnimationManager.cpp
@@ -35,47 +84,6 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
      ElementAnimation* anim = aCollection->mAnimations[animIdx];
  
      ComputedTiming computedTiming = anim->GetComputedTiming(anim->mTiming);
-@@ -818,20 +807,40 @@ nsAnimationManager::StopAllAnimations()
-       collection->PostRestyleForAnimation(mPresContext);
-     }
-   }
- }
- 
- void
- nsAnimationManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
- {
-+  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
-+
-   PRCList *next = PR_LIST_HEAD(&mElementCollections);
-   while (next != &mElementCollections) {
-     ElementAnimationCollection *collection = static_cast<ElementAnimationCollection*>(next);
-     next = PR_NEXT_LINK(next);
- 
-+    nsRefPtr<css::AnimValuesStyleRule> oldStyleRule = collection->mStyleRule;
-+    collection->EnsureStyleRuleFor(now, false);
-+    GetEventsForCurrentTime(collection, mPendingEvents);
-+#if 0
-+    // FIXME: It would be nice to check this; it would allow us to skip
-+    // a good bit of duplication of work.  Unfortunately it's the norm
-+    // that we have already updated the style rule, but not yet
-+    // restyled.
-+    if (oldStyleRule == collection->mStyleRule) {
-+      // No style to update.
-+      continue;
-+    }
-+#endif
-+
-     dom::Element* elementToRestyle = collection->ElementToRestyle();
-     if (elementToRestyle) {
-       aTracker.AddPendingRestyle(elementToRestyle, eRestyle_CSSAnimations,
-                                  nsChangeHint(0));
-     }
-   }
-+
-+  // FIXME: Do something with mPendingEvents?
-+
-+  CheckNeedsRefresh();
- }
 diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
 --- a/layout/style/nsAnimationManager.h
 +++ b/layout/style/nsAnimationManager.h
@@ -152,47 +160,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -70,21 +70,39 @@ ElementPropertyTransition::CurrentValueP
- 
- /*****************************************************************************
-  * nsTransitionManager                                                       *
-  *****************************************************************************/
- 
- void
- nsTransitionManager::AddStyleUpdatesTo(RestyleTracker& aTracker)
- {
-+  // FIXME: Do we need to do something with events like FlushTransitions
-+  // does?
-+
-+  TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
-+
-   PRCList *next = PR_LIST_HEAD(&mElementCollections);
-   while (next != &mElementCollections) {
-     ElementAnimationCollection *collection = static_cast<ElementAnimationCollection*>(next);
-     next = PR_NEXT_LINK(next);
- 
-+    nsRefPtr<css::AnimValuesStyleRule> oldStyleRule = collection->mStyleRule;
-+    collection->EnsureStyleRuleFor(now);
-+#if 0
-+    // FIXME: It would be nice to check this; it would allow us to skip
-+    // a good bit of duplication of work.  Unfortunately it's the norm
-+    // that we have already updated the style rule, but not yet
-+    // restyled.
-+    if (oldStyleRule == collection->mStyleRule) {
-+      // No style to update.
-+      continue;
-+    }
-+#endif
-+
-     dom::Element* elementToRestyle = collection->ElementToRestyle();
-     if (elementToRestyle) {
-       aTracker.AddPendingRestyle(elementToRestyle, eRestyle_CSSTransitions,
-                                  nsChangeHint(0));
-     }
-   }
- }
- 
-@@ -350,16 +368,17 @@ nsTransitionManager::StyleContextChanged
+@@ -334,16 +334,17 @@ nsTransitionManager::StyleContextChanged
      AnimationProperty& prop = animation->mProperties[0];
      AnimationPropertySegment& segment = prop.mSegments[0];
      if (whichStarted.HasProperty(prop.mProperty)) {
@@ -210,7 +178,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
  nsTransitionManager::ConsiderStartingTransition(
    nsCSSProperty aProperty,
    const StyleTransition& aTransition,
-@@ -841,16 +860,17 @@ nsTransitionManager::FlushTransitions(Fl
+@@ -825,16 +826,17 @@ nsTransitionManager::FlushTransitions(Fl
        MOZ_ASSERT(collection->mElementProperty ==
                     nsGkAtoms::transitionsProperty ||
                   collection->mElementProperty ==
