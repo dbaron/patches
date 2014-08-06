@@ -1,0 +1,79 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug Bug 914253 patch 3 - Implement separate debug info for fix_linux_stack.py, including the addition of support for .note.gnu.build-id sections that fix-linux-stack.pl did not support.
+
+diff --git a/tools/rb/fix_linux_stack.py b/tools/rb/fix_linux_stack.py
+--- a/tools/rb/fix_linux_stack.py
++++ b/tools/rb/fix_linux_stack.py
+@@ -18,16 +18,17 @@
+ # or make-tree.pl balance trees) through this script.
+ 
+ import subprocess
+ import sys
+ import re
+ import os
+ import pty
+ import termios
++from StringIO import StringIO
+ 
+ class unbufferedLineConverter:
+     """
+     Wrap a child process that responds to each line of input with one line of
+     output.  Uses pty to trick the child into providing unbuffered output.
+     """
+     def __init__(self, command, args = []):
+         pid, fd = pty.fork()
+@@ -46,17 +47,53 @@ class unbufferedLineConverter:
+         self.w.write(line + "\n")
+         return (self.r.readline().rstrip("\r\n"), self.r.readline().rstrip("\r\n"))
+     @staticmethod
+     def test():
+         assert unbufferedLineConverter("rev").convert("123") == "321"
+         assert unbufferedLineConverter("cut", ["-c3"]).convert("abcde") == "c"
+         print "Pass"
+ 
++objdump_section_re = re.compile("^ [0-9a-f]* ([0-9a-f ]{8}) ([0-9a-f ]{8}) ([0-9a-f ]{8}) ([0-9a-f ]{8}).*")
++def elf_section(file, section):
++    """
++    Return the requested ELF section of the file as a str, represented
++    as a sequence of bytes.
++    """
++    # We can read the .gnu_debuglink section using either of:
++    #   objdump -s --section=.gnu_debuglink $file
++    #   readelf -x .gnu_debuglink $file
++    # Since readelf prints things backwards on little-endian platforms
++    # for some versions only (backwards on Fedora Core 6, forwards on
++    # Fedora 7), use objdump.
++    readelf = subprocess.Popen(['objdump', '-s', '--section=' + section, file],
++                               stdout=subprocess.PIPE)
++    (readelf_stdout, readelf_stderr) = readelf.communicate()
++    if readelf.returncode != 0:
++        return None
++    result = ""
++    # Turn hexadecimal dump into the bytes it represents
++    for line in StringIO(readelf_stdout).readlines():
++        m = objdump_section_re.match(line)
++        if m:
++            for gnum in [0, 1, 2, 3]:
++                word = m.groups()[gnum]
++                if word != "        ":
++                    for idx in [0, 2, 4, 6]:
++                        result += chr(int(word[idx:idx+2], 16))
++    return result
++
++# FIXME: Hard-coded to gdb defaults (works on Fedora and Ubuntu).
++global_debug_dir = '/usr/lib/debug';
++
+ def separate_debug_file_for(file):
++    def try_debug_file(debugfile):
++        return None
++    buildid = elf_section(file, ".note.gnu.build-id");
++    debuglink = elf_section(file, ".gnu_debuglink");
+     return None
+ 
+ addr2lines = {}
+ def addressToSymbol(file, address):
+     converter = None
+     if not file in addr2lines:
+         debug_file = separate_debug_file_for(file) or file
+         converter = unbufferedLineConverter('/usr/bin/addr2line', ['-C', '-f', '-e', debug_file])
