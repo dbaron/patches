@@ -1,0 +1,127 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 977991 patch 1 - Add ability for RuleNodeWithReplacement to replace the style attribute rule and its important rule.
+
+diff --git a/layout/base/nsChangeHint.h b/layout/base/nsChangeHint.h
+--- a/layout/base/nsChangeHint.h
++++ b/layout/base/nsChangeHint.h
+@@ -285,12 +285,19 @@ enum nsRestyleHint {
+   eRestyle_CSSTransitions = (1<<3),
+ 
+   // Replace the style data coming from CSS animations without updating
+   // any other style data.  If a new style context results, update style
+   // contexts on the descendants.  (Irrelevant if eRestyle_Self or
+   // eRestyle_Subtree is also set, since those imply a superset of the
+   // work.)
+   eRestyle_CSSAnimations = (1<<4),
++
++  // Replace the style data coming from inline style without updating
++  // any other style data.  If a new style context results, update style
++  // contexts on the descendants.  (Irrelevant if eRestyle_Self or
++  // eRestyle_Subtree is also set, since those imply a superset of the
++  // work.)
++  eRestyle_StyleAttribute = (1<<5),
+ };
+ 
+ 
+ #endif /* nsChangeHint_h___ */
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1311,36 +1311,37 @@ struct CascadeLevel {
+ };
+ 
+ static const CascadeLevel gCascadeLevels[] = {
+   { nsStyleSet::eAgentSheet,      false, nsRestyleHint(0) },
+   { nsStyleSet::eUserSheet,       false, nsRestyleHint(0) },
+   { nsStyleSet::ePresHintSheet,   false, nsRestyleHint(0) },
+   { nsStyleSet::eDocSheet,        false, nsRestyleHint(0) },
+   { nsStyleSet::eScopedDocSheet,  false, nsRestyleHint(0) },
+-  { nsStyleSet::eStyleAttrSheet,  false, nsRestyleHint(0) },
++  { nsStyleSet::eStyleAttrSheet,  false, eRestyle_StyleAttribute },
+   { nsStyleSet::eOverrideSheet,   false, nsRestyleHint(0) },
+   { nsStyleSet::eAnimationSheet,  false, eRestyle_CSSAnimations },
+   { nsStyleSet::eScopedDocSheet,  true,  nsRestyleHint(0) },
+   { nsStyleSet::eDocSheet,        true,  nsRestyleHint(0) },
+-  { nsStyleSet::eStyleAttrSheet,  true,  nsRestyleHint(0) },
++  { nsStyleSet::eStyleAttrSheet,  true,  eRestyle_StyleAttribute },
+   { nsStyleSet::eOverrideSheet,   true,  nsRestyleHint(0) },
+   { nsStyleSet::eUserSheet,       true,  nsRestyleHint(0) },
+   { nsStyleSet::eAgentSheet,      true,  nsRestyleHint(0) },
+   { nsStyleSet::eTransitionSheet, false, eRestyle_CSSTransitions },
+ };
+ 
+ nsRuleNode*
+ nsStyleSet::RuleNodeWithReplacement(Element* aElement,
+                                     nsRuleNode* aOldRuleNode,
+                                     nsCSSPseudoElements::Type aPseudoType,
+                                     nsRestyleHint aReplacements)
+ {
+   NS_ABORT_IF_FALSE(!(aReplacements & ~(eRestyle_CSSTransitions |
+-                                        eRestyle_CSSAnimations)),
++                                        eRestyle_CSSAnimations |
++                                        eRestyle_StyleAttribute)),
+                     // FIXME: Once bug 931668 lands we'll have a better
+                     // way to print these.
+                     nsPrintfCString("unexpected replacement bits 0x%lX",
+                                     uint32_t(aReplacements)).get());
+ 
+   // FIXME (perf): This should probably not rebuild the whole path, but
+   // only the path from the last change in the rule tree, like
+   // ReplaceAnimationRule in nsStyleSet.cpp does.  (That could then
+@@ -1356,16 +1357,20 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+     curRule->mRule = ruleNode->GetRule();
+     curRule->mLevel = ruleNode->GetLevel();
+     curRule->mIsImportant = ruleNode->IsImportantRule();
+   }
+ 
+   nsRuleWalker ruleWalker(mRuleTree, mAuthorStyleDisabled);
+   auto rulesIndex = rules.Length();
+ 
++  // We need to transfer this rule between the non-!important and
++  // !important phases for the style attribute level.
++  nsIStyleRule* styleAttributeImportantRule = nullptr;
++
+   for (const CascadeLevel *level = gCascadeLevels,
+                        *levelEnd = ArrayEnd(gCascadeLevels);
+        level != levelEnd; ++level) {
+     ruleWalker.SetLevel(level->mLevel, level->mIsImportant, false);
+ 
+     bool doReplace = level->mLevelReplacementHint & aReplacements;
+     if (doReplace) {
+       switch (level->mLevelReplacementHint) {
+@@ -1402,17 +1407,34 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+               presContext->RefreshDriver()->MostRecentRefresh(),
+               EnsureStyleRule_IsNotThrottled);
+             if (collection->mStyleRule) {
+               ruleWalker.ForwardOnPossiblyCSSRule(collection->mStyleRule);
+             }
+           }
+           break;
+         }
++        case eRestyle_StyleAttribute: {
++          if (!level->mIsImportant) {
++            // First time through, we handle the non-!important rule.
++            // FIXME: WRITE ME
++#if 0
++            styleAttributeImportantRule =
++              static_cast<css::StyleRule*>(rule)->GetImportantRule();
++#endif
++          } else {
++            // Second time through, we handle the !important rule.
++            if (styleAttributeImportantRule) {
++              ruleWalker.ForwardOnPossiblyCSSRule(styleAttributeImportantRule);
++            }
++          }
++          break;
++        }
+         default:
++          MOZ_ASSERT(false, "should not be reached");
+           break;
+       }
+     }
+ 
+     while (rulesIndex != 0) {
+       --rulesIndex;
+       const RuleNodeInfo& ruleInfo = rules[rulesIndex];
+ 
