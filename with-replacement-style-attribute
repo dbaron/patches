@@ -5,7 +5,7 @@ Bug 977991 patch 2 - Add ability for RuleNodeWithReplacement to replace the styl
 diff --git a/layout/base/nsChangeHint.h b/layout/base/nsChangeHint.h
 --- a/layout/base/nsChangeHint.h
 +++ b/layout/base/nsChangeHint.h
-@@ -285,12 +285,19 @@ enum nsRestyleHint {
+@@ -285,12 +285,20 @@ enum nsRestyleHint {
    eRestyle_CSSTransitions = (1<<3),
  
    // Replace the style data coming from CSS animations without updating
@@ -19,7 +19,8 @@ diff --git a/layout/base/nsChangeHint.h b/layout/base/nsChangeHint.h
 +  // any other style data.  If a new style context results, update style
 +  // contexts on the descendants.  (Irrelevant if eRestyle_Self or
 +  // eRestyle_Subtree is also set, since those imply a superset of the
-+  // work.)
++  // work.)  Supported only for element style contexts and not for
++  // pseudo-elements or anonymous boxes.
 +  eRestyle_StyleAttribute = (1<<5),
  };
  
@@ -69,7 +70,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
    // FIXME (perf): This should probably not rebuild the whole path, but
    // only the path from the last change in the rule tree, like
    // ReplaceAnimationRule in nsStyleSet.cpp does.  (That could then
-@@ -1356,16 +1357,20 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+@@ -1356,16 +1357,21 @@ nsStyleSet::RuleNodeWithReplacement(Elem
      curRule->mRule = ruleNode->GetRule();
      curRule->mLevel = ruleNode->GetLevel();
      curRule->mIsImportant = ruleNode->IsImportantRule();
@@ -78,9 +79,10 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
    nsRuleWalker ruleWalker(mRuleTree, mAuthorStyleDisabled);
    auto rulesIndex = rules.Length();
  
-+  // We need to transfer this rule between the non-!important and
++  // We need to transfer this information between the non-!important and
 +  // !important phases for the style attribute level.
-+  nsIStyleRule* styleAttributeImportantRule = nullptr;
++  nsRuleNode* lastScopedRN = nullptr;
++  nsRuleNode* lastStyleAttrRN = nullptr;
 +
    for (const CascadeLevel *level = gCascadeLevels,
                         *levelEnd = ArrayEnd(gCascadeLevels);
@@ -90,7 +92,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
      bool doReplace = level->mLevelReplacementHint & aReplacements;
      if (doReplace) {
        switch (level->mLevelReplacementHint) {
-@@ -1402,17 +1407,60 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+@@ -1402,17 +1408,42 @@ nsStyleSet::RuleNodeWithReplacement(Elem
                presContext->RefreshDriver()->MostRecentRefresh(),
                EnsureStyleRule_IsNotThrottled);
              if (collection->mStyleRule) {
@@ -102,42 +104,24 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 +        case eRestyle_StyleAttribute: {
 +          if (!level->mIsImportant) {
 +            // First time through, we handle the non-!important rule.
++            NS_ASSERTION(aPseudoType ==
++                           nsCSSPseudoElements::ePseudo_NotPseudoElement,
++                         "this code doesn't know how to replace "
++                         "pseudo-element rules");
 +            nsHTMLCSSStyleSheet* ruleProcessor =
 +              static_cast<nsHTMLCSSStyleSheet*>(
 +                mRuleProcessors[eStyleAttrSheet]);
-+            if (ruleProcessor) {
-+              switch (aPseudoType) {
-+                case nsCSSPseudoElements::ePseudo_NotPseudoElement: {
-+                  ruleProcessor->ElementRulesMatching(PresContext(),
-+                                                      aElement,
-+                                                      &ruleWalker);
-+                  break;
-+                }
-+#ifdef MOZ_XUL
-+                case nsCSSPseudoElements::ePseudo_XULTree:
-+#endif
-+                case nsCSSPseudoElements::ePseudo_AnonBox: {
-+                  NS_NOTREACHED("should not be called");
-+                  break;
-+                }
-+                default: {
-+                  // FIXME: Wrong aElement!
-+                  ruleProcessor->PseudoElementRulesMatching(aElement,
-+                                                            aPseudoType,
-+                                                            &ruleWalker);
-+                  break;
-+                }
-+              }
-+#if 0
-+              styleAttributeImportantRule =
-+                static_cast<css::StyleRule*>(rule)->GetImportantRule();
-+#endif
++            if (ruleProcessor &&
++                aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement) {
++              lastScopedRN = aRuleWalker->CurrentNode();
++              ruleProcessor->ElementRulesMatching(PresContext(),
++                                                  aElement,
++                                                  &ruleWalker);
++              lastStyleAttrRN = aRuleWalker->CurrentNode();
 +            }
 +          } else {
 +            // Second time through, we handle the !important rule.
-+            if (styleAttributeImportantRule) {
-+              ruleWalker.ForwardOnPossiblyCSSRule(styleAttributeImportantRule);
-+            }
++            AddImportantRules(lastStyleAttrRN, lastScopedRN, aRuleWalker);
 +          }
 +          break;
 +        }
