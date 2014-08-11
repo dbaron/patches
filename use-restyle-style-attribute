@@ -1,0 +1,134 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 977991 patch 3 - Use faster eRestyle_StyleAttribute path for non-native-anonymous elements.
+
+diff --git a/content/base/public/Element.h b/content/base/public/Element.h
+--- a/content/base/public/Element.h
++++ b/content/base/public/Element.h
+@@ -31,16 +31,17 @@
+ #include "nsIScrollableFrame.h"
+ #include "mozilla/dom/Attr.h"
+ #include "nsISMILAttr.h"
+ #include "mozilla/dom/DOMRect.h"
+ #include "nsAttrValue.h"
+ #include "mozilla/EventForwards.h"
+ #include "mozilla/dom/BindingDeclarations.h"
+ #include "Units.h"
++#include "nsChangeHint.h"
+ 
+ class nsIDOMEventListener;
+ class nsIFrame;
+ class nsIDOMMozNamedAttrMap;
+ class nsIDOMCSSStyleDeclaration;
+ class nsIURI;
+ class nsIControllers;
+ class nsEventChainVisitor;
+@@ -266,16 +267,25 @@ public:
+    * animated style values.
+    *
+    * Note: This method is analogous to the 'GetStyle' method in
+    * nsGenericHTMLElement and nsStyledElement.
+    */
+   virtual nsICSSDeclaration* GetSMILOverrideStyle();
+ 
+   /**
++   * Return the hint used for style attribute changes on this element.
++   * This can be either eRestyle_Self or eRestyle_StyleAttribute
++   * depending on whether this element can use the
++   * eRestyle_StyleAttribute optimization (which requires that it not be
++   * the element generated for a pseudo-element.
++   */
++  nsRestyleHint RestyleHintForStyleAttribute() const;
++
++  /**
+    * Returns if the element is labelable as per HTML specification.
+    */
+   virtual bool IsLabelable() const;
+ 
+   /**
+    * Is the attribute named stored in the mapped attributes?
+    *
+    * // XXXbz we use this method in HasAttributeDependentStyle, so svg
+diff --git a/content/base/src/Element.cpp b/content/base/src/Element.cpp
+--- a/content/base/src/Element.cpp
++++ b/content/base/src/Element.cpp
+@@ -1560,24 +1560,35 @@ Element::SetSMILOverrideStyleRule(css::S
+   if (aNotify) {
+     nsIDocument* doc = GetCurrentDoc();
+     // Only need to request a restyle if we're in a document.  (We might not
+     // be in a document, if we're clearing animation effects on a target node
+     // that's been detached since the previous animation sample.)
+     if (doc) {
+       nsCOMPtr<nsIPresShell> shell = doc->GetShell();
+       if (shell) {
+-        shell->RestyleForAnimation(this, eRestyle_Self);
++        shell->RestyleForAnimation(this, RestyleHintForStyleAttribute());
+       }
+     }
+   }
+ 
+   return NS_OK;
+ }
+ 
++nsRestyleHint
++Element::RestyleHintForStyleAttribute() const
++{
++  // We can really return eRestyle_StyleAttribute for any case where
++  // this element doesn't have a pseudo-element style.  We'll be a
++  // little bit conservative and use native-anonymous as an indicator
++  // for that.
++  return IsInNativeAnonymousSubtree() ? eRestyle_Self
++                                      : eRestyle_StyleAttribute;
++}
++
+ bool
+ Element::IsLabelable() const
+ {
+   return false;
+ }
+ 
+ css::StyleRule*
+ Element::GetInlineStyleRule()
+diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
+--- a/layout/style/nsHTMLCSSStyleSheet.cpp
++++ b/layout/style/nsHTMLCSSStyleSheet.cpp
+@@ -72,18 +72,18 @@ nsHTMLCSSStyleSheet::ElementRulesMatchin
+ 
+   rule = aElement->GetSMILOverrideStyleRule();
+   if (rule) {
+     if (aPresContext->IsProcessingRestyles() &&
+         !aPresContext->IsProcessingAnimationStyleChange()) {
+       // Non-animation restyle -- don't process SMIL override style, because we
+       // don't want SMIL animation to trigger new CSS transitions. Instead,
+       // request an Animation restyle, so we still get noticed.
+-      aPresContext->PresShell()->RestyleForAnimation(aElement,
+-                                                     eRestyle_Self);
++      aPresContext->PresShell()->
++        RestyleForAnimation(aElement, aElement->RestyleHintForStyleAttribute());
+     } else {
+       // Animation restyle (or non-restyle traversal of rules)
+       // Now we can walk SMIL overrride style, without triggering transitions.
+       rule->RuleMatched();
+       aRuleWalker->Forward(rule);
+     }
+   }
+ }
+@@ -138,17 +138,17 @@ nsHTMLCSSStyleSheet::HasDocumentStateDep
+ 
+ // Test if style is dependent on attribute
+ /* virtual */ nsRestyleHint
+ nsHTMLCSSStyleSheet::HasAttributeDependentStyle(AttributeRuleProcessorData* aData)
+ {
+   // Perhaps should check that it's XUL, SVG, (or HTML) namespace, but
+   // it doesn't really matter.
+   if (aData->mAttrHasChanged && aData->mAttribute == nsGkAtoms::style) {
+-    return eRestyle_Self;
++    return aData->mElement->RestyleHintForStyleAttribute();
+   }
+ 
+   return nsRestyleHint(0);
+ }
+ 
+ /* virtual */ bool
+ nsHTMLCSSStyleSheet::MediumFeaturesChanged(nsPresContext* aPresContext)
+ {
