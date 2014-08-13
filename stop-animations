@@ -2,10 +2,71 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 651506 - Stop animations in the same cases we stop animated images.
 
+diff --git a/dom/animation/AnimationPlayer.h b/dom/animation/AnimationPlayer.h
+--- a/dom/animation/AnimationPlayer.h
++++ b/dom/animation/AnimationPlayer.h
+@@ -27,17 +27,18 @@ namespace dom {
+ 
+ class AnimationPlayer MOZ_FINAL : public nsWrapperCache
+ {
+ protected:
+   virtual ~AnimationPlayer() { }
+ 
+ public:
+   explicit AnimationPlayer(AnimationTimeline* aTimeline)
+-    : mIsRunningOnCompositor(false)
++    : mForcedPause(false)
++    , mIsRunningOnCompositor(false)
+     , mTimeline(aTimeline)
+   {
+     SetIsDOMBinding();
+   }
+ 
+   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(AnimationPlayer)
+   NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(AnimationPlayer)
+ 
+@@ -49,17 +50,18 @@ public:
+   AnimationTimeline* Timeline() const { return mTimeline; }
+   double StartTime() const;
+   double CurrentTime() const;
+ 
+   void SetSource(Animation* aSource);
+   void Tick();
+ 
+   bool IsPaused() const {
+-    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED;
++    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED ||
++           mForcedPause;
+   }
+ 
+   bool IsRunning() const;
+   bool IsCurrent() const;
+ 
+   // Return the duration since the start time of the player, taking into
+   // account the pause state.  May be negative.
+   // Returns a null value if the timeline associated with this object has a
+@@ -81,16 +83,17 @@ public:
+     return result;
+   }
+ 
+   nsString mName;
+   // The beginning of the delay period.
+   TimeStamp mStartTime;
+   TimeStamp mPauseStart;
+   uint8_t mPlayState;
++  bool mForcedPause;
+   bool mIsRunningOnCompositor;
+ 
+   nsRefPtr<AnimationTimeline> mTimeline;
+   nsRefPtr<Animation> mSource;
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
 diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
 --- a/layout/base/nsPresContext.cpp
 +++ b/layout/base/nsPresContext.cpp
-@@ -1407,16 +1407,24 @@ nsPresContext::SetImageAnimationModeInte
+@@ -1406,16 +1406,24 @@ nsPresContext::SetImageAnimationModeInte
        Element *rootElement = doc->GetRootElement();
        if (rootElement) {
          SetImgAnimations(rootElement, aMode);
@@ -30,71 +91,10 @@ diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
  {
    SetImageAnimationModeInternal(aMode);
  }
-diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
---- a/layout/style/AnimationCommon.h
-+++ b/layout/style/AnimationCommon.h
-@@ -246,17 +246,18 @@ struct ComputedTiming
-  */
- class ElementAnimation : public nsWrapperCache
- {
- protected:
-   virtual ~ElementAnimation() { }
- 
- public:
-   explicit ElementAnimation(dom::AnimationTimeline* aTimeline)
--    : mIsRunningOnCompositor(false)
-+    : mForcedPause(false)
-+    , mIsRunningOnCompositor(false)
-     , mIsFinishedTransition(false)
-     , mLastNotification(LAST_NOTIFICATION_NONE)
-     , mTimeline(aTimeline)
-   {
-     SetIsDOMBinding();
-   }
- 
-   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(ElementAnimation)
-@@ -274,17 +275,18 @@ public:
-   // AnimationEffect (as per the Web Animations API) we should remove these
-   // virtual methods.
-   virtual ElementPropertyTransition* AsTransition() { return nullptr; }
-   virtual const ElementPropertyTransition* AsTransition() const {
-     return nullptr;
-   }
- 
-   bool IsPaused() const {
--    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED;
-+    return mPlayState == NS_STYLE_ANIMATION_PLAY_STATE_PAUSED ||
-+           mForcedPause;
-   }
- 
-   // After transitions finish they need to be retained for one throttle-able
-   // cycle (for reasons see explanation in nsTransitionManager.cpp). In the
-   // meantime, however, they should be ignored.
-   bool IsFinishedTransition() const {
-     return mIsFinishedTransition;
-   }
-@@ -351,16 +353,17 @@ public:
-   static mozilla::TimeDuration ActiveDuration(const AnimationTiming& aTiming);
- 
-   nsString mName;
-   AnimationTiming mTiming;
-   // The beginning of the delay period.
-   mozilla::TimeStamp mStartTime;
-   mozilla::TimeStamp mPauseStart;
-   uint8_t mPlayState;
-+  bool mForcedPause;
-   bool mIsRunningOnCompositor;
-   // A flag to mark transitions that have finished and are due to
-   // be removed on the next throttle-able cycle.
-   bool mIsFinishedTransition;
- 
-   enum {
-     LAST_NOTIFICATION_NONE = uint64_t(-1),
-     LAST_NOTIFICATION_END = uint64_t(-2)
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -770,8 +770,51 @@ nsAnimationManager::DoDispatchEvents()
+@@ -787,8 +787,51 @@ nsAnimationManager::DoDispatchEvents()
      AnimationEventInfo &info = events[i];
      EventDispatcher::Dispatch(info.mElement, mPresContext, &info.mEvent);
  
@@ -151,7 +151,7 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
 +++ b/layout/style/nsAnimationManager.h
 @@ -140,16 +140,29 @@ protected:
    virtual void
-   AddElementCollection(mozilla::ElementAnimationCollection* aData) MOZ_OVERRIDE;
+   AddElementCollection(mozilla::AnimationPlayerCollection* aData) MOZ_OVERRIDE;
  
    /**
     * Check to see if we should stop or start observing the refresh driver
@@ -174,7 +174,7 @@ diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager
  private:
    void BuildAnimations(nsStyleContext* aStyleContext,
                         mozilla::dom::AnimationTimeline* aTimeline,
-                        mozilla::ElementAnimationPtrArray& aAnimations);
+                        mozilla::AnimationPlayerPtrArray& aAnimations);
    bool BuildSegment(InfallibleTArray<mozilla::AnimationPropertySegment>&
                        aSegments,
                      nsCSSProperty aProperty,
