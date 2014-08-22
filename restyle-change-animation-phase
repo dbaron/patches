@@ -28,3 +28,108 @@ diff --git a/layout/base/nsChangeHint.h b/layout/base/nsChangeHint.h
  
  
  #endif /* nsChangeHint_h___ */
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1332,22 +1332,38 @@ static const CascadeLevel gCascadeLevels
+ nsRuleNode*
+ nsStyleSet::RuleNodeWithReplacement(Element* aElement,
+                                     nsRuleNode* aOldRuleNode,
+                                     nsCSSPseudoElements::Type aPseudoType,
+                                     nsRestyleHint aReplacements)
+ {
+   NS_ABORT_IF_FALSE(!(aReplacements & ~(eRestyle_CSSTransitions |
+                                         eRestyle_CSSAnimations |
+-                                        eRestyle_StyleAttribute)),
++                                        eRestyle_StyleAttribute |
++                                        eRestyle_ChangeAnimationPhase)),
+                     // FIXME: Once bug 931668 lands we'll have a better
+                     // way to print these.
+                     nsPrintfCString("unexpected replacement bits 0x%lX",
+                                     uint32_t(aReplacements)).get());
+ 
++  bool skipAnimationRules = false;
++
++  // If we're changing animation phase, we have to reconsider what rules
++  // are in these three levels.
++  if (aReplacements & eRestyle_ChangeAnimationPhase) {
++    // FIXME: Need to deal with the SMIL style rule added in
++    // nsSVGElement::WalkContentStyleRules (in the ePresHintSheet level).
++    aReplacements |= eRestyle_CSSTransitions |
++                     eRestyle_CSSAnimations |
++                     eRestyle_StyleAttribute;
++
++    skipAnimationRules = mPresContext->IsProcessingRestyles() &&
++                         !mPresContext->IsProcessingAnimationStyleChange();
++  }
++
+   // FIXME (perf): This should probably not rebuild the whole path, but
+   // only the path from the last change in the rule tree, like
+   // ReplaceAnimationRule in nsStyleSet.cpp does.  (That could then
+   // perhaps share this code, too?)
+   // But if we do that, we'll need to pass whether we are rebuilding the
+   // rule tree from ElementRestyler::RestyleSelf to avoid taking that
+   // path when we're rebuilding the rule tree.
+ 
+@@ -1376,16 +1392,20 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+     bool doReplace = level->mLevelReplacementHint & aReplacements;
+ 
+     ruleWalker.SetLevel(level->mLevel, level->mIsImportant,
+                         level->mCheckForImportantRules && doReplace);
+ 
+     if (doReplace) {
+       switch (level->mLevelReplacementHint) {
+         case eRestyle_CSSAnimations: {
++          if (skipAnimationRules) {
++            break;
++          }
++
+           // FIXME: This should probably be more similar to what
+           // FileRules does; this feels like too much poking into the
+           // internals of nsAnimationManager.
+           nsAnimationManager* animationManager =
+             PresContext()->AnimationManager();
+           AnimationPlayerCollection* collection =
+             animationManager->GetAnimationPlayers(aElement, aPseudoType, false);
+ 
+@@ -1395,16 +1415,20 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+               EnsureStyleRule_IsNotThrottled);
+             if (collection->mStyleRule) {
+               ruleWalker.ForwardOnPossiblyCSSRule(collection->mStyleRule);
+             }
+           }
+           break;
+         }
+         case eRestyle_CSSTransitions: {
++          if (skipAnimationRules) {
++            break;
++          }
++
+           // FIXME: This should probably be more similar to what
+           // FileRules does; this feels like too much poking into the
+           // internals of nsTransitionManager.
+           nsPresContext* presContext = PresContext();
+           AnimationPlayerCollection* collection =
+             presContext->TransitionManager()->GetElementTransitions(
+               aElement, aPseudoType, false);
+ 
+@@ -1414,16 +1438,19 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+               EnsureStyleRule_IsNotThrottled);
+             if (collection->mStyleRule) {
+               ruleWalker.ForwardOnPossiblyCSSRule(collection->mStyleRule);
+             }
+           }
+           break;
+         }
+         case eRestyle_StyleAttribute: {
++          MOZ_ASSERT(aReplacements & eRestyle_ChangeAnimationPhase,
++                     "don't know how to do this level without phase change");
++
+           if (!level->mIsImportant) {
+             // First time through, we handle the non-!important rule.
+             NS_ASSERTION(aPseudoType ==
+                            nsCSSPseudoElements::ePseudo_NotPseudoElement,
+                          "this code doesn't know how to replace "
+                          "pseudo-element rules");
+             nsHTMLCSSStyleSheet* ruleProcessor =
+               static_cast<nsHTMLCSSStyleSheet*>(
