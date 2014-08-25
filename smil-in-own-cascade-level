@@ -1,14 +1,15 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 1057231 - Put SMIL/SVG Animation rules in their own level of the cascade.
+Bug 1057231 patch 1 - Add new cascade level for SVG Animation (SMIL Animation) rules.
 
-This is needed so that they can participate in the mechanism for
+This patch series (to move SVG Animation rules to their own level of the
+cascade) is needed so that they can participate in the mechanism for
 updating only animation styles to the present time without touching any
 other styles.
 
 In theory, this should have been done as part of 996796 or even as part
 of prior work on off main thread animations, except that it doesn't seem
-possible to have SMIL Animations and CSS Transitions interacting on the
+possible to have SVG Animations and CSS Transitions interacting on the
 same element and have that element's style out of date, which means it
 wasn't necessary for the existing code to update only animation styles.
 
@@ -16,7 +17,7 @@ However, bug 960465 will use this similar mechanism as the new mechanism
 for making sure transitions start in a reasonable way (replacing the
 mechanism of phases, going from style without animation to style with
 animation via nsPresContext::IsProcessingAnimationStyleChange).  This
-will require that, for SMIL Animations to continue interacting correctly
+will require that, for SVG Animations to continue interacting correctly
 with CSS Transitions, that they have their own cascade level so that
 they can participate in RestyleManager::UpdateOnlyAnimationStyles.
 
@@ -24,3 +25,170 @@ Additionally, this is needed even sooner, for bug 977991, which needs
 (temporarily, until bug 960465 lands) a mechanism for updating the style
 attribute style *and* all animation-phase-dependent styles.
 
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -955,16 +955,17 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   PROFILER_LABEL("nsStyleSet", "FileRules",
+     js::ProfileEntry::Category::CSS);
+ 
+   // Cascading order:
+   // [least important]
+   //  - UA normal rules                    = Agent        normal
+   //  - User normal rules                  = User         normal
+   //  - Presentation hints                 = PresHint     normal
++  //  - SVG Animation (highest pres hint)  = SVGAnimation normal
+   //  - Author normal rules                = Document     normal
+   //  - Override normal rules              = Override     normal
+   //  - animation rules                    = Animation    normal
+   //  - Author !important rules            = Document     !important
+   //  - Override !important rules          = Override     !important
+   //  - User !important rules              = User         !important
+   //  - UA !important rules                = Agent        !important
+   //  - transition rules                   = Transition   normal
+@@ -986,18 +987,22 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   if (!skipUserStyles && mRuleProcessors[eUserSheet]) // NOTE: different
+     (*aCollectorFunc)(mRuleProcessors[eUserSheet], aData);
+   nsRuleNode* lastUserRN = aRuleWalker->CurrentNode();
+   bool haveImportantUserRules = !aRuleWalker->GetCheckForImportantRules();
+ 
+   aRuleWalker->SetLevel(ePresHintSheet, false, false);
+   if (mRuleProcessors[ePresHintSheet])
+     (*aCollectorFunc)(mRuleProcessors[ePresHintSheet], aData);
+-  nsRuleNode* lastPresHintRN = aRuleWalker->CurrentNode();
+-  
++
++  aRuleWalker->SetLevel(eSVGAnimationSheet, false, false);
++  if (mRuleProcessors[eSVGAnimationSheet])
++    (*aCollectorFunc)(mRuleProcessors[eSVGAnimationSheet], aData);
++  nsRuleNode* lastSVGAnimationRN = aRuleWalker->CurrentNode();
++
+   aRuleWalker->SetLevel(eDocSheet, false, true);
+   bool cutOffInheritance = false;
+   if (mBindingManager && aElement) {
+     // We can supply additional document-level sheets that should be walked.
+     mBindingManager->WalkRules(aCollectorFunc,
+                                static_cast<ElementDependentRuleProcessorData*>(aData),
+                                &cutOffInheritance);
+   }
+@@ -1060,21 +1065,21 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+ #ifdef DEBUG
+   else {
+     AssertNoImportantRules(lastScopedRN, lastDocRN);
+   }
+ #endif
+ 
+   if (haveImportantDocRules) {
+     aRuleWalker->SetLevel(eDocSheet, true, false);
+-    AddImportantRules(lastDocRN, lastPresHintRN, aRuleWalker);  // doc
++    AddImportantRules(lastDocRN, lastSVGAnimationRN, aRuleWalker);  // doc
+   }
+ #ifdef DEBUG
+   else {
+-    AssertNoImportantRules(lastDocRN, lastPresHintRN);
++    AssertNoImportantRules(lastDocRN, lastSVGAnimationRN);
+   }
+ #endif
+ 
+   if (haveImportantStyleAttrRules) {
+     aRuleWalker->SetLevel(eStyleAttrSheet, true, false);
+     AddImportantRules(lastStyleAttrRN, lastScopedRN, aRuleWalker);  // style attr
+   }
+ #ifdef DEBUG
+@@ -1089,17 +1094,17 @@ nsStyleSet::FileRules(nsIStyleRuleProces
+   }
+ #ifdef DEBUG
+   else {
+     AssertNoImportantRules(lastOvrRN, lastStyleAttrRN);
+   }
+ #endif
+ 
+ #ifdef DEBUG
+-  AssertNoCSSRules(lastPresHintRN, lastUserRN);
++  AssertNoCSSRules(lastSVGAnimationRN, lastUserRN);
+ #endif
+ 
+   if (haveImportantUserRules) {
+     aRuleWalker->SetLevel(eUserSheet, true, false);
+     AddImportantRules(lastUserRN, lastAgentRN, aRuleWalker); //user
+   }
+ #ifdef DEBUG
+   else {
+@@ -1144,16 +1149,19 @@ nsStyleSet::WalkRuleProcessors(nsIStyleR
+ 
+   bool skipUserStyles = aData->mElement->IsInNativeAnonymousSubtree();
+   if (!skipUserStyles && mRuleProcessors[eUserSheet]) // NOTE: different
+     (*aFunc)(mRuleProcessors[eUserSheet], aData);
+ 
+   if (mRuleProcessors[ePresHintSheet])
+     (*aFunc)(mRuleProcessors[ePresHintSheet], aData);
+ 
++  if (mRuleProcessors[eSVGAnimationSheet])
++    (*aFunc)(mRuleProcessors[eSVGAnimationSheet], aData);
++
+   bool cutOffInheritance = false;
+   if (mBindingManager) {
+     // We can supply additional document-level sheets that should be walked.
+     if (aWalkAllXBLStylesheets) {
+       mBindingManager->WalkAllRules(aFunc, aData);
+     } else {
+       mBindingManager->WalkRules(aFunc, aData, &cutOffInheritance);
+     }
+@@ -1309,16 +1317,17 @@ struct CascadeLevel {
+   bool mIsImportant;
+   nsRestyleHint mLevelReplacementHint;
+ };
+ 
+ static const CascadeLevel gCascadeLevels[] = {
+   { nsStyleSet::eAgentSheet,      false, nsRestyleHint(0) },
+   { nsStyleSet::eUserSheet,       false, nsRestyleHint(0) },
+   { nsStyleSet::ePresHintSheet,   false, nsRestyleHint(0) },
++  { nsStyleSet::eSVGAnimationSheet, false, nsRestyleHint(0) },
+   { nsStyleSet::eDocSheet,        false, nsRestyleHint(0) },
+   { nsStyleSet::eScopedDocSheet,  false, nsRestyleHint(0) },
+   { nsStyleSet::eStyleAttrSheet,  false, nsRestyleHint(0) },
+   { nsStyleSet::eOverrideSheet,   false, nsRestyleHint(0) },
+   { nsStyleSet::eAnimationSheet,  false, eRestyle_CSSAnimations },
+   { nsStyleSet::eScopedDocSheet,  true,  nsRestyleHint(0) },
+   { nsStyleSet::eDocSheet,        true,  nsRestyleHint(0) },
+   { nsStyleSet::eStyleAttrSheet,  true,  nsRestyleHint(0) },
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -270,16 +270,17 @@ class nsStyleSet
+   }
+ 
+   // The "origins" of the CSS cascade, from lowest precedence to
+   // highest (for non-!important rules).
+   enum sheetType {
+     eAgentSheet, // CSS
+     eUserSheet, // CSS
+     ePresHintSheet,
++    eSVGAnimationSheet,
+     eDocSheet, // CSS
+     eScopedDocSheet,
+     eStyleAttrSheet,
+     eOverrideSheet, // CSS
+     eAnimationSheet,
+     eTransitionSheet,
+     eSheetTypeCount
+     // be sure to keep the number of bits in |mDirty| below and in
+@@ -467,17 +468,17 @@ class nsStyleSet
+                          // contexts use to look up properties.
+ 
+   uint16_t mBatching;
+ 
+   unsigned mInShutdown : 1;
+   unsigned mAuthorStyleDisabled: 1;
+   unsigned mInReconstruct : 1;
+   unsigned mInitFontFeatureValuesLookup : 1;
+-  unsigned mDirty : 9;  // one dirty bit is used per sheet type
++  unsigned mDirty : 10;  // one dirty bit is used per sheet type
+ 
+   uint32_t mUnusedRuleNodeCount; // used to batch rule node GC
+   nsTArray<nsStyleContext*> mRoots; // style contexts with no parent
+ 
+   // Empty style rules to force things that restrict which properties
+   // apply into different branches of the rule tree.
+   nsRefPtr<nsEmptyStyleRule> mFirstLineRule, mFirstLetterRule, mPlaceholderRule;
+ 
