@@ -65,63 +65,45 @@ diff --git a/content/base/public/Element.h b/content/base/public/Element.h
 diff --git a/content/svg/content/src/nsSVGElement.cpp b/content/svg/content/src/nsSVGElement.cpp
 --- a/content/svg/content/src/nsSVGElement.cpp
 +++ b/content/svg/content/src/nsSVGElement.cpp
-@@ -907,43 +907,25 @@ nsSVGElement::WalkContentStyleRules(nsRu
- 
-   return NS_OK;
- }
- 
+@@ -912,31 +912,19 @@ nsSVGElement::WalkContentStyleRules(nsRu
  void
  nsSVGElement::WalkAnimatedContentStyleRules(nsRuleWalker* aRuleWalker)
  {
    // Update & walk the animated content style rule, to include style from
--  // animated mapped attributes.  But first, get nsPresContext to check
--  // whether this is a "no-animation restyle". (This should match the check
--  // in nsHTMLCSSStyleSheet::RulesMatching(), where we determine whether to
--  // apply the SMILOverrideStyle.)
--  nsIDocument* doc = OwnerDoc();
--  nsIPresShell* shell = doc->GetShell();
--  nsPresContext* context = shell ? shell->GetPresContext() : nullptr;
--  if (context && context->IsProcessingRestyles() &&
--      !context->IsProcessingAnimationStyleChange()) {
--    // Any style changes right now could trigger CSS Transitions. We don't
--    // want that to happen from SMIL-animated value of mapped attrs, so
--    // ignore animated value for now, and request an animation restyle to
--    // get our animated value noticed.
--    shell->RestyleForAnimation(this,
--      eRestyle_SVGAttrAnimations | eRestyle_ChangeAnimationPhase);
+   // animated mapped attributes.  But first, get nsPresContext to check
+   // whether this is a "no-animation restyle". (This should match the check
+   // in nsHTMLCSSStyleSheet::RulesMatching(), where we determine whether to
+   // apply the SMILOverrideStyle.)
+-  nsPresContext* context = aRuleWalker->PresContext();
+-  nsIPresShell* shell = context->PresShell();
+-  RestyleManager* restyleManager = context->RestyleManager();
+-  if (restyleManager->SkipAnimationRules()) {
+-    if (restyleManager->PostAnimationRestyles()) {
+-      // Any style changes right now could trigger CSS Transitions. We don't
+-      // want that to happen from SMIL-animated value of mapped attrs, so
+-      // ignore animated value for now, and request an animation restyle to
+-      // get our animated value noticed.
+-      shell->RestyleForAnimation(this,
+-        eRestyle_SVGAttrAnimations | eRestyle_ChangeAnimationPhase);
+-    }
 -  } else {
 -    // Ok, this is an animation restyle -- go ahead and update/walk the
 -    // animated content style rule.
--    css::StyleRule* animContentStyleRule = GetAnimatedContentStyleRule();
--    if (!animContentStyleRule) {
--      UpdateAnimatedContentStyleRule();
--      animContentStyleRule = GetAnimatedContentStyleRule();
--    }
--    if (animContentStyleRule) {
--      animContentStyleRule->RuleMatched();
--      aRuleWalker->Forward(animContentStyleRule);
--    }
-+  // animated mapped attributes.
-+  css::StyleRule* animContentStyleRule = GetAnimatedContentStyleRule();
-+  if (!animContentStyleRule) {
-+    UpdateAnimatedContentStyleRule();
-+    animContentStyleRule = GetAnimatedContentStyleRule();
-+  }
-+  if (animContentStyleRule) {
-+    animContentStyleRule->RuleMatched();
-+    aRuleWalker->Forward(animContentStyleRule);
-   }
- }
- 
- NS_IMETHODIMP_(bool)
- nsSVGElement::IsAttributeMapped(const nsIAtom* name) const
- {
-   if (name == nsGkAtoms::lang) {
-     return true;
++  RestyleManager* restyleManager = aRuleWalker->PresContext()->RestyleManager();
++  if (!restyleManager->SkipAnimationRules()) {
++    // update/walk the animated content style rule.
+     css::StyleRule* animContentStyleRule = GetAnimatedContentStyleRule();
+     if (!animContentStyleRule) {
+       UpdateAnimatedContentStyleRule();
+       animContentStyleRule = GetAnimatedContentStyleRule();
+     }
+     if (animContentStyleRule) {
+       animContentStyleRule->RuleMatched();
+       aRuleWalker->Forward(animContentStyleRule);
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -67,25 +67,22 @@ RestyleManager::RestyleManager(nsPresCon
+@@ -71,27 +71,24 @@ RestyleManager::RestyleManager(nsPresCon
    , mHoverGeneration(0)
    , mRebuildAllExtraHint(nsChangeHint(0))
    , mLastUpdateForThrottledAnimations(aPresContext->RefreshDriver()->
@@ -132,7 +114,9 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                       ELEMENT_IS_POTENTIAL_RESTYLE_ROOT)
 -  , mPendingAnimationRestyles(ELEMENT_HAS_PENDING_ANIMATION_RESTYLE |
 -                              ELEMENT_IS_POTENTIAL_ANIMATION_RESTYLE_ROOT)
-   , mHavePendingNonAnimationRestyles(false)
+ #ifdef DEBUG
+   , mIsProcessingRestyles(false)
+ #endif
  #ifdef RESTYLE_LOGGING
    , mLoggingDepth(0)
  #endif
@@ -147,14 +131,14 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    mOverflowChangedTracker.RemoveFrame(aFrame);
  }
  
-@@ -1560,40 +1557,21 @@ RestyleManager::ProcessPendingRestyles()
-   // for starting the transition.
-   if (mHavePendingNonAnimationRestyles) {
-     ++mAnimationGeneration;
-     UpdateOnlyAnimationStyles();
-   }
+@@ -1594,42 +1591,23 @@ RestyleManager::ProcessPendingRestyles()
+   mSkipAnimationRules = true;
+   mPostAnimationRestyles = true;
  
    mPendingRestyles.ProcessRestyles();
+ 
+   mPostAnimationRestyles = false;
+   mSkipAnimationRules = false;
  
 -#ifdef DEBUG
 -  uint32_t oldPendingRestyleCount = mPendingRestyles.Count();
@@ -168,15 +152,17 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 -  // mid-transition (since processing the non-animation restyle ignores
 -  // the running transition so it can check for a new change on the same
 -  // property, and then posts an immediate animation style change).
--  mPresContext->SetProcessingAnimationStyleChange(true);
+-  mIsProcessingAnimationStyleChange = true;
 -  mPendingAnimationRestyles.ProcessRestyles();
--  mPresContext->SetProcessingAnimationStyleChange(false);
+-  mIsProcessingAnimationStyleChange = false;
 -
    if (!haveNonAnimation) {
      mPresContext->TransitionManager()->SetInAnimationOnlyStyleUpdate(false);
    }
  
-   mPresContext->SetProcessingRestyles(false);
+ #ifdef DEBUG
+   mIsProcessingRestyles = false;
+ #endif
 -  NS_POSTCONDITION(mPendingRestyles.Count() == oldPendingRestyleCount,
 -                   "We should not have posted new non-animation restyles while "
 -                   "processing animation restyles");
@@ -188,7 +174,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    if (mRebuildAllStyleData) {
      // We probably wasted a lot of work up above, but this seems safest
      // and it should be rarely used.
-@@ -1654,33 +1632,31 @@ RestyleManager::UpdateOnlyAnimationStyle
+@@ -1690,33 +1668,31 @@ RestyleManager::UpdateOnlyAnimationStyle
    animationManager->AddStyleUpdatesTo(tracker);
  
    tracker.ProcessRestyles();
@@ -231,7 +217,35 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 --- a/layout/base/RestyleManager.h
 +++ b/layout/base/RestyleManager.h
-@@ -283,34 +283,28 @@ public:
+@@ -90,27 +90,16 @@ public:
+ 
+   // Get a counter that increments on every style change, that we use to
+   // track whether off-main-thread animations are up-to-date.
+   uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
+ 
+   // Whether rule matching should skip styles associated with animation
+   bool SkipAnimationRules() const { return mSkipAnimationRules; }
+ 
+-  // Whether rule matching should post animation restyles when it skips
+-  // styles associated with animation.  Only true when
+-  // SkipAnimationRules() is also true.
+-  bool PostAnimationRestyles() const { return mPostAnimationRestyles; }
+-
+-  // Whether we're currently in the animation phase of restyle
+-  // processing (to be eliminated in bug 960465)
+-  bool IsProcessingAnimationStyleChange() const {
+-    return mIsProcessingAnimationStyleChange;
+-  }
+-
+   /**
+    * Reparent the style contexts of this frame subtree.  The parent frame of
+    * aFrame must be changed to the new parent before this function is called;
+    * the new parent style context will be automatically computed based on the
+    * new position in the frame tree.
+    *
+    * @param aFrame the root of the subtree to reparent.  Must not be null.
+    */
+@@ -297,34 +286,28 @@ public:
    void RebuildAllStyleData(nsChangeHint aExtraHint);
  
    // Helper that does part of the work of RebuildAllStyleData, shared by
@@ -256,7 +270,7 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
 -  {
 -    if (mPresContext) {
 -      PostRestyleEventCommon(aElement, aRestyleHint, aMinChangeHint,
--                             mPresContext->IsProcessingAnimationStyleChange());
+-                             IsProcessingAnimationStyleChange());
 -    }
 -  }
 -
@@ -276,7 +290,7 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
  
    void FlushOverflowChangedTracker()
    {
-@@ -318,35 +312,16 @@ public:
+@@ -332,35 +315,16 @@ public:
    }
  
  #ifdef DEBUG
@@ -312,7 +326,30 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
     * it will all be rebuilt. This is safe to call anytime; it will schedule
     * a restyle and take effect next time style changes are flushed.
     * This method is used to recompute the style data when some change happens
-@@ -426,17 +401,16 @@ private:
+@@ -429,40 +393,32 @@ private:
+ 
+   bool mRebuildAllStyleData : 1;
+   // True if we're already waiting for a refresh notification
+   bool mObservingRefreshDriver : 1;
+   // True if we're in the middle of a nsRefreshDriver refresh
+   bool mInStyleRefresh : 1;
+   // Whether rule matching should skip styles associated with animation
+   bool mSkipAnimationRules : 1;
+-  // Whether rule matching should post animation restyles when it skips
+-  // styles associated with animation.  Only true when
+-  // mSkipAnimationRules is also true.
+-  bool mPostAnimationRestyles : 1;
+-  // Whether we're currently in the animation phase of restyle
+-  // processing (to be eliminated in bug 960465)
+-  bool mIsProcessingAnimationStyleChange : 1;
+   bool mHavePendingNonAnimationRestyles : 1;
+ 
+   uint32_t mHoverGeneration;
+   nsChangeHint mRebuildAllExtraHint;
+ 
+   mozilla::TimeStamp mLastUpdateForThrottledAnimations;
+ 
+   OverflowChangedTracker mOverflowChangedTracker;
  
    // The total number of animation flushes by this frame constructor.
    // Used to keep the layer and animation manager in sync.
@@ -322,62 +359,14 @@ diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
  
    RestyleTracker mPendingRestyles;
 -  RestyleTracker mPendingAnimationRestyles;
-   bool mHavePendingNonAnimationRestyles;
+ 
+ #ifdef DEBUG
+   bool mIsProcessingRestyles;
+ #endif
  
  #ifdef RESTYLE_LOGGING
    int32_t mLoggingDepth;
  #endif
- };
- 
- /**
-diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
---- a/layout/base/nsPresContext.h
-+++ b/layout/base/nsPresContext.h
-@@ -905,26 +905,16 @@ public:
-   }
- 
-   void SetProcessingRestyles(bool aProcessing) {
-     NS_ASSERTION(aProcessing != bool(mProcessingRestyles),
-                  "should never nest");
-     mProcessingRestyles = aProcessing;
-   }
- 
--  bool IsProcessingAnimationStyleChange() const {
--    return mProcessingAnimationStyleChange;
--  }
--
--  void SetProcessingAnimationStyleChange(bool aProcessing) {
--    NS_ASSERTION(aProcessing != bool(mProcessingAnimationStyleChange),
--                 "should never nest");
--    mProcessingAnimationStyleChange = aProcessing;
--  }
--
-   /**
-    * Notify the prescontext that the presshell is about to reflow a reflow root.
-    * The single argument indicates whether this reflow should be interruptible.
-    * If aInterruptible is false then CheckForInterrupt and HasPendingInterrupt
-    * will always return false. If aInterruptible is true then CheckForInterrupt
-    * will return true when a pending event is detected.  This is for use by the
-    * presshell only.  Reflow code wanting to prevent interrupts should use
-    * InterruptPreventer.
-@@ -1351,17 +1341,16 @@ protected:
- 
-   // resize reflow is suppressed when the only change has been to zoom
-   // the document rather than to change the document's dimensions
-   unsigned              mSupressResizeReflow : 1;
- 
-   unsigned              mIsVisual : 1;
- 
-   unsigned              mProcessingRestyles : 1;
--  unsigned              mProcessingAnimationStyleChange : 1;
- 
-   unsigned              mBelowSomethingDirty : 1;
- 
-   unsigned              mFireAfterPaintEvents : 1;
- 
-   unsigned              mIsChrome : 1;
-   unsigned              mIsChromeOriginImage : 1;
- 
 diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
 --- a/layout/base/nsPresShell.cpp
 +++ b/layout/base/nsPresShell.cpp
@@ -409,7 +398,7 @@ diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
 diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
 --- a/layout/style/nsAnimationManager.cpp
 +++ b/layout/style/nsAnimationManager.cpp
-@@ -221,145 +221,143 @@ nsAnimationManager::SizeOfIncludingThis(
+@@ -221,146 +221,143 @@ nsAnimationManager::SizeOfIncludingThis(
  {
    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
  }
@@ -418,7 +407,8 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
  nsAnimationManager::CheckAnimationRule(nsStyleContext* aStyleContext,
                                         mozilla::dom::Element* aElement)
  {
--  if (!mPresContext->IsProcessingAnimationStyleChange()) {
+-  // FIXME (bug 960465): This test should go away.
+-  if (!mPresContext->RestyleManager()->IsProcessingAnimationStyleChange()) {
 -    if (!mPresContext->IsDynamic()) {
 -      // For print or print preview, ignore animations.
 -      return nullptr;
@@ -680,28 +670,7 @@ diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManag
 diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
 --- a/layout/style/nsHTMLCSSStyleSheet.cpp
 +++ b/layout/style/nsHTMLCSSStyleSheet.cpp
-@@ -49,47 +49,35 @@ nsHTMLCSSStyleSheet::~nsHTMLCSSStyleShee
-   mCachedStyleAttrs.Enumerate(ClearAttrCache, nullptr);
- }
- 
- NS_IMPL_ISUPPORTS(nsHTMLCSSStyleSheet, nsIStyleRuleProcessor)
- 
- /* virtual */ void
- nsHTMLCSSStyleSheet::RulesMatching(ElementRuleProcessorData* aData)
- {
--  ElementRulesMatching(aData->mPresContext, aData->mElement,
--                       aData->mRuleWalker);
-+  ElementRulesMatching(aData->mElement, aData->mRuleWalker);
- }
- 
- void
--nsHTMLCSSStyleSheet::ElementRulesMatching(nsPresContext* aPresContext,
--                                          Element* aElement,
-+nsHTMLCSSStyleSheet::ElementRulesMatching(Element* aElement,
-                                           nsRuleWalker* aRuleWalker)
- {
-   // just get the one and only style rule from the content's STYLE attribute
-   css::StyleRule* rule = aElement->GetInlineStyleRule();
+@@ -69,25 +69,17 @@ nsHTMLCSSStyleSheet::ElementRulesMatchin
    if (rule) {
      rule->RuleMatched();
      aRuleWalker->Forward(rule);
@@ -709,30 +678,25 @@ diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleS
  
    rule = aElement->GetSMILOverrideStyleRule();
    if (rule) {
--    if (aPresContext->IsProcessingRestyles() &&
--        !aPresContext->IsProcessingAnimationStyleChange()) {
+     RestyleManager* restyleManager = aPresContext->RestyleManager();
+-    if (restyleManager->SkipAnimationRules()) {
 -      // Non-animation restyle -- don't process SMIL override style, because we
 -      // don't want SMIL animation to trigger new CSS transitions. Instead,
 -      // request an Animation restyle, so we still get noticed.
--      aPresContext->PresShell()->RestyleForAnimation(aElement,
--        eRestyle_StyleAttribute | eRestyle_ChangeAnimationPhase);
+-      if (restyleManager->PostAnimationRestyles()) {
+-        aPresContext->PresShell()->RestyleForAnimation(aElement,
+-          eRestyle_StyleAttribute | eRestyle_ChangeAnimationPhase);
+-      }
 -    } else {
--      // Animation restyle (or non-restyle traversal of rules)
--      // Now we can walk SMIL overrride style, without triggering transitions.
--      rule->RuleMatched();
--      aRuleWalker->Forward(rule);
--    }
-+    // Walk SMIL overrride style
-+    rule->RuleMatched();
-+    aRuleWalker->Forward(rule);
++    if (!restyleManager->SkipAnimationRules()) {
+       // Animation restyle (or non-restyle traversal of rules)
+       // Now we can walk SMIL overrride style, without triggering transitions.
+       rule->RuleMatched();
+       aRuleWalker->Forward(rule);
+     }
    }
  }
  
- /* virtual */ void
- nsHTMLCSSStyleSheet::RulesMatching(PseudoElementRuleProcessorData* aData)
- {
-   if (nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(aData->mPseudoType)) {
-     MOZ_ASSERT(aData->mPseudoElement,
 diff --git a/layout/style/nsHTMLCSSStyleSheet.h b/layout/style/nsHTMLCSSStyleSheet.h
 --- a/layout/style/nsHTMLCSSStyleSheet.h
 +++ b/layout/style/nsHTMLCSSStyleSheet.h
@@ -759,7 +723,83 @@ diff --git a/layout/style/nsHTMLCSSStyleSheet.h b/layout/style/nsHTMLCSSStyleShe
 diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 --- a/layout/style/nsStyleSet.cpp
 +++ b/layout/style/nsStyleSet.cpp
-@@ -2073,54 +2073,16 @@ nsStyleSet::GCRuleTrees()
+@@ -1363,29 +1363,27 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+                                         eRestyle_Force |
+                                         eRestyle_ForceDescendants)),
+                     // FIXME: Once bug 979133 lands we'll have a better
+                     // way to print these.
+                     nsPrintfCString("unexpected replacement bits 0x%lX",
+                                     uint32_t(aReplacements)).get());
+ 
+   bool skipAnimationRules = false;
+-  bool postAnimationRestyles = false;
+ 
+   // If we're changing animation phase, we have to reconsider what rules
+   // are in these four levels.
+   if (aReplacements & eRestyle_ChangeAnimationPhase) {
+     aReplacements |= eRestyle_CSSTransitions |
+                      eRestyle_CSSAnimations |
+                      eRestyle_SVGAttrAnimations |
+                      eRestyle_StyleAttribute;
+ 
+     RestyleManager* restyleManager = PresContext()->RestyleManager();
+     skipAnimationRules = restyleManager->SkipAnimationRules();
+-    postAnimationRestyles = restyleManager->PostAnimationRestyles();
+   }
+ 
+   // FIXME (perf): This should probably not rebuild the whole path, but
+   // only the path from the last change in the rule tree, like
+   // ReplaceAnimationRule in nsStyleSet.cpp does.  (That could then
+   // perhaps share this code, too?)
+   // But if we do that, we'll need to pass whether we are rebuilding the
+   // rule tree from ElementRestyler::RestyleSelf to avoid taking that
+@@ -1426,21 +1424,17 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+           // internals of nsAnimationManager.
+           nsPresContext* presContext = PresContext();
+           nsAnimationManager* animationManager =
+             presContext->AnimationManager();
+           AnimationPlayerCollection* collection =
+             animationManager->GetAnimationPlayers(aElement, aPseudoType, false);
+ 
+           if (collection) {
+-            if (skipAnimationRules) {
+-              if (postAnimationRestyles) {
+-                collection->PostRestyleForAnimation(presContext);
+-              }
+-            } else {
++            if (!skipAnimationRules) {
+               animationManager->UpdateStyleAndEvents(
+                 collection, PresContext()->RefreshDriver()->MostRecentRefresh(),
+                 EnsureStyleRule_IsNotThrottled);
+               if (collection->mStyleRule) {
+                 ruleWalker.ForwardOnPossiblyCSSRule(collection->mStyleRule);
+               }
+             }
+           }
+@@ -1451,21 +1445,17 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+           // FileRules does; this feels like too much poking into the
+           // internals of nsTransitionManager.
+           nsPresContext* presContext = PresContext();
+           AnimationPlayerCollection* collection =
+             presContext->TransitionManager()->GetElementTransitions(
+               aElement, aPseudoType, false);
+ 
+           if (collection) {
+-            if (skipAnimationRules) {
+-              if (postAnimationRestyles) {
+-                collection->PostRestyleForAnimation(presContext);
+-              }
+-            } else {
++            if (!skipAnimationRules) {
+               collection->EnsureStyleRuleFor(
+                 presContext->RefreshDriver()->MostRecentRefresh(),
+                 EnsureStyleRule_IsNotThrottled);
+               if (collection->mStyleRule) {
+                 ruleWalker.ForwardOnPossiblyCSSRule(collection->mStyleRule);
+               }
+             }
+           }
+@@ -2076,55 +2066,16 @@ nsStyleSet::GCRuleTrees()
        // It was deleted, as it should be.
        mOldRuleTrees.RemoveElementAt(i);
      } else {
@@ -773,7 +813,8 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 - * rules removed, and post a restyle if needed.
 - */
 -static inline nsRuleNode*
--SkipAnimationRules(nsRuleNode* aRuleNode, Element* aElementOrPseudoElement)
+-SkipAnimationRules(nsRuleNode* aRuleNode, Element* aElementOrPseudoElement,
+-                   bool aPostAnimationRestyles)
 -{
 -  nsRuleNode* ruleNode = aRuleNode;
 -  // The transition rule must be at the top of the cascade.
@@ -792,7 +833,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 -    ruleNode = ReplaceAnimationRule(ruleNode, animationRule, nullptr);
 -  }
 -
--  if (ruleNode != aRuleNode) {
+-  if (ruleNode != aRuleNode && aPostAnimationRestyles) {
 -    NS_ASSERTION(aElementOrPseudoElement,
 -                 "How can we have transition rules but no element?");
 -    // Need to do an animation restyle, just like
@@ -814,7 +855,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
                                   // until bug 960465 lands, and for
                                   // SkipAnimationRules only
                                   Element* aElementOrPseudoElement)
-@@ -2133,42 +2095,24 @@ nsStyleSet::ReparentStyleContext(nsStyle
+@@ -2137,44 +2088,27 @@ nsStyleSet::ReparentStyleContext(nsStyle
      nsRefPtr<nsStyleContext> ret = aStyleContext;
      return ret.forget();
    }
@@ -825,16 +866,19 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
  
 -  // Skip transition rules as needed just like
 -  // nsTransitionManager::WalkTransitionRule would.
--  bool skipAnimationRules = PresContext()->IsProcessingRestyles() &&
--    !PresContext()->IsProcessingAnimationStyleChange();
+-  RestyleManager* restyleManager = PresContext()->RestyleManager();
+-  bool skipAnimationRules = restyleManager->SkipAnimationRules();
+-  bool postAnimationRestyles = restyleManager->PostAnimationRestyles();
 -  if (skipAnimationRules) {
 -    // Make sure that we're not using transition rules or animation rules for
 -    // our new style context.  If we need them, an animation restyle will
 -    // provide.
--    ruleNode =
--      SkipAnimationRules(ruleNode, aElementOrPseudoElement);
+-    ruleNode = SkipAnimationRules(ruleNode, aElementOrPseudoElement,
+-                                  postAnimationRestyles);
 -  }
--
++  NS_ASSERTION(!restyleManager->SkipAnimationRules(),
++               "we no longer handle SkipAnimationRules()");
+ 
    nsRuleNode* visitedRuleNode = nullptr;
    nsStyleContext* visitedContext = aStyleContext->GetStyleIfVisited();
    // Reparenting a style context just changes where we inherit from,
@@ -847,7 +891,8 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 -     if (skipAnimationRules) {
 -      // FIXME do something here for animations?
 -       visitedRuleNode =
--         SkipAnimationRules(visitedRuleNode, aElementOrPseudoElement);
+-         SkipAnimationRules(visitedRuleNode, aElementOrPseudoElement,
+-                            postAnimationRestyles);
 -     }
 +    visitedRuleNode = visitedContext->RuleNode();
    }
@@ -861,7 +906,7 @@ diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
 diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
 --- a/layout/style/nsTransitionManager.cpp
 +++ b/layout/style/nsTransitionManager.cpp
-@@ -169,20 +169,16 @@ nsTransitionManager::StyleContextChanged
+@@ -169,22 +169,16 @@ nsTransitionManager::StyleContextChanged
      GetElementTransitions(aElement, pseudoType, false);
    if (!collection &&
        disp->mTransitionPropertyCount == 1 &&
@@ -870,7 +915,9 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
      return false;
    }
  
--  if (aNewStyleContext->PresContext()->IsProcessingAnimationStyleChange()) {
+-  // FIXME (bug 960465): This test should go away.
+-  if (aNewStyleContext->PresContext()->RestyleManager()->
+-        IsProcessingAnimationStyleChange()) {
 -    return false;
 -  }
 -
@@ -882,7 +929,7 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
      return false;
    }
  
-@@ -602,29 +598,16 @@ nsTransitionManager::WalkTransitionRule(
+@@ -604,31 +598,16 @@ nsTransitionManager::WalkTransitionRule(
      return;
    }
  
@@ -891,16 +938,18 @@ diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionMan
      return;
    }
  
--  if (aData->mPresContext->IsProcessingRestyles() &&
--      !aData->mPresContext->IsProcessingAnimationStyleChange()) {
+-  RestyleManager* restyleManager = aData->mPresContext->RestyleManager();
+-  if (restyleManager->SkipAnimationRules()) {
 -    // If we're processing a normal style change rather than one from
 -    // animation, don't add the transition rule.  This allows us to
 -    // compute the new style value rather than having the transition
 -    // override it, so that we can start transitioning differently.
 -
--    // We need to immediately restyle with animation
--    // after doing this.
--    collection->PostRestyleForAnimation(mPresContext);
+-    if (restyleManager->PostAnimationRestyles()) {
+-      // We need to immediately restyle with animation
+-      // after doing this.
+-      collection->PostRestyleForAnimation(mPresContext);
+-    }
 -    return;
 -  }
 -
