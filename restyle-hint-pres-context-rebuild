@@ -1,0 +1,233 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1047928 patch 2 - Pass restyle hint to nsPresContext::RebuildAllStyleData.
+
+diff --git a/content/base/src/nsFrameLoader.cpp b/content/base/src/nsFrameLoader.cpp
+--- a/content/base/src/nsFrameLoader.cpp
++++ b/content/base/src/nsFrameLoader.cpp
+@@ -842,20 +842,21 @@ nsFrameLoader::MarginsChanged(uint32_t a
+   if (!mDocShell)
+     return;
+ 
+   // Set the margins
+   mDocShell->SetMarginWidth(aMarginWidth);
+   mDocShell->SetMarginHeight(aMarginHeight);
+ 
+   // Trigger a restyle if there's a prescontext
++  // FIXME: This could do something much less expensive.
+   nsRefPtr<nsPresContext> presContext;
+   mDocShell->GetPresContext(getter_AddRefs(presContext));
+   if (presContext)
+-    presContext->RebuildAllStyleData(nsChangeHint(0));
++    presContext->RebuildAllStyleData(nsChangeHint(0), eRestyle_Subtree);
+ }
+ 
+ bool
+ nsFrameLoader::ShowRemoteFrame(const nsIntSize& size,
+                                nsSubDocumentFrame *aFrame)
+ {
+   NS_ASSERTION(mRemoteFrame, "ShowRemote only makes sense on remote frames.");
+ 
+diff --git a/dom/base/nsHistory.cpp b/dom/base/nsHistory.cpp
+--- a/dom/base/nsHistory.cpp
++++ b/dom/base/nsHistory.cpp
+@@ -163,17 +163,17 @@ nsHistory::Go(int32_t aDelta, ErrorResul
+       // trick to work around gecko reflow bugs, and this should have
+       // the same effect.
+ 
+       nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+ 
+       nsIPresShell *shell;
+       nsPresContext *pcx;
+       if (doc && (shell = doc->GetShell()) && (pcx = shell->GetPresContext())) {
+-        pcx->RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++        pcx->RebuildAllStyleData(NS_STYLE_HINT_REFLOW, eRestyle_Subtree);
+       }
+ 
+       return;
+     }
+   }
+ 
+   nsCOMPtr<nsISHistory> session_history = GetSessionHistory();
+   nsCOMPtr<nsIWebNavigation> webnav(do_QueryInterface(session_history));
+diff --git a/dom/base/nsLocation.cpp b/dom/base/nsLocation.cpp
+--- a/dom/base/nsLocation.cpp
++++ b/dom/base/nsLocation.cpp
+@@ -919,17 +919,17 @@ nsLocation::Reload(bool aForceget)
+     // page since some sites may use this trick to work around gecko
+     // reflow bugs, and this should have the same effect.
+ 
+     nsCOMPtr<nsIDocument> doc = window->GetExtantDoc();
+ 
+     nsIPresShell *shell;
+     nsPresContext *pcx;
+     if (doc && (shell = doc->GetShell()) && (pcx = shell->GetPresContext())) {
+-      pcx->RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++      pcx->RebuildAllStyleData(NS_STYLE_HINT_REFLOW, eRestyle_Subtree);
+     }
+ 
+     return NS_OK;
+   }
+ 
+   if (webNav) {
+     uint32_t reloadFlags = nsIWebNavigation::LOAD_FLAGS_NONE;
+ 
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -940,17 +940,22 @@ nsPresContext::UpdateAfterPreferencesCha
+   mDeviceContext->FlushFontCache();
+ 
+   nsChangeHint hint = nsChangeHint(0);
+ 
+   if (mPrefChangePendingNeedsReflow) {
+     NS_UpdateHint(hint, NS_STYLE_HINT_REFLOW);
+   }
+ 
+-  RebuildAllStyleData(hint);
++  // Preferences don't change the results of selector matching; they
++  // only change the computed style data.  This means we can pass
++  // nsRestyleHint(0).
++  // FIXME: Many preferences don't require rebuilding style data,
++  // either.
++  RebuildAllStyleData(hint, nsRestyleHint(0));
+ }
+ 
+ nsresult
+ nsPresContext::Init(nsDeviceContext* aDeviceContext)
+ {
+   NS_ASSERTION(!mInitialized, "attempt to reinit pres context");
+   NS_ENSURE_ARG(aDeviceContext);
+ 
+@@ -1167,17 +1172,17 @@ nsPresContext::SetShell(nsIPresShell* aS
+   }
+ }
+ 
+ void
+ nsPresContext::DoChangeCharSet(const nsCString& aCharSet)
+ {
+   UpdateCharSet(aCharSet);
+   mDeviceContext->FlushFontCache();
+-  RebuildAllStyleData(NS_STYLE_HINT_REFLOW);
++  RebuildAllStyleData(NS_STYLE_HINT_REFLOW, nsRestyleHint(0));
+ }
+ 
+ void
+ nsPresContext::UpdateCharSet(const nsCString& aCharSet)
+ {
+   if (mLangService) {
+     mLanguage = mLangService->LookupCharSet(aCharSet);
+     // this will be a language group (or script) code rather than a true language code
+@@ -1737,17 +1742,17 @@ nsPresContext::SysColorChangedInternal()
+   }
+ 
+   // Reset default background and foreground colors for the document since
+   // they may be using system colors
+   GetDocumentColorPreferences();
+ 
+   // The system color values are computed to colors in the style data,
+   // so normal style data comparison is sufficient here.
+-  RebuildAllStyleData(nsChangeHint(0));
++  RebuildAllStyleData(nsChangeHint(0), nsRestyleHint(0));
+ }
+ 
+ void
+ nsPresContext::UIResolutionChanged()
+ {
+   if (!mPendingUIResolutionChanged) {
+     nsCOMPtr<nsIRunnable> ev =
+       NS_NewRunnableMethod(this, &nsPresContext::UIResolutionChangedInternal);
+@@ -1847,30 +1852,30 @@ void nsPresContext::StopEmulatingMedium(
+   nsIAtom* previousMedium = Medium();
+   mIsEmulatingMedia = false;
+   if (Medium() != previousMedium) {
+     MediaFeatureValuesChanged(eRebuildStyleIfNeeded, nsChangeHint(0));
+   }
+ }
+ 
+ void
+-nsPresContext::RebuildAllStyleData(nsChangeHint aExtraHint)
++nsPresContext::RebuildAllStyleData(nsChangeHint aExtraHint,
++                                   nsRestyleHint aRestyleHint)
+ {
+   if (!mShell) {
+     // We must have been torn down. Nothing to do here.
+     return;
+   }
+ 
+   mUsesRootEMUnits = false;
+   mUsesViewportUnits = false;
+   RebuildUserFontSet();
+   RebuildCounterStyles();
+ 
+-  // FIXME: Pass through from callers
+-  RestyleManager()->RebuildAllStyleData(aExtraHint, eRestyle_Subtree);
++  RestyleManager()->RebuildAllStyleData(aExtraHint, aRestyleHint);
+ }
+ 
+ void
+ nsPresContext::PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint)
+ {
+   if (!mShell) {
+     // We must have been torn down. Nothing to do here.
+     return;
+@@ -1889,17 +1894,17 @@ nsPresContext::MediaFeatureValuesChanged
+ 
+   // MediumFeaturesChanged updates the applied rules, so it always gets called.
+   bool mediaFeaturesDidChange = mShell ? mShell->StyleSet()->MediumFeaturesChanged(this)
+                                        : false;
+ 
+   if (aShouldRebuild == eAlwaysRebuildStyle ||
+       mediaFeaturesDidChange ||
+       (mUsesViewportUnits && mPendingViewportChange)) {
+-    RebuildAllStyleData(aChangeHint);
++    RebuildAllStyleData(aChangeHint, eRestyle_Subtree);
+   }
+ 
+   mPendingViewportChange = false;
+ 
+   if (mDocument->IsBeingUsedAsImage()) {
+     MOZ_ASSERT(PR_CLIST_IS_EMPTY(&mDOMMediaQueryLists));
+     return;
+   }
+@@ -2238,17 +2243,17 @@ nsPresContext::EnsureSafeToHandOutCSSRul
+   CSSStyleSheet::EnsureUniqueInnerResult res =
+     mShell->StyleSet()->EnsureUniqueInnerOnCSSSheets();
+   if (res == CSSStyleSheet::eUniqueInner_AlreadyUnique) {
+     // Nothing to do.
+     return;
+   }
+ 
+   MOZ_ASSERT(res == CSSStyleSheet::eUniqueInner_ClonedInner);
+-  RebuildAllStyleData(nsChangeHint(0));
++  RebuildAllStyleData(nsChangeHint(0), eRestyle_Subtree);
+ }
+ 
+ void
+ nsPresContext::FireDOMPaintEvent(nsInvalidateRequestList* aList)
+ {
+   nsPIDOMWindow* ourWindow = mDocument->GetWindow();
+   if (!ourWindow)
+     return;
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -251,17 +251,17 @@ public:
+ #endif
+ 
+   /**
+    * Rebuilds all style data by throwing out the old rule tree and
+    * building a new one, and additionally applying aExtraHint (which
+    * must not contain nsChangeHint_ReconstructFrame) to the root frame.
+    * Also rebuild the user font set and counter style manager.
+    */
+-  void RebuildAllStyleData(nsChangeHint aExtraHint);
++  void RebuildAllStyleData(nsChangeHint aExtraHint, nsRestyleHint aRestyleHint);
+   /**
+    * Just like RebuildAllStyleData, except (1) asynchronous and (2) it
+    * doesn't rebuild the user font set.
+    */
+   void PostRebuildAllStyleDataEvent(nsChangeHint aExtraHint);
+ 
+   void MediaFeatureValuesChanged(StyleRebuildType aShouldRebuild,
+                                  nsChangeHint aChangeHint = nsChangeHint(0));
