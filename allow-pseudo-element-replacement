@@ -1,0 +1,388 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug ?????? patch 1 - Allow pseudo-elements for style attribute replacement in RuleNodeWithReplacement.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1914,17 +1914,17 @@ RestyleManager::TryStartingTransition(ns
+   if (coverRule) {
+     nsCOMArray<nsIStyleRule> rules;
+     rules.AppendObject(coverRule);
+     *aNewStyleContext = aPresContext->StyleSet()->
+                           ResolveStyleByAddingRules(*aNewStyleContext, rules);
+   }
+ }
+ 
+-static inline dom::Element*
++static dom::Element*
+ ElementForStyleContext(nsIContent* aParentContent,
+                        nsIFrame* aFrame,
+                        nsCSSPseudoElements::Type aPseudoType)
+ {
+   // We don't expect XUL tree stuff here.
+   NS_PRECONDITION(aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement ||
+                   aPseudoType == nsCSSPseudoElements::ePseudo_AnonBox ||
+                   aPseudoType < nsCSSPseudoElements::ePseudo_PseudoElementCount,
+@@ -1977,16 +1977,32 @@ ElementForStyleContext(nsIContent* aPare
+     return aParentContent->AsElement();
+   }
+ 
+   MOZ_ASSERT(aFrame->GetContent()->GetParent(),
+              "should not have got here for the root element");
+   return aFrame->GetContent()->GetParent()->AsElement();
+ }
+ 
++static dom::Element*
++PseudoElementForStyleContext(nsIFrame* aFrame,
++                             nsCSSPseudoElements::Type aPseudoType)
++{
++  if (aPseudoType < ePseudo_PseudoElementCount) {
++    return nullptr;
++  }
++
++  if (nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(pseudoType) ||
++      nsCSSPseudoElements::PseudoElementSupportsUserActionState(pseudoType)) {
++    return aFrame->GetContent()->AsElement();
++  }
++
++  return nullptr;
++}
++
+ /**
+  * FIXME: Temporary.  Should merge with following function.
+  */
+ static nsIFrame*
+ GetPrevContinuationWithPossiblySameStyle(nsIFrame* aFrame)
+ {
+   // Account for {ib} splits when looking for "prevContinuation".  In
+   // particular, for the first-continuation of a part of an {ib} split
+@@ -2859,25 +2875,16 @@ ElementRestyler::RestyleSelf(nsIFrame* a
+ 
+   if (providerFrame != aSelf->GetParent()) {
+     // We don't actually know what the parent style context's
+     // non-inherited hints were, so assume the worst.
+     mParentFrameHintsNotHandledForDescendants =
+       nsChangeHint_Hints_NotHandledForDescendants;
+   }
+ 
+-  // We don't support using eRestyle_StyleAttribute when pseudo-elements
+-  // are involved.  This is mostly irrelevant since style attribute
+-  // changes on pseudo-elements are very rare, though it does mean we
+-  // don't get the optimization for table elements.
+-  if (pseudoType != nsCSSPseudoElements::ePseudo_NotPseudoElement &&
+-      (aRestyleHint & eRestyle_StyleAttribute)) {
+-    aRestyleHint = (aRestyleHint & ~eRestyle_StyleAttribute) | eRestyle_Self;
+-  }
+-
+   LOG_RESTYLE("parentContext = %p", parentContext);
+ 
+   // do primary context
+   nsRefPtr<nsStyleContext> newContext;
+   nsIFrame *prevContinuation =
+     GetPrevContinuationWithPossiblySameStyle(aSelf);
+   nsStyleContext *prevContinuationContext;
+   bool copyFromContinuation =
+@@ -2910,19 +2917,22 @@ ElementRestyler::RestyleSelf(nsIFrame* a
+         styleSet->ReparentStyleContext(oldContext, parentContext, element,
+                                        pseudoElement);
+     } else {
+       // Use ResolveStyleWithReplacement either for actual replacements
+       // or, with no replacements, as a substitute for
+       // ReparentStyleContext that rebuilds the path in the rule tree
+       // rather than reusing the rule node, as we need to do during a
+       // rule tree reconstruct.
++      Element* pseudoElement = PseudoElementForStyleContext(aSelf, pseudoType);
++      MOZ_ASSERT(element != pseudoElement);
+       LOG_RESTYLE("resolving style with replacement");
+       newContext =
+-        styleSet->ResolveStyleWithReplacement(element, parentContext, oldContext,
++        styleSet->ResolveStyleWithReplacement(element, pseudoElement,
++                                              parentContext, oldContext,
+                                               aRestyleHint);
+     }
+   } else if (pseudoType == nsCSSPseudoElements::ePseudo_AnonBox) {
+     newContext = styleSet->ResolveAnonymousBoxStyle(pseudoTag,
+                                                     parentContext);
+   }
+   else {
+     Element* element = ElementForStyleContext(mParentContent, aSelf, pseudoType);
+@@ -2954,19 +2964,17 @@ ElementRestyler::RestyleSelf(nsIFrame* a
+         }
+       } else {
+         // Don't expect XUL tree stuff here, since it needs a comparator and
+         // all.
+         NS_ASSERTION(pseudoType <
+                        nsCSSPseudoElements::ePseudo_PseudoElementCount,
+                      "Unexpected pseudo type");
+         Element* pseudoElement =
+-          nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(pseudoType) ||
+-          nsCSSPseudoElements::PseudoElementSupportsUserActionState(pseudoType) ?
+-            aSelf->GetContent()->AsElement() : nullptr;
++          PseudoElementForStyleContext(aSelf, pseudoType);
+         MOZ_ASSERT(element != pseudoElement);
+         newContext = styleSet->ResolvePseudoElementStyle(element,
+                                                          pseudoType,
+                                                          parentContext,
+                                                          pseudoElement);
+       }
+     }
+     else {
+@@ -3157,19 +3165,22 @@ ElementRestyler::RestyleSelf(nsIFrame* a
+     if (!(aRestyleHint & (eRestyle_Self | eRestyle_Subtree))) {
+       Element* element = extraPseudoType != nsCSSPseudoElements::ePseudo_AnonBox
+                            ? mContent->AsElement() : nullptr;
+       if (styleSet->IsInRuleTreeReconstruct()) {
+         // Use ResolveStyleWithReplacement as a substitute for
+         // ReparentStyleContext that rebuilds the path in the rule tree
+         // rather than reusing the rule node, as we need to do during a
+         // rule tree reconstruct.
++        Element* pseudoElement =
++          PseudoElementForStyleContext(aSelf, extraPseudoType);
++        MOZ_ASSERT(element != pseudoElement);
+         newExtraContext =
+-          styleSet->ResolveStyleWithReplacement(element, newContext,
+-                                                oldExtraContext,
++          styleSet->ResolveStyleWithReplacement(element, pseudoElement,
++                                                newContext, oldExtraContext,
+                                                 nsRestyleHint(0));
+       } else {
+         nsIContent* pseudoElementContent = aSelf->GetContent();
+         Element* pseudoElement =
+           (pseudoElementContent && pseudoElementContent->IsElement())
+             ? pseudoElementContent->AsElement() : nullptr;
+         newExtraContext =
+           styleSet->ReparentStyleContext(oldExtraContext, newContext, element,
+@@ -3346,17 +3357,17 @@ ElementRestyler::RestyleUndisplayedChild
+       } else if (thisChildHint ||
+                  styleSet->IsInRuleTreeReconstruct()) {
+         // Use ResolveStyleWithReplacement either for actual
+         // replacements, or as a substitute for ReparentStyleContext
+         // that rebuilds the path in the rule tree rather than reusing
+         // the rule node, as we need to do during a rule tree
+         // reconstruct.
+         undisplayedContext =
+-          styleSet->ResolveStyleWithReplacement(element,
++          styleSet->ResolveStyleWithReplacement(element, nullptr,
+                                                 mFrame->StyleContext(),
+                                                 undisplayed->mStyle,
+                                                 thisChildHint);
+       } else {
+         undisplayedContext =
+           styleSet->ReparentStyleContext(undisplayed->mStyle,
+                                          mFrame->StyleContext(),
+                                          element, element);
+diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
+--- a/layout/style/nsHTMLCSSStyleSheet.cpp
++++ b/layout/style/nsHTMLCSSStyleSheet.cpp
+@@ -86,30 +86,44 @@ nsHTMLCSSStyleSheet::ElementRulesMatchin
+       // Animation restyle (or non-restyle traversal of rules)
+       // Now we can walk SMIL overrride style, without triggering transitions.
+       rule->RuleMatched();
+       aRuleWalker->Forward(rule);
+     }
+   }
+ }
+ 
++void
++nsHTMLCSSStyleSheet::PseudoElementRulesMatching(Element* aPseudoElement,
++                                                nsCSSPseudoElements::Type
++                                                  aPseudoType,
++                                                nsRuleWalker* aRuleWalker)
++{
++  MOZ_ASSERT(nsCSSPseudoElements::
++               PseudoElementSupportsStyleAttribute(aPseudoType));
++  MOZ_ASSERT(aPseudoElement);
++
++  // just get the one and only style rule from the content's STYLE attribute
++  css::StyleRule* rule = aPseudoElement->GetInlineStyleRule();
++  if (rule) {
++    rule->RuleMatched();
++    aRuleWalker->Forward(rule);
++  }
++}
++
+ /* virtual */ void
+ nsHTMLCSSStyleSheet::RulesMatching(PseudoElementRuleProcessorData* aData)
+ {
+   if (nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(aData->mPseudoType)) {
+     MOZ_ASSERT(aData->mPseudoElement,
+         "If pseudo element is supposed to support style attribute, it must "
+         "have a pseudo element set");
+ 
+-    // just get the one and only style rule from the content's STYLE attribute
+-    css::StyleRule* rule = aData->mPseudoElement->GetInlineStyleRule();
+-    if (rule) {
+-      rule->RuleMatched();
+-      aData->mRuleWalker->Forward(rule);
+-    }
++    PseudoElementRulesMatching(aData->mPseudoElement, aData->mPseudoType,
++                               aData->mRuleWalker);
+   }
+ }
+ 
+ /* virtual */ void
+ nsHTMLCSSStyleSheet::RulesMatching(AnonBoxRuleProcessorData* aData)
+ {
+ }
+ 
+diff --git a/layout/style/nsHTMLCSSStyleSheet.h b/layout/style/nsHTMLCSSStyleSheet.h
+--- a/layout/style/nsHTMLCSSStyleSheet.h
++++ b/layout/style/nsHTMLCSSStyleSheet.h
+@@ -45,21 +45,26 @@ public:
+   virtual nsRestyleHint
+     HasAttributeDependentStyle(AttributeRuleProcessorData* aData) MOZ_OVERRIDE;
+   virtual bool MediumFeaturesChanged(nsPresContext* aPresContext) MOZ_OVERRIDE;
+   virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+     const MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+     const MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+ 
+-  // Variant of RulesMatching method above that is specific to this
++  // Variants of RulesMatching method above that are specific to this
+   // rule processor.
+   void ElementRulesMatching(nsPresContext* aPresContext,
+                             mozilla::dom::Element* aElement,
+                             nsRuleWalker* aRuleWalker);
++  // aPseudoElement here is the content node for the pseudo-element, not
++  // its corresponding real element.
++  void PseudoElementRulesMatching(mozilla::dom::Element* aPseudoElement,
++                                  nsCSSPseudoElements::Type aPseudoType,
++                                  nsRuleWalker* aRuleWalker);
+ 
+   void CacheStyleAttr(const nsAString& aSerialized, MiscContainer* aValue);
+   void EvictStyleAttr(const nsAString& aSerialized, MiscContainer* aValue);
+   MiscContainer* LookupStyleAttr(const nsAString& aSerialized);
+ 
+ private: 
+   ~nsHTMLCSSStyleSheet();
+ 
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1346,16 +1346,17 @@ static const CascadeLevel gCascadeLevels
+   { nsStyleSet::eOverrideSheet,         true,  false, nsRestyleHint(0) },
+   { nsStyleSet::eUserSheet,             true,  false, nsRestyleHint(0) },
+   { nsStyleSet::eAgentSheet,            true,  false, nsRestyleHint(0) },
+   { nsStyleSet::eTransitionSheet,       false, false, eRestyle_CSSTransitions },
+ };
+ 
+ nsRuleNode*
+ nsStyleSet::RuleNodeWithReplacement(Element* aElement,
++                                    Element* aPseudoElement,
+                                     nsRuleNode* aOldRuleNode,
+                                     nsCSSPseudoElements::Type aPseudoType,
+                                     nsRestyleHint aReplacements)
+ {
+   NS_ABORT_IF_FALSE(!(aReplacements & ~(eRestyle_CSSTransitions |
+                                         eRestyle_CSSAnimations |
+                                         eRestyle_SVGAttrAnimations |
+                                         eRestyle_StyleAttribute |
+@@ -1485,30 +1486,32 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+           break;
+         }
+         case eRestyle_StyleAttribute: {
+           MOZ_ASSERT(aReplacements & eRestyle_ChangeAnimationPhase,
+                      "don't know how to do this level without phase change");
+ 
+           if (!level->mIsImportant) {
+             // First time through, we handle the non-!important rule.
+-            MOZ_ASSERT(aPseudoType ==
+-                         nsCSSPseudoElements::ePseudo_NotPseudoElement,
+-                       "this code doesn't know how to replace "
+-                       "pseudo-element rules");
+             nsHTMLCSSStyleSheet* ruleProcessor =
+               static_cast<nsHTMLCSSStyleSheet*>(
+                 mRuleProcessors[eStyleAttrSheet].get());
+-            if (ruleProcessor &&
+-                // check condition we asserted above (belt & braces security)
+-                aPseudoType == nsCSSPseudoElements::ePseudo_NotPseudoElement) {
++            if (ruleProcessor) {
+               lastScopedRN = ruleWalker.CurrentNode();
+-              ruleProcessor->ElementRulesMatching(PresContext(),
+-                                                  aElement,
+-                                                  &ruleWalker);
++              if (aPseudoType ==
++                    nsCSSPseudoElements::ePseudo_NotPseudoElement) {
++                ruleProcessor->ElementRulesMatching(PresContext(),
++                                                    aElement,
++                                                    &ruleWalker);
++              } else if (nsCSSPseudoElements::
++                           PseudoElementSupportsStyleAttribute(aPseudoType)) {
++                ruleProcessor->ElementRulesMatching(aPseudoElement,
++                                                    aPseudoType,
++                                                    &ruleWalker);
++              }
+               lastStyleAttrRN = ruleWalker.CurrentNode();
+               haveImportantStyleAttrRules =
+                 !ruleWalker.GetCheckForImportantRules();
+             }
+           } else {
+             // Second time through, we handle the !important rule(s).
+             if (haveImportantStyleAttrRules) {
+               AddImportantRules(lastStyleAttrRN, lastScopedRN, &ruleWalker);
+@@ -1538,22 +1541,24 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+     }
+   }
+ 
+   return ruleWalker.CurrentNode();
+ }
+ 
+ already_AddRefed<nsStyleContext>
+ nsStyleSet::ResolveStyleWithReplacement(Element* aElement,
++                                        Element* aPseudoElement,
+                                         nsStyleContext* aNewParentContext,
+                                         nsStyleContext* aOldStyleContext,
+                                         nsRestyleHint aReplacements)
+ {
+   nsRuleNode* ruleNode =
+-    RuleNodeWithReplacement(aElement, aOldStyleContext->RuleNode(),
++    RuleNodeWithReplacement(aElement, aPseudoElement,
++                            aOldStyleContext->RuleNode(),
+                             aOldStyleContext->GetPseudoType(), aReplacements);
+ 
+   nsRuleNode* visitedRuleNode = nullptr;
+   nsStyleContext* oldStyleIfVisited = aOldStyleContext->GetStyleIfVisited();
+   if (oldStyleIfVisited) {
+     if (oldStyleIfVisited->RuleNode() == aOldStyleContext->RuleNode()) {
+       visitedRuleNode = ruleNode;
+     } else {
+diff --git a/layout/style/nsStyleSet.h b/layout/style/nsStyleSet.h
+--- a/layout/style/nsStyleSet.h
++++ b/layout/style/nsStyleSet.h
+@@ -119,16 +119,17 @@ class nsStyleSet
+   ResolveStyleByAddingRules(nsStyleContext* aBaseContext,
+                             const nsCOMArray<nsIStyleRule> &aRules);
+ 
+   // Resolve style by making replacements in the list of style rules as
+   // described by aReplacements, but otherwise maintaining the status
+   // quo.
+   already_AddRefed<nsStyleContext>
+   ResolveStyleWithReplacement(mozilla::dom::Element* aElement,
++                              mozilla::dom::Element* aPseudoElement,
+                               nsStyleContext* aNewParentContext,
+                               nsStyleContext* aOldStyleContext,
+                               nsRestyleHint aReplacements);
+ 
+   // Get a style context for a non-element (which no rules will match),
+   // such as text nodes, placeholder frames, and the nsFirstLetterFrame
+   // for everything after the first letter.
+   //
+@@ -407,16 +408,17 @@ class nsStyleSet
+   // Enumerate all the rules in a way that doesn't care about the order
+   // of the rules and break out if the enumeration is halted.
+   void WalkRuleProcessors(nsIStyleRuleProcessor::EnumFunc aFunc,
+                           ElementDependentRuleProcessorData* aData,
+                           bool aWalkAllXBLStylesheets);
+ 
+   // Helper for ResolveStyleWithReplacement
+   nsRuleNode* RuleNodeWithReplacement(mozilla::dom::Element* aElement,
++                                      mozilla::dom::Element* aPseudoElement,
+                                       nsRuleNode* aOldRuleNode,
+                                       nsCSSPseudoElements::Type aPseudoType,
+                                       nsRestyleHint aReplacements);
+ 
+   /**
+    * Bit-flags that can be passed to GetContext() in its parameter 'aFlags'.
+    */
+   enum {
