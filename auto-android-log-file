@@ -1,0 +1,174 @@
+From: L. David Baron <dbaron@dbaron.org>
+Bug 1100741 patch 2 - Add AutoAndroidLogFile class to produce a FILE* that goes to logcat on Android or Firefox OS.
+
+diff --git a/xpcom/glue/nsCRTGlue.cpp b/xpcom/glue/nsCRTGlue.cpp
+--- a/xpcom/glue/nsCRTGlue.cpp
++++ b/xpcom/glue/nsCRTGlue.cpp
+@@ -2,30 +2,32 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsCRTGlue.h"
+ #include "nsXPCOM.h"
+ #include "nsDebug.h"
++#include "nsString.h"
+ #include "prtime.h"
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ 
+ #ifdef XP_WIN
+ #include <io.h>
+ #include <windows.h>
+ #endif
+ 
+ #ifdef ANDROID
+ #include <android/log.h>
++#include <unistd.h>
+ #endif
+ 
+ const char*
+ NS_strspnp(const char* aDelims, const char* aStr)
+ {
+   const char* d;
+   do {
+     for (d = aDelims; *d != '\0'; ++d) {
+@@ -378,9 +380,81 @@ fprintf_stderr(FILE* aFile, const char* 
+   if (aFile == stderr) {
+     vprintf_stderr(aFmt, args);
+   } else {
+     vfprintf(aFile, aFmt, args);
+   }
+   va_end(args);
+ }
+ 
++#ifdef ANDROID
+ 
++namespace mozilla {
++
++AutoAndroidLogFile::AutoAndroidLogFile(FILE* aFile)
++  : mFile(aFile)
++  , mReadPipe(-1)
++{
++  if (mFile != stderr) {
++    return;
++  }
++
++  int pipefd[2]; // read from [0], write to [1]
++  int success = pipe(pipefd);
++  if (success != 0) {
++    // Error: just give up write to stderr.
++    return;
++  }
++
++  MOZ_ASSERT(pipefd[0] != -1);
++  MOZ_ASSERT(pipefd[1] != -1);
++
++  FILE* writeFile = fdopen(pipefd[1], "w");
++  if (!writeFile) {
++    // Error: just give up write to stderr.
++    close(pipefd[0]);
++    close(pipefd[1]);
++    return;
++  }
++
++  mFile = writeFile;
++  mReadPipe = pipefd[0];
++}
++
++AutoAndroidLogFile::~AutoAndroidLogFile()
++{
++  if (mReadPipe == -1) {
++    return;
++  }
++
++  fclose(mFile);
++
++  // |str| is both to carry over from one read to the next, and to
++  // have a separate buffer to which we add the null-terminator.
++  nsAutoCString str;
++  char buf[4096];
++  while (ssize_t bytes_read = read(mReadPipe, buf, sizeof(buf))) {
++    if (bytes_read == -1) {
++      // Error.
++      break;
++    }
++
++    char* cur = buf;
++    char* end = buf + bytes_read;
++
++    while (char* newline = static_cast<char*>(memchr(cur, '\n', end - cur))) {
++      char* next = newline + 1;
++      str.Append(Substring(cur, next));
++      fprintf_stderr(stderr, str.get());
++      str.Truncate();
++      cur = next;
++    }
++
++    str.Append(Substring(cur, end));
++  }
++  fprintf_stderr(stderr, str.get());
++
++  close(mReadPipe);
++}
++
++} // namespace mozilla
++
++#endif
+diff --git a/xpcom/glue/nsDebug.h b/xpcom/glue/nsDebug.h
+--- a/xpcom/glue/nsDebug.h
++++ b/xpcom/glue/nsDebug.h
+@@ -430,11 +430,49 @@ void vprintf_stderr(const char* aFmt, va
+ void fprintf_stderr(FILE* aFile, const char* aFmt, ...) MOZ_FORMAT_PRINTF(2, 3);
+ 
+ // used by the profiler to log stderr in the profiler for more
+ // advanced performance debugging and display/layers visualization.
+ void set_stderr_callback(StderrCallback aCallback);
+ 
+ #ifdef __cplusplus
+ }
++
++namespace mozilla {
++
++/**
++ * AutoAndroidLogFile is an RAII class that provides a FILE* to which
++ * logs can be written.  It can be used to make existing logging code
++ * that takes a FILE* argument, but does not use fprintf_stderr (above,
++ * which is preferable), appear in the logcat on Firefox OS and Android.
++ *
++ * On Android and Firefox OS, it works by constructing a pipe and
++ * providing a FILE* that writes to that pipe, and in its destructor,
++ * closing that FILE* and printing the output using printf_stderr.
++ */
++class AutoAndroidLogFile {
++public:
++  FILE* file() const {
++    return mFile;
++  }
++
++#ifdef ANDROID
++  AutoAndroidLogFile(FILE* aFile = stderr);
++  ~AutoAndroidLogFile();
++#else
++  AutoAndroidLogFile(FILE* aFile = stderr)
++    : mFile(aFile)
++  {
++  }
++#endif
++
++private:
++  FILE* mFile;
++#ifdef ANDROID
++  int mReadPipe; // -1 means no pipe
++#endif
++};
++
++} // namespace mozilla
++
+ #endif
+ 
+ #endif /* nsDebug_h___ */
