@@ -1,0 +1,251 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 960465 patch N - Move the addition of the cover rule into nsTransitionManager::StyleContextChanged so that later patches can make it other than just addition of a rule.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -2058,23 +2058,17 @@ RestyleManager::TryStartingTransition(ns
+   // Notify the transition manager, and if it starts a transition,
+   // it will give us back a transition-covering style rule which
+   // we'll use to get *another* style context.  We want to ignore
+   // any already-running transitions, but cover up any that we're
+   // currently starting with their start value so we don't start
+   // them again for descendants that inherit that value.
+   nsCOMPtr<nsIStyleRule> coverRule =
+     aPresContext->TransitionManager()->StyleContextChanged(
+-      aContent->AsElement(), aOldStyleContext, *aNewStyleContext);
+-  if (coverRule) {
+-    nsCOMArray<nsIStyleRule> rules;
+-    rules.AppendObject(coverRule);
+-    *aNewStyleContext = aPresContext->StyleSet()->
+-                          ResolveStyleByAddingRules(*aNewStyleContext, rules);
+-  }
++      aContent->AsElement(), aOldStyleContext, aNewStyleContext);
+ }
+ 
+ static inline dom::Element*
+ ElementForStyleContext(nsIContent* aParentContent,
+                        nsIFrame* aFrame,
+                        nsCSSPseudoElements::Type aPseudoType)
+ {
+   // We don't expect XUL tree stuff here.
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -98,71 +98,72 @@ CSSTransitionPlayer::GetAnimationManager
+ 
+   return context->TransitionManager();
+ }
+ 
+ /*****************************************************************************
+  * nsTransitionManager                                                       *
+  *****************************************************************************/
+ 
+-already_AddRefed<nsIStyleRule>
++void
+ nsTransitionManager::StyleContextChanged(dom::Element *aElement,
+                                          nsStyleContext *aOldStyleContext,
+-                                         nsStyleContext *aNewStyleContext)
++                                         nsRefPtr<nsStyleContext>* aNewStyleContext /* inout */)
+ {
+-  NS_PRECONDITION(aOldStyleContext->GetPseudo() ==
+-                      aNewStyleContext->GetPseudo(),
++  nsStyleContext* newStyleContext = *aNewStyleContext;
++
++  NS_PRECONDITION(aOldStyleContext->GetPseudo() == newStyleContext->GetPseudo(),
+                   "pseudo type mismatch");
+ 
+   if (mInAnimationOnlyStyleUpdate) {
+     // If we're doing an animation-only style update, return, since the
+     // purpose of an animation-only style update is to update only the
+     // animation styles so that we don't consider style changes
+     // resulting from changes in the animation time for starting a
+     // transition.
+-    return nullptr;
++    return;
+   }
+ 
+   if (!mPresContext->IsDynamic()) {
+     // For print or print preview, ignore transitions.
+-    return nullptr;
++    return;
+   }
+ 
+   if (aOldStyleContext->HasPseudoElementData() !=
+-      aNewStyleContext->HasPseudoElementData()) {
++      newStyleContext->HasPseudoElementData()) {
+     // If the old style context and new style context differ in terms of
+     // whether they're inside ::first-letter, ::first-line, or similar,
+     // bail.  We can't hit this codepath for normal style changes
+     // involving moving frames around the boundaries of these
+     // pseudo-elements since we don't call StyleContextChanged from
+     // ReparentStyleContext.  However, we can hit this codepath during
+     // the handling of transitions that start across reframes.
+     //
+     // While there isn't an easy *perfect* way to handle this case, err
+     // on the side of missing some transitions that we ought to have
+     // rather than having bogus transitions that we shouldn't.
+     //
+     // We could consider changing this handling, although it's worth
+     // thinking about whether the code below could do anything weird in
+     // this case.
+-    return nullptr;
++    return;
+   }
+ 
+   // NOTE: Things in this function (and ConsiderStartingTransition)
+   // should never call PeekStyleData because we don't preserve gotten
+   // structs across reframes.
+ 
+   // Return sooner (before the startedAny check below) for the most
+   // common case: no transitions specified or running.
+-  const nsStyleDisplay *disp = aNewStyleContext->StyleDisplay();
+-  nsCSSPseudoElements::Type pseudoType = aNewStyleContext->GetPseudoType();
++  const nsStyleDisplay *disp = newStyleContext->StyleDisplay();
++  nsCSSPseudoElements::Type pseudoType = newStyleContext->GetPseudoType();
+   if (pseudoType != nsCSSPseudoElements::ePseudo_NotPseudoElement) {
+     if (pseudoType != nsCSSPseudoElements::ePseudo_before &&
+         pseudoType != nsCSSPseudoElements::ePseudo_after) {
+-      return nullptr;
++      return;
+     }
+ 
+     NS_ASSERTION((pseudoType == nsCSSPseudoElements::ePseudo_before &&
+                   aElement->Tag() == nsGkAtoms::mozgeneratedcontentbefore) ||
+                  (pseudoType == nsCSSPseudoElements::ePseudo_after &&
+                   aElement->Tag() == nsGkAtoms::mozgeneratedcontentafter),
+                  "Unexpected aElement coming through");
+ 
+@@ -172,50 +173,50 @@ nsTransitionManager::StyleContextChanged
+   }
+ 
+   AnimationPlayerCollection* collection =
+     GetAnimationPlayers(aElement, pseudoType, false);
+   if (!collection &&
+       disp->mTransitionPropertyCount == 1 &&
+       disp->mTransitions[0].GetDelay() == 0.0f &&
+       disp->mTransitions[0].GetDuration() == 0.0f) {
+-    return nullptr;
++    return;
+   }
+ 
+ 
+   // FIXME (bug 960465): This test should go away.
+-  if (aNewStyleContext->PresContext()->RestyleManager()->
++  if (newStyleContext->PresContext()->RestyleManager()->
+         IsProcessingAnimationStyleChange()) {
+-    return nullptr;
++    return;
+   }
+ 
+-  if (aNewStyleContext->GetParent() &&
+-      aNewStyleContext->GetParent()->HasPseudoElementData()) {
++  if (newStyleContext->GetParent() &&
++      newStyleContext->GetParent()->HasPseudoElementData()) {
+     // Ignore transitions on things that inherit properties from
+     // pseudo-elements.
+     // FIXME (Bug 522599): Add tests for this.
+-    return nullptr;
++    return;
+   }
+ 
+   NS_WARN_IF_FALSE(!nsLayoutUtils::AreAsyncAnimationsEnabled() ||
+                      mPresContext->RestyleManager()->
+                        ThrottledAnimationStyleIsUpToDate(),
+                    "throttled animations not up to date");
+ 
+   // Compute what the css-transitions spec calls the "after-change
+   // style", which is the new style without any data from transitions,
+   // but still inheriting from data that contains transitions that are
+   // not stopping or starting right now.
+   nsRefPtr<nsStyleContext> afterChangeStyle;
+   if (collection) {
+-    afterChangeStyle = aNewStyleContext->PresContext()->StyleSet()->
+-      ResolveStyleWithoutAnimation(aElement, aNewStyleContext,
++    afterChangeStyle = newStyleContext->PresContext()->StyleSet()->
++      ResolveStyleWithoutAnimation(aElement, newStyleContext,
+                                    eRestyle_CSSTransitions);
+   } else {
+-    afterChangeStyle = aNewStyleContext;
++    afterChangeStyle = newStyleContext;
+   }
+ 
+   // In the CSS working group discussion (2009 Jul 15 telecon,
+   // http://www.w3.org/mid/4A5E1470.4030904@inkedblade.net ) of
+   // http://lists.w3.org/Archives/Public/www-style/2009Jun/0121.html ,
+   // the working group decided that a transition property on an
+   // element should not cause any transitions if the property change
+   // is itself inheriting a value that is transitioning on an
+@@ -337,27 +338,31 @@ nsTransitionManager::StyleContextChanged
+ 
+     if (players.IsEmpty()) {
+       collection->Destroy();
+       collection = nullptr;
+     }
+   }
+ 
+   if (!startedAny) {
+-    return nullptr;
++    return;
+   }
+ 
+   NS_ABORT_IF_FALSE(collection, "must have element transitions if we started "
+                                 "any transitions");
+ 
+   // Set the style rule refresh time to null so that EnsureStyleRuleFor
+   // creates a new style rule.
+   collection->mStyleRuleRefreshTime = TimeStamp();
+ 
+-  return coverRule.forget();
++  // Replace the new style context by appending the cover rule.
++  nsCOMArray<nsIStyleRule> rules;
++  rules.AppendObject(coverRule);
++  *aNewStyleContext = aPresContext->StyleSet()->
++                        ResolveStyleByAddingRules(*aNewStyleContext, rules);
+ }
+ 
+ void
+ nsTransitionManager::ConsiderStartingTransition(
+   nsCSSProperty aProperty,
+   const StyleTransition& aTransition,
+   dom::Element* aElement,
+   AnimationPlayerCollection*& aElementTransitions,
+diff --git a/layout/style/nsTransitionManager.h b/layout/style/nsTransitionManager.h
+--- a/layout/style/nsTransitionManager.h
++++ b/layout/style/nsTransitionManager.h
+@@ -114,27 +114,24 @@ public:
+    * StyleContextChanged
+    *
+    * To be called from nsFrameManager::ReResolveStyleContext when the
+    * style of an element has changed, to initiate transitions from
+    * that style change.  For style contexts with :before and :after
+    * pseudos, aElement is expected to be the generated before/after
+    * element.
+    *
+-   * It may return a "cover rule" (see CoverTransitionStartStyleRule) to
+-   * cover up some of the changes for the duration of the restyling of
+-   * descendants.  If it does, this function will take care of causing
+-   * the necessary restyle afterwards, but the caller must restyle the
+-   * element *again* with the original sequence of rules plus the
+-   * returned cover rule as the most specific rule.
++   * It may modify the new style context (by replacing
++   * *aNewStyleContext) to cover up some of the changes for the duration
++   * of the restyling of descendants.  If it does, this function will
++   * take care of causing the necessary restyle afterwards.
+    */
+-  already_AddRefed<nsIStyleRule>
+-    StyleContextChanged(mozilla::dom::Element *aElement,
+-                        nsStyleContext *aOldStyleContext,
+-                        nsStyleContext *aNewStyleContext);
++  void StyleContextChanged(mozilla::dom::Element *aElement,
++                           nsStyleContext *aOldStyleContext,
++                           nsRefPtr<nsStyleContext>* aNewStyleContext /* inout */);
+ 
+   void SetInAnimationOnlyStyleUpdate(bool aInAnimationOnlyUpdate) {
+     mInAnimationOnlyStyleUpdate = aInAnimationOnlyUpdate;
+   }
+ 
+   virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+     MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
