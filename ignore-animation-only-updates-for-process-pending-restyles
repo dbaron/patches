@@ -5,67 +5,7 @@ Bug 960465 patch N - Use SetInAnimationOnlyStyleUpdate for ProcessPendingRestyle
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -1532,19 +1532,37 @@ RestyleManager::RebuildAllStyleData(nsCh
-   presShell->GetDocument()->FlushPendingNotifications(Flush_ContentAndNotify);
- 
-   nsAutoScriptBlocker scriptBlocker;
- 
-   // Before we process any restyles, we need to ensure that style
-   // resulting from any animations is up-to-date, so that if any style
-   // changes we cause trigger transitions, we have the correct old style
-   // for starting the transition.
--  if (mHavePendingNonAnimationRestyles) {
-+  bool haveNonAnimation = mHavePendingNonAnimationRestyles;
-+  if (haveNonAnimation) {
-     IncrementAnimationGeneration();
-     UpdateOnlyAnimationStyles();
-+  } else {
-+    // If we don't have non-animation style updates, then we have queued
-+    // up animation style updates from the refresh driver tick.  This
-+    // doesn't necessarily include *all* animation style updates, since
-+    // we might be suppressing main-thread updates for some animations,
-+    // so we don't want to call UpdateOnlyAnimationStyles, which updates
-+    // all animations.
-+    //
-+    // So we want to act here as though we're in an animation-only style
-+    // update and suppress changes to transitions, since we're really
-+    // doing *part* of UpdateOnlyAnimationStyles.
-+    //
-+    // FIXME: In the future, we might want to refactor the way the
-+    // animation and transition manager do their refresh driver ticks so
-+    // that we can use UpdateOnlyAnimationStyles, with a different
-+    // boolean argument, for this update as well.
-+    mPresContext->TransitionManager()->SetInAnimationOnlyStyleUpdate(true);
-   }
- 
-   MOZ_ASSERT(!mIsProcessingRestyles, "Nesting calls to processing restyles");
- #ifdef DEBUG
-   mIsProcessingRestyles = true;
- #endif
- 
-   // Until we get rid of these phases in bug 960465, we need to skip
-@@ -1571,16 +1589,20 @@ RestyleManager::RebuildAllStyleData(nsCh
-   }
- 
-   mPostAnimationRestyles = false;
-   mSkipAnimationRules = false;
- #ifdef DEBUG
-   mIsProcessingRestyles = false;
- #endif
- 
-+  if (!haveNonAnimation) {
-+    mPresContext->TransitionManager()->SetInAnimationOnlyStyleUpdate(false);
-+  }
-+
-   // Make sure that we process any pending animation restyles from the
-   // above style change.  Note that we can *almost* implement the above
-   // by just posting a style change -- except we really need to restyle
-   // the root frame rather than the root element's primary frame.
-   ProcessPendingRestyles();
- }
- 
- void
-@@ -1660,19 +1682,37 @@ RestyleManager::ProcessPendingRestyles()
+@@ -1576,19 +1576,37 @@ RestyleManager::ProcessPendingRestyles()
  #ifdef DEBUG
    mIsProcessingRestyles = true;
  #endif
@@ -74,8 +14,8 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    // resulting from any animations is up-to-date, so that if any style
    // changes we cause trigger transitions, we have the correct old style
    // for starting the transition.
--  if (mHavePendingNonAnimationRestyles) {
-+  bool haveNonAnimation = mHavePendingNonAnimationRestyles;
+-  if (mHavePendingNonAnimationRestyles || mInRebuildAllStyleData) {
++  bool haveNonAnimation = mHavePendingNonAnimationRestyles || mInRebuildAllStyleData;
 +  if (haveNonAnimation) {
      IncrementAnimationGeneration();
      UpdateOnlyAnimationStyles();
@@ -104,12 +44,12 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    // animation phase.
    mSkipAnimationRules = true;
    mPostAnimationRestyles = true;
-@@ -1695,23 +1735,29 @@ RestyleManager::ProcessPendingRestyles()
+@@ -1616,23 +1634,29 @@ RestyleManager::ProcessPendingRestyles()
    // the running transition so it can check for a new change on the same
    // property, and then posts an immediate animation style change).
    MOZ_ASSERT(!mIsProcessingAnimationStyleChange, "nesting forbidden");
    mIsProcessingAnimationStyleChange = true;
-   mPendingAnimationRestyles.ProcessRestyles();
+   ProcessRestyles(mPendingAnimationRestyles);
    MOZ_ASSERT(mIsProcessingAnimationStyleChange, "nesting forbidden");
    mIsProcessingAnimationStyleChange = false;
  
@@ -128,7 +68,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +               "should not have added restyles");
    mHavePendingNonAnimationRestyles = false;
  
-   if (mRebuildAllStyleData) {
+   if (mDoRebuildAllStyleData) {
      // We probably wasted a lot of work up above, but this seems safest
      // and it should be rarely used.
      // This might add us as a refresh observer again; that's ok.
