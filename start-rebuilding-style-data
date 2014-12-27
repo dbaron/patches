@@ -1,0 +1,114 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1115812 patch 11 - Refactor the before-part of the rebuild to StartRebuildingStyleData.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1504,25 +1504,45 @@ RestyleManager::RebuildAllStyleData(nsCh
+ 
+   mPendingRestyles.AddPendingRestyleToRoot(aRestyleHint, aExtraHint);
+   mDoRebuildAllStyleData = true;
+ 
+   ProcessPendingRestyles();
+ }
+ 
+ void
++RestyleManager::StartRebuildAllStyleData()
++{
++  MOZ_ASSERT(mIsProcessingRestyles);
++
++  mInRebuildAllStyleData = true;
++  // Tell the style set to get the old rule tree out of the way
++  // so we can recalculate while maintaining rule tree immutability
++  nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
++  if (NS_FAILED(rv)) {
++    MOZ_CRASH("unable to rebuild style data");
++  }
++
++  // Recalculate all of the style contexts for the document, from the
++  // root frame.  We can't do this with a change hint, since we can't
++  // post a change hint for the root frame.
++  // Note that we can ignore the return value of ComputeStyleChangeFor
++  // because we never need to reframe the root frame.
++  ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
++                               nsChangeHint(0), mPendingRestyles,
++                               eRestyle_ForceDescendants);
++}
++
++void
+ RestyleManager::ProcessPendingRestyles()
+ {
+   NS_PRECONDITION(mPresContext->Document(), "No document?  Pshaw!");
+   NS_PRECONDITION(!nsContentUtils::IsSafeToRunScript(),
+                   "Missing a script blocker!");
+ 
+-  mInRebuildAllStyleData = mDoRebuildAllStyleData;
+-  mDoRebuildAllStyleData = false;
+-
+   // First do any queued-up frame creation.  (We should really
+   // merge this into the rest of the process, though; see bug 827239.)
+   mPresContext->FrameConstructor()->CreateNeededFrames();
+ 
+   // Process non-animation restyles...
+   NS_ABORT_IF_FALSE(!mIsProcessingRestyles,
+                     "Nesting calls to ProcessPendingRestyles?");
+ #ifdef DEBUG
+@@ -1542,32 +1562,19 @@ RestyleManager::ProcessPendingRestyles()
+ 
+   // Until we get rid of these phases in bug 960465, we need to skip
+   // animation restyles during the non-animation phase, and post
+   // animation restyles so that we restyle those elements again in the
+   // animation phase.
+   mSkipAnimationRules = true;
+   mPostAnimationRestyles = true;
+ 
+-  if (mInRebuildAllStyleData) {
+-    // Tell the style set to get the old rule tree out of the way
+-    // so we can recalculate while maintaining rule tree immutability
+-    nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
+-    if (NS_FAILED(rv)) {
+-      MOZ_CRASH("unable to rebuild style data");
+-    }
+-
+-    // Recalculate all of the style contexts for the document, from the
+-    // root frame.  We can't do this with a change hint, since we can't
+-    // post a change hint for the root frame.
+-    // Note that we can ignore the return value of ComputeStyleChangeFor
+-    // because we never need to reframe the root frame.
+-    ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
+-                                 nsChangeHint(0), mPendingRestyles,
+-                                 eRestyle_ForceDescendants);
++  if (mDoRebuildAllStyleData) {
++    mDoRebuildAllStyleData = false;
++    StartRebuildAllStyleData();
+   }
+ 
+   mPendingRestyles.ProcessRestyles();
+ 
+   mPostAnimationRestyles = false;
+   mSkipAnimationRules = false;
+ 
+ #ifdef DEBUG
+diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
+--- a/layout/base/RestyleManager.h
++++ b/layout/base/RestyleManager.h
+@@ -444,16 +444,18 @@ private:
+   /* aMinHint is the minimal change that should be made to the element */
+   // XXXbz do we really need the aPrimaryFrame argument here?
+   void RestyleElement(Element*        aElement,
+                       nsIFrame*       aPrimaryFrame,
+                       nsChangeHint    aMinHint,
+                       RestyleTracker& aRestyleTracker,
+                       nsRestyleHint   aRestyleHint);
+ 
++  void StartRebuildAllStyleData();
++
+   void StyleChangeReflow(nsIFrame* aFrame, nsChangeHint aHint);
+ 
+   // Recursively add all the given frame and all children to the tracker.
+   void AddSubtreeToOverflowTracker(nsIFrame* aFrame);
+ 
+   // Returns true if this function managed to successfully move a frame, and
+   // false if it could not process the position change, and a reflow should
+   // be performed instead.
