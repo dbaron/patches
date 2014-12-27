@@ -12,57 +12,50 @@ Also fixes bug 1111451.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -953,16 +953,20 @@ RestyleManager::RestyleElement(Element* 
-         if (aMinHint == 0) {
-           return;
-         }
-         aPrimaryFrame = aElement->GetPrimaryFrame();
-       }
-     }
-   }
+@@ -923,16 +923,17 @@ RestyleManager::ProcessRestyledFrames(ns
  
-+  // Create a ReframingStyleContexts struct on the stack and put it in our
-+  // mReframingStyleContexts for the remaining scope of this function.
-+  ReframingStyleContexts reframingStyleContexts(this);
-+
-   if (aMinHint & nsChangeHint_ReconstructFrame) {
-     FrameConstructor()->RecreateFramesForContent(aElement, false,
-       nsCSSFrameConstructor::REMOVE_FOR_RECONSTRUCTION, nullptr);
-   } else if (aPrimaryFrame) {
-     ComputeAndProcessStyleChange(aPrimaryFrame, aMinHint, aRestyleTracker,
-                                  aRestyleHint);
-   } else if (aRestyleHint & ~eRestyle_LaterSiblings) {
-     // We're restyling an element with no frame, so we should try to
-@@ -1577,18 +1581,26 @@ RestyleManager::DoRebuildAllStyleData(Re
-   // because we never need to reframe the root frame
-   // XXX This could be made faster by not rerunning rule matching
-   // (but note that nsPresShell::SetPreferenceStyleRules currently depends
-   // on us re-running rule matching here
-   // XXX Does it matter that we're passing aExtraHint to the real root
-   // frame and not the root node's primary frame?  (We could do
-   // roughly what we do for aRestyleHint above.)
-   // Note: The restyle tracker we pass in here doesn't matter.
--  ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
--                               aExtraHint, aRestyleTracker, aRestyleHint);
-+
+ void
+ RestyleManager::RestyleElement(Element*        aElement,
+                                nsIFrame*       aPrimaryFrame,
+                                nsChangeHint    aMinHint,
+                                RestyleTracker& aRestyleTracker,
+                                nsRestyleHint   aRestyleHint)
+ {
++  MOZ_ASSERT(mReframingStyleContexts, "should have rsc");
+   NS_ASSERTION(aPrimaryFrame == aElement->GetPrimaryFrame(),
+                "frame/content mismatch");
+   if (aPrimaryFrame && aPrimaryFrame->GetContent() != aElement) {
+     // XXXbz this is due to image maps messing with the primary frame pointer
+     // of <area>s.  See bug 135040.  We can remove this block once that's fixed.
+     aPrimaryFrame = nullptr;
+   }
+   NS_ASSERTION(!aPrimaryFrame || aPrimaryFrame->GetContent() == aElement,
+@@ -1520,17 +1521,23 @@ RestyleManager::RebuildAllStyleData(nsCh
+   // animation restyles so that we restyle those elements again in the
+   // animation phase.  Furthermore, we need to add
+   // eRestyle_ChangeAnimationPhaseDescendants so that we actually honor
+   // these booleans in all cases.
+   mSkipAnimationRules = true;
+   mPostAnimationRestyles = true;
+   aRestyleHint |= eRestyle_ChangeAnimationPhaseDescendants;
+ 
+-  DoRebuildAllStyleData(mPendingRestyles, aExtraHint, aRestyleHint);
 +  {
 +    // Create a ReframingStyleContexts struct on the stack and put it in
 +    // our mReframingStyleContexts within this scope.
 +    ReframingStyleContexts reframingStyleContexts(this);
 +
-+    ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
-+                                 aExtraHint, aRestyleTracker, aRestyleHint);
++    DoRebuildAllStyleData(mPendingRestyles, aExtraHint, aRestyleHint);
 +  }
-+
-   FlushOverflowChangedTracker();
  
-   // Tell the style set it's safe to destroy the old rule tree.  We
-   // must do this after the ProcessRestyledFrames call in case the
-   // change list has frame reconstructs in it (since frames to be
-   // reconstructed will still have their old style context pointers
-   // until they are destroyed).
-   mPresContext->StyleSet()->EndReconstruct();
-@@ -3897,37 +3909,29 @@ ElementRestyler::SendAccessibilityNotifi
+   mPostAnimationRestyles = false;
+   mSkipAnimationRules = false;
+ #ifdef DEBUG
+   mIsProcessingRestyles = false;
+ #endif
+ 
+   // Make sure that we process any pending animation restyles from the
+@@ -3897,37 +3904,31 @@ ElementRestyler::SendAccessibilityNotifi
  }
  
  void
@@ -75,6 +68,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 -  // our mReframingStyleContexts for the scope of this function.
 -  ReframingStyleContexts reframingStyleContexts(this);
 -
++  MOZ_ASSERT(mReframingStyleContexts, "should have rsc");
    nsStyleChangeList changeList;
    ElementRestyler::ComputeStyleChangeFor(aFrame, &changeList, aMinChange,
                                           aRestyleTracker, aRestyleHint);
@@ -92,6 +86,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 -  // our mReframingStyleContexts for the scope of this function.
 -  ReframingStyleContexts reframingStyleContexts(this);
 -
++  MOZ_ASSERT(mReframingStyleContexts, "should have rsc");
    MOZ_ASSERT(aNewContext->StyleDisplay()->mDisplay == NS_STYLE_DISPLAY_CONTENTS);
    nsIFrame* frame = GetNearestAncestorFrame(aElement);
    MOZ_ASSERT(frame, "display:contents node in map although it's a "
@@ -100,3 +95,27 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
                                      nsRuleWalker::eRelevantLinkUnvisited,
                                      frame->PresContext()->Document());
    nsIContent* parent = aElement->GetParent();
+diff --git a/layout/base/RestyleTracker.cpp b/layout/base/RestyleTracker.cpp
+--- a/layout/base/RestyleTracker.cpp
++++ b/layout/base/RestyleTracker.cpp
+@@ -187,16 +187,20 @@ RestyleTracker::ProcessOneRestyle(Elemen
+     changeList.AppendChange(primaryFrame, aElement, aChangeHint);
+     mRestyleManager->ProcessRestyledFrames(changeList);
+   }
+ }
+ 
+ void
+ RestyleTracker::DoProcessRestyles()
+ {
++  // Create a ReframingStyleContexts struct on the stack and put it in our
++  // mReframingStyleContexts for the remaining scope of this function.
++  ReframingStyleContexts reframingStyleContexts(mRestyleManager);
++
+   PROFILER_LABEL("RestyleTracker", "ProcessRestyles",
+     js::ProfileEntry::Category::CSS);
+ 
+   mRestyleManager->BeginProcessingRestyles();
+ 
+   LOG_RESTYLE("Processing %d pending %srestyles with %d restyle roots for %s",
+               mPendingRestyles.Count(),
+               mRestyleManager->IsProcessingAnimationStyleChange()
