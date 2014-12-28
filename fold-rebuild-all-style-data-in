@@ -8,7 +8,7 @@ patches and then maybe even getting rid of patch 4.
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -1498,121 +1498,93 @@ RestyleManager::RebuildAllStyleData(nsCh
+@@ -1496,41 +1496,18 @@ RestyleManager::RebuildAllStyleData(nsCh
    nsAutoScriptBlocker scriptBlocker;
  
    // Until we get rid of these phases in bug 960465, we need to add
@@ -19,50 +19,17 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
    mPendingRestyles.AddPendingRestyleToRoot(aRestyleHint, aExtraHint);
 -
 -  MOZ_ASSERT(!mIsProcessingRestyles, "Nesting calls to processing restyles");
-+  mDoRebuildAllStyleData = true;
-+
-+  ProcessPendingRestyles();
-+}
-+
-+void
-+RestyleManager::ProcessPendingRestyles()
-+{
-+  NS_PRECONDITION(mPresContext->Document(), "No document?  Pshaw!");
-+  NS_PRECONDITION(!nsContentUtils::IsSafeToRunScript(),
-+                  "Missing a script blocker!");
-+
-+  bool rebuildAllStyleData = mDoRebuildAllStyleData;
-+  mDoRebuildAllStyleData = false;
-+
-+  // First do any queued-up frame creation.  (We should really
-+  // merge this into the rest of the process, though; see bug 827239.)
-+  mPresContext->FrameConstructor()->CreateNeededFrames();
-+
-+  // Process non-animation restyles...
-+  NS_ABORT_IF_FALSE(!mIsProcessingRestyles,
-+                    "Nesting calls to ProcessPendingRestyles?");
- #ifdef DEBUG
-   mIsProcessingRestyles = true;
- #endif
- 
-+  // Before we process any restyles, we need to ensure that style
-+  // resulting from any throttled animations (animations that we're
-+  // running entirely on the compositor thread) is up-to-date, so that
-+  // if any style changes we cause trigger transitions, we have the
-+  // correct old style for starting the transition.
-+  if (nsLayoutUtils::AreAsyncAnimationsEnabled() &&
-+      (mPendingRestyles.Count() > 0 || rebuildAllStyleData)) {
-+    IncrementAnimationGeneration();
-+    UpdateOnlyAnimationStyles();
-+  }
-+
-   // Until we get rid of these phases in bug 960465, we need to skip
-   // animation restyles during the non-animation phase, and post
-   // animation restyles so that we restyle those elements again in the
-   // animation phase.
-   mSkipAnimationRules = true;
-   mPostAnimationRestyles = true;
- 
+-#ifdef DEBUG
+-  mIsProcessingRestyles = true;
+-#endif
+-
+-  // Until we get rid of these phases in bug 960465, we need to skip
+-  // animation restyles during the non-animation phase, and post
+-  // animation restyles so that we restyle those elements again in the
+-  // animation phase.
+-  mSkipAnimationRules = true;
+-  mPostAnimationRestyles = true;
+-
 -  DoRebuildAllStyleData(mPendingRestyles);
 -
 -  mPostAnimationRestyles = false;
@@ -75,163 +42,58 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 -  // above style change.  Note that we can *almost* implement the above
 -  // by just posting a style change -- except we really need to restyle
 -  // the root frame rather than the root element's primary frame.
--  ProcessPendingRestyles();
--}
--
--void
--RestyleManager::DoRebuildAllStyleData(RestyleTracker& aRestyleTracker)
--{
--  // Tell the style set to get the old rule tree out of the way
--  // so we can recalculate while maintaining rule tree immutability
--  nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
--  if (NS_FAILED(rv)) {
--    return;
-+  if (rebuildAllStyleData) {
-+    // Tell the style set to get the old rule tree out of the way
-+    // so we can recalculate while maintaining rule tree immutability
-+    nsresult rv = mPresContext->StyleSet()->BeginReconstruct();
-+    if (NS_FAILED(rv)) {
-+      MOZ_CRASH("unable to rebuild style data");
-+    }
++  mDoRebuildAllStyleData = true;
 +
-+    // Recalculate all of the style contexts for the document, from the
-+    // root frame.  We can't do this with a change hint, since we can't
-+    // post a change hint for the root frame.
-+    // Note that we can ignore the return value of ComputeStyleChangeFor
-+    // because we never need to reframe the root frame.
-+    ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
-+                                 nsChangeHint(0), mPendingRestyles,
-+                                 eRestyle_ForceDescendants);
-   }
+   ProcessPendingRestyles();
+ }
  
--  // Recalculate all of the style contexts for the document
--  // Note that we can ignore the return value of ComputeStyleChangeFor
--  // because we never need to reframe the root frame
--  // XXX This could be made faster by not rerunning rule matching
--  // (but note that nsPresShell::SetPreferenceStyleRules currently depends
--  // on us re-running rule matching here
--  // XXX Does it matter that we're passing aExtraHint to the real root
--  // frame and not the root node's primary frame?  (We could do
--  // roughly what we do for aRestyleHint above.)
--  // Note: The restyle tracker we pass in here doesn't matter.
--  ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
--                               nsChangeHint(0), aRestyleTracker,
--                               eRestyle_ForceDescendants);
--  FlushOverflowChangedTracker();
--
--  // Tell the style set it's safe to destroy the old rule tree.  We
--  // must do this after the ProcessRestyledFrames call in case the
--  // change list has frame reconstructs in it (since frames to be
--  // reconstructed will still have their old style context pointers
--  // until they are destroyed).
--  mPresContext->StyleSet()->EndReconstruct();
--}
--
--void
--RestyleManager::ProcessPendingRestyles()
--{
--  NS_PRECONDITION(mPresContext->Document(), "No document?  Pshaw!");
--  NS_PRECONDITION(!nsContentUtils::IsSafeToRunScript(),
--                  "Missing a script blocker!");
--
+ void
+ RestyleManager::StartRebuildAllStyleData()
+ {
+   MOZ_ASSERT(mIsProcessingRestyles);
+ 
+@@ -1563,22 +1540,16 @@ RestyleManager::DoRebuildAllStyleData(Re
+ 
+ void
+ RestyleManager::ProcessPendingRestyles()
+ {
+   NS_PRECONDITION(mPresContext->Document(), "No document?  Pshaw!");
+   NS_PRECONDITION(!nsContentUtils::IsSafeToRunScript(),
+                   "Missing a script blocker!");
+ 
 -  if (mDoRebuildAllStyleData) {
 -    RebuildAllStyleData(nsChangeHint(0), nsRestyleHint(0));
 -    MOZ_ASSERT(mPendingRestyles.Count() == 0);
 -    return;
-+  mPendingRestyles.ProcessRestyles();
-+
-+  if (rebuildAllStyleData) {
-+    // We might not have gotten to the FlushOverflowChangedTracker call
-+    // in the ProcessRestyles() call above.
-+    FlushOverflowChangedTracker();
-+
-+    // Tell the style set it's safe to destroy the old rule tree.  We
-+    // must do this after the ProcessRestyledFrames call in case the
-+    // change list has frame reconstructs in it (since frames to be
-+    // reconstructed will still have their old style context pointers
-+    // until they are destroyed).
-+    mPresContext->StyleSet()->EndReconstruct();
-   }
- 
--  // First do any queued-up frame creation.  (We should really
--  // merge this into the rest of the process, though; see bug 827239.)
--  mPresContext->FrameConstructor()->CreateNeededFrames();
--
--  // Process non-animation restyles...
--  NS_ABORT_IF_FALSE(!mIsProcessingRestyles,
--                    "Nesting calls to ProcessPendingRestyles?");
--#ifdef DEBUG
--  mIsProcessingRestyles = true;
--#endif
--
--  // Before we process any restyles, we need to ensure that style
--  // resulting from any throttled animations (animations that we're
--  // running entirely on the compositor thread) is up-to-date, so that
--  // if any style changes we cause trigger transitions, we have the
--  // correct old style for starting the transition.
--  if (nsLayoutUtils::AreAsyncAnimationsEnabled() &&
--      mPendingRestyles.Count() > 0) {
--    IncrementAnimationGeneration();
--    UpdateOnlyAnimationStyles();
 -  }
 -
--  // Until we get rid of these phases in bug 960465, we need to skip
--  // animation restyles during the non-animation phase, and post
--  // animation restyles so that we restyle those elements again in the
--  // animation phase.
--  mSkipAnimationRules = true;
--  mPostAnimationRestyles = true;
--
--  mPendingRestyles.ProcessRestyles();
--
+   // First do any queued-up frame creation.  (We should really
+   // merge this into the rest of the process, though; see bug 827239.)
+   mPresContext->FrameConstructor()->CreateNeededFrames();
+ 
+   // Process non-animation restyles...
+   NS_ABORT_IF_FALSE(!mIsProcessingRestyles,
+                     "Nesting calls to ProcessPendingRestyles?");
+ #ifdef DEBUG
+@@ -1598,16 +1569,21 @@ RestyleManager::ProcessPendingRestyles()
+ 
+   // Until we get rid of these phases in bug 960465, we need to skip
+   // animation restyles during the non-animation phase, and post
+   // animation restyles so that we restyle those elements again in the
+   // animation phase.
+   mSkipAnimationRules = true;
+   mPostAnimationRestyles = true;
+ 
++  if (mDoRebuildAllStyleData) {
++    mDoRebuildAllStyleData = false;
++    StartRebuildAllStyleData();
++  }
++
+   ProcessRestyles(mPendingRestyles);
+ 
    mPostAnimationRestyles = false;
    mSkipAnimationRules = false;
  
  #ifdef DEBUG
    uint32_t oldPendingRestyleCount = mPendingRestyles.Count();
  #endif
- 
-   // ...and then process animation restyles.  This needs to happen
-@@ -2593,17 +2565,17 @@ ElementRestyler::Restyle(nsRestyleHint a
-   // restyle.  Before we return from this function, we call
-   // RestyleTracker::AddRestyleRootsIfAwaitingRestyle to ensure they get
-   // restyled in RestyleTracker::DoProcessRestyles.
-   nsTArray<nsRefPtr<Element>> descendants;
- 
-   nsRestyleHint hintToRestore = nsRestyleHint(0);
-   if (mContent && mContent->IsElement() &&
-       // If we're we're resolving from the root of the frame tree (which
--      // we do in DoRebuildAllStyleData), we need to avoid getting the
-+      // we do when mDoRebuildAllStyleData), we need to avoid getting the
-       // root's restyle data until we get to its primary frame, since
-       // it's the primary frame that has the styles for the root element
-       // (rather than the ancestors of the primary frame whose mContent
-       // is the root node but which have different styles).  If we use
-       // up the hint for one of the ancestors that we hit first, then
-       // we'll fail to do the restyling we need to do.
-       (mContent->GetParent() || mContent->GetPrimaryFrame() == mFrame)) {
-     mContent->OwnerDoc()->FlushPendingLinkUpdates();
-diff --git a/layout/base/RestyleManager.h b/layout/base/RestyleManager.h
---- a/layout/base/RestyleManager.h
-+++ b/layout/base/RestyleManager.h
-@@ -322,20 +322,16 @@ public:
-   // (which says that rerunning selector matching is not required.  (The
-   // method adds eRestyle_ForceDescendants internally, and including it
-   // in the restyle hint is harmless; some callers (e.g.,
-   // nsPresContext::MediaFeatureValuesChanged) might do this for their
-   // own reasons.)
-   void RebuildAllStyleData(nsChangeHint aExtraHint,
-                            nsRestyleHint aRestyleHint);
- 
--  // Helper that does part of the work of RebuildAllStyleData, shared by
--  // RestyleElement for 'rem' handling.
--  void DoRebuildAllStyleData(RestyleTracker& aRestyleTracker);
--
-   // See PostRestyleEventCommon below.
-   void PostRestyleEvent(Element* aElement,
-                         nsRestyleHint aRestyleHint,
-                         nsChangeHint aMinChangeHint)
-   {
-     if (mPresContext) {
-       PostRestyleEventCommon(aElement, aRestyleHint, aMinChangeHint,
-                              IsProcessingAnimationStyleChange());
