@@ -1,0 +1,132 @@
+
+# HG changeset patch
+# User Gregory Szorc <gps@mozilla.com>
+# Date 1419883581 28800
+# Node ID 685c246ce3e0f2112fcedf21c74072f997f0668e
+# Parent  11e3df6283a05732f564c3bde728dba3847665ad
+Bug 1116194 - Catch errors calling psutil; r=ted
+
+The build system / mach currently has a very hacky virtualenv setup.
+Essentially, it resorts to sys.path munging instead of a proper,
+isolated environment.
+
+During initialization, mach installs python/psutil in sys.path. Later
+on, some code does an |import psutil|. This fails iff the psutil C
+extension can't be found.
+
+If there is a psutil C extension installed outside of mach and
+python/psutil, |import psutil| may load it. The version mismatch isn't
+detected until an extension-using psutil API is called. This has
+manifested inside |mach build| via the resource monitor as an
+|AttributeError: 'module' object has no attribute 'linux_sysinfo'|
+exception during psutil.virtual_memory().
+
+The proper fix for this is for the Python environment to ensure the
+psutil C extension is built before attempting to import and use psutil.
+Arguably, psutil itself should perform some kind of version check when
+it imports the C extension to ensure things are in sync and fail at
+import time.
+
+Fixing mach and the build system Python environment to build psutil
+earlier/properly is a long outstanding bug. It needs to be addressed.
+But it is considerable effort. This patch continues the long history of
+wallpapering over psutil import/run failures because using a proper
+virutalenv from mach/build system is a lot of work. Sad panda.
+
+diff --git a/testing/mozbase/mozsystemmonitor/mozsystemmonitor/resourcemonitor.py b/testing/mozbase/mozsystemmonitor/mozsystemmonitor/resourcemonitor.py
+--- a/testing/mozbase/mozsystemmonitor/mozsystemmonitor/resourcemonitor.py
++++ b/testing/mozbase/mozsystemmonitor/mozsystemmonitor/resourcemonitor.py
+@@ -1,15 +1,16 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ # You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ import multiprocessing
+ import sys
+ import time
++import warnings
+ 
+ # psutil will raise NotImplementedError if the platform is not supported.
+ try:
+     import psutil
+ except Exception:
+     psutil = None
+ 
+ from collections import (
+@@ -173,25 +174,36 @@ class SystemResourceMonitor(object):
+ 
+         self.events = []
+         self.phases = OrderedDict()
+ 
+         self._active_phases = {}
+ 
+         self._running = False
+         self._stopped = False
++        self._process = None
+ 
+         if psutil is None:
+             return
+ 
+-        cpu_percent = psutil.cpu_percent(0.0, True)
+-        cpu_times = psutil.cpu_times(False)
+-        io = get_disk_io_counters()
+-        virt = psutil.virtual_memory()
+-        swap = psutil.swap_memory()
++        # This try..except should not be needed! However, some tools (like
++        # |mach build|) attempt to load psutil before properly creating a
++        # virtualenv by building psutil. As a result, python/psutil may be in
++        # sys.path and its .py files may pick up the psutil C extension from
++        # the system install. If the versions don't match, we typically see
++        # failures invoking one of these functions.
++        try:
++            cpu_percent = psutil.cpu_percent(0.0, True)
++            cpu_times = psutil.cpu_times(False)
++            io = get_disk_io_counters()
++            virt = psutil.virtual_memory()
++            swap = psutil.swap_memory()
++        except Exception as e:
++            warnings.warn('psutil failed to run: %s' % e)
++            return
+ 
+         self._cpu_cores = len(cpu_percent)
+         self._cpu_times_type = type(cpu_times)
+         self._cpu_times_len = len(cpu_times)
+         self._io_type = type(io)
+         self._io_len = len(io)
+         self._virt_type = type(virt)
+         self._virt_len = len(virt)
+@@ -210,31 +222,31 @@ class SystemResourceMonitor(object):
+ 
+     # Methods to control monitoring.
+ 
+     def start(self):
+         """Start measuring system-wide CPU resource utilization.
+ 
+         You should only call this once per instance.
+         """
+-        if psutil is None:
++        if not self._process:
+             return
+ 
+         self._running = True
+         self._process.start()
+ 
+     def stop(self):
+         """Stop measuring system-wide CPU resource utilization.
+ 
+         You should call this if and only if you have called start(). You should
+         always pair a stop() with a start().
+ 
+         Currently, data is not available until you call stop().
+         """
+-        if psutil is None:
++        if not self._process:
+             self._stopped = True
+             return
+ 
+         assert self._running
+         assert not self._stopped
+ 
+         self._pipe.send(('terminate'))
+         self._running = False
+
