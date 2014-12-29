@@ -1,11 +1,11 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 1115812 patch 4 - Replace hint parameters to DoRebuildAllStyleData with calls to AddPendingRestyleToRoot.
+Bug 1115812 patch 3 - Pass the hints to DoRebuildAllStyleData via the member variables, in preparation for future refactoring.
 
 diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 --- a/layout/base/RestyleManager.cpp
 +++ b/layout/base/RestyleManager.cpp
-@@ -942,17 +942,18 @@ RestyleManager::RestyleElement(Element* 
+@@ -944,17 +944,18 @@ RestyleManager::RestyleElement(Element* 
      nsStyleContext *oldContext = aPrimaryFrame->StyleContext();
      if (!oldContext->GetParent()) { // check that we're the root element
        nsRefPtr<nsStyleContext> newContext = mPresContext->StyleSet()->
@@ -15,7 +15,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
          // The basis for 'rem' units has changed.
          newContext = nullptr;
 -        DoRebuildAllStyleData(aRestyleTracker, nsChangeHint(0), aRestyleHint);
-+        aRestyleTracker.AddPendingRestyleToRoot(aRestyleHint, nsChangeHint(0));
++        mRebuildAllRestyleHint |= aRestyleHint;
 +        DoRebuildAllStyleData(aRestyleTracker);
          if (aMinHint == 0) {
            return;
@@ -25,40 +25,39 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
      }
    }
  
-@@ -1489,75 +1490,67 @@ RestyleManager::RebuildAllStyleData(nsCh
-   nsCOMPtr<nsIPresShell> kungFuDeathGrip(presShell);
+@@ -1473,20 +1474,18 @@ void
+ RestyleManager::RebuildAllStyleData(nsChangeHint aExtraHint,
+                                     nsRestyleHint aRestyleHint)
+ {
+   NS_ASSERTION(!(aExtraHint & nsChangeHint_ReconstructFrame),
+                "Should not reconstruct the root of the frame tree.  "
+                "Use ReconstructDocElementHierarchy instead.");
  
-   // We may reconstruct frames below and hence process anything that is in the
-   // tree. We don't want to get notified to process those items again after.
-   presShell->GetDocument()->FlushPendingNotifications(Flush_ContentAndNotify);
+   mRebuildAllStyleData = false;
+-  NS_UpdateHint(aExtraHint, mRebuildAllExtraHint);
+-  aRestyleHint |= mRebuildAllRestyleHint;
+-  mRebuildAllExtraHint = nsChangeHint(0);
+-  mRebuildAllRestyleHint = nsRestyleHint(0);
++  NS_UpdateHint(mRebuildAllExtraHint, aExtraHint);
++  mRebuildAllRestyleHint |= aRestyleHint;
  
-   nsAutoScriptBlocker scriptBlocker;
+   nsIPresShell* presShell = mPresContext->GetPresShell();
+   if (!presShell || !presShell->GetRootFrame())
+     return;
  
-+  // Until we get rid of these phases in bug 960465, we need to add
-+  // eRestyle_ChangeAnimationPhaseDescendants so that we actually honor
-+  // animation phase booleans in all cases.
-+  aRestyleHint |= eRestyle_ChangeAnimationPhaseDescendants;
-+
-+  mPendingRestyles.AddPendingRestyleToRoot(aRestyleHint, aExtraHint);
-+
-   MOZ_ASSERT(!mIsProcessingRestyles, "Nesting calls to processing restyles");
- #ifdef DEBUG
-   mIsProcessingRestyles = true;
- #endif
+   // Make sure that the viewmanager will outlive the presshell
+   nsRefPtr<nsViewManager> vm = presShell->GetViewManager();
+ 
+@@ -1507,77 +1506,80 @@ RestyleManager::RebuildAllStyleData(nsCh
  
    // Until we get rid of these phases in bug 960465, we need to skip
    // animation restyles during the non-animation phase, and post
    // animation restyles so that we restyle those elements again in the
--  // animation phase.  Furthermore, we need to add
--  // eRestyle_ChangeAnimationPhaseDescendants so that we actually honor
--  // these booleans in all cases.
-+  // animation phase.
+   // animation phase.
    mSkipAnimationRules = true;
    mPostAnimationRestyles = true;
--  aRestyleHint |= eRestyle_ChangeAnimationPhaseDescendants;
--
+ 
 -  DoRebuildAllStyleData(mPendingRestyles, aExtraHint, aRestyleHint);
-+
 +  DoRebuildAllStyleData(mPendingRestyles);
  
    mPostAnimationRestyles = false;
@@ -87,25 +86,54 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
      return;
    }
  
++  nsRestyleHint restyleHint = mRebuildAllRestyleHint;
++  nsChangeHint changeHint = mRebuildAllChangeHint;
++  mRebuildAllExtraHint = nsChangeHint(0);
++  mRebuildAllRestyleHint = nsRestyleHint(0);
++
+   // Until we get rid of these phases in bug 960465, we need to add
+   // eRestyle_ChangeAnimationPhaseDescendants so that we actually honor
+   // these booleans in all cases.
+-  aRestyleHint |= eRestyle_ChangeAnimationPhaseDescendants;
+-
 -  aRestyleHint = aRestyleHint | eRestyle_ForceDescendants;
 -
 -  if (!(aRestyleHint & eRestyle_Subtree) &&
 -      (aRestyleHint & ~(eRestyle_Force | eRestyle_ForceDescendants))) {
--    aRestyleTracker.AddPendingRestyleToRoot(aRestyleHint, nsChangeHint(0));
++  restyleHint |= eRestyle_ChangeAnimationPhaseDescendants;
++
++  restyleHint |= eRestyle_ForceDescendants;
++
++  if (!(restyleHint & eRestyle_Subtree) &&
++      (restyleHint & ~(eRestyle_Force | eRestyle_ForceDescendants))) {
+     // We want this hint to apply to the root node's primary frame
+     // rather than the root frame, since it's the primary frame that has
+     // the styles for the root element (rather than the ancestors of the
+     // primary frame whose mContent is the root node but which have
+     // different styles).  If we use up the hint for one of the
+     // ancestors that we hit first, then we'll fail to do the restyling
+     // we need to do.
+     Element* root = mPresContext->Document()->GetRootElement();
+     if (root) {
+       // If the root element is gone, dropping the hint on the floor
+       // should be fine.
+-      aRestyleTracker.AddPendingRestyle(root, aRestyleHint, nsChangeHint(0));
++      aRestyleTracker.AddPendingRestyle(root, restyleHint, nsChangeHint(0));
+     }
 -    aRestyleHint = nsRestyleHint(0);
--  }
--
++    restyleHint = nsRestyleHint(0);
+   }
+ 
    // Recalculate all of the style contexts for the document
    // Note that we can ignore the return value of ComputeStyleChangeFor
    // because we never need to reframe the root frame
--  // XXX Does it matter that we're passing aExtraHint to the real root
--  // frame and not the root node's primary frame?  (We could do
--  // roughly what we do for aRestyleHint above.)
+   // XXX Does it matter that we're passing aExtraHint to the real root
+   // frame and not the root node's primary frame?  (We could do
+   // roughly what we do for aRestyleHint above.)
    // Note: The restyle tracker we pass in here doesn't matter.
    ComputeAndProcessStyleChange(mPresContext->PresShell()->GetRootFrame(),
 -                               aExtraHint, aRestyleTracker, aRestyleHint);
-+                               nsChangeHint(0), aRestyleTracker,
-+                               eRestyle_ForceDescendants);
++                               changeHint, aRestyleTracker, restyleHint);
    FlushOverflowChangedTracker();
  
    // Tell the style set it's safe to destroy the old rule tree.  We
