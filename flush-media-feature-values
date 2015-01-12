@@ -2,3 +2,112 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 1089417 patch 11 - Flush pending media feature value changes where needed.
 
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1026,16 +1026,20 @@ RestyleManager::ContentStateChanged(nsIC
+   // XXXbz it would be good if this function only took Elements, but
+   // we'd have to make ESM guarantee that usefully.
+   if (!aContent->IsElement()) {
+     return NS_OK;
+   }
+ 
+   Element* aElement = aContent->AsElement();
+ 
++  // We have to flush pending media feature values changes before doing
++  // something that might rebuild CSS rule processors.
++  mPresContext->FlushPendingMediaFeatureValuesChanged();
++
+   nsStyleSet* styleSet = mPresContext->StyleSet();
+   NS_ASSERTION(styleSet, "couldn't get style set");
+ 
+   nsChangeHint hint = NS_STYLE_HINT_NONE;
+   // Any change to a content state that affects which frames we construct
+   // must lead to a frame reconstruct here if we already have a frame.
+   // Note that we never decide through non-CSS means to not create frames
+   // based on content states, so if we already don't have a frame we don't
+@@ -1130,16 +1134,20 @@ RestyleManager::AttributeChanged(Element
+                                  nsIAtom* aAttribute,
+                                  int32_t aModType)
+ {
+   // Hold onto the PresShell to prevent ourselves from being destroyed.
+   // XXXbz how, exactly, would this attribute change cause us to be
+   // destroyed from inside this function?
+   nsCOMPtr<nsIPresShell> shell = mPresContext->GetPresShell();
+ 
++  // We have to flush pending media feature values changes before doing
++  // something that might rebuild CSS rule processors.
++  mPresContext->FlushPendingMediaFeatureValuesChanged();
++
+   // Get the frame associated with the content which is the highest in the frame tree
+   nsIFrame* primaryFrame = aElement->GetPrimaryFrame();
+ 
+ #if 0
+   NS_FRAME_LOG(NS_FRAME_TRACE_CALLS,
+      ("RestyleManager::AttributeChanged: content=%p[%s] frame=%p",
+       aContent, ContentTag(aElement, 0), frame));
+ #endif
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -2086,16 +2086,20 @@ nsPresContext::FlushUserFontSet()
+   if (!mGetUserFontSetCalled) {
+     return; // No one cares about this font set yet, but we want to be careful
+             // to not unset our mFontFaceSetDirty bit, so when someone really
+             // does we'll create it.
+   }
+ 
+   if (mFontFaceSetDirty) {
+     if (gfxPlatform::GetPlatform()->DownloadableFontsEnabled()) {
++      // We have to flush pending media feature values changes before doing
++      // something that might rebuild CSS rule processors.
++      mPresContext->FlushPendingMediaFeatureValuesChanged();
++
+       nsTArray<nsFontFaceRuleContainer> rules;
+       if (!mShell->StyleSet()->AppendFontFaceRules(this, rules)) {
+         // FIXME: What if it had rules before?
+         return;
+       }
+ 
+       if (!mFontFaceSet) {
+         mFontFaceSet = new FontFaceSet(mDocument->GetInnerWindow(), this);
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -4427,24 +4427,28 @@ PresShell::ContentStateChanged(nsIDocume
+ 
+ void
+ PresShell::DocumentStatesChanged(nsIDocument* aDocument,
+                                  EventStates aStateMask)
+ {
+   NS_PRECONDITION(!mIsDocumentGone, "Unexpected DocumentStatesChanged");
+   NS_PRECONDITION(aDocument == mDocument, "Unexpected aDocument");
+ 
+-  if (mDidInitialize &&
+-      mStyleSet->HasDocumentStateDependentStyle(mPresContext,
+-                                                mDocument->GetRootElement(),
+-                                                aStateMask)) {
+-    mPresContext->RestyleManager()->PostRestyleEvent(mDocument->GetRootElement(),
+-                                                     eRestyle_Subtree,
+-                                                     NS_STYLE_HINT_NONE);
+-    VERIFY_STYLE_TREE;
++  if (mDidInitialize) {
++    // We have to flush pending media feature values changes before doing
++    // something that might rebuild CSS rule processors.
++    mPresContext->FlushPendingMediaFeatureValuesChanged();
++
++    Element* rootElement = mDocument->GetRootElement();
++    if (mStyleSet->HasDocumentStateDependentStyle(mPresContext, rootElement,
++                                                  aStateMask)) {
++      mPresContext->RestyleManager()->
++        PostRestyleEvent(rootElement, eRestyle_Subtree, NS_STYLE_HINT_NONE);
++      VERIFY_STYLE_TREE;
++    }
+   }
+ 
+   if (aStateMask.HasState(NS_DOCUMENT_STATE_WINDOW_INACTIVE)) {
+     nsIFrame* root = mFrameConstructor->GetRootFrame();
+     if (root) {
+       root->SchedulePaint();
+     }
+   }
