@@ -33,7 +33,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
          // nsChangeHint_UpdatePostTransformOverflow hint.
          hint = NS_SubtractHint(hint, nsChangeHint_UpdatePostTransformOverflow);
        }
-@@ -822,16 +824,17 @@ RestyleManager::ProcessRestyledFrames(ns
+@@ -822,21 +824,22 @@ RestyleManager::ProcessRestyledFrames(ns
          }
        }
        NS_ASSERTION(!(hint & nsChangeHint_ChildrenOnlyTransform) ||
@@ -45,40 +45,71 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
 +                   nsChangeHint_UpdateParentOverflow |
                     nsChangeHint_UpdateSubtreeOverflow))) {
          if (hint & nsChangeHint_UpdateSubtreeOverflow) {
++          // FIXME: Continuations?
            AddSubtreeToOverflowTracker(frame);
          }
-         OverflowChangedTracker::ChangeKind changeKind;
+-        OverflowChangedTracker::ChangeKind changeKind;
          if (hint & nsChangeHint_ChildrenOnlyTransform) {
            // The overflow areas of the child frames need to be updated:
            nsIFrame* hintFrame = GetFrameForChildrenOnlyTransformHint(frame);
-@@ -861,25 +864,33 @@ RestyleManager::ProcessRestyledFrames(ns
+           nsIFrame* childFrame = hintFrame->GetFirstPrincipalChild();
+           NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrIBSplitSibling(frame),
+                        "SVG frames should not have continuations "
+                        "or ib-split siblings");
+           NS_ASSERTION(!nsLayoutUtils::GetNextContinuationOrIBSplitSibling(hintFrame),
+@@ -858,28 +861,49 @@ RestyleManager::ProcessRestyledFrames(ns
+             NS_ASSERTION(childFrame->GetParent() == hintFrame,
+                          "SVG child frame not expected to have different parent");
+           }
          }
          // If |frame| is dirty or has dirty children, we don't bother updating
          // overflows since that will happen when it's reflowed.
          if (!(frame->GetStateBits() &
                (NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN))) {
-           // If we have both nsChangeHint_UpdateOverflow and
-           // nsChangeHint_UpdatePostTransformOverflow, CHILDREN_AND_PARENT_CHANGED
-           // is selected as it is stronger.
-+          bool doParent = false;
-           if (hint & (nsChangeHint_UpdateOverflow | 
-                       nsChangeHint_UpdateSubtreeOverflow)) {
-             changeKind = OverflowChangedTracker::CHILDREN_AND_PARENT_CHANGED;
-+          } else if (hint & nsChangeHint_UpdatePostTransformOverflow) {
-+            changeKind = OverflowChangedTracker::TRANSFORM_CHANGED;
-           } else {
+-          // If we have both nsChangeHint_UpdateOverflow and
+-          // nsChangeHint_UpdatePostTransformOverflow, CHILDREN_AND_PARENT_CHANGED
+-          // is selected as it is stronger.
+-          if (hint & (nsChangeHint_UpdateOverflow | 
+-                      nsChangeHint_UpdateSubtreeOverflow)) {
+-            changeKind = OverflowChangedTracker::CHILDREN_AND_PARENT_CHANGED;
+-          } else {
 -            changeKind = OverflowChangedTracker::TRANSFORM_CHANGED;
-+            MOZ_ASSERT(hint & nsChangeHint_UpdateParentOverflow);
++          bool doParent = false;
++          if (hint & (nsChangeHint_UpdateOverflow |
++                      nsChangeHint_UpdateSubtreeOverflow |
++                      nsChangeHint_UpdatePostTransformOverflow)) {
++            OverflowChangedTracker::ChangeKind changeKind;
++            // If we have both nsChangeHint_UpdateOverflow and
++            // nsChangeHint_UpdatePostTransformOverflow,
++            // CHILDREN_AND_PARENT_CHANGED is selected as it is
++            // strictly stronger.
++            if (hint & (nsChangeHint_UpdateOverflow |
++                        nsChangeHint_UpdateSubtreeOverflow)) {
++              changeKind = OverflowChangedTracker::CHILDREN_AND_PARENT_CHANGED;
++            } else {
++              changeKind = OverflowChangedTracker::TRANSFORM_CHANGED;
++            }
++            for (nsIFrame *cont = frame; cont; cont =
++                   nsLayoutUtils::GetNextContinuationOrIBSplitSibling(cont)) {
++              mOverflowChangedTracker.AddFrame(cont, changeKind);
++            }
+           }
+-          for (nsIFrame *cont = frame; cont; cont =
+-                 nsLayoutUtils::GetNextContinuationOrIBSplitSibling(cont)) {
+-            mOverflowChangedTracker.AddFrame(cont, changeKind);
++          // UpdateParentOverflow hints need to be processed in addition
++          // to the above, since if the processing of the above hints
++          // yields no change, the update will not propagate to the
++          // parent.
++          if (hint & nsChangeHint_UpdateParentOverflow) {
 +            MOZ_ASSERT(frame->GetParent(),
 +                       "shouldn't get style hints for the root frame");
-+            doParent = true;
-+            changeKind = OverflowChangedTracker::CHILDREN_CHANGED;
-           }
-           for (nsIFrame *cont = frame; cont; cont =
-                  nsLayoutUtils::GetNextContinuationOrIBSplitSibling(cont)) {
--            mOverflowChangedTracker.AddFrame(cont, changeKind);
-+            nsIFrame *toadd = doParent ? cont->GetParent() : cont;
-+            mOverflowChangedTracker.AddFrame(toadd, changeKind);
++            for (nsIFrame *cont = frame; cont; cont =
++                   nsLayoutUtils::GetNextContinuationOrIBSplitSibling(cont)) {
++              nsIFrame *toadd = doParent ? cont->GetParent() : cont;
++              mOverflowChangedTracker.AddFrame(cont->GetParent(),
++                                   OverflowChangedTracker::CHILDREN_CHANGED);
++            }
            }
          }
        }
@@ -87,7 +118,7 @@ diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
          didUpdateCursor = true;
        }
      }
-@@ -4070,16 +4081,17 @@ RestyleManager::ChangeHintToString(nsCha
+@@ -4070,16 +4094,17 @@ RestyleManager::ChangeHintToString(nsCha
    nsCString result;
    bool any = false;
    const char* names[] = {
