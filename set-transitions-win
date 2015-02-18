@@ -1,0 +1,140 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1125455 - Set mWinsInCascade for transitions based on whether there are animations.
+
+FIXME: Need to run this code again when fill of an animation changes.
+
+diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
+--- a/layout/style/AnimationCommon.h
++++ b/layout/style/AnimationCommon.h
+@@ -186,16 +186,24 @@ public:
+     return &p->mValue;
+   }
+ 
+   struct PropertyValuePair {
+     nsCSSProperty mProperty;
+     mozilla::StyleAnimationValue mValue;
+   };
+ 
++  void AddPropertiesToSet(nsCSSPropertySet& aSet)
++  {
++    for (uint32_t i = 0, i_end = mPropertyValuePairs.Length(); i < i_end; ++i) {
++      PropertyValuePair &cv = mPropertyValuePairs[i];
++      aSet.AddProperty(cv.mProperty);
++    }
++  }
++
+ private:
+   ~AnimValuesStyleRule() {}
+ 
+   InfallibleTArray<PropertyValuePair> mPropertyValuePairs;
+ };
+ 
+ } /* end css sub-namespace */
+ 
+@@ -319,16 +327,29 @@ struct AnimationPlayerCollection : publi
+     if (IsForBeforePseudo()) {
+       return NS_LITERAL_STRING("::before");
+     }
+     MOZ_ASSERT(IsForAfterPseudo(),
+                "::before & ::after should be the only pseudo-elements here");
+     return NS_LITERAL_STRING("::after");
+   }
+ 
++  nsCSSPseudoElements::Type PseudoElementType() const
++  {
++    if (IsForElement()) {
++      return nsCSSPseudoElements::ePseudo_NotPseudoElement;
++    }
++    if (IsForBeforePseudo()) {
++      return nsCSSPseudoElements::ePseudo_before;
++    }
++    MOZ_ASSERT(IsForAfterPseudo(),
++               "::before & ::after should be the only pseudo-elements here");
++    return nsCSSPseudoElements::ePseudo_after;
++  }
++
+   mozilla::dom::Element* GetElementToRestyle() const;
+ 
+   void PostRestyleForAnimation(nsPresContext *aPresContext) {
+     mozilla::dom::Element* element = GetElementToRestyle();
+     if (element) {
+       nsRestyleHint hint = IsForTransitions() ? eRestyle_CSSTransitions
+                                               : eRestyle_CSSAnimations;
+       aPresContext->PresShell()->RestyleForAnimation(element, hint);
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -339,16 +339,18 @@ nsTransitionManager::StyleContextChanged
+       collection = nullptr;
+     }
+   }
+ 
+   MOZ_ASSERT(!startedAny || collection,
+              "must have element transitions if we started any transitions");
+ 
+   if (collection) {
++    UpdateCascadeResults(collection);
++
+     // Set the style rule refresh time to null so that EnsureStyleRuleFor
+     // creates a new style rule if we started *or* stopped transitions.
+     collection->mStyleRuleRefreshTime = TimeStamp();
+     collection->UpdateCheckGeneration(mPresContext);
+     collection->mNeedsRefreshes = true;
+     TimeStamp now = mPresContext->RefreshDriver()->MostRecentRefresh();
+     collection->EnsureStyleRuleFor(now, EnsureStyleRule_IsNotThrottled);
+   }
+@@ -590,16 +592,53 @@ nsTransitionManager::ConsiderStartingTra
+     }
+   }
+   aElementTransitions->UpdateAnimationGeneration(mPresContext);
+ 
+   *aStartedAny = true;
+   aWhichStarted->AddProperty(aProperty);
+ }
+ 
++void
++nsTransitionManager::UpdateCascadeResults(AnimationPlayerCollection& aTransitions)
++{
++  nsCSSPropertySet propertiesUsed;
++#ifdef DEBUG
++  nsCSSPropertySet propertiesWithTransitions;
++#endif
++
++  // http://dev.w3.org/csswg/css-transitions/#application says that
++  // transitions do not apply when the same property has a CSS Animation
++  // on that element (even though animations are lower in the cascade).
++  AnimationPlayerCollection* animations =
++    mPresContext->AnimationManager()->
++      GetAnimationPlayers(aTransitions.mElement,
++                          aTransitions.PseudoElementType(), false);
++  if (animations && animations->mStyleRule) {
++    animations->mStyleRule->AddPropertiesToSet(propertiesUsed);
++  }
++
++  // Since we should never have more than one transition for the same
++  // property, it doesn't matter what order we iterate the transitions.
++  // But let's go the same way as animations.
++  AnimationPlayerPtrArray& players = aTransitions.mPlayers;
++  for (size_t playerIdx = players.Length(); playerIdx-- != 0; ) {
++    MOZ_ASSERT(players[i]->GetSource() &&
++               players[i]->GetSource()->Properties().Length() == 1,
++               "Should have one animation property for a transition");
++    AnimationProperty& prop = players[i]->GetSource()->Properties()[0];
++    prop.mWinsInCascade = !propertiesUsed.Has(prop.mProperty);
++#ifdef DEBUG
++    MOZ_ASSERT(!propertiesWithTransitions.Has(prop.mProperty),
++               "we're assuming we have only one transition per property");
++    propertiesWithTransitions.AddProperty(prop.mProperty);
++#endif
++  }
++}
++
+ /*
+  * nsIStyleRuleProcessor implementation
+  */
+ 
+ /* virtual */ size_t
+ nsTransitionManager::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
+ {
+   return CommonAnimationManager::SizeOfExcludingThis(aMallocSizeOf);
