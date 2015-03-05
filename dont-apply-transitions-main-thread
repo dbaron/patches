@@ -1,0 +1,78 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1125455 patch 3 - For main-thread application of transitions, don't apply transitions when animations are also running.
+
+diff --git a/dom/animation/Animation.cpp b/dom/animation/Animation.cpp
+--- a/dom/animation/Animation.cpp
++++ b/dom/animation/Animation.cpp
+@@ -292,16 +292,26 @@ Animation::ComposeStyle(nsRefPtr<css::An
+     if (aSetProperties.HasProperty(prop.mProperty)) {
+       // Animations are composed by AnimationPlayerCollection by iterating
+       // from the last animation to first. For animations targetting the
+       // same property, the later one wins. So if this property is already set,
+       // we should not override it.
+       return;
+     }
+ 
++    if (!prop.mWinsInCascade) {
++      // This isn't the winning declaration, so don't add it to style.
++      // For transitions, this is important, because it's how we
++      // implement the rule that CSS transitions don't run when a CSS
++      // animation is running on the same property and element.  For
++      // animations, this is only skipping this that will otherwise be
++      // overridden.
++      continue;
++    }
++
+     aSetProperties.AddProperty(prop.mProperty);
+ 
+     MOZ_ASSERT(prop.mSegments.Length() > 0,
+                "property should not be in animations if it has no segments");
+ 
+     // FIXME: Maybe cache the current segment?
+     const AnimationPropertySegment *segment = prop.mSegments.Elements(),
+                                 *segmentEnd = segment + prop.mSegments.Length();
+diff --git a/layout/style/nsTransitionManager.cpp b/layout/style/nsTransitionManager.cpp
+--- a/layout/style/nsTransitionManager.cpp
++++ b/layout/style/nsTransitionManager.cpp
+@@ -640,28 +640,39 @@ nsTransitionManager::UpdateCascadeResult
+   // transitions do not apply when the same property has a CSS Animation
+   // on that element (even though animations are lower in the cascade).
+   aAnimations->mStyleRule->AddPropertiesToSet(propertiesUsed);
+ 
+   // Since we should never have more than one transition for the same
+   // property, it doesn't matter what order we iterate the transitions.
+   // But let's go the same way as animations.
+   AnimationPlayerPtrArray& players = aTransitions->mPlayers;
++  bool changed = false;
+   for (size_t playerIdx = players.Length(); playerIdx-- != 0; ) {
+     MOZ_ASSERT(players[playerIdx]->GetSource() &&
+                players[playerIdx]->GetSource()->Properties().Length() == 1,
+                "Should have one animation property for a transition");
+     AnimationProperty& prop = players[playerIdx]->GetSource()->Properties()[0];
+-    prop.mWinsInCascade = !propertiesUsed.HasProperty(prop.mProperty);
++    bool newWinsInCascade = !propertiesUsed.HasProperty(prop.mProperty);
++    if (prop.mWinsInCascade != newWinsInCascade) {
++      changed = true;
++    }
++    prop.mWinsInCascade = newWinsInCascade;
+ #ifdef DEBUG
+     MOZ_ASSERT(!propertiesWithTransitions.HasProperty(prop.mProperty),
+                "we're assuming we have only one transition per property");
+     propertiesWithTransitions.AddProperty(prop.mProperty);
+ #endif
+   }
++
++  if (changed) {
++    // FIXME: What do we need to do here?
++    aTransitions->mStyleRuleRefreshTime = TimeStamp();
++    aTransitions->mNeedsRefreshes = true;
++  }
+ }
+ 
+ /*
+  * nsIStyleRuleProcessor implementation
+  */
+ 
+ /* virtual */ size_t
+ nsTransitionManager::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
