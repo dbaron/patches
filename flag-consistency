@@ -1,0 +1,167 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 847287 patch 2 - Add assertions about consistency of the flags for animating on the compositor.
+
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -404,16 +404,20 @@ AddAnimationForProperty(nsIFrame* aFrame
+ }
+ 
+ static void
+ AddAnimationsForProperty(nsIFrame* aFrame, nsCSSProperty aProperty,
+                          AnimationPlayerPtrArray& aPlayers,
+                          Layer* aLayer, AnimationData& aData,
+                          bool aPending)
+ {
++  MOZ_ASSERT(nsCSSProps::PropHasFlags(aProperty,
++                                      CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR),
++             "inconsistent property flags");
++
+   for (size_t playerIdx = 0; playerIdx < aPlayers.Length(); playerIdx++) {
+     AnimationPlayer* player = aPlayers[playerIdx];
+     dom::Animation* anim = player->GetSource();
+     if (!anim) {
+       continue;
+     }
+     const AnimationProperty* property =
+       anim->GetAnimationOfProperty(aProperty);
+@@ -456,16 +460,20 @@ AddAnimationsForProperty(nsIFrame* aFram
+ 
+ /* static */ void
+ nsDisplayListBuilder::AddAnimationsAndTransitionsToLayer(Layer* aLayer,
+                                                          nsDisplayListBuilder* aBuilder,
+                                                          nsDisplayItem* aItem,
+                                                          nsIFrame* aFrame,
+                                                          nsCSSProperty aProperty)
+ {
++  MOZ_ASSERT(nsCSSProps::PropHasFlags(aProperty,
++                                      CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR),
++             "inconsistent property flags");
++
+   // This function can be called in two ways:  from
+   // nsDisplay*::BuildLayer while constructing a layer (with all
+   // pointers non-null), or from RestyleManager's handling of
+   // UpdateOpacityLayer/UpdateTransformLayer hints.
+   MOZ_ASSERT(!aBuilder == !aItem,
+              "should only be called in two configurations, with both "
+              "aBuilder and aItem, or with neither");
+   MOZ_ASSERT(!aItem || aFrame == aItem->Frame(), "frame mismatch");
+diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
+--- a/layout/build/nsLayoutStatics.cpp
++++ b/layout/build/nsLayoutStatics.cpp
+@@ -60,16 +60,17 @@
+ #include "Navigator.h"
+ #include "DOMStorageObserver.h"
+ #include "CacheObserver.h"
+ #include "DisplayItemClip.h"
+ #include "ActiveLayerTracker.h"
+ #include "CounterStyleManager.h"
+ #include "FrameLayerBuilder.h"
+ #include "mozilla/dom/RequestSyncWifiService.h"
++#include "AnimationCommon.h"
+ 
+ #include "AudioChannelService.h"
+ #include "mozilla/dom/DataStoreService.h"
+ 
+ #ifdef MOZ_XUL
+ #include "nsXULPopupManager.h"
+ #include "nsXULContentUtils.h"
+ #include "nsXULPrototypeCache.h"
+@@ -303,16 +304,17 @@ nsLayoutStatics::Initialize()
+   ServiceWorkerRegistrar::Initialize();
+ 
+ #ifdef MOZ_B2G
+   RequestSyncWifiService::Init();
+ #endif
+ 
+ #ifdef DEBUG
+   nsStyleContext::Initialize();
++  AnimationCommon::Initialize();
+ #endif
+ 
+   return NS_OK;
+ }
+ 
+ void
+ nsLayoutStatics::Shutdown()
+ {
+diff --git a/layout/style/AnimationCommon.cpp b/layout/style/AnimationCommon.cpp
+--- a/layout/style/AnimationCommon.cpp
++++ b/layout/style/AnimationCommon.cpp
+@@ -399,16 +399,51 @@ CommonAnimationManager::GetAnimationRule
+   CommonAnimationManager::sLayerAnimationInfo[] =
+     { { eCSSProperty_transform,
+         nsDisplayItem::TYPE_TRANSFORM,
+         nsChangeHint_UpdateTransformLayer },
+       { eCSSProperty_opacity,
+         nsDisplayItem::TYPE_OPACITY,
+         nsChangeHint_UpdateOpacityLayer } };
+ 
++#ifdef DEBUG
++static void
++CommonAnimationManager::Initialize()
++{
++  const auto& info = css::CommonAnimationManager::sLayerAnimationInfo;
++  for (size_t i = 0; i < ArrayLength(info); i++) {
++    auto record = info[i];
++    MOZ_ASSERT(nsCSSProps::PropHasFlags(record.mProperty,
++                                        CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR),
++               "CSS property with entry in sLayerAnimationInfo does not "
++               "have the CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR flag");
++  }
++
++  // Set that every property with the flag for animating on the
++  // compositor has an entry in sLayerAnimationInfo.
++  for (nsCSSProperty prop = nsCSSProperty(0);
++       prop < eCSSProperty_COUNT;
++       prop = nsCSSProperty(prop + 1)) {
++    if (nsCSSProps::PropHasFlags(aProperty,
++                                 CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR)) {
++      bool found = false;
++      for (size_t i = 0; i < ArrayLength(info); i++) {
++        if (record.mProperty == prop) {
++          found = true;
++          break;
++        }
++      }
++      MOZ_ASSERT(found,
++                 "CSS property with the CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR "
++                 "flag does not have an entry in sLayerAnimationInfo");
++    }
++  }
++}
++#endif
++
+ NS_IMPL_ISUPPORTS(AnimValuesStyleRule, nsIStyleRule)
+ 
+ /* virtual */ void
+ AnimValuesStyleRule::MapRuleInfoInto(nsRuleData* aRuleData)
+ {
+   nsStyleContext *contextParent = aRuleData->mStyleContext->GetParent();
+   if (contextParent && contextParent->HasPseudoElementData()) {
+     // Don't apply transitions or animations to things inside of
+diff --git a/layout/style/AnimationCommon.h b/layout/style/AnimationCommon.h
+--- a/layout/style/AnimationCommon.h
++++ b/layout/style/AnimationCommon.h
+@@ -60,16 +60,20 @@ public:
+ #ifdef MOZ_XUL
+   virtual void RulesMatching(XULTreeRuleProcessorData* aData) MOZ_OVERRIDE;
+ #endif
+   virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+     const MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+   virtual size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf)
+     const MOZ_MUST_OVERRIDE MOZ_OVERRIDE;
+ 
++#ifdef DEBUG
++  static void Initialize();
++#endif
++
+   /**
+    * Notify the manager that the pres context is going away.
+    */
+   void Disconnect();
+ 
+   // Tell the restyle tracker about all the styles that we're currently
+   // animating, so that it can update the animation rule for these
+   // elements.
