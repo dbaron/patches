@@ -1,0 +1,124 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 847287 patch 3 - Add a method to nsRuleNode that reports the properties overriding a CSS animation.
+
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -9687,16 +9687,86 @@ nsRuleNode::HasAuthorSpecifiedRules(nsSt
+           values[i]->Reset();
+       styleContext = styleContext->GetParent();
+     }
+   } while (haveExplicitUAInherit && styleContext);
+ 
+   return false;
+ }
+ 
++/* static */ void
++nsRuleNode::PropertiesOverridingAnimation(const nsTArray<nsCSSProperty>& aProperties,
++                                          nsStyleContext* aStyleContext,
++                                          nsCSSPropertySet& aPropertiesOverridden)
++{
++  /*
++   * Set up an nsRuleData with all the structs needed for all of the
++   * properties in aProperties.
++   */
++  uint64_t structBits = 0;
++  uint64_t nprops = 0;
++  size_t offsets[nsStyleStructID_Length];
++  for (size_t propIdx = 0, propEnd = aProperties.Length();
++       propIdx < propEnd; ++propIdx) {
++    nsCSSProperty prop = aProperties[propIdx];
++    nsStyleStructID sid = nsCSSProps::kSIDTable[prop];
++    uint64_t bit = NS_STYLE_INHERIT_BIT(sid);
++    if (!(structBits & bit)) {
++      structBits |= bit;
++      offsets[sid] = nprops;
++      size += nsCSSProps::PropertyCountInStruct(sid);
++    }
++  }
++
++  void* dataStorage = alloca(nprops * sizeof(nsCSSValue));
++  AutoCSSValueArray dataArray(dataStorage, nprops);
++
++  // We're relying on the use of |aStyleContext| not mutating it!
++  nsRuleData ruleData(structBits, dataArray.get(),
++                      PresContext(), aStyleContext);
++  for (nsStyleStructID sid = nsStyleStructID(0);
++       sid < nsStyleStructID_Length; sid = nsStyleStructID(sid + 1)) {
++    if (structBits & NS_STYLE_INHERIT_BIT(sid)) {
++      ruleData.mValueOffsets[sid] = offsets[sid];
++    }
++  }
++
++  /*
++   * Actually walk up the rule tree until we're someplace less
++   * specific than animations.
++   */
++  for (nsRuleNode* ruleNode = aStyleContext->RuleNode(); ruleNode;
++       ruleNode = ruleNode->GetParent()) {
++    nsIStyleRule *rule = ruleNode->GetRule();
++    if (rule) {
++      ruleData.mLevel = ruleNode->GetLevel();
++      ruleData.mIsImportantRule = ruleNode->IsImportantRule();
++
++      if (ruleData.mLevel != nsStyleSet::eTransitionSheet &&
++          !ruleData.mIsImportantRule) {
++        // We're now equal to or less than the animation level; stop.
++        break;
++      }
++
++      rule->MapRuleInfoInto(&ruleData);
++    }
++  }
++
++  /*
++   * Fill in which properties were overridden.
++   */
++  for (size_t propIdx = 0, propEnd = aProperties.Length();
++       propIdx < propEnd; ++propIdx) {
++    nsCSSProperty prop = aProperties[propIdx];
++    if (ruleData->ValueFor(prop)->GetUnit() != eCSSUnit_Null) {
++      aPropertiesOverridden.AddProperty(prop);
++    }
++  }
++}
++
+ /* static */
+ bool
+ nsRuleNode::ComputeColor(const nsCSSValue& aValue, nsPresContext* aPresContext,
+                          nsStyleContext* aStyleContext, nscolor& aResult)
+ {
+   MOZ_ASSERT(aValue.GetUnit() != eCSSUnit_Inherit,
+              "aValue shouldn't have eCSSUnit_Inherit");
+   MOZ_ASSERT(aValue.GetUnit() != eCSSUnit_Initial,
+diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
+--- a/layout/style/nsRuleNode.h
++++ b/layout/style/nsRuleNode.h
+@@ -733,16 +733,26 @@ public:
+   void Mark();
+   bool Sweep();
+ 
+   static bool
+     HasAuthorSpecifiedRules(nsStyleContext* aStyleContext,
+                             uint32_t ruleTypeMask,
+                             bool aAuthorColorsAllowed);
+ 
++  /**
++   * Fill in to aPropertiesOverridden all of the properties in aProperties
++   * that, for this rule node, have a declaration that is higher than the
++   * animation level in the CSS Cascade.
++   */
++  static void
++  PropertiesOverridingAnimation(const nsTArray<nsCSSProperty>& aProperties,
++                                nsStyleContext* aStyleContext,
++                                nsCSSPropertySet& aPropertiesOverridden);
++
+   // Expose this so media queries can use it
+   static nscoord CalcLengthWithInitialFont(nsPresContext* aPresContext,
+                                            const nsCSSValue& aValue);
+   // Expose this so nsTransformFunctions can use it.
+   static nscoord CalcLength(const nsCSSValue& aValue,
+                             nsStyleContext* aStyleContext,
+                             nsPresContext* aPresContext,
+                             bool& aCanStoreInRuleTree);
