@@ -1,0 +1,141 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 847287 patch 6 - Dynamically update cascade results when animations start or stop filling.
+
+diff --git a/layout/style/nsAnimationManager.cpp b/layout/style/nsAnimationManager.cpp
+--- a/layout/style/nsAnimationManager.cpp
++++ b/layout/style/nsAnimationManager.cpp
+@@ -203,30 +203,56 @@ CSSAnimationPlayer::PseudoTypeAsString(n
+ void
+ nsAnimationManager::UpdateStyleAndEvents(AnimationPlayerCollection*
+                                            aCollection,
+                                          TimeStamp aRefreshTime,
+                                          EnsureStyleRuleFlags aFlags)
+ {
+   aCollection->EnsureStyleRuleFor(aRefreshTime, aFlags);
+   QueueEvents(aCollection, mPendingEvents);
++  MaybeUpdateCascadeResults(aCollection);
++
+ }
+ 
+ void
+ nsAnimationManager::QueueEvents(AnimationPlayerCollection* aCollection,
+                                 EventArray& aEventsToDispatch)
+ {
+   for (size_t playerIdx = aCollection->mPlayers.Length(); playerIdx-- != 0; ) {
+     CSSAnimationPlayer* player =
+       aCollection->mPlayers[playerIdx]->AsCSSAnimationPlayer();
+     MOZ_ASSERT(player, "Expected a collection of CSS Animation players");
+     player->QueueEvents(aEventsToDispatch);
+   }
+ }
+ 
++void
++nsAnimationManager::MaybeUpdateCascadeResults(AnimationPlayerCollection* aCollection)
++{
++  for (size_t playerIdx = aCollection->mPlayers.Length(); playerIdx-- != 0; ) {
++    CSSAnimationPlayer* player =
++      aCollection->mPlayers[playerIdx]->AsCSSAnimationPlayer();
++
++    bool filling = anim->GetComputedTiming().mTimeFraction !=
++                   ComputedTiming::kNullTimeFraction;
++    if (filling != player->mFillingForCascadeResults) {
++      mozilla::dom::Element* element = aCollection->GetElementToRestyle();
++      if (!element) {
++        return;
++      }
++      nsIFrame* frame = element->GetPrimaryFrame();
++      if (!frame) {
++        return;
++      }
++      UpdateCascadeResults(frame->StyleContext(), aCollection);
++      return;
++    }
++  }
++}
++
+ /* virtual */ size_t
+ nsAnimationManager::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
+ {
+   return CommonAnimationManager::SizeOfExcludingThis(aMallocSizeOf);
+ 
+   // Measurement of the following members may be added later if DMD finds it is
+   // worthwhile:
+   // - mPendingEvents
+@@ -760,39 +786,40 @@ nsAnimationManager::UpdateCascadeResults
+    * AnimationPlayerCollection::EnsureStyleRuleFor.  Later animations
+    * override earlier ones, so we add properties to the set of
+    * overridden properties as we encounter them, if the animation is
+    * currently filling.
+    */
+ 
+   for (size_t playerIdx = aElementAnimations->mPlayers.Length();
+        playerIdx-- != 0; ) {
+-    AnimationPlayer* player = aElementAnimations->mPlayers[playerIdx];
++    CSSAnimationPlayer* player =
++      aElementAnimations->mPlayers[playerIdx]->AsCSSAnimationPlayer();
+     Animation* anim = player->GetSource();
+     if (!anim) {
+       continue;
+     }
+ 
++    player->mFillingForCascadeResults =
++      anim->GetComputedTiming().mTimeFraction !=
++      ComputedTiming::kNullTimeFraction;
++
+     for (size_t propIdx = 0, propEnd = anim->Properties().Length();
+          propIdx != propEnd; ++propIdx) {
+       AnimationProperty& prop = anim->Properties()[propIdx];
+       // We only bother setting mWinsInCascade for properties that we
+       // can animate on the compositor.
+       if (nsCSSProps::PropHasFlags(prop.mProperty,
+                                    CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR)) {
+         prop.mWinsInCascade = !propertiesOverridden.HasProperty(prop.mProperty);
+ 
+-        if (prop.mWinsInCascade) {
+-          ComputedTiming computedTiming = anim->GetComputedTiming();
+-          if (computedTiming.mTimeFraction !=
+-              ComputedTiming::kNullTimeFraction) {
+-            // This animation is filling right now, so it overrides
+-            // earlier animations.
+-            propertiesOverridden.AddProperty(prop.mProperty);
+-          }
++        if (prop.mWinsInCascade && player->mFillingForCascadeResults) {
++          // This animation is filling right now, so it overrides
++          // earlier animations.
++          propertiesOverridden.AddProperty(prop.mProperty);
+         }
+       }
+     }
+   }
+ }
+ 
+ /* virtual */ void
+ nsAnimationManager::WillRefresh(mozilla::TimeStamp aTime)
+diff --git a/layout/style/nsAnimationManager.h b/layout/style/nsAnimationManager.h
+--- a/layout/style/nsAnimationManager.h
++++ b/layout/style/nsAnimationManager.h
+@@ -133,16 +133,23 @@ protected:
+   // E. Paused by animation-play-state
+   //    (mIsPaused; mIsStylePaused; !mPauseShouldStick)
+   //
+   // (That leaves 3 combinations of the boolean values that we never set because
+   // they don't represent valid states.)
+   bool mIsStylePaused;
+   bool mPauseShouldStick;
+ 
++  // Is this animation currently filling for the purposes of computing
++  // mWinsInCascade.  (In general, this can be computed from the timing
++  // function.  This boolean remembers the state as of the last time we
++  // called UpdateCascadeResults so we know if it changes and we need to
++  // call UpdateCascadeResults again.)
++  bool mFillingForCascadeResults;
++
+   enum {
+     PREVIOUS_PHASE_BEFORE = uint64_t(-1),
+     PREVIOUS_PHASE_AFTER = uint64_t(-2)
+   };
+   // One of the PREVIOUS_PHASE_* constants, or an integer for the iteration
+   // whose start we last notified on.
+   uint64_t mPreviousPhaseOrIteration;
+ };
