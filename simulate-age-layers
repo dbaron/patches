@@ -1,0 +1,147 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make DOMWindowUtils::AdvanceTimeAndRefresh age the ActiveLayerTracker.
+
+diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
+--- a/dom/base/nsDOMWindowUtils.cpp
++++ b/dom/base/nsDOMWindowUtils.cpp
+@@ -89,16 +89,17 @@
+ #include "nsIInterfaceRequestorUtils.h"
+ #include "GeckoProfiler.h"
+ #include "mozilla/Preferences.h"
+ #include "nsIContentIterator.h"
+ #include "nsIDOMStyleSheet.h"
+ #include "nsIStyleSheet.h"
+ #include "nsContentPermissionHelper.h"
+ #include "nsNetUtil.h"
++#include "ActiveLayerTracker.h"
+ 
+ #ifdef XP_WIN
+ #undef GetClassName
+ #endif
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ using namespace mozilla::ipc;
+@@ -2594,16 +2595,18 @@ nsDOMWindowUtils::AdvanceTimeAndRefresh(
+   nsCOMPtr<nsIDocument> doc = GetDocument();
+   if (doc) {
+     PendingPlayerTracker* tracker = doc->GetPendingPlayerTracker();
+     if (tracker) {
+       tracker->TriggerPendingPlayersNow();
+     }
+   }
+ 
++  ActiveLayerTracker::SimulateTimeAdvance(aMilliseconds);
++
+   nsRefreshDriver* driver = GetPresContext()->RefreshDriver();
+   driver->AdvanceTimeAndRefresh(aMilliseconds);
+ 
+   RefPtr<LayerTransactionChild> transaction = GetLayerTransaction();
+   if (transaction && transaction->IPCOpen()) {
+     transaction->SendSetTestSampleTime(driver->MostRecentRefresh());
+   }
+ 
+diff --git a/layout/base/ActiveLayerTracker.cpp b/layout/base/ActiveLayerTracker.cpp
+--- a/layout/base/ActiveLayerTracker.cpp
++++ b/layout/base/ActiveLayerTracker.cpp
+@@ -322,15 +322,34 @@ ActiveLayerTracker::NotifyContentChange(
+ /* static */ bool
+ ActiveLayerTracker::IsContentActive(nsIFrame* aFrame)
+ {
+   LayerActivity* layerActivity = GetLayerActivity(aFrame);
+   return layerActivity && layerActivity->mContentActive;
+ }
+ 
+ /* static */ void
++ActiveLayerTracker::SimulateTimeAdvance(int64_t aMilliseconds)
++{
++  if (aMilliseconds < 0) {
++    return;
++  }
++
++  if (gLayerActivityTracker) {
++    // Round to the nearest number of iterations.
++    uint32_t timerPeriod = gLayerActivityTracker->TimerPeriod();
++    uint32_t iterations = (aMilliseconds + timerPeriod / 2) / timerPeriod;
++    iterations = std::min(iterations, gLayerActivityTracker->GenerationCount());
++
++    while (iterations-- != 0) {
++      gLayerActivityTracker->AgeOneGeneration();
++    }
++  }
++}
++
++/* static */ void
+ ActiveLayerTracker::Shutdown()
+ {
+   delete gLayerActivityTracker;
+   gLayerActivityTracker = nullptr;
+ }
+ 
+ }
+diff --git a/layout/base/ActiveLayerTracker.h b/layout/base/ActiveLayerTracker.h
+--- a/layout/base/ActiveLayerTracker.h
++++ b/layout/base/ActiveLayerTracker.h
+@@ -94,13 +94,19 @@ public:
+    * Mark aFrame's content as being active. This marking will time out after
+    * a short period.
+    */
+   static void NotifyContentChange(nsIFrame* aFrame);
+   /**
+    * Return true if this frame's content is still marked as active.
+    */
+   static bool IsContentActive(nsIFrame* aFrame);
++
++  /**
++   * Method to allow tests to simulate the advance of time.  Rounds to
++   * the granularity of the expiration tracker.
++   */
++  static void SimulateTimeAdvance(int64_t aMilliseconds);
+ };
+ 
+ }
+ 
+ #endif /* ACTIVELAYERTRACKER_H_ */
+diff --git a/xpcom/ds/nsExpirationTracker.h b/xpcom/ds/nsExpirationTracker.h
+--- a/xpcom/ds/nsExpirationTracker.h
++++ b/xpcom/ds/nsExpirationTracker.h
+@@ -94,16 +94,38 @@ public:
+   ~nsExpirationTracker()
+   {
+     if (mTimer) {
+       mTimer->Cancel();
+     }
+     mObserver->Destroy();
+   }
+ 
++  uint32_t GenerationCount() const
++  {
++    return K;
++  }
++
++  // The timer period (interval for aging one generation), in milliseconds.
++  uint32_t TimerPeriod() const
++  {
++    return mTimerPeriod;
++  }
++
++  // The bounds (in milliseconds) on object expiration, assuming
++  // accurate timer firing.
++  uint32_t MinExpirationInterval() const
++  {
++    return TimerPeriod() * (GenerationCount() - 1);
++  }
++  uint32_t MaxExpirationInterval() const
++  {
++    return TimerPeriod() * GenerationCount();
++  }
++
+   /**
+    * Add an object to be tracked. It must not already be tracked. It will
+    * be added to the newest generation, i.e., as if it was just used.
+    * @return an error on out-of-memory
+    */
+   nsresult AddObject(T* aObj)
+   {
+     nsExpirationState* state = aObj->GetExpirationState();
