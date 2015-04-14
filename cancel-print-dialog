@@ -1,0 +1,112 @@
+From: L. David Baron <dbaron@dbaron.org>, Ben Turner <bent.mozilla@gmail.com>
+
+Bug 1152921 - Don't send an uninitialized PrintData over IPC when cancelling print dialog.
+
+diff --git a/embedding/components/printingui/ipc/PPrintSettingsDialog.ipdl b/embedding/components/printingui/ipc/PPrintSettingsDialog.ipdl
+--- a/embedding/components/printingui/ipc/PPrintSettingsDialog.ipdl
++++ b/embedding/components/printingui/ipc/PPrintSettingsDialog.ipdl
+@@ -4,18 +4,24 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ include PPrintingTypes;
+ include protocol PPrinting;
+ 
+ namespace mozilla {
+ namespace embedding {
+ 
++union PrintDataOrNSResult
++{
++  PrintData;
++  nsresult;
++};
++
+ protocol PPrintSettingsDialog
+ {
+   manager PPrinting;
+ 
+ child:
+-  __delete__(nsresult rv, PrintData data);
++  __delete__(PrintDataOrNSResult result);
+ };
+ 
+ } // namespace embedding
+ } // namespace mozilla
+diff --git a/embedding/components/printingui/ipc/PrintSettingsDialogChild.cpp b/embedding/components/printingui/ipc/PrintSettingsDialogChild.cpp
+--- a/embedding/components/printingui/ipc/PrintSettingsDialogChild.cpp
++++ b/embedding/components/printingui/ipc/PrintSettingsDialogChild.cpp
+@@ -16,19 +16,22 @@ MOZ_IMPLICIT PrintSettingsDialogChild::P
+ }
+ 
+ MOZ_IMPLICIT PrintSettingsDialogChild::~PrintSettingsDialogChild()
+ {
+   MOZ_COUNT_DTOR(PrintSettingsDialogChild);
+ }
+ 
+ bool
+-PrintSettingsDialogChild::Recv__delete__(const nsresult& aResult,
+-                                         const PrintData& aData)
++PrintSettingsDialogChild::Recv__delete__(const PrintDataOrNSResult& aData)
+ {
+-  mResult = aResult;
+-  mData = aData;
++  if (aData.type() == PrintDataOrNSResult::Tnsresult) {
++    mResult = aData.get_nsresult();
++  } else {
++    mResult = NS_OK;
++    mData = aData.get_PrintData();
++  }
+   mReturned = true;
+   return true;
+ }
+ 
+ } // namespace embedding
+ } // namespace mozilla
+diff --git a/embedding/components/printingui/ipc/PrintSettingsDialogChild.h b/embedding/components/printingui/ipc/PrintSettingsDialogChild.h
+--- a/embedding/components/printingui/ipc/PrintSettingsDialogChild.h
++++ b/embedding/components/printingui/ipc/PrintSettingsDialogChild.h
+@@ -11,18 +11,17 @@ namespace embedding {
+ 
+ class PrintSettingsDialogChild final : public PPrintSettingsDialogChild
+ {
+   NS_INLINE_DECL_REFCOUNTING(PrintSettingsDialogChild)
+ 
+ public:
+   MOZ_IMPLICIT PrintSettingsDialogChild();
+ 
+-  virtual bool Recv__delete__(const nsresult& aResult,
+-                              const PrintData& aData) override;
++  virtual bool Recv__delete__(const PrintDataOrNSResult& aData) override;
+ 
+   bool returned() { return mReturned; };
+   nsresult result() { return mResult; };
+   PrintData data() { return mData; };
+ 
+ private:
+   virtual ~PrintSettingsDialogChild();
+   bool mReturned;
+diff --git a/embedding/components/printingui/ipc/PrintingParent.cpp b/embedding/components/printingui/ipc/PrintingParent.cpp
+--- a/embedding/components/printingui/ipc/PrintingParent.cpp
++++ b/embedding/components/printingui/ipc/PrintingParent.cpp
+@@ -112,17 +112,21 @@ PrintingParent::RecvShowPrintDialog(PPri
+ {
+   PrintData resultData;
+   nsresult rv = ShowPrintDialog(aParent, aData, &resultData);
+ 
+   // The child has been spinning an event loop while waiting
+   // to hear about the print settings. We return the results
+   // with an async message which frees the child process from
+   // its nested event loop.
+-  mozilla::unused << aDialog->Send__delete__(aDialog, rv, resultData);
++  if (NS_FAILED(rv)) {
++    mozilla::unused << aDialog->Send__delete__(aDialog, rv);
++  } else {
++    mozilla::unused << aDialog->Send__delete__(aDialog, resultData);
++  }
+   return true;
+ }
+ 
+ bool
+ PrintingParent::RecvSavePrintSettings(const PrintData& aData,
+                                       const bool& aUsePrinterNamePrefix,
+                                       const uint32_t& aFlags,
+                                       nsresult* aResult)
