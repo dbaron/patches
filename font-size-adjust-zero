@@ -74,10 +74,70 @@ diff --git a/gfx/thebes/gfxDWriteFonts.cpp b/gfx/thebes/gfxDWriteFonts.cpp
      }
  
      // Note that GetMeasuringMode depends on mAdjustedSize
+diff --git a/gfx/thebes/gfxFT2FontBase.cpp b/gfx/thebes/gfxFT2FontBase.cpp
+--- a/gfx/thebes/gfxFT2FontBase.cpp
++++ b/gfx/thebes/gfxFT2FontBase.cpp
+@@ -109,17 +109,18 @@ gfxFT2FontBase::GetGlyphExtents(uint32_t
+ }
+ 
+ const gfxFont::Metrics&
+ gfxFT2FontBase::GetHorizontalMetrics()
+ {
+     if (mHasMetrics)
+         return mMetrics;
+ 
+-    if (MOZ_UNLIKELY(GetStyle()->size <= 0.0)) {
++    if (MOZ_UNLIKELY(GetStyle()->size <= 0.0) ||
++        MOZ_UNLIKELY(GetStyle()->sizeAdjust == 0.0)) {
+         new(&mMetrics) gfxFont::Metrics(); // zero initialize
+         mSpaceGlyph = GetGlyph(' ');
+     } else {
+         gfxFT2LockedFace face(this);
+         face.GetMetrics(&mMetrics, &mSpaceGlyph);
+     }
+ 
+     SanitizeMetrics(&mMetrics, false);
 diff --git a/gfx/thebes/gfxFont.cpp b/gfx/thebes/gfxFont.cpp
 --- a/gfx/thebes/gfxFont.cpp
 +++ b/gfx/thebes/gfxFont.cpp
-@@ -3647,17 +3647,17 @@ gfxFontStyle::ParseFontLanguageOverride(
+@@ -2196,16 +2196,17 @@ gfxFont::Measure(gfxTextRun *aTextRun,
+     const gfxTextRun::CompressedGlyph *charGlyphs = aTextRun->GetCharacterGlyphs();
+     bool isRTL = aTextRun->IsRightToLeft();
+     double direction = aTextRun->GetDirection();
+     bool needsGlyphExtents = NeedsGlyphExtents(this, aTextRun);
+     gfxGlyphExtents *extents =
+         ((aBoundingBoxType == LOOSE_INK_EXTENTS &&
+             !needsGlyphExtents &&
+             !aTextRun->HasDetailedGlyphs()) ||
++         (MOZ_UNLIKELY(GetStyle()->sizeAdjust == 0.0)) ||
+          (MOZ_UNLIKELY(GetStyle()->size == 0))) ? nullptr
+         : GetOrCreateGlyphExtents(aTextRun->GetAppUnitsPerDevUnit());
+     double x = 0;
+     if (aSpacing) {
+         x += direction*aSpacing[0].mBefore;
+     }
+     uint32_t spaceGlyph = GetSpaceGlyph();
+     bool allGlyphsInvisible = true;
+@@ -3327,17 +3328,17 @@ void gfxFont::CalculateDerivedMetrics(Me
+     }
+ }
+ 
+ void
+ gfxFont::SanitizeMetrics(gfxFont::Metrics *aMetrics, bool aIsBadUnderlineFont)
+ {
+     // Even if this font size is zero, this font is created with non-zero size.
+     // However, for layout and others, we should return the metrics of zero size font.
+-    if (mStyle.size == 0.0) {
++    if (mStyle.size == 0.0 || mStyle.sizeAdjust == 0.0) {
+         memset(aMetrics, 0, sizeof(gfxFont::Metrics));
+         return;
+     }
+ 
+     aMetrics->underlineSize = std::max(1.0, aMetrics->underlineSize);
+     aMetrics->strikeoutSize = std::max(1.0, aMetrics->strikeoutSize);
+ 
+     aMetrics->underlineOffset = std::min(aMetrics->underlineOffset, -1.0);
+@@ -3647,17 +3648,17 @@ gfxFontStyle::ParseFontLanguageOverride(
    while (index++ < 4) {
      result = (result << 8) + 0x20;
    }
@@ -96,7 +156,7 @@ diff --git a/gfx/thebes/gfxFont.cpp b/gfx/thebes/gfxFont.cpp
      noFallbackVariantFeatures(true),
      explicitLanguage(false),
      variantCaps(NS_FONT_VARIANT_CAPS_NORMAL),
-@@ -3692,17 +3692,17 @@ gfxFontStyle::gfxFontStyle(uint8_t aStyl
+@@ -3692,17 +3693,17 @@ gfxFontStyle::gfxFontStyle(uint8_t aStyl
  
      if (weight > 900)
          weight = 900;
@@ -161,6 +221,27 @@ diff --git a/gfx/thebes/gfxFont.h b/gfx/thebes/gfxFont.h
          return ((style + (systemFont << 7) +
              (weight << 8)) + uint32_t(size*1000) + uint32_t(sizeAdjust*1000)) ^
              nsISupportsHashKey::HashKey(language);
+@@ -1382,17 +1382,19 @@ public:
+     virtual cairo_scaled_font_t* GetCairoScaledFont() { return mScaledFont; }
+ 
+     virtual gfxFont* CopyWithAntialiasOption(AntialiasOption anAAOption) {
+         // platforms where this actually matters should override
+         return nullptr;
+     }
+ 
+     virtual gfxFloat GetAdjustedSize() const {
+-        return mAdjustedSize > 0.0 ? mAdjustedSize : mStyle.size;
++        return mAdjustedSize > 0.0
++                 ? mAdjustedSize
++                 : (mStyle.sizeAdjust == 0.0 ? 0.0 : mStyle.size);
+     }
+ 
+     float FUnitsToDevUnitsFactor() const {
+         // check this was set up during font initialization
+         NS_ASSERTION(mFUnitsConvFactor > 0.0f, "mFUnitsConvFactor not valid");
+         return mFUnitsConvFactor;
+     }
+ 
 diff --git a/gfx/thebes/gfxGDIFont.cpp b/gfx/thebes/gfxGDIFont.cpp
 --- a/gfx/thebes/gfxGDIFont.cpp
 +++ b/gfx/thebes/gfxGDIFont.cpp
@@ -183,6 +264,25 @@ diff --git a/gfx/thebes/gfxGDIFont.cpp b/gfx/thebes/gfxGDIFont.cpp
              // initialize its metrics so we can calculate size adjustment
              Initialize();
  
+@@ -208,16 +208,18 @@ gfxGDIFont::Initialize()
+             gfxFloat aspect = mMetrics->xHeight / mMetrics->emHeight;
+             mAdjustedSize = mStyle.GetAdjustedSize(aspect);
+ 
+             // delete the temporary font and metrics
+             ::DeleteObject(mFont);
+             mFont = nullptr;
+             delete mMetrics;
+             mMetrics = nullptr;
++        } else if (mStyle.sizeAdjust == 0.0) {
++            mAdjustedSize = 0.0;
+         }
+     }
+ 
+     // (bug 724231) for local user fonts, we don't use GDI's synthetic bold,
+     // as it could lead to a different, incompatible face being used
+     // but instead do our own multi-striking
+     if (mNeedsBold && GetFontEntry()->IsLocalUserFont()) {
+         mApplySyntheticBold = true;
 diff --git a/gfx/thebes/gfxMacFont.cpp b/gfx/thebes/gfxMacFont.cpp
 --- a/gfx/thebes/gfxMacFont.cpp
 +++ b/gfx/thebes/gfxMacFont.cpp
