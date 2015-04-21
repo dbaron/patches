@@ -1,0 +1,129 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1156456 patch 2 - Send transform origin and perspective origin to layer in device pixels rather than CSS pixels.
+
+diff --git a/gfx/layers/composite/AsyncCompositionManager.cpp b/gfx/layers/composite/AsyncCompositionManager.cpp
+--- a/gfx/layers/composite/AsyncCompositionManager.cpp
++++ b/gfx/layers/composite/AsyncCompositionManager.cpp
+@@ -401,26 +401,19 @@ SampleValue(float aPortion, Animation& a
+     return;
+   }
+ 
+   nsCSSValueSharedList* interpolatedList =
+     interpolatedValue.GetCSSValueSharedListValue();
+ 
+   TransformData& data = aAnimation.data().get_TransformData();
+   nsPoint origin = data.origin();
+-  // we expect all our transform data to arrive in css pixels, so here we must
+-  // adjust to dev pixels.
+-  double cssPerDev = double(nsDeviceContext::AppUnitsPerCSSPixel())
+-                     / double(data.appUnitsPerDevPixel());
++  // we expect all our transform data to arrive in device pixels
+   Point3D transformOrigin = data.transformOrigin();
+-  transformOrigin.x = transformOrigin.x * cssPerDev;
+-  transformOrigin.y = transformOrigin.y * cssPerDev;
+   Point3D perspectiveOrigin = data.perspectiveOrigin();
+-  perspectiveOrigin.x = perspectiveOrigin.x * cssPerDev;
+-  perspectiveOrigin.y = perspectiveOrigin.y * cssPerDev;
+   nsDisplayTransform::FrameTransformProperties props(interpolatedList,
+                                                      transformOrigin,
+                                                      perspectiveOrigin,
+                                                      data.perspective());
+   gfx3DMatrix transform =
+     nsDisplayTransform::GetResultingTransformMatrix(props, origin,
+                                                     data.appUnitsPerDevPixel(),
+                                                     &data.bounds());
+diff --git a/gfx/layers/ipc/LayerTransactionParent.cpp b/gfx/layers/ipc/LayerTransactionParent.cpp
+--- a/gfx/layers/ipc/LayerTransactionParent.cpp
++++ b/gfx/layers/ipc/LayerTransactionParent.cpp
+@@ -715,19 +715,17 @@ LayerTransactionParent::RecvGetAnimation
+   for (uint32_t i=0; i < layer->GetAnimations().Length(); i++) {
+     if (layer->GetAnimations()[i].data().type() == AnimationData::TTransformData) {
+       const TransformData& data = layer->GetAnimations()[i].data().get_TransformData();
+       scale = data.appUnitsPerDevPixel();
+       scaledOrigin =
+         Point3D(NS_round(NSAppUnitsToFloatPixels(data.origin().x, scale)),
+                 NS_round(NSAppUnitsToFloatPixels(data.origin().y, scale)),
+                 0.0f);
+-      double cssPerDev =
+-        double(nsDeviceContext::AppUnitsPerCSSPixel()) / double(scale);
+-      transformOrigin = data.transformOrigin() * cssPerDev;
++      transformOrigin = data.transformOrigin();
+       break;
+     }
+   }
+ 
+   // Undo the translation to the origin of the reference frame applied by
+   // AsyncCompositionManager::SampleValue
+   transform.PreTranslate(-scaledOrigin.x, -scaledOrigin.y, -scaledOrigin.z);
+ 
+diff --git a/gfx/layers/ipc/LayersMessages.ipdlh b/gfx/layers/ipc/LayersMessages.ipdlh
+--- a/gfx/layers/ipc/LayersMessages.ipdlh
++++ b/gfx/layers/ipc/LayersMessages.ipdlh
+@@ -149,19 +149,19 @@ struct AnimationSegment {
+   TimingFunction sampleFn;
+ };
+ 
+ // Transforms need extra information to correctly convert the list of transform
+ // functions to a Matrix4x4 that can be applied directly to the layer.
+ struct TransformData {
+   // the origin of the frame being transformed in app units
+   nsPoint origin;
+-  // the transform-origin property for the transform in css pixels
++  // the transform-origin property for the transform in device pixels
+   Point3D transformOrigin;
+-  // the perspective-origin property for the transform in css pixels
++  // the perspective-origin property for the transform in device pixels
+   Point3D perspectiveOrigin;
+   nsRect bounds;
+   nscoord perspective;
+   int32_t appUnitsPerDevPixel;
+ };
+ 
+ union AnimationData {
+   null_t;
+diff --git a/layout/base/nsDisplayList.cpp b/layout/base/nsDisplayList.cpp
+--- a/layout/base/nsDisplayList.cpp
++++ b/layout/base/nsDisplayList.cpp
+@@ -525,18 +525,19 @@ nsDisplayListBuilder::AddAnimationsAndTr
+     // or TransitionManager get a chance to unthrottle the animation.
+     aFrame->SchedulePaint();
+     return;
+   }
+ 
+   AnimationData data;
+   if (aProperty == eCSSProperty_transform) {
+     nsRect bounds = nsDisplayTransform::GetFrameBoundsForTransform(aFrame);
+-    // all data passed directly to the compositor should be in css pixels
+-    float scale = nsDeviceContext::AppUnitsPerCSSPixel();
++    // all data passed directly to the compositor should be in dev pixels
++    int32_t d2a = aFrame->PresContext()->AppUnitsPerDevPixel();
++    float scale = d2a;
+     Point3D offsetToTransformOrigin =
+       nsDisplayTransform::GetDeltaToTransformOrigin(aFrame, scale, &bounds);
+     Point3D offsetToPerspectiveOrigin =
+       nsDisplayTransform::GetDeltaToPerspectiveOrigin(aFrame, scale);
+     nscoord perspective = 0.0;
+     nsStyleContext* parentStyleContext = aFrame->StyleContext()->GetParent();
+     if (parentStyleContext) {
+       const nsStyleDisplay* disp = parentStyleContext->StyleDisplay();
+@@ -551,18 +552,17 @@ nsDisplayListBuilder::AddAnimationsAndTr
+       // transform display items used a reference frame computed from
+       // their GetTransformRootFrame().
+       nsIFrame* referenceFrame =
+         nsLayoutUtils::GetReferenceFrame(GetTransformRootFrame(aFrame));
+       origin = aFrame->GetOffsetToCrossDoc(referenceFrame);
+     }
+ 
+     data = TransformData(origin, offsetToTransformOrigin,
+-                         offsetToPerspectiveOrigin, bounds, perspective,
+-                         aFrame->PresContext()->AppUnitsPerDevPixel());
++                         offsetToPerspectiveOrigin, bounds, perspective, d2a);
+   } else if (aProperty == eCSSProperty_opacity) {
+     data = null_t();
+   }
+ 
+   // When both are running, animations override transitions.  We want
+   // to add the ones that override last.
+   if (transitions) {
+     AddAnimationsForProperty(aFrame, aProperty, transitions->mAnimations,
