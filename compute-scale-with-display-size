@@ -1,0 +1,146 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1153539 patch 2 - Compute scale for rasterizing off-main-thread transform animations based on maximum scale and ratio to display size.
+
+diff --git a/layout/base/FrameLayerBuilder.cpp b/layout/base/FrameLayerBuilder.cpp
+--- a/layout/base/FrameLayerBuilder.cpp
++++ b/layout/base/FrameLayerBuilder.cpp
+@@ -4480,17 +4480,19 @@ ChooseScaleAndSetTransform(FrameLayerBui
+   gfxSize scale;
+   // XXX Should we do something for 3D transforms?
+   if (canDraw2D) {
+     // If the container's transform is animated off main thread, fix a suitable scale size
+     // for animation
+     if (aContainerFrame->GetContent() &&
+         nsLayoutUtils::HasAnimationsForCompositor(
+           aContainerFrame->GetContent(), eCSSProperty_transform)) {
+-      scale = nsLayoutUtils::ComputeSuitableScaleForAnimation(aContainerFrame->GetContent());
++      scale = nsLayoutUtils::ComputeSuitableScaleForAnimation(
++                aContainerFrame->GetContent(), aVisibleRect.Size(),
++                aContainerFrame->PresContext()->GetVisibleArea().Size());
+     } else {
+       // Scale factors are normalized to a power of 2 to reduce the number of resolution changes
+       scale = RoundToFloatPrecision(ThebesMatrix(transform2d).ScaleFactors(true));
+       // For frames with a changing transform that's not just a translation,
+       // round scale factors up to nearest power-of-2 boundary so that we don't
+       // keep having to redraw the content as it scales up and down. Rounding up to nearest
+       // power-of-2 boundary ensures we never scale up, only down --- avoiding
+       // jaggies. It also ensures we never scale down by more than a factor of 2,
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -478,28 +478,25 @@ GetScaleForValue(const StyleAnimationVal
+   if (!canDraw2D) {
+     return gfxSize();
+   }
+ 
+   return transform2d.ScaleFactors(true);
+ }
+ 
+ static float
+-GetSuitableScale(float aMaxScale, float aMinScale)
+-{
+-  // If the minimum scale >= 1.0f, use it; if the maximum <= 1.0f, use it;
+-  // otherwise use 1.0f.
+-  if (aMinScale >= 1.0f) {
+-    return aMinScale;
+-  }
+-  else if (aMaxScale <= 1.0f) {
+-    return aMaxScale;
+-  }
+-
+-  return 1.0f;
++GetSuitableScale(float aMaxScale,
++                 nscoord aVisibleDimension, nscoord aDisplayDimension)
++{
++  float visibleDisplayRatio = float(aVisibleDimension) /
++                              float(aDisplayDimension);
++  // We want to rasterize based on the largest scale used during the
++  // transform animation, unless that would make us rasterize something
++  // larger than the screen.
++  return std::min(aMaxScale, visibleDisplayRatio);
+ }
+ 
+ static void
+ GetMinAndMaxScaleForAnimationProperty(nsIContent* aContent,
+                                       AnimationCollection* aAnimations,
+                                       gfxSize& aMaxScale,
+                                       gfxSize& aMinScale)
+ {
+@@ -528,17 +525,19 @@ GetMinAndMaxScaleForAnimationProperty(ns
+           aMinScale.height = std::min<float>(aMinScale.height, to.height);
+         }
+       }
+     }
+   }
+ }
+ 
+ gfxSize
+-nsLayoutUtils::ComputeSuitableScaleForAnimation(nsIContent* aContent)
++nsLayoutUtils::ComputeSuitableScaleForAnimation(nsIContent* aContent,
++                                                const nsSize& aVisibleSize,
++                                                const nsSize& aDisplaySize)
+ {
+   gfxSize maxScale(std::numeric_limits<gfxFloat>::min(),
+                    std::numeric_limits<gfxFloat>::min());
+   gfxSize minScale(std::numeric_limits<gfxFloat>::max(),
+                    std::numeric_limits<gfxFloat>::max());
+ 
+   AnimationCollection* animations =
+     nsAnimationManager::GetAnimationsForCompositor(aContent,
+@@ -553,21 +552,23 @@ nsLayoutUtils::ComputeSuitableScaleForAn
+                                                     eCSSProperty_transform);
+   if (animations) {
+     GetMinAndMaxScaleForAnimationProperty(aContent, animations,
+                                           maxScale, minScale);
+   }
+ 
+   if (maxScale.width == std::numeric_limits<gfxFloat>::min()) {
+     // We didn't encounter a transform
+-    maxScale = minScale = gfxSize(1.0, 1.0);
+-  }
+-
+-  return gfxSize(GetSuitableScale(maxScale.width, minScale.width),
+-                 GetSuitableScale(maxScale.height, minScale.height));
++    return gfxSize(1.0, 1.0);
++  }
++
++  return gfxSize(GetSuitableScale(maxScale.width,
++                                  aVisibleSize.width, aDisplaySize.width),
++                 GetSuitableScale(maxScale.height,
++                                  aVisibleSize.height, aDisplaySize.height));
+ }
+ 
+ bool
+ nsLayoutUtils::AreAsyncAnimationsEnabled()
+ {
+   static bool sAreAsyncAnimationsEnabled;
+   static bool sAsyncPrefCached = false;
+ 
+diff --git a/layout/base/nsLayoutUtils.h b/layout/base/nsLayoutUtils.h
+--- a/layout/base/nsLayoutUtils.h
++++ b/layout/base/nsLayoutUtils.h
+@@ -2148,18 +2148,22 @@ public:
+   /**
+    * Find a suitable scale for an element (aContent) over the course of any
+    * animations and transitions of the CSS transform property on the
+    * element that run on the compositor thread.
+    * It will check the maximum and minimum scale during the animations and
+    * transitions and return a suitable value for performance and quality.
+    * Will return scale(1,1) if there are no such animations.
+    * Always returns a positive value.
++   * @param aVisibleSize is the size of the area we want to paint
++   * @param aDisplaySize is the size of the display area of the pres context
+    */
+-  static gfxSize ComputeSuitableScaleForAnimation(nsIContent* aContent);
++  static gfxSize ComputeSuitableScaleForAnimation(nsIContent* aContent,
++                                                  const nsSize& aVisibleSize,
++                                                  const nsSize& aDisplaySize);
+ 
+   /**
+    * Checks if we should forcibly use nearest pixel filtering for the
+    * background.
+    */
+   static bool UseBackgroundNearestFiltering();
+ 
+   /**
