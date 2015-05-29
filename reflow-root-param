@@ -1,0 +1,120 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1169440 patch 4 - Add parameter to nsIFrame::FrameNeedsReflow to control handling of target being a reflow root.
+
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -507,19 +507,26 @@ public:
+    * would result in no work being done, so don't do that.
+    */
+   enum IntrinsicDirty {
+     // XXXldb eResize should be renamed
+     eResize,     // don't mark any intrinsic widths dirty
+     eTreeChange, // mark intrinsic widths dirty on aFrame and its ancestors
+     eStyleChange // Do eTreeChange, plus all of aFrame's descendants
+   };
++  enum ReflowRootHandling {
++    ePositionOrSizeChange, // aFrame is changing position or size
++    eNoPositionOrSizeChange, // ... NOT changing ...
++    eInferFromBitToAdd // is changing iff (aBitToAdd == NS_FRAME_IS_DIRTY)
++  };
+   virtual void FrameNeedsReflow(nsIFrame *aFrame,
+                                 IntrinsicDirty aIntrinsicDirty,
+-                                nsFrameState aBitToAdd) = 0;
++                                nsFrameState aBitToAdd,
++                                ReflowRootHandling aRootHandling =
++                                  eInferFromBitToAdd) = 0;
+ 
+   /**
+    * Calls FrameNeedsReflow on all fixed position children of the root frame.
+    */
+   virtual void MarkFixedFramesForReflow(IntrinsicDirty aIntrinsicDirty);
+ 
+   /**
+    * Tell the presshell that the given frame's reflow was interrupted.  This
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -2794,17 +2794,18 @@ PresShell::VerifyHasDirtyRootAncestor(ns
+   }
+   NS_NOTREACHED("Frame has dirty bits set but isn't scheduled to be "
+                 "reflowed?");
+ }
+ #endif
+ 
+ void
+ PresShell::FrameNeedsReflow(nsIFrame *aFrame, IntrinsicDirty aIntrinsicDirty,
+-                            nsFrameState aBitToAdd)
++                            nsFrameState aBitToAdd,
++                            ReflowRootHandling aRootHandling)
+ {
+   NS_PRECONDITION(aBitToAdd == NS_FRAME_IS_DIRTY ||
+                   aBitToAdd == NS_FRAME_HAS_DIRTY_CHILDREN ||
+                   !aBitToAdd,
+                   "Unexpected bits being added");
+   NS_PRECONDITION(!(aIntrinsicDirty == eStyleChange &&
+                     aBitToAdd == NS_FRAME_HAS_DIRTY_CHILDREN),
+                   "bits don't correspond to style change reason");
+@@ -2844,23 +2845,34 @@ PresShell::FrameNeedsReflow(nsIFrame *aF
+     nsIFrame *subtreeRoot = subtrees.ElementAt(subtrees.Length() - 1);
+     subtrees.RemoveElementAt(subtrees.Length() - 1);
+ 
+     // Grab |wasDirty| now so we can go ahead and update the bits on
+     // subtreeRoot.
+     bool wasDirty = NS_SUBTREE_DIRTY(subtreeRoot);
+     subtreeRoot->AddStateBits(aBitToAdd);
+ 
+-    // Now if subtreeRoot is a reflow root we can cut off this reflow at it if
+-    // the bit being added is NS_FRAME_HAS_DIRTY_CHILDREN.
+-    bool targetFrameDirty = (aBitToAdd == NS_FRAME_IS_DIRTY);
++    // Determine whether we need to keep looking for the next ancestor
++    // reflow root if subtreeRoot itself is a reflow root.
++    bool targetNeedsReflowFromParent;
++    switch (aRootHandling) {
++      case ePositionOrSizeChange:
++        targetNeedsReflowFromParent = true;
++        break;
++      case eNoPositionOrSizeChange:
++        targetNeedsReflowFromParent = false;
++        break;
++      case eInferFromBitToAdd:
++        targetNeedsReflowFromParent = (aBitToAdd == NS_FRAME_IS_DIRTY);
++        break;
++    }
+ 
+ #define FRAME_IS_REFLOW_ROOT(_f)                   \
+   ((_f->GetStateBits() & NS_FRAME_REFLOW_ROOT) &&  \
+-   (_f != subtreeRoot || !targetFrameDirty))
++   (_f != subtreeRoot || !targetNeedsReflowFromParent))
+ 
+ 
+     // Mark the intrinsic widths as dirty on the frame, all of its ancestors,
+     // and all of its descendants, if needed:
+ 
+     if (aIntrinsicDirty != eResize) {
+       // Mark argument and all ancestors dirty. (Unless we hit a reflow
+       // root that should contain the reflow.  That root could be
+diff --git a/layout/base/nsPresShell.h b/layout/base/nsPresShell.h
+--- a/layout/base/nsPresShell.h
++++ b/layout/base/nsPresShell.h
+@@ -105,17 +105,18 @@ public:
+   virtual nsresult ResizeReflow(nscoord aWidth, nscoord aHeight) override;
+   virtual nsresult ResizeReflowOverride(nscoord aWidth, nscoord aHeight) override;
+   virtual nsIPageSequenceFrame* GetPageSequenceFrame() const override;
+   virtual nsCanvasFrame* GetCanvasFrame() const override;
+   virtual nsIFrame* GetRealPrimaryFrameFor(nsIContent* aContent) const override;
+ 
+   virtual nsIFrame* GetPlaceholderFrameFor(nsIFrame* aFrame) const override;
+   virtual void FrameNeedsReflow(nsIFrame *aFrame, IntrinsicDirty aIntrinsicDirty,
+-                                            nsFrameState aBitToAdd) override;
++                                nsFrameState aBitToAdd,
++                                ReflowRootHandling aRootHandling) override;
+   virtual void FrameNeedsToContinueReflow(nsIFrame *aFrame) override;
+   virtual void CancelAllPendingReflows() override;
+   virtual bool IsSafeToFlush() const override;
+   virtual void FlushPendingNotifications(mozFlushType aType) override;
+   virtual void FlushPendingNotifications(mozilla::ChangesToFlush aType) override;
+   virtual void DestroyFramesFor(nsIContent*  aContent,
+                                 nsIContent** aDestroyedFramesFor) override;
+   virtual void CreateFramesFor(nsIContent* aContent) override;
