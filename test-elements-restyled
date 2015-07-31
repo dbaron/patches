@@ -1,0 +1,167 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1189598 patch 1 - Add mechanism for testing the number of elements restyled.
+
+diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
+--- a/dom/base/nsDOMWindowUtils.cpp
++++ b/dom/base/nsDOMWindowUtils.cpp
+@@ -3869,16 +3869,30 @@ nsDOMWindowUtils::AskPermission(nsIConte
+ {
+   MOZ_RELEASE_ASSERT(nsContentUtils::IsCallerChrome());
+ 
+   nsCOMPtr<nsPIDOMWindow> window = do_QueryReferent(mWindow);
+   return nsContentPermissionUtils::AskPermission(aRequest, window->GetCurrentInnerWindow());
+ }
+ 
+ NS_IMETHODIMP
++nsDOMWindowUtils::GetElementsRestyled(uint64_t* aResult)
++{
++  MOZ_RELEASE_ASSERT(nsContentUtils::IsCallerChrome());
++
++  nsPresContext* presContext = GetPresContext();
++  if (!presContext) {
++    return NS_ERROR_NOT_AVAILABLE;
++  }
++
++  *aResult = presContext->ElementsRestyledCount();
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ nsDOMWindowUtils::GetFramesConstructed(uint64_t* aResult)
+ {
+   MOZ_RELEASE_ASSERT(nsContentUtils::IsCallerChrome());
+ 
+   nsPresContext* presContext = GetPresContext();
+   if (!presContext) {
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsIDOMWindowUtils.idl
+--- a/dom/interfaces/base/nsIDOMWindowUtils.idl
++++ b/dom/interfaces/base/nsIDOMWindowUtils.idl
+@@ -44,17 +44,17 @@ interface nsIDOMClientRect;
+ interface nsIURI;
+ interface nsIDOMEventTarget;
+ interface nsIRunnable;
+ interface nsITranslationNodeList;
+ interface nsIJSRAIIHelper;
+ interface nsIContentPermissionRequest;
+ interface nsIObserver;
+ 
+-[scriptable, uuid(7a37e173-ea6e-495e-8702-013f8063352a)]
++[scriptable, uuid(b39744ac-97ed-4907-9be0-697b5b5d20fb)]
+ interface nsIDOMWindowUtils : nsISupports {
+ 
+   /**
+    * Image animation mode of the window. When this attribute's value
+    * is changed, the implementation should set all images in the window
+    * to the given value. That is, when set to kDontAnimMode, all images
+    * will stop animating. The attribute's value must be one of the
+    * animationMode values from imgIContainer.
+@@ -1810,16 +1810,23 @@ interface nsIDOMWindowUtils : nsISupport
+ 
+   /**
+    * Helper for JS components that need to send permission requests with
+    * e10s support properly.
+    */
+   void askPermission(in nsIContentPermissionRequest aRequest);
+ 
+   /**
++   * Number of elements restyled for the curent document.
++   *
++   * May throw NS_ERROR_NOT_AVAILABLE.
++   */
++  readonly attribute unsigned long long elementsRestyled;
++
++  /**
+    * Number of frames constructed (excluding breaking) for the curent
+    * document.
+    *
+    * May throw NS_ERROR_NOT_AVAILABLE.
+    */
+   readonly attribute unsigned long long framesConstructed;
+ 
+   /**
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -2724,24 +2724,27 @@ ElementRestyler::Restyle(nsRestyleHint a
+   // |content| and |pseudoContent| mean, and their relationship to
+   // |mFrame->GetContent()|, make more sense.  However, we can't,
+   // because of frame trees like the one in
+   // https://bugzilla.mozilla.org/show_bug.cgi?id=472353#c14 .  Once we
+   // fix bug 242277 we should be able to make this make more sense.
+   NS_ASSERTION(mFrame->GetContent() || !mParentContent ||
+                !mParentContent->GetParent(),
+                "frame must have content (unless at the top of the tree)");
++  MOZ_ASSERT(mPresContext == mFrame->PresContext(), "pres contexts match");
+ 
+   NS_ASSERTION(!GetPrevContinuationWithSameStyle(mFrame),
+                "should not be trying to restyle this frame separately");
+ 
+   MOZ_ASSERT(!(aRestyleHint & eRestyle_LaterSiblings),
+              "eRestyle_LaterSiblings must not be part of aRestyleHint");
+ 
+-  AutoDisplayContentsAncestorPusher adcp(mTreeMatchContext, mFrame->PresContext(),
++  mPresContext->ElementRestyled();
++
++  AutoDisplayContentsAncestorPusher adcp(mTreeMatchContext, mPresContext,
+       mFrame->GetContent() ? mFrame->GetContent()->GetParent() : nullptr);
+ 
+   // List of descendant elements of mContent we know we will eventually need to
+   // restyle.  Before we return from this function, we call
+   // RestyleTracker::AddRestyleRootsIfAwaitingRestyle to ensure they get
+   // restyled in RestyleTracker::DoProcessRestyles.
+   nsTArray<nsRefPtr<Element>> descendants;
+ 
+diff --git a/layout/base/nsPresContext.h b/layout/base/nsPresContext.h
+--- a/layout/base/nsPresContext.h
++++ b/layout/base/nsPresContext.h
+@@ -816,23 +816,29 @@ public:
+   */
+   bool EnsureVisible();
+ 
+ #ifdef MOZ_REFLOW_PERF
+   void CountReflows(const char * aName,
+                                 nsIFrame * aFrame);
+ #endif
+ 
++  void RestyledElement() {
++    ++mElementsRestyled;
++  }
+   void ConstructedFrame() {
+     ++mFramesConstructed;
+   }
+   void ReflowedFrame() {
+     ++mFramesReflowed;
+   }
+ 
++  uint64_t ElementsRestyledCount() {
++    return mElementsRestyled;
++  }
+   uint64_t FramesConstructedCount() {
+     return mFramesConstructed;
+   }
+   uint64_t FramesReflowedCount() {
+     return mFramesReflowed;
+   }
+ 
+   /**
+@@ -1301,16 +1307,17 @@ protected:
+   LangGroupFontPrefs    mLangGroupFontPrefs;
+ 
+   nscoord               mBorderWidthTable[3];
+ 
+   uint32_t              mInterruptChecksToSkip;
+ 
+   // Counters for tests and tools that want to detect frame construction
+   // or reflow.
++  uint64_t              mElementsRestyled;
+   uint64_t              mFramesConstructed;
+   uint64_t              mFramesReflowed;
+ 
+   mozilla::TimeStamp    mReflowStartTime;
+ 
+   // last time we did a full style flush
+   mozilla::TimeStamp    mLastStyleUpdateForAllAnimations;
+ 
