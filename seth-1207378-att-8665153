@@ -1,0 +1,293 @@
+# HG changeset patch
+# User Seth Fowler <mark.seth.fowler@gmail.com>
+
+Bug 1207378 (Part 1) - Add support for an offset to Downscaler. r=tn
+
+diff --git a/image/Downscaler.cpp b/image/Downscaler.cpp
+index 0700eeb..dce13ed 100644
+--- a/image/Downscaler.cpp
++++ b/image/Downscaler.cpp
+@@ -52,38 +52,46 @@ Downscaler::ReleaseWindow()
+   }
+ 
+   mWindow = nullptr;
+   mWindowCapacity = 0;
+ }
+ 
+ nsresult
+ Downscaler::BeginFrame(const nsIntSize& aOriginalSize,
++                       const nsIntSize& aOffset,
+                        uint8_t* aOutputBuffer,
+                        bool aHasAlpha,
+                        bool aFlipVertically /* = false */)
+ {
+   MOZ_ASSERT(aOutputBuffer);
+   MOZ_ASSERT(mTargetSize != aOriginalSize,
+              "Created a downscaler, but not downscaling?");
+   MOZ_ASSERT(mTargetSize.width <= aOriginalSize.width,
+              "Created a downscaler, but width is larger");
+   MOZ_ASSERT(mTargetSize.height <= aOriginalSize.height,
+              "Created a downscaler, but height is larger");
+   MOZ_ASSERT(aOriginalSize.width > 0 && aOriginalSize.height > 0,
+              "Invalid original size");
++  MOZ_ASSERT(aOffset.width >= 0 && aOffset.height >= 0,
++             "Offset must be non-negative");
++  MOZ_ASSERT(aOffset.width < aOriginalSize.width,
++             "Horizontal offset must fit inside image");
++  MOZ_ASSERT(aOffset.height < aOriginalSize.height,
++             "Vertical offset must fit inside image");
++  MOZ_ASSERT_IF(aOffset != nsIntSize(), aHasAlpha);
+ 
+   mOriginalSize = aOriginalSize;
++  mOffset = aOffset;
+   mScale = gfxSize(double(mOriginalSize.width) / mTargetSize.width,
+                    double(mOriginalSize.height) / mTargetSize.height);
+   mOutputBuffer = aOutputBuffer;
+   mHasAlpha = aHasAlpha;
+   mFlipVertically = aFlipVertically;
+ 
+-  ResetForNextProgressivePass();
+   ReleaseWindow();
+ 
+   auto resizeMethod = skia::ImageOperations::RESIZE_LANCZOS3;
+ 
+   skia::resize::ComputeFilters(resizeMethod,
+                                mOriginalSize.width, mTargetSize.width,
+                                0, mTargetSize.width,
+                                mXFilter.get());
+@@ -119,26 +127,36 @@ Downscaler::BeginFrame(const nsIntSize& aOriginalSize,
+ 
+   if (MOZ_UNLIKELY(anyAllocationFailed)) {
+     // We intentionally iterate through the entire array even if an allocation
+     // fails, to ensure that all the pointers in it are either valid or nullptr.
+     // That in turn ensures that ReleaseWindow() can clean up correctly.
+     return NS_ERROR_OUT_OF_MEMORY;
+   }
+ 
++  ResetForNextProgressivePass();
++
+   return NS_OK;
+ }
+ 
+ void
+ Downscaler::ResetForNextProgressivePass()
+ {
+   mPrevInvalidatedLine = 0;
+   mCurrentOutLine = 0;
+   mCurrentInLine = 0;
+   mLinesInBuffer = 0;
++
++  // If we have a vertical offset, commit rows to shift us past it.
++  if (mOffset.height > 0) {
++    ClearRow();
++    for (int32_t y = 0 ; y < mOffset.height ; ++y) {
++      CommitRow();
++    }
++  }
+ }
+ 
+ static void
+ GetFilterOffsetAndLength(UniquePtr<skia::ConvolutionFilter1D>& aFilter,
+                          int32_t aOutputImagePosition,
+                          int32_t* aFilterOffsetOut,
+                          int32_t* aFilterLengthOut)
+ {
+diff --git a/image/Downscaler.h b/image/Downscaler.h
+index c883d952..b474f66 100644
+--- a/image/Downscaler.h
++++ b/image/Downscaler.h
+@@ -63,29 +63,36 @@ public:
+   /**
+    * Begins a new frame and reinitializes the Downscaler.
+    *
+    * @param aOriginalSize The original size of this frame, before scaling.
+    * @param aOutputBuffer The buffer to which the Downscaler should write its
+    *                      output; this is the same buffer where the Decoder
+    *                      would write its output when not downscaling during
+    *                      decode.
++   * @param aOffset       An offset into the original image at which data
++   *                      starts. Every pixel above aOffset.height, or to the
++   *                      left of aOffset.width, is considered blank.
+    * @param aHasAlpha Whether or not this frame has an alpha channel.
+    *                  Performance is a little better if it doesn't have one.
+    * @param aFlipVertically If true, output rows will be written to the output
+    *                        buffer in reverse order vertically, which matches
+    *                        the way they are stored in some image formats.
+    */
+   nsresult BeginFrame(const nsIntSize& aOriginalSize,
++                      const nsIntSize& aOffset,
+                       uint8_t* aOutputBuffer,
+                       bool aHasAlpha,
+                       bool aFlipVertically = false);
+ 
+   /// Retrieves the buffer into which the Decoder should write each row.
+-  uint8_t* RowBuffer() { return mRowBuffer.get(); }
++  uint8_t* RowBuffer()
++  {
++    return mRowBuffer.get() + mOffset.width * sizeof(uint32_t);
++  }
+ 
+   /// Clears the current row buffer (optionally starting at @aStartingAtCol).
+   void ClearRow(uint32_t aStartingAtCol = 0);
+ 
+   /// Signals that the decoder has finished writing a row into the row buffer.
+   void CommitRow();
+ 
+   /// Returns true if there is a non-empty invalid rect available.
+@@ -102,16 +109,17 @@ public:
+   void ResetForNextProgressivePass();
+ 
+ private:
+   void DownscaleInputLine();
+   void ReleaseWindow();
+ 
+   nsIntSize mOriginalSize;
+   nsIntSize mTargetSize;
++  nsIntSize mOffset;
+   gfxSize mScale;
+ 
+   uint8_t* mOutputBuffer;
+ 
+   UniquePtr<uint8_t[]> mRowBuffer;
+   UniquePtr<uint8_t*[]> mWindow;
+ 
+   UniquePtr<skia::ConvolutionFilter1D> mXFilter;
+diff --git a/image/decoders/nsBMPDecoder.cpp b/image/decoders/nsBMPDecoder.cpp
+index c9c2329..81a5bb8 100644
+--- a/image/decoders/nsBMPDecoder.cpp
++++ b/image/decoders/nsBMPDecoder.cpp
+@@ -456,17 +456,18 @@ nsBMPDecoder::WriteInternal(const char* aBuffer, uint32_t aCount)
+           return;
+       }
+ 
+       MOZ_ASSERT(mImageData, "Should have a buffer now");
+ 
+       if (mDownscaler) {
+         // BMPs store their rows in reverse order, so the downscaler needs to
+         // reverse them again when writing its output.
+-        rv = mDownscaler->BeginFrame(GetSize(), mImageData, hasTransparency,
++        rv = mDownscaler->BeginFrame(GetSize(), IntSize(),
++                                     mImageData, hasTransparency,
+                                      /* aFlipVertically = */ true);
+         if (NS_FAILED(rv)) {
+           return;
+         }
+       }
+   }
+ 
+   if (mColors && mPos >= mLOH) {
+diff --git a/image/decoders/nsGIFDecoder2.cpp b/image/decoders/nsGIFDecoder2.cpp
+index 2a64a34..f1a2699 100644
+--- a/image/decoders/nsGIFDecoder2.cpp
++++ b/image/decoders/nsGIFDecoder2.cpp
+@@ -274,17 +274,17 @@ nsGIFDecoder2::BeginImageFrame(uint16_t aDepth)
+ 
+   mCurrentFrameIndex = mGIFStruct.images_decoded;
+ 
+   if (NS_FAILED(rv)) {
+     return rv;
+   }
+ 
+   if (mDownscaler) {
+-    rv = mDownscaler->BeginFrame(frameRect.Size(), mImageData,
++    rv = mDownscaler->BeginFrame(frameRect.Size(), IntSize(), mImageData,
+                                  mGIFStruct.is_transparent);
+   }
+ 
+   return rv;
+ }
+ 
+ 
+ //******************************************************************************
+diff --git a/image/decoders/nsICODecoder.cpp b/image/decoders/nsICODecoder.cpp
+index 1f8cf94..6968863 100644
+--- a/image/decoders/nsICODecoder.cpp
++++ b/image/decoders/nsICODecoder.cpp
+@@ -548,17 +548,17 @@ nsICODecoder::PrepareForMask()
+   // produced, so we need to downscale the mask into a temporary buffer and then
+   // combine the mask's alpha values with the color values from the image.
+   if (mDownscaler) {
+     MOZ_ASSERT(bmpDecoder->GetImageDataLength() ==
+                  mDownscaler->TargetSize().width *
+                  mDownscaler->TargetSize().height *
+                  sizeof(uint32_t));
+     mMaskBuffer = MakeUnique<uint8_t[]>(bmpDecoder->GetImageDataLength());
+-    nsresult rv = mDownscaler->BeginFrame(GetRealSize(),
++    nsresult rv = mDownscaler->BeginFrame(GetRealSize(), IntSize(),
+                                           mMaskBuffer.get(),
+                                           /* aHasAlpha = */ true,
+                                           /* aFlipVertically = */ true);
+     if (NS_FAILED(rv)) {
+       return Transition::Terminate(ICOState::FAILURE);
+     }
+   }
+ 
+diff --git a/image/decoders/nsIconDecoder.cpp b/image/decoders/nsIconDecoder.cpp
+index 55666f6..1d9e3ab 100644
+--- a/image/decoders/nsIconDecoder.cpp
++++ b/image/decoders/nsIconDecoder.cpp
+@@ -88,17 +88,17 @@ nsIconDecoder::WriteInternal(const char* aBuffer, uint32_t aCount)
+             mState = iconStateFinished;
+             return;
+           }
+         }
+ 
+         MOZ_ASSERT(mImageData, "Should have a buffer now");
+ 
+         if (mDownscaler) {
+-          nsresult rv = mDownscaler->BeginFrame(GetSize(),
++          nsresult rv = mDownscaler->BeginFrame(GetSize(), IntSize(),
+                                                 mImageData,
+                                                 /* aHasAlpha = */ true);
+           if (NS_FAILED(rv)) {
+             mState = iconStateFinished;
+             return;
+           }
+         }
+ 
+diff --git a/image/decoders/nsJPEGDecoder.cpp b/image/decoders/nsJPEGDecoder.cpp
+index 61d32c0..b92e3e5 100644
+--- a/image/decoders/nsJPEGDecoder.cpp
++++ b/image/decoders/nsJPEGDecoder.cpp
+@@ -393,17 +393,17 @@ nsJPEGDecoder::WriteInternal(const char* aBuffer, uint32_t aCount)
+       MOZ_LOG(GetJPEGDecoderAccountingLog(), LogLevel::Debug,
+              ("} (could not initialize image frame)"));
+       return;
+     }
+ 
+     MOZ_ASSERT(mImageData, "Should have a buffer now");
+ 
+     if (mDownscaler) {
+-      nsresult rv = mDownscaler->BeginFrame(GetSize(),
++      nsresult rv = mDownscaler->BeginFrame(GetSize(), IntSize(),
+                                             mImageData,
+                                             /* aHasAlpha = */ false);
+       if (NS_FAILED(rv)) {
+         mState = JPEG_ERROR;
+         return;
+       }
+     }
+ 
+diff --git a/image/decoders/nsPNGDecoder.cpp b/image/decoders/nsPNGDecoder.cpp
+index 7411917..50ac1e8 100644
+--- a/image/decoders/nsPNGDecoder.cpp
++++ b/image/decoders/nsPNGDecoder.cpp
+@@ -204,17 +204,18 @@ nsPNGDecoder::CreateFrame(png_uint_32 aXOffset, png_uint_32 aYOffset,
+       // animation playback, so we regard it as transparent.
+       PostHasTransparency();
+     }
+   }
+ #endif
+ 
+   if (mDownscaler) {
+     bool hasAlpha = aFormat != SurfaceFormat::B8G8R8X8;
+-    rv = mDownscaler->BeginFrame(frameRect.Size(), mImageData, hasAlpha);
++    rv = mDownscaler->BeginFrame(frameRect.Size(), IntSize(),
++                                 mImageData, hasAlpha);
+     if (NS_FAILED(rv)) {
+       return rv;
+     }
+   }
+ 
+   return NS_OK;
+ }
