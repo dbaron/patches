@@ -1,0 +1,671 @@
+# HG changeset patch
+# Parent 315b52c96aa0c95e35c436bc4cea1b3c0bc873b6
+# User Mats Palmgren <matspal@gmail.com>
+Bug 881832 - Add a eDelayResize flag to SetPositionAndSize() and propagate it to SetWindowDimensions() to make it delay its ResizeReflow() call.  r=tn
+
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -5675,17 +5675,17 @@ nsDocShell::GetCurrentDescriptor(nsISupp
+ //*****************************************************************************
+ 
+ NS_IMETHODIMP
+ nsDocShell::InitWindow(nativeWindow aParentNativeWindow,
+                        nsIWidget* aParentWidget, int32_t aX, int32_t aY,
+                        int32_t aWidth, int32_t aHeight)
+ {
+   SetParentWidget(aParentWidget);
+-  SetPositionAndSize(aX, aY, aWidth, aHeight, false);
++  SetPositionAndSize(aX, aY, aWidth, aHeight, 0);
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::Create()
+ {
+   if (mCreated) {
+@@ -5892,53 +5892,57 @@ nsDocShell::GetPosition(int32_t* aX, int
+   return GetPositionAndSize(aX, aY, nullptr, nullptr);
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::SetSize(int32_t aWidth, int32_t aHeight, bool aRepaint)
+ {
+   int32_t x = 0, y = 0;
+   GetPosition(&x, &y);
+-  return SetPositionAndSize(x, y, aWidth, aHeight, aRepaint);
++  return SetPositionAndSize(x, y, aWidth, aHeight,
++                            aRepaint ? nsIBaseWindow::eRepaint : 0);
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::GetSize(int32_t* aWidth, int32_t* aHeight)
+ {
+   return GetPositionAndSize(nullptr, nullptr, aWidth, aHeight);
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::SetPositionAndSize(int32_t aX, int32_t aY, int32_t aWidth,
+-                               int32_t aHeight, bool aFRepaint)
++                               int32_t aHeight, uint32_t aFlags)
+ {
+   mBounds.x = aX;
+   mBounds.y = aY;
+   mBounds.width = aWidth;
+   mBounds.height = aHeight;
+ 
+   // Hold strong ref, since SetBounds can make us null out mContentViewer
+   nsCOMPtr<nsIContentViewer> viewer = mContentViewer;
+   if (viewer) {
++    uint32_t cvflags = (aFlags & nsIBaseWindow::eDelayResize) ?
++                           nsIContentViewer::eDelayResize : 0;
+     // XXX Border figured in here or is that handled elsewhere?
+-    NS_ENSURE_SUCCESS(viewer->SetBounds(mBounds), NS_ERROR_FAILURE);
++    nsresult rv = viewer->SetBoundsWithFlags(mBounds, cvflags);
++    NS_ENSURE_SUCCESS(rv, NS_ERROR_FAILURE);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShell::GetPositionAndSize(int32_t* aX, int32_t* aY, int32_t* aWidth,
+                                int32_t* aHeight)
+ {
+   if (mParentWidget) {
+     // ensure size is up-to-date if window has changed resolution
+     nsIntRect r;
+     mParentWidget->GetClientBounds(r);
+-    SetPositionAndSize(mBounds.x, mBounds.y, r.width, r.height, false);
++    SetPositionAndSize(mBounds.x, mBounds.y, r.width, r.height, 0);
+   }
+ 
+   // We should really consider just getting this information from
+   // our window instead of duplicating the storage and code...
+   if (aWidth || aHeight) {
+     // Caller wants to know our size; make sure to give them up to
+     // date information.
+     nsCOMPtr<nsIDocument> doc(do_GetInterface(GetAsSupports(mParent)));
+diff --git a/docshell/base/nsIContentViewer.idl b/docshell/base/nsIContentViewer.idl
+--- a/docshell/base/nsIContentViewer.idl
++++ b/docshell/base/nsIContentViewer.idl
+@@ -26,17 +26,17 @@ class nsDOMNavigationTiming;
+ [ptr] native nsIWidgetPtr(nsIWidget);
+ [ref] native nsIntRectRef(nsIntRect);
+ [ptr] native nsIPresShellPtr(nsIPresShell);
+ [ptr] native nsPresContextPtr(nsPresContext);
+ [ptr] native nsViewPtr(nsView);
+ [ptr] native nsDOMNavigationTimingPtr(nsDOMNavigationTiming);
+ [ref] native nsIContentViewerTArray(nsTArray<nsCOMPtr<nsIContentViewer> >);
+ 
+-[scriptable, builtinclass, uuid(702e0a92-7d63-490e-b5ee-d247e6bd4588)]
++[scriptable, builtinclass, uuid(90a6165f-8e3f-498d-a85a-f73ecf0c291c)]
+ interface nsIContentViewer : nsISupports
+ {
+ 
+   [noscript] void init(in nsIWidgetPtr aParentWidget,
+                        [const] in nsIntRectRef aBounds);
+ 
+   attribute nsIDocShell container;
+ 
+@@ -114,16 +114,22 @@ interface nsIContentViewer : nsISupports
+ 
+   /**
+    * Returns DOMDocument as nsIDocument and without addrefing.
+    */
+   [noscript,notxpcom] nsIDocument getDocument();
+ 
+   [noscript] void getBounds(in nsIntRectRef aBounds);
+   [noscript] void setBounds([const] in nsIntRectRef aBounds);
++  /**
++   * The 'aFlags' argument to setBoundsWithFlags is a set of these bits.
++   */
++  const unsigned long eDelayResize = 1;
++  [noscript] void setBoundsWithFlags([const] in nsIntRectRef aBounds,
++                                     in unsigned long aFlags);
+ 
+   /**
+    * The previous content viewer, which has been |close|d but not
+    * |destroy|ed.
+    */
+   [noscript] attribute nsIContentViewer previousViewer;
+ 
+   void move(in long aX, in long aY);
+diff --git a/dom/base/nsFrameLoader.cpp b/dom/base/nsFrameLoader.cpp
+--- a/dom/base/nsFrameLoader.cpp
++++ b/dom/base/nsFrameLoader.cpp
+@@ -2084,17 +2084,18 @@ nsFrameLoader::UpdateBaseWindowPositionA
+ 
+     if (!weakFrame.IsAlive()) {
+       // GetPosition() killed us
+       return;
+     }
+ 
+     ScreenIntSize size = aIFrame->GetSubdocumentSize();
+ 
+-    baseWindow->SetPositionAndSize(x, y, size.width, size.height, false);
++    baseWindow->SetPositionAndSize(x, y, size.width, size.height,
++                                   nsIBaseWindow::eDelayResize);
+   }
+ }
+ 
+ NS_IMETHODIMP
+ nsFrameLoader::GetEventMode(uint32_t* aEventMode)
+ {
+   *aEventMode = mEventMode;
+   return NS_OK;
+diff --git a/dom/ipc/TabChild.cpp b/dom/ipc/TabChild.cpp
+--- a/dom/ipc/TabChild.cpp
++++ b/dom/ipc/TabChild.cpp
+@@ -2030,17 +2030,17 @@ TabChild::RecvUpdateDimensions(const nsI
+     mOrientation = orientation;
+     ScreenIntSize oldScreenSize = mInnerSize;
+     mInnerSize = size;
+     mWidget->Resize(rect.x + chromeDisp.x, rect.y + chromeDisp.y, size.width, size.height,
+                      true);
+ 
+     nsCOMPtr<nsIBaseWindow> baseWin = do_QueryInterface(WebNavigation());
+     baseWin->SetPositionAndSize(0, 0, size.width, size.height,
+-                                true);
++                                nsIBaseWindow::eRepaint);
+ 
+     if (initialSizing && mContentDocumentIsDisplayed) {
+       // If this is the first time we're getting a valid mInnerSize, and the
+       // before-first-paint event has already been handled, then we need to set
+       // up our default viewport here. See the corresponding call to
+       // InitializeRootMetrics in the before-first-paint handler.
+       InitializeRootMetrics();
+     }
+diff --git a/embedding/browser/nsDocShellTreeOwner.cpp b/embedding/browser/nsDocShellTreeOwner.cpp
+--- a/embedding/browser/nsDocShellTreeOwner.cpp
++++ b/embedding/browser/nsDocShellTreeOwner.cpp
+@@ -523,17 +523,17 @@ nsDocShellTreeOwner::GetSize(int32_t* aC
+     return ownerWin->GetDimensions(nsIEmbeddingSiteWindow::DIM_FLAGS_SIZE_OUTER,
+                                    nullptr, nullptr, aCX, aCY);
+   }
+   return NS_ERROR_NULL_POINTER;
+ }
+ 
+ NS_IMETHODIMP
+ nsDocShellTreeOwner::SetPositionAndSize(int32_t aX, int32_t aY, int32_t aCX,
+-                                        int32_t aCY, bool aRepaint)
++                                        int32_t aCY, uint32_t aFlags)
+ {
+   nsCOMPtr<nsIEmbeddingSiteWindow> ownerWin = GetOwnerWin();
+   if (ownerWin)
+   {
+     return ownerWin->SetDimensions(nsIEmbeddingSiteWindow::DIM_FLAGS_SIZE_OUTER |
+                                    nsIEmbeddingSiteWindow::DIM_FLAGS_POSITION,
+                                    aX, aY, aCX, aCY);
+   }
+diff --git a/embedding/browser/nsWebBrowser.cpp b/embedding/browser/nsWebBrowser.cpp
+--- a/embedding/browser/nsWebBrowser.cpp
++++ b/embedding/browser/nsWebBrowser.cpp
+@@ -1081,17 +1081,17 @@ NS_IMETHODIMP nsWebBrowser::InitWindow(n
+   NS_ENSURE_STATE(!mDocShell || mInitInfo);
+ 
+   if (aParentWidget)
+     NS_ENSURE_SUCCESS(SetParentWidget(aParentWidget), NS_ERROR_FAILURE);
+   else
+     NS_ENSURE_SUCCESS(SetParentNativeWindow(aParentNativeWindow),
+                       NS_ERROR_FAILURE);
+ 
+-  NS_ENSURE_SUCCESS(SetPositionAndSize(aX, aY, aCX, aCY, false),
++  NS_ENSURE_SUCCESS(SetPositionAndSize(aX, aY, aCX, aCY, 0),
+                     NS_ERROR_FAILURE);
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::Create()
+ {
+   NS_ENSURE_STATE(!mDocShell && (mParentNativeWindow || mParentWidget));
+@@ -1223,63 +1223,65 @@ NS_IMETHODIMP nsWebBrowser::GetUnscaledD
+ 
+ NS_IMETHODIMP nsWebBrowser::SetPosition(int32_t aX, int32_t aY)
+ {
+   int32_t cx = 0;
+   int32_t cy = 0;
+ 
+   GetSize(&cx, &cy);
+ 
+-  return SetPositionAndSize(aX, aY, cx, cy, false);
++  return SetPositionAndSize(aX, aY, cx, cy, 0);
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::GetPosition(int32_t* aX, int32_t* aY)
+ {
+   return GetPositionAndSize(aX, aY, nullptr, nullptr);
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::SetSize(int32_t aCX, int32_t aCY, bool aRepaint)
+ {
+   int32_t x = 0;
+   int32_t y = 0;
+ 
+   GetPosition(&x, &y);
+ 
+-  return SetPositionAndSize(x, y, aCX, aCY, aRepaint);
++  return SetPositionAndSize(x, y, aCX, aCY,
++                            aRepaint ? nsIBaseWindow::eRepaint : 0);
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::GetSize(int32_t* aCX, int32_t* aCY)
+ {
+   return GetPositionAndSize(nullptr, nullptr, aCX, aCY);
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::SetPositionAndSize(int32_t aX, int32_t aY,
+                                                int32_t aCX, int32_t aCY,
+-                                               bool aRepaint)
++                                               uint32_t aFlags)
+ {
+   if (!mDocShell) {
+     mInitInfo->x = aX;
+     mInitInfo->y = aY;
+     mInitInfo->cx = aCX;
+     mInitInfo->cy = aCY;
+   } else {
+     int32_t doc_x = aX;
+     int32_t doc_y = aY;
+ 
+     // If there is an internal widget we need to make the docShell coordinates
+     // relative to the internal widget rather than the calling app's parent.
+     // We also need to resize our widget then.
+     if (mInternalWidget) {
+       doc_x = doc_y = 0;
+-      NS_ENSURE_SUCCESS(mInternalWidget->Resize(aX, aY, aCX, aCY, aRepaint),
++      NS_ENSURE_SUCCESS(mInternalWidget->Resize(aX, aY, aCX, aCY,
++                                                !!(aFlags & nsIBaseWindow::eRepaint)),
+                         NS_ERROR_FAILURE);
+     }
+     // Now reposition/ resize the doc
+     NS_ENSURE_SUCCESS(mDocShellAsWin->SetPositionAndSize(doc_x, doc_y, aCX, aCY,
+-                                                         aRepaint), NS_ERROR_FAILURE);
++                                                         aFlags), NS_ERROR_FAILURE);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP nsWebBrowser::GetPositionAndSize(int32_t* aX, int32_t* aY,
+                                                int32_t* aCX, int32_t* aCY)
+ {
+diff --git a/embedding/tests/winEmbed/winEmbed.cpp b/embedding/tests/winEmbed/winEmbed.cpp
+--- a/embedding/tests/winEmbed/winEmbed.cpp
++++ b/embedding/tests/winEmbed/winEmbed.cpp
+@@ -354,17 +354,17 @@ nsresult ResizeEmbedding(nsIWebBrowserCh
+     chrome->GetWebBrowser(getter_AddRefs(webBrowser));
+     nsCOMPtr<nsIBaseWindow> webBrowserAsWin = do_QueryInterface(webBrowser);
+     if (webBrowserAsWin)
+     {
+         webBrowserAsWin->SetPositionAndSize(rect.left, 
+                                    rect.top, 
+                                    rect.right - rect.left, 
+                                    rect.bottom - rect.top,
+-                                   true);
++                                   nsIBaseWindow::eRepaint);
+         webBrowserAsWin->SetVisibility(true);
+     }
+ 
+     return NS_OK;
+ }
+ 
+ 
+ //
+diff --git a/layout/base/nsDocumentViewer.cpp b/layout/base/nsDocumentViewer.cpp
+--- a/layout/base/nsDocumentViewer.cpp
++++ b/layout/base/nsDocumentViewer.cpp
+@@ -1927,32 +1927,33 @@ nsDocumentViewer::SetPreviousViewer(nsIC
+     }
+   }
+ 
+   mPreviousViewer = aViewer;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-nsDocumentViewer::SetBounds(const nsIntRect& aBounds)
++nsDocumentViewer::SetBoundsWithFlags(const nsIntRect& aBounds, uint32_t aFlags)
+ {
+   NS_ENSURE_TRUE(mDocument, NS_ERROR_NOT_AVAILABLE);
+ 
+   mBounds = aBounds;
+ 
+   if (mWindow && !mAttachedToParent) {
+     // Resize the widget, but don't trigger repaint. Layout will generate
+     // repaint requests during reflow.
+     mWindow->Resize(aBounds.x, aBounds.y,
+                     aBounds.width, aBounds.height,
+                     false);
+   } else if (mPresContext && mViewManager) {
+     int32_t p2a = mPresContext->AppUnitsPerDevPixel();
+     mViewManager->SetWindowDimensions(NSIntPixelsToAppUnits(mBounds.width, p2a),
+-                                      NSIntPixelsToAppUnits(mBounds.height, p2a));
++                                      NSIntPixelsToAppUnits(mBounds.height, p2a),
++                                      !!(aFlags & nsIContentViewer::eDelayResize));
+   }
+ 
+   // If there's a previous viewer, it's the one that's actually showing,
+   // so be sure to resize it as well so it paints over the right area.
+   // This may slow down the performance of the new page load, but resize
+   // during load is also probably a relatively unusual condition
+   // relating to things being hidden while something is loaded.  It so
+   // happens that Firefox does this a good bit with its infobar, and it
+@@ -1961,16 +1962,22 @@ nsDocumentViewer::SetBounds(const nsIntR
+     nsCOMPtr<nsIContentViewer> previousViewer = mPreviousViewer;
+     previousViewer->SetBounds(aBounds);
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++nsDocumentViewer::SetBounds(const nsIntRect& aBounds)
++{
++  return SetBoundsWithFlags(aBounds, 0);
++}
++
++NS_IMETHODIMP
+ nsDocumentViewer::Move(int32_t aX, int32_t aY)
+ {
+   NS_ENSURE_TRUE(mDocument, NS_ERROR_NOT_AVAILABLE);
+   mBounds.MoveTo(aX, aY);
+   if (mWindow) {
+     mWindow->Move(aX, aY);
+   }
+   return NS_OK;
+diff --git a/layout/xul/nsResizerFrame.cpp b/layout/xul/nsResizerFrame.cpp
+--- a/layout/xul/nsResizerFrame.cpp
++++ b/layout/xul/nsResizerFrame.cpp
+@@ -274,17 +274,18 @@ nsResizerFrame::HandleEvent(nsPresContex
+              menuPopupFrame->PopupLevel() != ePopupLevelParent)) {
+ 
+           rect.x = aPresContext->DevPixelsToIntCSSPixels(rect.x);
+           rect.y = aPresContext->DevPixelsToIntCSSPixels(rect.y);
+           menuPopupFrame->MoveTo(rect.x, rect.y, true);
+         }
+       }
+       else {
+-        window->SetPositionAndSize(rect.x, rect.y, rect.width, rect.height, true); // do the repaint.
++        window->SetPositionAndSize(rect.x, rect.y, rect.width, rect.height,
++                                   nsIBaseWindow::eRepaint); // do the repaint.
+       }
+ 
+       doDefault = false;
+     }
+   }
+   break;
+ 
+   case NS_MOUSE_CLICK: {
+diff --git a/view/nsViewManager.cpp b/view/nsViewManager.cpp
+--- a/view/nsViewManager.cpp
++++ b/view/nsViewManager.cpp
+@@ -189,20 +189,21 @@ void nsViewManager::DoSetWindowDimension
+     // Don't resize the widget. It is already being set elsewhere.
+     mRootView->SetDimensions(newDim, true, false);
+     if (mPresShell)
+       mPresShell->ResizeReflow(aWidth, aHeight);
+   }
+ }
+ 
+ void
+-nsViewManager::SetWindowDimensions(nscoord aWidth, nscoord aHeight)
++nsViewManager::SetWindowDimensions(nscoord aWidth, nscoord aHeight, bool aDelayResize)
+ {
+   if (mRootView) {
+-    if (mRootView->IsEffectivelyVisible() && mPresShell && mPresShell->IsVisible()) {
++    if (!aDelayResize &&
++        mRootView->IsEffectivelyVisible() && mPresShell && mPresShell->IsVisible()) {
+       if (mDelayedResize != nsSize(NSCOORD_NONE, NSCOORD_NONE) &&
+           mDelayedResize != nsSize(aWidth, aHeight)) {
+         // We have a delayed resize; that now obsolete size may already have
+         // been flushed to the PresContext so we need to update the PresContext
+         // with the new size because if the new size is exactly the same as the
+         // root view's current size then DoSetWindowDimensions will not
+         // request a resize reflow (which would correct it). See bug 617076.
+         mDelayedResize = nsSize(aWidth, aHeight);
+diff --git a/view/nsViewManager.h b/view/nsViewManager.h
+--- a/view/nsViewManager.h
++++ b/view/nsViewManager.h
+@@ -81,17 +81,18 @@ public:
+ 
+   /**
+    * Set the dimensions of the root window.
+    * Called if the root window is resized. The dimensions are in
+    * twips
+    * @param aWidth of window in twips
+    * @param aHeight of window in twips
+    */
+-  void SetWindowDimensions(nscoord aWidth, nscoord aHeight);
++  void SetWindowDimensions(nscoord aWidth, nscoord aHeight,
++                           bool aDelayResize = false);
+ 
+   /**
+    * Do any resizes that are pending.
+    */
+   void FlushDelayedResize(bool aDoReflow);
+ 
+   /**
+    * Called to inform the view manager that the entire area of a view
+diff --git a/widget/nsIBaseWindow.idl b/widget/nsIBaseWindow.idl
+--- a/widget/nsIBaseWindow.idl
++++ b/widget/nsIBaseWindow.idl
+@@ -16,17 +16,17 @@ class nsIWidget;
+ typedef voidPtr nativeWindow;
+ 
+ /**
+  * The nsIBaseWindow describes a generic window and basic operations that 
+  * can be performed on it.  This is not to be a complete windowing interface
+  * but rather a common set that nearly all windowed objects support.    
+  */
+ 
+-[scriptable, uuid(9DA319F3-EEE6-4504-81A5-6A19CF6215BF)]
++[scriptable, uuid(db9d2014-711e-4377-82a1-b09ae48ca2b8)]
+ interface nsIBaseWindow : nsISupports
+ {
+ 	/*
+ 	Allows a client to initialize an object implementing this interface with
+ 	the usually required window setup information.
+ 	It is possible to pass null for both parentNativeWindow and parentWidget,
+ 	but only docshells support this.
+ 
+@@ -102,22 +102,28 @@ interface nsIBaseWindow : nsISupports
+ 	*/
+ 	void setSize(in long cx, in long cy, in boolean fRepaint);
+ 
+ 	/*
+ 	Gets the width and height of the control.
+ 	*/
+ 	void getSize(out long cx, out long cy);
+ 
++	/**
++	 * The 'flags' argument to setPositionAndSize is a set of these bits.
++	 */
++	const unsigned long eRepaint = 1;
++	const unsigned long eDelayResize = 2;
++
+ 	/*
+ 	Convenience function combining the SetPosition and SetSize into one call.
+ 	Also is more efficient than calling both.
+ 	*/
+ 	void setPositionAndSize(in long x, in long y, in long cx, in long cy, 
+-		in boolean fRepaint);
++		in unsigned long flags);
+ 		
+ 	/*
+ 	Convenience function combining the GetPosition and GetSize into one call.
+ 	Also is more efficient than calling both.
+ 	*/
+ 	void getPositionAndSize(out long x, out long y, out long cx, out long cy);
+ 	 
+ 	/** 
+diff --git a/xpfe/appshell/nsChromeTreeOwner.cpp b/xpfe/appshell/nsChromeTreeOwner.cpp
+--- a/xpfe/appshell/nsChromeTreeOwner.cpp
++++ b/xpfe/appshell/nsChromeTreeOwner.cpp
+@@ -333,17 +333,17 @@ nsChromeTreeOwner::GetTargetableShellCou
+ //*****************************************************************************
+ // nsChromeTreeOwner::nsIBaseWindow
+ //*****************************************************************************   
+ 
+ NS_IMETHODIMP nsChromeTreeOwner::InitWindow(nativeWindow aParentNativeWindow,
+    nsIWidget* parentWidget, int32_t x, int32_t y, int32_t cx, int32_t cy)   
+ {
+    // Ignore widget parents for now.  Don't think those are a vaild thing to call.
+-   NS_ENSURE_SUCCESS(SetPositionAndSize(x, y, cx, cy, false), NS_ERROR_FAILURE);
++   NS_ENSURE_SUCCESS(SetPositionAndSize(x, y, cx, cy, 0), NS_ERROR_FAILURE);
+ 
+    return NS_OK;
+ }
+ 
+ NS_IMETHODIMP nsChromeTreeOwner::Create()
+ {
+    NS_ASSERTION(false, "You can't call this");
+    return NS_ERROR_UNEXPECTED;
+@@ -381,20 +381,20 @@ NS_IMETHODIMP nsChromeTreeOwner::SetSize
+ 
+ NS_IMETHODIMP nsChromeTreeOwner::GetSize(int32_t* cx, int32_t* cy)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+    return mXULWindow->GetSize(cx, cy);
+ }
+ 
+ NS_IMETHODIMP nsChromeTreeOwner::SetPositionAndSize(int32_t x, int32_t y, int32_t cx,
+-   int32_t cy, bool fRepaint)
++   int32_t cy, uint32_t aFlags)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+-   return mXULWindow->SetPositionAndSize(x, y, cx, cy, fRepaint);
++   return mXULWindow->SetPositionAndSize(x, y, cx, cy, aFlags);
+ }
+ 
+ NS_IMETHODIMP nsChromeTreeOwner::GetPositionAndSize(int32_t* x, int32_t* y, int32_t* cx,
+    int32_t* cy)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+    return mXULWindow->GetPositionAndSize(x, y, cx, cy);
+ }
+diff --git a/xpfe/appshell/nsContentTreeOwner.cpp b/xpfe/appshell/nsContentTreeOwner.cpp
+--- a/xpfe/appshell/nsContentTreeOwner.cpp
++++ b/xpfe/appshell/nsContentTreeOwner.cpp
+@@ -572,17 +572,17 @@ NS_IMETHODIMP nsContentTreeOwner::ExitMo
+ //*****************************************************************************
+ // nsContentTreeOwner::nsIBaseWindow
+ //*****************************************************************************   
+ 
+ NS_IMETHODIMP nsContentTreeOwner::InitWindow(nativeWindow aParentNativeWindow,
+    nsIWidget* parentWidget, int32_t x, int32_t y, int32_t cx, int32_t cy)   
+ {
+    // Ignore wigdet parents for now.  Don't think those are a vaild thing to call.
+-   NS_ENSURE_SUCCESS(SetPositionAndSize(x, y, cx, cy, false), NS_ERROR_FAILURE);
++   NS_ENSURE_SUCCESS(SetPositionAndSize(x, y, cx, cy, 0), NS_ERROR_FAILURE);
+ 
+    return NS_OK;
+ }
+ 
+ NS_IMETHODIMP nsContentTreeOwner::Create()
+ {
+    NS_ASSERTION(false, "You can't call this");
+    return NS_ERROR_UNEXPECTED;
+@@ -620,20 +620,20 @@ NS_IMETHODIMP nsContentTreeOwner::SetSiz
+ 
+ NS_IMETHODIMP nsContentTreeOwner::GetSize(int32_t* aCX, int32_t* aCY)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+    return mXULWindow->GetSize(aCX, aCY);
+ }
+ 
+ NS_IMETHODIMP nsContentTreeOwner::SetPositionAndSize(int32_t aX, int32_t aY,
+-   int32_t aCX, int32_t aCY, bool aRepaint)
++   int32_t aCX, int32_t aCY, uint32_t aFlags)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+-   return mXULWindow->SetPositionAndSize(aX, aY, aCX, aCY, aRepaint);
++   return mXULWindow->SetPositionAndSize(aX, aY, aCX, aCY, aFlags);
+ }
+ 
+ NS_IMETHODIMP nsContentTreeOwner::GetPositionAndSize(int32_t* aX, int32_t* aY,
+    int32_t* aCX, int32_t* aCY)
+ {
+    NS_ENSURE_STATE(mXULWindow);
+    return mXULWindow->GetPositionAndSize(aX, aY, aCX, aCY); 
+ }
+@@ -1017,17 +1017,18 @@ NS_INTERFACE_MAP_BEGIN(nsSiteWindow)
+   NS_INTERFACE_MAP_ENTRY(nsIEmbeddingSiteWindow)
+ NS_INTERFACE_MAP_END_AGGREGATED(mAggregator)
+ 
+ NS_IMETHODIMP
+ nsSiteWindow::SetDimensions(uint32_t aFlags,
+                     int32_t aX, int32_t aY, int32_t aCX, int32_t aCY)
+ {
+   // XXX we're ignoring aFlags
+-  return mAggregator->SetPositionAndSize(aX, aY, aCX, aCY, true);
++  return mAggregator->SetPositionAndSize(aX, aY, aCX, aCY,
++                                         nsIBaseWindow::eRepaint);
+ }
+ 
+ NS_IMETHODIMP
+ nsSiteWindow::GetDimensions(uint32_t aFlags,
+                     int32_t *aX, int32_t *aY, int32_t *aCX, int32_t *aCY)
+ {
+   // XXX we're ignoring aFlags
+   return mAggregator->GetPositionAndSize(aX, aY, aCX, aCY);
+diff --git a/xpfe/appshell/nsWebShellWindow.cpp b/xpfe/appshell/nsWebShellWindow.cpp
+--- a/xpfe/appshell/nsWebShellWindow.cpp
++++ b/xpfe/appshell/nsWebShellWindow.cpp
+@@ -274,17 +274,17 @@ nsWebShellWindow::WindowMoved(nsIWidget*
+   return false;
+ }
+ 
+ bool
+ nsWebShellWindow::WindowResized(nsIWidget* aWidget, int32_t aWidth, int32_t aHeight)
+ {
+   nsCOMPtr<nsIBaseWindow> shellAsWin(do_QueryInterface(mDocShell));
+   if (shellAsWin) {
+-    shellAsWin->SetPositionAndSize(0, 0, aWidth, aHeight, false);
++    shellAsWin->SetPositionAndSize(0, 0, aWidth, aHeight, 0);
+   }
+   // Persist size, but not immediately, in case this OS is firing
+   // repeated size events as the user drags the sizing handle
+   if (!IsLocked())
+     SetPersistenceTimer(PAD_POSITION | PAD_SIZE | PAD_MISC);
+   return true;
+ }
+ 
+diff --git a/xpfe/appshell/nsXULWindow.cpp b/xpfe/appshell/nsXULWindow.cpp
+--- a/xpfe/appshell/nsXULWindow.cpp
++++ b/xpfe/appshell/nsXULWindow.cpp
+@@ -578,30 +578,30 @@ NS_IMETHODIMP nsXULWindow::SetSize(int32
+ }
+ 
+ NS_IMETHODIMP nsXULWindow::GetSize(int32_t* aCX, int32_t* aCY)
+ {
+   return GetPositionAndSize(nullptr, nullptr, aCX, aCY);
+ }
+ 
+ NS_IMETHODIMP nsXULWindow::SetPositionAndSize(int32_t aX, int32_t aY, 
+-   int32_t aCX, int32_t aCY, bool aRepaint)
++   int32_t aCX, int32_t aCY, uint32_t aFlags)
+ {
+   /* any attempt to set the window's size or position overrides the window's
+      zoom state. this is important when these two states are competing while
+      the window is being opened. but it should probably just always be so. */
+   mWindow->SetSizeMode(nsSizeMode_Normal);
+ 
+   mIntrinsicallySized = false;
+ 
+   CSSToLayoutDeviceScale scale = mWindow->GetDefaultScale();
+   double invScale = 1.0 / scale.scale;
+   nsresult rv = mWindow->Resize(aX * invScale, aY * invScale,
+                                 aCX * invScale, aCY * invScale,
+-                                aRepaint);
++                                !!(aFlags & nsIBaseWindow::eRepaint));
+   NS_ENSURE_SUCCESS(rv, NS_ERROR_FAILURE);
+   if (!mChromeLoaded) {
+     // If we're called before the chrome is loaded someone obviously wants this
+     // window at this size and position. We don't persist this one-time setting.
+     mIgnoreXULPosition = true;
+     mIgnoreXULSize = true;
+     mIgnoreXULSizeMode = true;
+     return NS_OK;
