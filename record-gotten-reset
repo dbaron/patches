@@ -5,7 +5,49 @@ Bug 1209603 patch 6 - Record in mBits when we have gotten a reset style struct t
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
-@@ -2779,16 +2779,20 @@ nsRuleNode::SetDefaultOnRoot(const nsSty
+@@ -2374,16 +2374,21 @@ nsRuleNode::WalkRuleTree(const nsStyleSt
+ 
+   if (detail == eRuleNone && startStruct) {
+     // We specified absolutely no rule information, but a parent rule in the tree
+     // specified all the rule information.  We set a bit along the branch from our
+     // node in the tree to the node that specified the data that tells nodes on that
+     // branch that they never need to examine their rules for this particular struct type
+     // ever again.
+     PropagateDependentBit(aSID, ruleNode, startStruct);
++    if (!isReset) {
++      // Record that we have asked for this struct on this context, but
++      // it is not cached on the context.
++      aContext->AddStyleBit(nsCachedStyleData::GetBitForSID(aSID));
++    }
+     return startStruct;
+   }
+   if ((!startStruct && !isReset &&
+        (detail == eRuleNone || detail == eRulePartialInherited)) ||
+       detail == eRuleFullInherited) {
+     // We specified no non-inherited information and neither did any of
+     // our parent rules.
+ 
+@@ -2743,18 +2748,17 @@ nsRuleNode::SetDefaultOnRoot(const nsSty
+     NS_ASSERTION(!aHighestNode->mStyleData.mInheritedData->                   \
+                    mStyleStructs[eStyleStruct_##type_],                       \
+                  "Going to leak style data");                                 \
+     aHighestNode->mStyleData.mInheritedData->                                 \
+       mStyleStructs[eStyleStruct_##type_] = data_;                            \
+     /* Propagate the bit down. */                                             \
+     PropagateDependentBit(eStyleStruct_##type_, aHighestNode, data_);         \
+     /* Tell the style context that it doesn't own the data */                 \
+-    aContext->                                                                \
+-      AddStyleBit(nsCachedStyleData::GetBitForSID(eStyleStruct_##type_));     \
++    aContext->AddStyleBit(NS_STYLE_INHERIT_BIT(type_));                       \
+   }                                                                           \
+   /* Always cache inherited data on the style context */                      \
+   aContext->SetStyle##type_(data_);                                           \
+                                                                               \
+   return data_;
+ 
+ /**
+  * End an nsRuleNode::Compute*Data function for a reset struct.
+@@ -2779,25 +2783,27 @@ nsRuleNode::SetDefaultOnRoot(const nsSty
      }                                                                         \
      NS_ASSERTION(!aHighestNode->mStyleData.mResetData->                       \
                     GetStyleData(eStyleStruct_##type_),                        \
@@ -16,8 +58,7 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
      PropagateDependentBit(eStyleStruct_##type_, aHighestNode, data_);         \
 +    /* Tell the context that we've gotten the data (separate meaning */       \
 +    /* of mBits when the cached data pointer is null) */                      \
-+    aContext->                                                                \
-+      AddStyleBit(nsCachedStyleData::GetBitForSID(eStyleStruct_##type_));     \
++    aContext->AddStyleBit(NS_STYLE_INHERIT_BIT(type_));                       \
    } else if (conditions.Cacheable()) {                                        \
      if (!mStyleData.mResetData) {                                             \
        mStyleData.mResetData = new (mPresContext) nsConditionalResetStyleData; \
@@ -25,7 +66,89 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
      mStyleData.mResetData->                                                   \
        SetStyleData(eStyleStruct_##type_, mPresContext, data_, conditions);    \
      /* Tell the style context that it doesn't own the data */                 \
-     aContext->                                                                \
+-    aContext->                                                                \
+-      AddStyleBit(nsCachedStyleData::GetBitForSID(eStyleStruct_##type_));     \
++    aContext->AddStyleBit(NS_STYLE_INHERIT_BIT(type_));                       \
+     aContext->SetStyle(eStyleStruct_##type_, data_);                          \
+   } else {                                                                    \
+     /* We can't be cached in the rule node.  We have to be put right */       \
+     /* on the style context. */                                               \
+     aContext->SetStyle(eStyleStruct_##type_, data_);                          \
+     if (aContext->GetParent()) {                                              \
+       /* This is pessimistic; we could be uncacheable because we had a */     \
+       /* relative font-weight, for example, which does not need to defeat */  \
+@@ -9437,16 +9443,18 @@ const void*
+ nsRuleNode::GetStyleData(nsStyleStructID aSID,
+                          nsStyleContext* aContext,
+                          bool aComputeData)
+ {
+   NS_ASSERTION(IsUsedDirectly(),
+                "if we ever call this on rule nodes that aren't used "
+                "directly, we should adjust handling of mDependentBits "
+                "in some way.");
++  MOZ_ASSERT(!aContext->GetCachedStyleData(eStyleStruct_##name_),
++             "style context should not have cached data for struct");
+ 
+   const void *data;
+ 
+   // Never use cached data for animated style inside a pseudo-element;
+   // see comment on cacheability in AnimValuesStyleRule::MapRuleInfoInto.
+   if (!(HasAnimationData() && ParentHasPseudoElementData(aContext))) {
+     data = mStyleData.GetStyleData(aSID, aContext);
+     if (MOZ_LIKELY(data != nullptr))
+diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
+--- a/layout/style/nsRuleNode.h
++++ b/layout/style/nsRuleNode.h
+@@ -883,16 +883,18 @@ public:
+   template<bool aComputeData>                                                 \
+   const nsStyle##name_*                                                       \
+   GetStyle##name_(nsStyleContext* aContext)                                   \
+   {                                                                           \
+     NS_ASSERTION(IsUsedDirectly(),                                            \
+                  "if we ever call this on rule nodes that aren't used "       \
+                  "directly, we should adjust handling of mDependentBits "     \
+                  "in some way.");                                             \
++    MOZ_ASSERT(!aContext->GetCachedStyleData(eStyleStruct_##name_),           \
++               "style context should not have cached data for struct");       \
+                                                                               \
+     const nsStyle##name_ *data;                                               \
+                                                                               \
+     /* Never use cached data for animated style inside a pseudo-element; */   \
+     /* see comment on cacheability in AnimValuesStyleRule::MapRuleInfoInto */ \
+     if (!(HasAnimationData() && ParentHasPseudoElementData(aContext))) {      \
+       data = mStyleData.GetStyle##name_();                                    \
+       if (MOZ_LIKELY(data != nullptr))                                        \
+@@ -913,25 +915,29 @@ public:
+   template<bool aComputeData>                                                 \
+   const nsStyle##name_*                                                       \
+   GetStyle##name_(nsStyleContext* aContext)                                   \
+   {                                                                           \
+     NS_ASSERTION(IsUsedDirectly(),                                            \
+                  "if we ever call this on rule nodes that aren't used "       \
+                  "directly, we should adjust handling of mDependentBits "     \
+                  "in some way.");                                             \
++    MOZ_ASSERT(!aContext->GetCachedStyleData(eStyleStruct_##name_),           \
++               "style context should not have cached data for struct");       \
+                                                                               \
+     const nsStyle##name_ *data;                                               \
+                                                                               \
+     /* Never use cached data for animated style inside a pseudo-element; */   \
+     /* see comment on cacheability in AnimValuesStyleRule::MapRuleInfoInto */ \
+     if (!(HasAnimationData() && ParentHasPseudoElementData(aContext))) {      \
+       data = mStyleData.GetStyle##name_(aContext);                            \
+-      if (MOZ_LIKELY(data != nullptr))                                        \
++      if (MOZ_LIKELY(data != nullptr)) {                                      \
++        aContext->AddStyleBit(NS_STYLE_INHERIT_BIT(name_));                   \
+         return data;                                                          \
++      }                                                                       \
+     }                                                                         \
+                                                                               \
+     if (!aComputeData)                                                        \
+       return nullptr;                                                         \
+                                                                               \
+     data = static_cast<const nsStyle##name_ *>                                \
+              (WalkRuleTree(eStyleStruct_##name_, aContext));                  \
+                                                                               \
 diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
 --- a/layout/style/nsStyleContext.h
 +++ b/layout/style/nsStyleContext.h
