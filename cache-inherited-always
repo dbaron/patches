@@ -38,10 +38,52 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
   *
   * @param type_ The nsStyle* type this function computes.
   * @param data_ Variable holding the result of this function.
+@@ -9408,21 +9408,22 @@ nsRuleNode::GetStyleData(nsStyleStructID
+ 
+   const void *data;
+ 
+   // Never use cached data for animated style inside a pseudo-element;
+   // see comment on cacheability in AnimValuesStyleRule::MapRuleInfoInto.
+   if (!(HasAnimationData() && ParentHasPseudoElementData(aContext))) {
+     data = mStyleData.GetStyleData(aSID, aContext);
+     if (MOZ_LIKELY(data != nullptr)) {
++      // With this same bit set, we do two different things:
+       // For reset structs, mark the struct as having been retrieved for
+       // this context.
+-      if (nsCachedStyleData::IsReset(aSID)) {
+-        aContext->AddStyleBit(nsCachedStyleData::GetBitForSID(aSID));
+-      }
++      // For inherited structs, mark the struct (which will be set on
++      // the context by our caller) as not being owned by the context.
++      aContext->AddStyleBit(nsCachedStyleData::GetBitForSID(aSID));
+       return data; // We have a fully specified struct. Just return it.
+     }
+   }
+ 
+   if (MOZ_UNLIKELY(!aComputeData))
+     return nullptr;
+ 
+   // Nothing is cached.  We'll have to delve further and examine our rules.
 diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
 --- a/layout/style/nsRuleNode.h
 +++ b/layout/style/nsRuleNode.h
-@@ -892,18 +892,20 @@ public:
+@@ -877,33 +877,40 @@ public:
+                            bool aComputeData);
+ 
+ 
+   // See comments in GetStyleData for an explanation of what the
+   // code below does.
+   #define STYLE_STRUCT_INHERITED(name_, checkdata_cb_)                        \
+   template<bool aComputeData>                                                 \
+   const nsStyle##name_*                                                       \
+-  GetStyle##name_(nsStyleContext* aContext)                                   \
++  GetStyle##name_(nsStyleContext* aContext, uint64_t& aContextStyleBits)      \
+   {                                                                           \
+     NS_ASSERTION(IsUsedDirectly(),                                            \
+                  "if we ever call this on rule nodes that aren't used "       \
+                  "directly, we should adjust handling of mDependentBits "     \
+                  "in some way.");                                             \
+     MOZ_ASSERT(!ContextHasCachedData(aContext, eStyleStruct_##name_),         \
                 "style context should not have cached data for struct");       \
                                                                                \
      const nsStyle##name_ *data;                                               \
@@ -52,6 +94,11 @@ diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
        data = mStyleData.GetStyle##name_();                                    \
 -      if (MOZ_LIKELY(data != nullptr))                                        \
 +      if (data != nullptr) {                                                  \
++        /* For inherited structs, mark the struct (which will be set on */    \
++        /* the context by our caller) as not being owned by the context. */   \
++        /* normally this would be aContext->AddStyleBit(), but aContext is */ \
++        /* an incomplete type here, so we work around that with a param */    \
++        aContextStyleBits |= NS_STYLE_INHERIT_BIT(name_);                     \
 +        /* Our caller will cache the data on the style context. */            \
          return data;                                                          \
 +      }                                                                       \
@@ -66,7 +113,7 @@ diff --git a/layout/style/nsRuleNode.h b/layout/style/nsRuleNode.h
 diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 --- a/layout/style/nsStyleContext.cpp
 +++ b/layout/style/nsStyleContext.cpp
-@@ -412,17 +412,23 @@ nsStyleContext::HasChildThatUsesGrandanc
+@@ -412,17 +412,24 @@ nsStyleContext::HasChildThatUsesGrandanc
           ListContainsStyleContextThatUsesGrandancestorStyle(mChild);
  }
  
@@ -79,7 +126,8 @@ diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 +  // Our rule node will take care of it for us.
 +  const void* newData = mRuleNode->GetStyleData(aSID, this, true);
 +  if (!nsCachedStyleData::IsReset(aSID)) {
-+    /* always cache inherited data on the style context */
++    // always cache inherited data on the style context; the rule
++    // node set the bit in mBits for us if needed.
 +    mCachedInheritedData.mStyleStructs[aSID] = const_cast<void*>(newData);
 +  }
 +  return newData;
@@ -94,7 +142,7 @@ diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
 diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
 --- a/layout/style/nsStyleContext.h
 +++ b/layout/style/nsStyleContext.h
-@@ -530,17 +530,21 @@ private:
+@@ -530,17 +530,23 @@ private:
      const nsStyle##name_ * DoGetStyle##name_() {                        \
        const nsStyle##name_ * cachedData =                               \
          static_cast<nsStyle##name_*>(                                   \
@@ -105,9 +153,11 @@ diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
        AUTO_CHECK_DEPENDENCY(eStyleStruct_##name_);                      \
 -      return mRuleNode->GetStyle##name_<aComputeData>(this);            \
 +      const nsStyle##name_ * newData =                                  \
-+        mRuleNode->GetStyle##name_<aComputeData>(this);                 \
-+      /* always cache inherited data on the style context */            \
-+      SetStyle##name_(const_cast<nsStyle##name_ *>(newData));           \
++        mRuleNode->GetStyle##name_<aComputeData>(this, mBits);          \
++      /* always cache inherited data on the style context; the rule */  \
++      /* node set the bit in mBits for us if needed. */                 \
++      mCachedInheritedData.mStyleStructs[eStyleStruct_##name_] =        \
++        const_cast<nsStyle##name_ *>(newData);                          \
 +      return newData;                                                   \
      }
    #define STYLE_STRUCT_RESET(name_, checkdata_cb_)                      \
