@@ -1,0 +1,194 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1215424 - Convert ParseBoxProperty and ParseBoxPropertyVariant to CSSParseResult.
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -784,24 +784,22 @@ protected:
+ 
+   // These are similar to ParseSingleValueProperty but only work for
+   // properties that are parsed with ParseBoxProperties or
+   // ParseGroupedBoxProperty.  Stores in aConsumedTokens whether any tokens
+   // were consumed.
+   //
+   // Only works with variants with the following flags:
+   // A, C, H, K, L, N, P, CALC.
+-  bool ParseBoxPropertyVariant(nsCSSValue& aValue,
+-                               uint32_t aVariantMask,
+-                               const KTableValue aKeywordTable[],
+-                               uint32_t aRestrictions,
+-                               bool& aConsumedTokens);
+-  bool ParseBoxProperty(nsCSSValue& aValue,
+-                        nsCSSProperty aPropID,
+-                        bool& aConsumedTokens);
++  CSSParseResult ParseBoxPropertyVariant(nsCSSValue& aValue,
++                                         uint32_t aVariantMask,
++                                         const KTableValue aKeywordTable[],
++                                         uint32_t aRestrictions);
++  CSSParseResult ParseBoxProperty(nsCSSValue& aValue,
++                                  nsCSSProperty aPropID);
+ 
+   enum PriorityParsingStatus {
+     ePriority_None,
+     ePriority_Important,
+     ePriority_Error
+   };
+   PriorityParsingStatus ParsePriority();
+ 
+@@ -9831,23 +9829,23 @@ CSSParserImpl::AppendValue(nsCSSProperty
+  */
+ bool
+ CSSParserImpl::ParseBoxProperties(const nsCSSProperty aPropIDs[])
+ {
+   // Get up to four values for the property
+   int32_t count = 0;
+   nsCSSRect result;
+   NS_FOR_CSS_SIDES (index) {
+-    bool consumedTokens;
+-    if (!ParseBoxProperty(result.*(nsCSSRect::sides[index]),
+-                          aPropIDs[index], consumedTokens)) {
+-      if (consumedTokens) {
+-        return false;
+-      }
+-      break;
++    CSSParseResult result =
++      ParseBoxProperty(result.*(nsCSSRect::sides[index]), aPropIDs[index]);
++    if (result == CSSParseResult::NotFound) {
++      break;
++    }
++    if (result == CSSParseResult::Error) {
++      return false;
+     }
+     count++;
+   }
+   if (count == 0) {
+     return false;
+   }
+ 
+   if (1 < count) { // verify no more than single inherit, initial or unset
+@@ -9882,28 +9880,25 @@ CSSParserImpl::ParseBoxProperties(const 
+ bool
+ CSSParserImpl::ParseGroupedBoxProperty(int32_t aVariantMask,
+                                        /** outparam */ nsCSSValue& aValue)
+ {
+   nsCSSRect& result = aValue.SetRectValue();
+ 
+   int32_t count = 0;
+   NS_FOR_CSS_SIDES (index) {
+-    bool consumedTokens;
+-    if (!ParseBoxPropertyVariant(result.*(nsCSSRect::sides[index]),
+-                                 aVariantMask, nullptr,
+-                                 CSS_PROPERTY_VALUE_NONNEGATIVE,
+-                                 consumedTokens)) {
+-      if (consumedTokens) {
+-        // we consumed some tokens, which means we failed in the middle
+-        // of parsing a multi-token value, and thus we shouldn't just
+-        // exit the loop and return true
+-        return false;
+-      }
+-      break;
++    CSSParseResult result =
++      ParseBoxPropertyVariant(result.*(nsCSSRect::sides[index]),
++                              aVariantMask, nullptr,
++                              CSS_PROPERTY_VALUE_NONNEGATIVE);
++    if (result == CSSParseResult::NotFound) {
++      break;
++    }
++    if (result == CSSParseResult::Error) {
++      return false;
+     }
+     count++;
+   }
+ 
+   if (count == 0) {
+     return false;
+   }
+ 
+@@ -10494,75 +10489,55 @@ CSSParserImpl::ParsePropertyByFunction(n
+ #define BG_BOTTOM  NS_STYLE_BG_POSITION_BOTTOM
+ #define BG_LEFT    NS_STYLE_BG_POSITION_LEFT
+ #define BG_RIGHT   NS_STYLE_BG_POSITION_RIGHT
+ #define BG_CTB    (BG_CENTER | BG_TOP | BG_BOTTOM)
+ #define BG_TB     (BG_TOP | BG_BOTTOM)
+ #define BG_CLR    (BG_CENTER | BG_LEFT | BG_RIGHT)
+ #define BG_LR     (BG_LEFT | BG_RIGHT)
+ 
+-bool
++CSSParseResult
+ CSSParserImpl::ParseBoxPropertyVariant(nsCSSValue& aValue,
+                                        uint32_t aVariantMask,
+                                        const KTableValue aKeywordTable[],
+-                                       uint32_t aRestrictions,
+-                                       bool& aConsumedTokens)
+-{
+-  CSSParseResult result =
+-      ParseVariantWithRestrictions(aValue, aVariantMask, aKeywordTable,
+-                                   aRestrictions);
+-  switch (result) {
+-    case CSSParseResult::Ok:
+-      aConsumedTokens = true;
+-      return true;
+-    case CSSParseResult::NotFound:
+-      aConsumedTokens = false;
+-      return false;
+-    default:
+-      MOZ_ASSERT_UNREACHABLE("invalid CSSParseResult value");
+-      // fall through
+-    case CSSParseResult::Error:
+-      aConsumedTokens = true;
+-      return false;
+-  }
++                                       uint32_t aRestrictions)
++{
++  return ParseVariantWithRestrictions(aValue, aVariantMask, aKeywordTable,
++                                      aRestrictions);
+ }
+ 
+ bool
+ CSSParserImpl::ParseBoxProperty(nsCSSValue& aValue,
+-                                nsCSSProperty aPropID,
+-                                bool& aConsumedTokens)
+-{
+-  aConsumedTokens = false;
+-
++                                nsCSSProperty aPropID)
++{
+   if (aPropID < 0 || aPropID >= eCSSProperty_COUNT_no_shorthands) {
+     MOZ_ASSERT(false, "must only be called for longhand properties");
+-    return false;
++    return CSSParseResult::NotFound;
+   }
+ 
+   MOZ_ASSERT(!nsCSSProps::PropHasFlags(aPropID,
+                                        CSS_PROPERTY_VALUE_PARSER_FUNCTION),
+              "must only be called for non-function-parsed properties");
+ 
+   uint32_t variant = nsCSSProps::ParserVariant(aPropID);
+   if (variant == 0) {
+     MOZ_ASSERT(false, "must only be called for variant-parsed properties");
+-    return false;
++    return CSSParseResult::NotFound;
+   }
+ 
+   if (variant & ~(VARIANT_AHKLP | VARIANT_COLOR | VARIANT_CALC)) {
+     MOZ_ASSERT(false, "must only be called for properties that take certain "
+                       "variants");
+-    return false;
++    return CSSParseResult::NotFound;
+   }
+ 
+   const KTableValue* kwtable = nsCSSProps::kKeywordTableTable[aPropID];
+   uint32_t restrictions = nsCSSProps::ValueRestrictions(aPropID);
+ 
+-  return ParseBoxPropertyVariant(aValue, variant, kwtable, restrictions,
+-                                 aConsumedTokens);
++  return ParseBoxPropertyVariant(aValue, variant, kwtable, restrictions);
+ }
+ 
+ bool
+ CSSParserImpl::ParseSingleValuePropertyByFunction(nsCSSValue& aValue,
+                                                   nsCSSProperty aPropID)
+ {
+   switch (aPropID) {
+     case eCSSProperty_font_family:
