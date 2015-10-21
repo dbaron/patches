@@ -1,0 +1,162 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug N patch 2 - Pass nsStyleVisibility to nsStylePosition::CalcDifference to avoid computing new nsStyleVisibility during nsStyleContext::CalcStyleDifference.
+
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -918,17 +918,17 @@ nsStyleContext::CalcStyleDifference(nsSt
+   DO_STRUCT_DIFFERENCE(Table);
+   DO_STRUCT_DIFFERENCE(UIReset);
+   DO_STRUCT_DIFFERENCE(Text);
+   DO_STRUCT_DIFFERENCE(List);
+   DO_STRUCT_DIFFERENCE(Quotes);
+   DO_STRUCT_DIFFERENCE(SVGReset);
+   DO_STRUCT_DIFFERENCE(SVG);
+ #undef EXTRA_DIFF_ARGS
+-#define EXTRA_DIFF_ARGS , this
++#define EXTRA_DIFF_ARGS , PeekStyleVisibility()
+   DO_STRUCT_DIFFERENCE(Position);
+ #undef EXTRA_DIFF_ARGS
+ #define EXTRA_DIFF_ARGS /* nothing */
+   DO_STRUCT_DIFFERENCE(Font);
+   DO_STRUCT_DIFFERENCE(Margin);
+   DO_STRUCT_DIFFERENCE(Padding);
+   DO_STRUCT_DIFFERENCE(Border);
+   DO_STRUCT_DIFFERENCE(TextReset);
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -1506,17 +1506,17 @@ IsAutonessEqual(const nsStyleSides& aSid
+       return false;
+     }
+   }
+   return true;
+ }
+ 
+ nsChangeHint
+ nsStylePosition::CalcDifference(const nsStylePosition& aOther,
+-                                nsStyleContext* aContext) const
++                                nsStyleVisibility* aOldStyleVisibility) const
+ {
+   nsChangeHint hint = nsChangeHint(0);
+ 
+   // Changes to "z-index" require a repaint.
+   if (mZIndex != aOther.mZIndex) {
+     NS_UpdateHint(hint, nsChangeHint_RepaintFrame);
+   }
+ 
+@@ -1597,39 +1597,50 @@ nsStylePosition::CalcDifference(const ns
+   }
+ 
+   // 'align-content' doesn't apply to a single-line flexbox but we don't know
+   // if we're a flex container at this point so we can't optimize for that.
+   if (mAlignContent != aOther.mAlignContent) {
+     NS_UpdateHint(hint, nsChangeHint_NeedReflow);
+   }
+ 
+-  bool widthChanged = mWidth != aOther.mWidth ||
+-                      mMinWidth != aOther.mMinWidth ||
+-                      mMaxWidth != aOther.mMaxWidth;
+-  bool heightChanged = mHeight != aOther.mHeight ||
+-                       mMinHeight != aOther.mMinHeight ||
+-                       mMaxHeight != aOther.mMaxHeight;
+-  bool isVertical = WritingMode(aContext).IsVertical();
+-  if (isVertical ? widthChanged : heightChanged) {
+-    // Block-size changes can affect descendant intrinsic sizes due to replaced
+-    // elements with percentage bsizes in descendants which also have
+-    // percentage bsizes. This is handled via nsChangeHint_UpdateComputedBSize
+-    // which clears intrinsic sizes for frames that have such replaced elements.
+-    NS_UpdateHint(hint, nsChangeHint_NeedReflow |
+-        nsChangeHint_UpdateComputedBSize |
+-        nsChangeHint_ReflowChangesSizeOrPosition);
+-  }
+-
+-  if (isVertical ? heightChanged : widthChanged) {
+-    // None of our inline-size differences can affect descendant intrinsic
+-    // sizes and none of them need to force children to reflow.
+-    NS_UpdateHint(hint, NS_SubtractHint(nsChangeHint_AllReflowHints,
+-                                        NS_CombineHint(nsChangeHint_ClearDescendantIntrinsics,
+-                                                       nsChangeHint_NeedDirtyReflow)));
++  // If aStyleVisibility is null, we don't need to bother with any of
++  // these tests, since we know that the element never had its
++  // nsStyleVisibility accessed, which means it couldn't have done
++  // layout.
++  // Note that we pass an nsStyleVisibility here because we don't want
++  // to cause a new struct to be computed during
++  // nsStyleContext::CalcStyleDifference, which can lead to incorrect
++  // style data.
++  if (aOldStyleVisibility) {
++    bool widthChanged = mWidth != aOther.mWidth ||
++                        mMinWidth != aOther.mMinWidth ||
++                        mMaxWidth != aOther.mMaxWidth;
++    bool heightChanged = mHeight != aOther.mHeight ||
++                         mMinHeight != aOther.mMinHeight ||
++                         mMaxHeight != aOther.mMaxHeight;
++
++    bool isVertical = WritingMode(aOldStyleVisibility).IsVertical();
++    if (isVertical ? widthChanged : heightChanged) {
++      // Block-size changes can affect descendant intrinsic sizes due to replaced
++      // elements with percentage bsizes in descendants which also have
++      // percentage bsizes. This is handled via nsChangeHint_UpdateComputedBSize
++      // which clears intrinsic sizes for frames that have such replaced elements.
++      NS_UpdateHint(hint, nsChangeHint_NeedReflow |
++          nsChangeHint_UpdateComputedBSize |
++          nsChangeHint_ReflowChangesSizeOrPosition);
++    }
++
++    if (isVertical ? heightChanged : widthChanged) {
++      // None of our inline-size differences can affect descendant intrinsic
++      // sizes and none of them need to force children to reflow.
++      NS_UpdateHint(hint, NS_SubtractHint(nsChangeHint_AllReflowHints,
++                                          NS_CombineHint(nsChangeHint_ClearDescendantIntrinsics,
++                                                         nsChangeHint_NeedDirtyReflow)));
++    }
+   }
+ 
+   // If any of the offsets have changed, then return the respective hints
+   // so that we would hopefully be able to avoid reflowing.
+   // Note that it is possible that we'll need to reflow when processing
+   // restyles, but we don't have enough information to make a good decision
+   // right now.
+   // Don't try to handle changes between "auto" and non-auto efficiently;
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -31,16 +31,17 @@
+ #include "Orientation.h"
+ #include "CounterStyleManager.h"
+ 
+ class nsIFrame;
+ class nsIURI;
+ class nsStyleContext;
+ class nsTextFrame;
+ class imgIContainer;
++struct nsStyleVisibility;
+ 
+ // Includes nsStyleStructID.
+ #include "nsStyleStructFwd.h"
+ 
+ // Bits for each struct.
+ // NS_STYLE_INHERIT_BIT defined in nsStyleStructFwd.h
+ #define NS_STYLE_INHERIT_MASK              0x000ffffff
+ 
+@@ -1379,17 +1380,17 @@ struct nsStylePosition {
+   }
+   void Destroy(nsPresContext* aContext) {
+     this->~nsStylePosition();
+     aContext->PresShell()->
+       FreeByObjectID(mozilla::eArenaObjectID_nsStylePosition, this);
+   }
+ 
+   nsChangeHint CalcDifference(const nsStylePosition& aOther,
+-                              nsStyleContext* aContext) const;
++                              nsStyleVisibility* aOldStyleVisibility) const;
+   static nsChangeHint MaxDifference() {
+     return NS_CombineHint(NS_STYLE_HINT_REFLOW,
+                           nsChangeHint(nsChangeHint_RecomputePosition |
+                                        nsChangeHint_UpdateParentOverflow |
+                                        nsChangeHint_UpdateComputedBSize));
+   }
+   static nsChangeHint DifferenceAlwaysHandledForDescendants() {
+     // CalcDifference can return all of the reflow hints that are
