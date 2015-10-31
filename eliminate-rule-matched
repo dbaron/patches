@@ -1,0 +1,257 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 978833 patch 12 - Eliminate StyleRule::RuleMatched and call Declaration::SetImmutable directly for style rules (like for @page and keyframe rules).
+
+diff --git a/layout/style/Declaration.h b/layout/style/Declaration.h
+--- a/layout/style/Declaration.h
++++ b/layout/style/Declaration.h
+@@ -37,19 +37,20 @@ namespace mozilla {
+ namespace css {
+ 
+ class ImportantStyleData;
+ 
+ // Declaration objects have unusual lifetime rules.  Every declaration
+ // begins life in an invalid state which ends when InitializeEmpty or
+ // CompressFrom is called upon it.  After that, it can be attached to
+ // exactly one style rule, and will be destroyed when that style rule
+-// is destroyed.  A declaration becomes immutable when its style rule's
+-// |RuleMatched| method is called; after that, it must be copied before
+-// it can be modified, which is taken care of by |EnsureMutable|.
++// is destroyed.  A declaration becomes immutable (via a SetImmutable)
++// call when it is matched (put in the rule tree); after that, it must
++// be copied before it can be modified, which is taken care of by
++// |EnsureMutable|.
+ 
+ class Declaration : public nsIStyleRule {
+ public:
+   /**
+    * Construct an |Declaration| that is in an invalid state (null
+    * |mData|) and cannot be used until its |CompressFrom| method or
+    * |InitializeEmpty| method is called.
+    */
+@@ -367,17 +368,17 @@ private:
+   // may be null
+   nsAutoPtr<CSSVariableDeclarations> mImportantVariables;
+ 
+   // The style rule that owns this declaration.  May be null.
+   Rule* mOwningRule;
+ 
+   RefPtr<ImportantStyleData> mImportantStyleData;
+ 
+-  // set by style rules when |RuleMatched| is called;
++  // set when declaration put in the rule tree;
+   // also by ToString (hence the 'mutable').
+   mutable bool mImmutable;
+ };
+ 
+ } // namespace css
+ } // namespace mozilla
+ 
+ #endif /* mozilla_css_Declaration_h */
+diff --git a/layout/style/StyleAnimationValue.cpp b/layout/style/StyleAnimationValue.cpp
+--- a/layout/style/StyleAnimationValue.cpp
++++ b/layout/style/StyleAnimationValue.cpp
+@@ -2656,18 +2656,19 @@ StyleAnimationValue::ComputeValues(
+   RefPtr<nsStyleContext> tmpStyleContext;
+   if (aIsContextSensitive) {
+     MOZ_ASSERT(!nsCSSProps::IsShorthand(aProperty),
+                "to correctly set aIsContextSensitive for shorthand properties, "
+                "this code must be adjusted");
+ 
+     nsCOMArray<nsIStyleRule> ruleArray;
+     ruleArray.AppendObject(styleSet->InitialStyleRule());
+-    ruleArray.AppendObject(aStyleRule->GetDeclaration());
+-    aStyleRule->RuleMatched();
++    css::Declaration* declaration = aStyleRule->GetDeclaration();
++    ruleArray.AppendObject(declaration);
++    declaration->SetImmutable();
+     tmpStyleContext =
+       styleSet->ResolveStyleByAddingRules(styleContext, ruleArray);
+     if (!tmpStyleContext) {
+       return false;
+     }
+ 
+     // Force walk of rule tree
+     nsStyleStructID sid = nsCSSProps::kSIDTable[aProperty];
+@@ -2683,18 +2684,19 @@ StyleAnimationValue::ComputeValues(
+   // If we're not concerned whether the property is context sensitive then just
+   // add the rule to a new temporary style context alongside the target
+   // element's style context.
+   // Also, if we previously discovered that this property IS context-sensitive
+   // then we need to throw the temporary style context out since the property's
+   // value may have been biased by the 'initial' values supplied.
+   if (!aIsContextSensitive || *aIsContextSensitive) {
+     nsCOMArray<nsIStyleRule> ruleArray;
+-    ruleArray.AppendObject(aStyleRule->GetDeclaration());
+-    aStyleRule->RuleMatched();
++    css::Declaration* declaration = aStyleRule->GetDeclaration();
++    ruleArray.AppendObject(declaration);
++    declaration->SetImmutable();
+     tmpStyleContext =
+       styleSet->ResolveStyleByAddingRules(styleContext, ruleArray);
+     if (!tmpStyleContext) {
+       return false;
+     }
+   }
+ 
+   // Extract computed value of our property (or all longhand components, if
+diff --git a/layout/style/StyleRule.cpp b/layout/style/StyleRule.cpp
+--- a/layout/style/StyleRule.cpp
++++ b/layout/style/StyleRule.cpp
+@@ -1483,22 +1483,16 @@ NS_INTERFACE_MAP_BEGIN(StyleRule)
+   else
+   NS_INTERFACE_MAP_ENTRY(nsIStyleRule)
+   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIStyleRule)
+ NS_INTERFACE_MAP_END
+ 
+ NS_IMPL_ADDREF(StyleRule)
+ NS_IMPL_RELEASE(StyleRule)
+ 
+-void
+-StyleRule::RuleMatched()
+-{
+-  mDeclaration->SetImmutable();
+-}
+-
+ /* virtual */ int32_t
+ StyleRule::GetType() const
+ {
+   return Rule::STYLE_RULE;
+ }
+ 
+ /* virtual */ already_AddRefed<Rule>
+ StyleRule::Clone() const
+diff --git a/layout/style/StyleRule.h b/layout/style/StyleRule.h
+--- a/layout/style/StyleRule.h
++++ b/layout/style/StyleRule.h
+@@ -343,22 +343,16 @@ public:
+    * the declaration is modified.
+    *
+    * |DeclarationChanged| handles replacing the object in the container
+    * sheet or group rule if |aHandleContainer| is true.
+    */
+   already_AddRefed<StyleRule>
+   DeclarationChanged(Declaration* aDecl, bool aHandleContainer);
+ 
+-  /**
+-   * The rule processor must call this method before calling
+-   * nsRuleWalker::Forward on this rule during rule matching.
+-   */
+-  void RuleMatched();
+-
+   // hooks for DOM rule
+   void GetCssText(nsAString& aCssText);
+   void SetCssText(const nsAString& aCssText);
+   void GetSelectorText(nsAString& aSelectorText);
+   void SetSelectorText(const nsAString& aSelectorText);
+ 
+   virtual int32_t GetType() const override;
+ 
+diff --git a/layout/style/nsCSSRuleProcessor.cpp b/layout/style/nsCSSRuleProcessor.cpp
+--- a/layout/style/nsCSSRuleProcessor.cpp
++++ b/layout/style/nsCSSRuleProcessor.cpp
+@@ -2613,19 +2613,19 @@ void ContentEnumFunc(const RuleValue& va
+                       data->mTreeMatchContext, selectorFlags)) {
+     nsCSSSelector *next = selector->mNext;
+     if (!next ||
+         SelectorMatchesTree(data->mElement, next,
+                             data->mTreeMatchContext,
+                             nodeContext.mIsRelevantLink ?
+                               SelectorMatchesTreeFlags(0) :
+                               eLookForRelevantLink)) {
+-      css::StyleRule *rule = value.mRule;
+-      rule->RuleMatched();
+-      data->mRuleWalker->Forward(rule->GetDeclaration());
++      css::Declaration* = value.mRule->GetDeclaration();
++      declaration->SetImmutable();
++      data->mRuleWalker->Forward(declaration);
+       // nsStyleSet will deal with the !important rule
+     }
+   }
+ }
+ 
+ /* virtual */ void
+ nsCSSRuleProcessor::RulesMatching(ElementRuleProcessorData *aData)
+ {
+@@ -2660,18 +2660,19 @@ nsCSSRuleProcessor::RulesMatching(AnonBo
+ 
+   if (cascade && cascade->mAnonBoxRules.EntryCount()) {
+     auto entry = static_cast<RuleHashTagTableEntry*>
+                             (cascade->mAnonBoxRules.Search(aData->mPseudoTag));
+     if (entry) {
+       nsTArray<RuleValue>& rules = entry->mRules;
+       for (RuleValue *value = rules.Elements(), *end = value + rules.Length();
+            value != end; ++value) {
+-        value->mRule->RuleMatched();
+-        aData->mRuleWalker->Forward(value->mRule->GetDeclaration());
++        nsCSSDeclaration* declaration = value->mRule->GetDeclaration();
++        declaration->SetImmutable();
++        aData->mRuleWalker->Forward(declaration);
+       }
+     }
+   }
+ }
+ 
+ #ifdef MOZ_XUL
+ /* virtual */ void
+ nsCSSRuleProcessor::RulesMatching(XULTreeRuleProcessorData* aData)
+diff --git a/layout/style/nsHTMLCSSStyleSheet.cpp b/layout/style/nsHTMLCSSStyleSheet.cpp
+--- a/layout/style/nsHTMLCSSStyleSheet.cpp
++++ b/layout/style/nsHTMLCSSStyleSheet.cpp
+@@ -62,28 +62,30 @@ nsHTMLCSSStyleSheet::RulesMatching(Eleme
+ void
+ nsHTMLCSSStyleSheet::ElementRulesMatching(nsPresContext* aPresContext,
+                                           Element* aElement,
+                                           nsRuleWalker* aRuleWalker)
+ {
+   // just get the one and only style rule from the content's STYLE attribute
+   css::StyleRule* rule = aElement->GetInlineStyleRule();
+   if (rule) {
+-    rule->RuleMatched();
+-    aRuleWalker->Forward(rule->GetDeclaration());
++    css::Declaration* declaration = rule->GetDeclaration();
++    declaration->SetImmutable();
++    aRuleWalker->Forward(declaration);
+   }
+ 
+   rule = aElement->GetSMILOverrideStyleRule();
+   if (rule) {
+     RestyleManager* restyleManager = aPresContext->RestyleManager();
+     if (!restyleManager->SkipAnimationRules()) {
+       // Animation restyle (or non-restyle traversal of rules)
+       // Now we can walk SMIL overrride style, without triggering transitions.
+-      rule->RuleMatched();
+-      aRuleWalker->Forward(rule->GetDeclaration());
++      css::Declaration* declaration = rule->GetDeclaration();
++      declaration->SetImmutable();
++      aRuleWalker->Forward(declaration);
+     }
+   }
+ }
+ 
+ void
+ nsHTMLCSSStyleSheet::PseudoElementRulesMatching(Element* aPseudoElement,
+                                                 nsCSSPseudoElements::Type
+                                                   aPseudoType,
+@@ -91,18 +93,19 @@ nsHTMLCSSStyleSheet::PseudoElementRulesM
+ {
+   MOZ_ASSERT(nsCSSPseudoElements::
+                PseudoElementSupportsStyleAttribute(aPseudoType));
+   MOZ_ASSERT(aPseudoElement);
+ 
+   // just get the one and only style rule from the content's STYLE attribute
+   css::StyleRule* rule = aPseudoElement->GetInlineStyleRule();
+   if (rule) {
+-    rule->RuleMatched();
+-    aRuleWalker->Forward(rule->GetDeclaration());
++    css::Declaration* declaration = rule->GetDeclaration();
++    declaration->SetImmutable();
++    aRuleWalker->Forward(declaration);
+   }
+ }
+ 
+ /* virtual */ void
+ nsHTMLCSSStyleSheet::RulesMatching(PseudoElementRuleProcessorData* aData)
+ {
+   if (nsCSSPseudoElements::PseudoElementSupportsStyleAttribute(aData->mPseudoType) &&
+       aData->mPseudoElement) {
