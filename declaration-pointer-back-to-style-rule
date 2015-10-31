@@ -1,0 +1,152 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 978833 patch 3 - Add pointer back from css::Declaration to css::StyleRule.
+
+diff --git a/layout/style/Declaration.cpp b/layout/style/Declaration.cpp
+--- a/layout/style/Declaration.cpp
++++ b/layout/style/Declaration.cpp
+@@ -16,32 +16,34 @@
+ #include "gfxFontConstants.h"
+ #include "nsStyleUtil.h"
+ 
+ namespace mozilla {
+ namespace css {
+ 
+ Declaration::Declaration()
+   : mImmutable(false)
++  , mOwningStyleRule(nullptr)
+ {
+   MOZ_COUNT_CTOR(mozilla::css::Declaration);
+ }
+ 
+ Declaration::Declaration(const Declaration& aCopy)
+   : mOrder(aCopy.mOrder),
+     mVariableOrder(aCopy.mVariableOrder),
+     mData(aCopy.mData ? aCopy.mData->Clone() : nullptr),
+     mImportantData(aCopy.mImportantData ?
+                      aCopy.mImportantData->Clone() : nullptr),
+     mVariables(aCopy.mVariables ?
+         new CSSVariableDeclarations(*aCopy.mVariables) :
+         nullptr),
+     mImportantVariables(aCopy.mImportantVariables ?
+         new CSSVariableDeclarations(*aCopy.mImportantVariables) :
+         nullptr),
++    mOwningStyleRule(nullptr),
+     mImmutable(false)
+ {
+   MOZ_COUNT_CTOR(mozilla::css::Declaration);
+ }
+ 
+ Declaration::~Declaration()
+ {
+   MOZ_COUNT_DTOR(mozilla::css::Declaration);
+diff --git a/layout/style/Declaration.h b/layout/style/Declaration.h
+--- a/layout/style/Declaration.h
++++ b/layout/style/Declaration.h
+@@ -275,16 +275,22 @@ public:
+     mData = nullptr;
+     mImportantData = nullptr;
+     mVariables = nullptr;
+     mImportantVariables = nullptr;
+     mOrder.Clear();
+     mVariableOrder.Clear();
+   }
+ 
++  void SetOwningStyleRule(StyleRule* aStyleRule) {
++    MOZ_ASSERT(!mOwningStyleRule || !aStyleRule,
++               "should never overwrite one rule with another");
++    mOwningStyleRule = aStyleRule;
++  }
++
+ private:
+   Declaration& operator=(const Declaration& aCopy) = delete;
+   bool operator==(const Declaration& aCopy) const = delete;
+ 
+   void GetValue(nsCSSProperty aProperty, nsAString& aValue,
+                 nsCSSValue::Serialization aValueSerialization) const;
+ 
+   static void AppendImportanceToString(bool aIsImportant, nsAString& aString);
+@@ -350,16 +356,19 @@ private:
+   nsAutoPtr<nsCSSCompressedDataBlock> mImportantData;
+ 
+   // may be null
+   nsAutoPtr<CSSVariableDeclarations> mVariables;
+ 
+   // may be null
+   nsAutoPtr<CSSVariableDeclarations> mImportantVariables;
+ 
++  // The style rule that owns this declaration.  May be null.
++  StyleRule* mOwningStyleRule;
++
+   // set by style rules when |RuleMatched| is called;
+   // also by ToString (hence the 'mutable').
+   mutable bool mImmutable;
+ };
+ 
+ } // namespace css
+ } // namespace mozilla
+ 
+diff --git a/layout/style/StyleRule.cpp b/layout/style/StyleRule.cpp
+--- a/layout/style/StyleRule.cpp
++++ b/layout/style/StyleRule.cpp
+@@ -1415,24 +1415,27 @@ StyleRule::StyleRule(nsCSSSelectorList* 
+                      Declaration* aDeclaration,
+                      uint32_t aLineNumber,
+                      uint32_t aColumnNumber)
+   : Rule(aLineNumber, aColumnNumber),
+     mSelector(aSelector),
+     mDeclaration(aDeclaration)
+ {
+   NS_PRECONDITION(aDeclaration, "must have a declaration");
++
++  mDeclaration->SetOwningStyleRule(this);
+ }
+ 
+ // for |Clone|
+ StyleRule::StyleRule(const StyleRule& aCopy)
+   : Rule(aCopy),
+     mSelector(aCopy.mSelector ? aCopy.mSelector->Clone() : nullptr),
+     mDeclaration(new Declaration(*aCopy.mDeclaration))
+ {
++  mDeclaration->SetOwningStyleRule(this);
+   // rest is constructed lazily on existing data
+ }
+ 
+ // for |SetCSSDeclaration|
+ StyleRule::StyleRule(StyleRule& aCopy,
+                      Declaration* aDeclaration)
+   : Rule(aCopy),
+     mSelector(aCopy.mSelector),
+@@ -1447,25 +1450,32 @@ StyleRule::StyleRule(StyleRule& aCopy,
+ 
+   // We are probably replacing the old declaration with |aDeclaration|
+   // instead of taking ownership of the old declaration; only null out
+   // aCopy.mDeclaration if we are taking ownership.
+   if (mDeclaration == aCopy.mDeclaration) {
+     // This should only ever happen if the declaration was modifiable.
+     mDeclaration->AssertMutable();
+     aCopy.mDeclaration = nullptr;
++    mDeclaration->SetOwningStyleRule(nullptr);
+   }
++
++  mDeclaration->SetOwningStyleRule(this);
+ }
+ 
+ StyleRule::~StyleRule()
+ {
+   delete mSelector;
+   if (mDOMRule) {
+     mDOMRule->DOMDeclaration()->DropReference();
+   }
++
++  if (mDeclaration) {
++    mDeclaration->SetOwningStyleRule(this);
++  }
+ }
+ 
+ // QueryInterface implementation for StyleRule
+ NS_INTERFACE_MAP_BEGIN(StyleRule)
+   if (aIID.Equals(NS_GET_IID(mozilla::css::StyleRule))) {
+     *aInstancePtr = this;
+     NS_ADDREF_THIS();
+     return NS_OK;
