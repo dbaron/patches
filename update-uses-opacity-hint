@@ -1,0 +1,135 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1224251 patch 1 - Add nsChangeHint_UpdateUsesOpacity to say when opacity changes between 1 and non-1.
+
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -5096,17 +5096,18 @@ RestyleManager::ChangeHintToString(nsCha
+     "ClearDescendantIntrinsics", "NeedDirtyReflow", "SyncFrameView",
+     "UpdateCursor", "UpdateEffects", "UpdateOpacityLayer",
+     "UpdateTransformLayer", "ReconstructFrame", "UpdateOverflow",
+     "UpdateSubtreeOverflow", "UpdatePostTransformOverflow",
+     "UpdateParentOverflow",
+     "ChildrenOnlyTransform", "RecomputePosition", "AddOrRemoveTransform",
+     "BorderStyleNoneChange", "UpdateTextPath", "SchedulePaint",
+     "NeutralChange", "InvalidateRenderingObservers",
+-    "ReflowChangesSizeOrPosition", "UpdateComputedBSize"
++    "ReflowChangesSizeOrPosition", "UpdateComputedBSize",
++    "UpdateUsesOpacity"
+   };
+   uint32_t hint = aHint & ((1 << ArrayLength(names)) - 1);
+   uint32_t rest = aHint & ~((1 << ArrayLength(names)) - 1);
+   if (hint == nsChangeHint_Hints_NotHandledForDescendants) {
+     result.AppendLiteral("nsChangeHint_Hints_NotHandledForDescendants");
+     hint = 0;
+     any = true;
+   } else {
+diff --git a/layout/base/nsChangeHint.h b/layout/base/nsChangeHint.h
+--- a/layout/base/nsChangeHint.h
++++ b/layout/base/nsChangeHint.h
+@@ -179,16 +179,23 @@ enum nsChangeHint {
+    */
+   nsChangeHint_ReflowChangesSizeOrPosition = 0x800000,
+ 
+   /**
+    * Indicates that the style changes the computed BSize --- e.g. 'height'.
+    */
+   nsChangeHint_UpdateComputedBSize = 0x1000000,
+ 
++  /**
++   * Indicates that the 'opacity' property changed between 1 and non-1.
++   *
++   * Used as extra data for handling UpdateOpacityLayer hints.
++   */
++  nsChangeHint_UpdateUsesOpacity = (1 << 25),
++
+   // IMPORTANT NOTE: When adding new hints, consider whether you need to
+   // add them to NS_HintsNotHandledForDescendantsIn() below.  Please also
+   // add them to RestyleManager::ChangeHintToString.
+ };
+ 
+ // Redefine these operators to return nothing. This will catch any use
+ // of these operators on hints. We should not be using these operators
+ // on nsChangeHints
+@@ -287,32 +294,34 @@ inline nsChangeHint operator^=(nsChangeH
+           nsChangeHint_UpdateParentOverflow | \
+           nsChangeHint_ChildrenOnlyTransform | \
+           nsChangeHint_RecomputePosition | \
+           nsChangeHint_UpdateContainingBlock | \
+           nsChangeHint_BorderStyleNoneChange | \
+           nsChangeHint_NeedReflow | \
+           nsChangeHint_ReflowChangesSizeOrPosition | \
+           nsChangeHint_ClearAncestorIntrinsics | \
+-          nsChangeHint_UpdateComputedBSize)
++          nsChangeHint_UpdateComputedBSize | \
++          nsChangeHint_UpdateUsesOpacity)
+ 
+ inline nsChangeHint NS_HintsNotHandledForDescendantsIn(nsChangeHint aChangeHint) {
+   nsChangeHint result = nsChangeHint(aChangeHint & (
+     nsChangeHint_UpdateTransformLayer |
+     nsChangeHint_UpdateEffects |
+     nsChangeHint_InvalidateRenderingObservers |
+     nsChangeHint_UpdateOpacityLayer |
+     nsChangeHint_UpdateOverflow |
+     nsChangeHint_UpdatePostTransformOverflow |
+     nsChangeHint_UpdateParentOverflow |
+     nsChangeHint_ChildrenOnlyTransform |
+     nsChangeHint_RecomputePosition |
+     nsChangeHint_UpdateContainingBlock |
+     nsChangeHint_BorderStyleNoneChange |
+-    nsChangeHint_UpdateComputedBSize));
++    nsChangeHint_UpdateComputedBSize |
++    nsChangeHint_UpdateUsesOpacity));
+ 
+   if (!NS_IsHintSubset(nsChangeHint_NeedDirtyReflow, aChangeHint)) {
+     if (NS_IsHintSubset(nsChangeHint_NeedReflow, aChangeHint)) {
+       // If NeedDirtyReflow is *not* set, then NeedReflow is a
+       // non-inherited hint.
+       NS_UpdateHint(result, nsChangeHint_NeedReflow);
+     }
+ 
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -2994,16 +2994,19 @@ nsChangeHint nsStyleDisplay::CalcDiffere
+     // If we're going from the optimized >=0.99 opacity value to 1.0 or back, then
+     // repaint the frame because DLBI will not catch the invalidation.  Otherwise,
+     // just update the opacity layer.
+     if ((mOpacity >= 0.99f && mOpacity < 1.0f && aOther.mOpacity == 1.0f) ||
+         (aOther.mOpacity >= 0.99f && aOther.mOpacity < 1.0f && mOpacity == 1.0f)) {
+       NS_UpdateHint(hint, nsChangeHint_RepaintFrame);
+     } else {
+       NS_UpdateHint(hint, nsChangeHint_UpdateOpacityLayer);
++      if ((mOpacity == 1.0f) != (aOther.mOpacity == 1.0f)) {
++        NS_UpdateHint(hint, nsChangeHint_UpdateUsesOpacity);
++      }
+     }
+   }
+ 
+   if (mMixBlendMode != aOther.mMixBlendMode
+       || mIsolation != aOther.mIsolation) {
+     NS_UpdateHint(hint, nsChangeHint_RepaintFrame);
+   }
+ 
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -2200,16 +2200,17 @@ struct nsStyleDisplay {
+       FreeByObjectID(mozilla::eArenaObjectID_nsStyleDisplay, this);
+   }
+ 
+   nsChangeHint CalcDifference(const nsStyleDisplay& aOther) const;
+   static nsChangeHint MaxDifference() {
+     // All the parts of FRAMECHANGE are present in CalcDifference.
+     return nsChangeHint(NS_STYLE_HINT_FRAMECHANGE |
+                         nsChangeHint_UpdateOpacityLayer |
++                        nsChangeHint_UpdateUsesOpacity |
+                         nsChangeHint_UpdateTransformLayer |
+                         nsChangeHint_UpdateOverflow |
+                         nsChangeHint_UpdatePostTransformOverflow |
+                         nsChangeHint_UpdateContainingBlock |
+                         nsChangeHint_NeutralChange);
+   }
+   static nsChangeHint DifferenceAlwaysHandledForDescendants() {
+     // CalcDifference can return all of the reflow hints that are
