@@ -15,6 +15,29 @@ Without the code change, the property_database.js changes lead to:
    should be idempotent":  2 for each longhand, 2 for the shorthand for
    the unprefixed, and 4 for the shorthand for each prefixed
 
+diff --git a/layout/style/nsComputedDOMStyle.cpp b/layout/style/nsComputedDOMStyle.cpp
+--- a/layout/style/nsComputedDOMStyle.cpp
++++ b/layout/style/nsComputedDOMStyle.cpp
+@@ -5828,17 +5828,18 @@ nsComputedDOMStyle::DoGetTransitionPrope
+     const StyleTransition *transition = &display->mTransitions[i];
+     nsROCSSPrimitiveValue* property = new nsROCSSPrimitiveValue;
+     valueList->AppendCSSValue(property);
+     nsCSSProperty cssprop = transition->GetProperty();
+     if (cssprop == eCSSPropertyExtra_all_properties)
+       property->SetIdent(eCSSKeyword_all);
+     else if (cssprop == eCSSPropertyExtra_no_properties)
+       property->SetIdent(eCSSKeyword_none);
+-    else if (cssprop == eCSSProperty_UNKNOWN)
++    else if (cssprop == eCSSProperty_UNKNOWN ||
++             cssprop == eCSSPropertyExtra_variable)
+     {
+       nsAutoString escaped;
+       nsStyleUtil::AppendEscapedCSSIdent(
+         nsDependentAtomString(transition->GetUnknownProperty()), escaped);
+       property->SetString(escaped); // really want SetIdent
+     }
+     else
+       property->SetString(nsCSSProps::GetStringValue(cssprop));
 diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 --- a/layout/style/nsRuleNode.cpp
 +++ b/layout/style/nsRuleNode.cpp
@@ -41,37 +64,82 @@ diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
 diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
 --- a/layout/style/nsStyleStruct.cpp
 +++ b/layout/style/nsStyleStruct.cpp
-@@ -2712,20 +2712,26 @@ mozilla::StyleTransition::SetInitialValu
-   mDuration = 0.0;
-   mDelay = 0.0;
-   mProperty = eCSSPropertyExtra_all_properties;
- }
- 
- void
- mozilla::StyleTransition::SetUnknownProperty(const nsAString& aUnknownProperty)
- {
--  NS_ASSERTION(nsCSSProps::LookupProperty(aUnknownProperty,
--                                          nsCSSProps::eEnabledForAllContent) ==
--                 eCSSProperty_UNKNOWN,
--               "should be unknown property");
-+#ifdef DEBUG
-+  {
-+    nsCSSProperty prop =
-+      nsCSSProps::LookupProperty(aUnknownProperty,
-+                                 nsCSSProps::eEnabledForAllContent);
-+    NS_ASSERTION(prop == eCSSProperty_UNKNOWN ||
-+                 prop == eCSSPropertyExtra_variable,
-+                 "should be unknown or custom property");
-+  }
-+#endif
+@@ -2720,16 +2720,27 @@ mozilla::StyleTransition::SetUnknownProp
+   NS_ASSERTION(nsCSSProps::LookupProperty(aUnknownProperty,
+                                           nsCSSProps::eEnabledForAllContent) ==
+                  eCSSProperty_UNKNOWN,
+                "should be unknown property");
    mProperty = eCSSProperty_UNKNOWN;
    mUnknownProperty = do_GetAtom(aUnknownProperty);
  }
  
++void
++mozilla::StyleTransition::SetCustomProperty(const nsAString& aCustomProperty)
++{
++  NS_ASSERTION(nsCSSProps::LookupProperty(aUnknownProperty,
++                                          nsCSSProps::eEnabledForAllContent) ==
++                 eCSSPropertyExtra_variable,
++               "should be custom property");
++  mProperty = eCSSPropertyExtra_variable;
++  mUnknownProperty = do_GetAtom(aUnknownProperty);
++}
++
  bool
  mozilla::StyleTransition::operator==(const mozilla::StyleTransition& aOther) const
  {
    return mTimingFunction == aOther.mTimingFunction &&
+          mDuration == aOther.mDuration &&
+          mDelay == aOther.mDelay &&
+          mProperty == aOther.mProperty &&
+          (mProperty != eCSSProperty_UNKNOWN ||
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -2090,20 +2090,23 @@ struct StyleTransition {
+   }
+ 
+   void SetTimingFunction(const nsTimingFunction& aTimingFunction)
+     { mTimingFunction = aTimingFunction; }
+   void SetDelay(float aDelay) { mDelay = aDelay; }
+   void SetDuration(float aDuration) { mDuration = aDuration; }
+   void SetProperty(nsCSSProperty aProperty)
+     {
+-      NS_ASSERTION(aProperty != eCSSProperty_UNKNOWN, "invalid property");
++      NS_ASSERTION(aProperty != eCSSProperty_UNKNOWN &&
++                   aProperty != eCSSPropertyExtra_variable,
++                   "invalid property");
+       mProperty = aProperty;
+     }
+   void SetUnknownProperty(const nsAString& aUnknownProperty);
++  void SetCustomProperty(const nsAString& aCustomProperty);
+   void CopyPropertyFrom(const StyleTransition& aOther)
+     {
+       mProperty = aOther.mProperty;
+       mUnknownProperty = aOther.mUnknownProperty;
+     }
+ 
+   nsTimingFunction& TimingFunctionSlot() { return mTimingFunction; }
+ 
+@@ -2112,17 +2115,18 @@ struct StyleTransition {
+     { return !(*this == aOther); }
+ 
+ private:
+   nsTimingFunction mTimingFunction;
+   float mDuration;
+   float mDelay;
+   nsCSSProperty mProperty;
+   nsCOMPtr<nsIAtom> mUnknownProperty; // used when mProperty is
+-                                      // eCSSProperty_UNKNOWN
++                                      // eCSSProperty_UNKNOWN or
++                                      // eCSSPropertyExtra_variable
+ };
+ 
+ struct StyleAnimation {
+   StyleAnimation() { /* leaves uninitialized; see also SetInitialValues */ }
+   explicit StyleAnimation(const StyleAnimation& aCopy);
+ 
+   void SetInitialValues();
+ 
 diff --git a/layout/style/test/property_database.js b/layout/style/test/property_database.js
 --- a/layout/style/test/property_database.js
 +++ b/layout/style/test/property_database.js
