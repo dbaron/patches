@@ -1,0 +1,241 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1228877 - Make nsStyleContext::HasChildThatUsesGrandancestorStyle by setting bit on grandchild's parent instead of grandchild.  r=xidorn
+
+diff --git a/layout/style/nsRuleNode.cpp b/layout/style/nsRuleNode.cpp
+--- a/layout/style/nsRuleNode.cpp
++++ b/layout/style/nsRuleNode.cpp
+@@ -1698,39 +1698,28 @@ nsRuleNode::PropagateDependentBit(nsStyl
+ }
+ 
+ /* static */ void
+ nsRuleNode::PropagateGrandancestorBit(nsStyleContext* aContext,
+                                       nsStyleContext* aContextInheritedFrom)
+ {
+   MOZ_ASSERT(aContext);
+   MOZ_ASSERT(aContextInheritedFrom &&
+-             aContextInheritedFrom != aContext &&
+-             aContextInheritedFrom != aContext->GetParent(),
+-             "aContextInheritedFrom must be an ancestor of aContext's parent");
+-
+-  aContext->AddStyleBit(NS_STYLE_USES_GRANDANCESTOR_STYLE);
+-
+-  nsStyleContext* context = aContext->GetParent();
+-  if (!context) {
+-    return;
+-  }
+-
+-  for (;;) {
+-    nsStyleContext* parent = context->GetParent();
+-    if (!parent) {
++             aContextInheritedFrom != aContext,
++             "aContextInheritedFrom must be an ancestor of aContext");
++
++  for (nsStyleContext* context = aContext->GetParent();
++       context != aContextInheritedFrom;
++       context = context->GetParent()) {
++    if (!context) {
+       MOZ_ASSERT(false, "aContextInheritedFrom must be an ancestor of "
+                         "aContext's parent");
+       break;
+     }
+-    if (parent == aContextInheritedFrom) {
+-      break;
+-    }
+-    context->AddStyleBit(NS_STYLE_USES_GRANDANCESTOR_STYLE);
+-    context = parent;
++    context->AddStyleBit(NS_STYLE_CHILD_USES_GRANDANCESTOR_STYLE);
+   }
+ }
+ 
+ /*
+  * The following "Check" functions are used for determining what type of
+  * sharing can be used for the data on this rule node.  MORE HERE...
+  */
+ 
+@@ -8035,17 +8024,17 @@ nsRuleNode::ComputePositionData(void* aS
+   }
+ 
+   // align-self: enum, inherit, initial
+   const auto& alignSelfValue = *aRuleData->ValueForAlignSelf();
+   if (MOZ_UNLIKELY(alignSelfValue.GetUnit() == eCSSUnit_Inherit)) {
+     if (MOZ_LIKELY(parentContext)) {
+       nsStyleContext* grandparentContext = parentContext->GetParent();
+       if (MOZ_LIKELY(grandparentContext)) {
+-        aContext->AddStyleBit(NS_STYLE_USES_GRANDANCESTOR_STYLE);
++        parentContext->AddStyleBit(NS_STYLE_CHILD_USES_GRANDANCESTOR_STYLE);
+       }
+       pos->mAlignSelf =
+         parentPos->ComputedAlignSelf(parentContext->StyleDisplay(),
+                                      grandparentContext);
+     } else {
+       pos->mAlignSelf = NS_STYLE_ALIGN_START;
+     }
+     conditions.SetUncacheable();
+@@ -8095,17 +8084,17 @@ nsRuleNode::ComputePositionData(void* aS
+   }
+ 
+   // justify-self: enum, inherit, initial
+   const auto& justifySelfValue = *aRuleData->ValueForJustifySelf();
+   if (MOZ_UNLIKELY(justifySelfValue.GetUnit() == eCSSUnit_Inherit)) {
+     if (MOZ_LIKELY(parentContext)) {
+       nsStyleContext* grandparentContext = parentContext->GetParent();
+       if (MOZ_LIKELY(grandparentContext)) {
+-        aContext->AddStyleBit(NS_STYLE_USES_GRANDANCESTOR_STYLE);
++        parentContext->AddStyleBit(NS_STYLE_CHILD_USES_GRANDANCESTOR_STYLE);
+       }
+       pos->mJustifySelf =
+         parentPos->ComputedJustifySelf(parentContext->StyleDisplay(),
+                                        grandparentContext);
+     } else {
+       pos->mJustifySelf = NS_STYLE_JUSTIFY_START;
+     }
+     conditions.SetUncacheable();
+diff --git a/layout/style/nsStyleContext.cpp b/layout/style/nsStyleContext.cpp
+--- a/layout/style/nsStyleContext.cpp
++++ b/layout/style/nsStyleContext.cpp
+@@ -384,39 +384,16 @@ nsStyleContext::FindChildWithRules(const
+       AddChild(result);
+     }
+     result->mBits |= NS_STYLE_IS_SHARED;
+   }
+ 
+   return result.forget();
+ }
+ 
+-/* static */ bool
+-nsStyleContext::ListContainsStyleContextThatUsesGrandancestorStyle(const nsStyleContext* aHead)
+-{
+-  if (aHead) {
+-    const nsStyleContext* child = aHead;
+-    do {
+-      if (child->UsesGrandancestorStyle()) {
+-        return true;
+-      }
+-      child = child->mNextSibling;
+-    } while (child != aHead);
+-  }
+-
+-  return false;
+-}
+-
+-bool
+-nsStyleContext::HasChildThatUsesGrandancestorStyle() const
+-{
+-  return ListContainsStyleContextThatUsesGrandancestorStyle(mEmptyChild) ||
+-         ListContainsStyleContextThatUsesGrandancestorStyle(mChild);
+-}
+-
+ const void* nsStyleContext::StyleData(nsStyleStructID aSID)
+ {
+   const void* cachedData = GetCachedStyleData(aSID);
+   if (cachedData)
+     return cachedData; // We have computed data stored on this node in the context tree.
+   // Our rule node will take care of it for us.
+   const void* newData = mRuleNode->GetStyleData(aSID, this, true);
+   if (!nsCachedStyleData::IsReset(aSID)) {
+@@ -1562,18 +1539,18 @@ nsStyleContext::LogStyleContextTree(bool
+     AppendUTF16toUTF8(pseudoTag, pseudo);
+     pseudo.Append(' ');
+   }
+ 
+   nsCString flags;
+   if (IsStyleIfVisited()) {
+     flags.AppendLiteral("IS_STYLE_IF_VISITED ");
+   }
+-  if (UsesGrandancestorStyle()) {
+-    flags.AppendLiteral("USES_GRANDANCESTOR_STYLE ");
++  if (HasChildThatUsesGrandancestorStyle()) {
++    flags.AppendLiteral("CHILD_USES_GRANDANCESTOR_STYLE ");
+   }
+   if (IsShared()) {
+     flags.AppendLiteral("IS_SHARED ");
+   }
+ 
+   nsCString parent;
+   if (aFirst) {
+     parent.AppendPrintf("parent=%p ", mParent);
+diff --git a/layout/style/nsStyleContext.h b/layout/style/nsStyleContext.h
+--- a/layout/style/nsStyleContext.h
++++ b/layout/style/nsStyleContext.h
+@@ -242,31 +242,26 @@ public:
+                    GetStyleIfVisited()->GetParent() == GetParent(),
+                    "parent mismatch");
+     } else {
+       NS_ASSERTION(GetStyleIfVisited()->GetParent() == GetParent(),
+                    "parent mismatch");
+     }
+   }
+ 
+-  // Does this style context, or any of its descendants, have any style values
+-  // that were computed based on this style context's grandparent style context
+-  // or any of the grandparent's ancestors?
+-  bool UsesGrandancestorStyle() const
+-    { return !!(mBits & NS_STYLE_USES_GRANDANCESTOR_STYLE); }
++  // Does any descendant of this style context have any style values
++  // that were computed based on this style context's ancestors?
++  bool HasChildThatUsesGrandancestorStyle() const
++    { return !!(mBits & NS_STYLE_CHILD_USES_GRANDANCESTOR_STYLE); }
+ 
+   // Is this style context shared with a sibling or cousin?
+   // (See nsStyleSet::GetContext.)
+   bool IsShared() const
+     { return !!(mBits & NS_STYLE_IS_SHARED); }
+ 
+-  // Does this style context have any children that return true for
+-  // UsesGrandancestorStyle()?
+-  bool HasChildThatUsesGrandancestorStyle() const;
+-
+   // Tell this style context to cache aStruct as the struct for aSID
+   void SetStyle(nsStyleStructID aSID, void* aStruct);
+ 
+   /**
+    * Returns whether this style context has cached style data for a
+    * given style struct and it does NOT own that struct.  This can
+    * happen because it was inherited from the parent style context, or
+    * because it was stored conditionally on the rule node.
+@@ -469,20 +464,16 @@ private:
+   void AddChild(nsStyleContext* aChild);
+   void RemoveChild(nsStyleContext* aChild);
+ 
+   void* GetUniqueStyleData(const nsStyleStructID& aSID);
+   void* CreateEmptyStyleData(const nsStyleStructID& aSID);
+ 
+   void ApplyStyleFixups(bool aSkipParentDisplayBasedStyleFixup);
+ 
+-  // Helper function for HasChildThatUsesGrandancestorStyle.
+-  static bool ListContainsStyleContextThatUsesGrandancestorStyle(
+-                                                   const nsStyleContext* aHead);
+-
+ #ifdef DEBUG
+   struct AutoCheckDependency {
+ 
+     nsStyleContext* mStyleContext;
+     nsStyleStructID mOuterSID;
+ 
+     AutoCheckDependency(nsStyleContext* aContext, nsStyleStructID aInnerSID)
+       : mStyleContext(aContext)
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -57,18 +57,18 @@ struct nsStyleVisibility;
+ // See nsStyleContext::HasTextDecorationLines
+ #define NS_STYLE_HAS_TEXT_DECORATION_LINES 0x001000000
+ // See nsStyleContext::HasPseudoElementData.
+ #define NS_STYLE_HAS_PSEUDO_ELEMENT_DATA   0x002000000
+ // See nsStyleContext::RelevantLinkIsVisited
+ #define NS_STYLE_RELEVANT_LINK_VISITED     0x004000000
+ // See nsStyleContext::IsStyleIfVisited
+ #define NS_STYLE_IS_STYLE_IF_VISITED       0x008000000
+-// See nsStyleContext::UsesGrandancestorStyle
+-#define NS_STYLE_USES_GRANDANCESTOR_STYLE  0x010000000
++// See nsStyleContext::HasChildThatUsesGrandancestorStyle
++#define NS_STYLE_CHILD_USES_GRANDANCESTOR_STYLE 0x010000000
+ // See nsStyleContext::IsShared
+ #define NS_STYLE_IS_SHARED                 0x020000000
+ // See nsStyleContext::AssertStructsNotUsedElsewhere
+ // (This bit is currently only used in #ifdef DEBUG code.)
+ #define NS_STYLE_IS_GOING_AWAY             0x040000000
+ // See nsStyleContext::ShouldSuppressLineBreak
+ #define NS_STYLE_SUPPRESS_LINEBREAK        0x080000000
+ // See nsStyleContext::IsInDisplayNoneSubtree
