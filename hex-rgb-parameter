@@ -1,0 +1,292 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 567283 patch 2 - Rename NS_HexToRGB to NS_HexToRGBA and add parameter saying whether 4 or 8 digit colors are allowed.
+
+MozReview-Commit-ID: FaLryfxaeHv
+
+diff --git a/dom/base/nsAttrValue.cpp b/dom/base/nsAttrValue.cpp
+--- a/dom/base/nsAttrValue.cpp
++++ b/dom/base/nsAttrValue.cpp
+@@ -1562,17 +1562,17 @@ nsAttrValue::ParseColor(const nsAString&
+     return false;
+   }
+ 
+   nscolor color;
+   // No color names begin with a '#'; in standards mode, all acceptable
+   // numeric colors do.
+   if (colorStr.First() == '#') {
+     nsDependentString withoutHash(colorStr.get() + 1, colorStr.Length() - 1);
+-    if (NS_HexToRGB(withoutHash, &color)) {
++    if (NS_HexToRGBA(withoutHash, nsHexColorType::NoAlpha, &color)) {
+       SetColorValue(color, aString);
+       return true;
+     }
+   } else {
+     if (NS_ColorNameToRGB(colorStr, &color)) {
+       SetColorValue(color, aString);
+       return true;
+     }
+diff --git a/editor/libeditor/nsHTMLCSSUtils.cpp b/editor/libeditor/nsHTMLCSSUtils.cpp
+--- a/editor/libeditor/nsHTMLCSSUtils.cpp
++++ b/editor/libeditor/nsHTMLCSSUtils.cpp
+@@ -1101,17 +1101,17 @@ nsHTMLCSSUtils::IsCSSEquivalentToHTMLInl
+                 aHTMLAttribute->EqualsLiteral("bgcolor"))) {
+       if (htmlValueString.IsEmpty()) {
+         aIsSet = true;
+       } else {
+         nscolor rgba;
+         nsAutoString subStr;
+         htmlValueString.Right(subStr, htmlValueString.Length() - 1);
+         if (NS_ColorNameToRGB(htmlValueString, &rgba) ||
+-            NS_HexToRGB(subStr, &rgba)) {
++            NS_HexToRGBA(subStr, nsHexColorType::NoAlpha, &rgba)) {
+           nsAutoString htmlColor, tmpStr;
+ 
+           if (NS_GET_A(rgba) != 255) {
+             // This should only be hit by the "transparent" keyword, which
+             // currently serializes to "transparent" (not "rgba(0, 0, 0, 0)").
+             MOZ_ASSERT(NS_GET_R(rgba) == 0 && NS_GET_G(rgba) == 0 &&
+                        NS_GET_B(rgba) == 0 && NS_GET_A(rgba) == 0);
+             htmlColor.AppendLiteral("transparent");
+diff --git a/gfx/src/nsColor.cpp b/gfx/src/nsColor.cpp
+--- a/gfx/src/nsColor.cpp
++++ b/gfx/src/nsColor.cpp
+@@ -70,24 +70,29 @@ static int ComponentValue(const char16_t
+     }
+     else {  // not a hex digit, treat it like 0
+       component = (component * 16);
+     }
+   }
+   return component;
+ }
+ 
+-bool NS_HexToRGB(const nsAString& aColorSpec, nscolor* aResult)
++bool
++NS_HexToRGB(const nsAString& aColorSpec, nsHexColorType aType, nscolor* aResult)
+ {
+   const char16_t* buffer = aColorSpec.BeginReading();
+ 
+   int nameLen = aColorSpec.Length();
++  bool hasAlpha = false;
+   if (nameLen != 3 && nameLen != 6) {
+-    // Improperly formatted color value
+-    return false;
++    if ((nameLen != 4 && nameLen != 8) || aType == nsHexColorType::NoAlpha) {
++      // Improperly formatted color value
++      return false;
++    }
++    hasAlpha = true;
+   }
+ 
+   // Make sure the digits are legal
+   for (int i = 0; i < nameLen; i++) {
+     char16_t ch = buffer[i];
+     if (((ch >= '0') && (ch <= '9')) ||
+         ((ch >= 'a') && (ch <= 'f')) ||
+         ((ch >= 'A') && (ch <= 'F'))) {
+@@ -99,27 +104,35 @@ bool NS_HexToRGB(const nsAString& aColor
+   }
+ 
+   // Convert the ascii to binary
+   int dpc = ((3 == nameLen) ? 1 : 2);
+   // Translate components from hex to binary
+   int r = ComponentValue(buffer, nameLen, 0, dpc);
+   int g = ComponentValue(buffer, nameLen, 1, dpc);
+   int b = ComponentValue(buffer, nameLen, 2, dpc);
++  int a;
++  if (hasAlpha) {
++    a = ComponentValue(buffer, nameLen, 3, dpc);
++  } else {
++    a = (nameLen == 1) ? 0xf : 0xff
++  }
+   if (dpc == 1) {
+     // Scale single digit component to an 8 bit value. Replicate the
+     // single digit to compute the new value.
+     r = (r << 4) | r;
+     g = (g << 4) | g;
+     b = (b << 4) | b;
++    a = (a << 4) | a;
+   }
+   NS_ASSERTION((r >= 0) && (r <= 255), "bad r");
+   NS_ASSERTION((g >= 0) && (g <= 255), "bad g");
+   NS_ASSERTION((b >= 0) && (b <= 255), "bad b");
+-  *aResult = NS_RGB(r, g, b);
++  NS_ASSERTION((a >= 0) && (a <= 255), "bad b");
++  *aResult = NS_RGBA(r, g, b, a);
+   return true;
+ }
+ 
+ // This implements part of the algorithm for legacy behavior described in
+ // http://www.whatwg.org/specs/web-apps/current-work/complete/common-microsyntaxes.html#rules-for-parsing-a-legacy-color-value
+ bool NS_LooseHexToRGB(const nsString& aColorSpec, nscolor* aResult)
+ {
+   if (aColorSpec.EqualsLiteral("transparent")) {
+diff --git a/gfx/src/nsColor.h b/gfx/src/nsColor.h
+--- a/gfx/src/nsColor.h
++++ b/gfx/src/nsColor.h
+@@ -40,20 +40,26 @@ typedef uint32_t nscolor;
+ //
+ // equivalent to target=v/255
+ #define FAST_DIVIDE_BY_255(target,v)               \
+   PR_BEGIN_MACRO                                   \
+     unsigned tmp_ = v;                             \
+     target = ((tmp_ << 8) + tmp_ + 255) >> 16;     \
+   PR_END_MACRO
+ 
++enum class nsHexColorType : uint8_t {
++  NoAlpha, // 3 or 6 digit hex colors only
++  AllowAlpha, // 3, 4, 6, or 8 digit hex colors
++};
++
+ // Translate a hex string to a color. Return true if it parses ok,
+ // otherwise return false.
+-// This accepts only 3 or 6 digits
+-bool NS_HexToRGB(const nsAString& aBuf, nscolor* aResult);
++// This accepts the number of digits specified by aType.
++bool
++NS_HexToRGBA(const nsAString& aBuf, nsHexColorType aType, nscolor* aResult);
+ 
+ // Compose one NS_RGB color onto another. The result is what
+ // you get if you draw aFG on top of aBG with operator OVER.
+ nscolor NS_ComposeColors(nscolor aBG, nscolor aFG);
+ 
+ // Translate a hex string to a color. Return true if it parses ok,
+ // otherwise return false.
+ // This version accepts 1 to 9 digits (missing digits are 0)
+diff --git a/gfx/tests/gtest/TestColorNames.cpp b/gfx/tests/gtest/TestColorNames.cpp
+--- a/gfx/tests/gtest/TestColorNames.cpp
++++ b/gfx/tests/gtest/TestColorNames.cpp
+@@ -62,23 +62,24 @@ void RunColorTests() {
+       "failed at index " << index << " out of " << ArrayLength(kColorNames);
+ 
+     // Check that parsing an RGB value in hex gets the right values
+     uint8_t r = NS_GET_R(rgb);
+     uint8_t g = NS_GET_G(rgb);
+     uint8_t b = NS_GET_B(rgb);
+     uint8_t a = NS_GET_A(rgb);
+     if (a != UINT8_MAX) {
+-      // NS_HexToRGB() can not handle a color with alpha channel
++      // FIXME: NS_HexToRGBA() now handle a color with alpha channel!
+       rgb = NS_RGB(r, g, b);
+     }
+     char cbuf[50];
+     snprintf_literal(cbuf, "%02x%02x%02x", r, g, b);
+     nscolor hexrgb;
+-    ASSERT_TRUE(NS_HexToRGB(NS_ConvertASCIItoUTF16(cbuf), &hexrgb)) <<
++    ASSERT_TRUE(NS_HexToRGBA(NS_ConvertASCIItoUTF16(cbuf),
++                             nsHexColorType::NoAlpha, &hexrgb)) <<
+       "hex conversion to color of '" << cbuf << "'";
+     ASSERT_TRUE(hexrgb == rgb);
+   }
+ }
+ 
+ static
+ void RunJunkColorTests() {
+   nscolor rgb;
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -6611,17 +6611,18 @@ CSSParserImpl::ParseColor(nsCSSValue& aV
+   }
+ 
+   nsCSSToken* tk = &mToken;
+   nscolor rgba;
+   switch (tk->mType) {
+     case eCSSToken_ID:
+     case eCSSToken_Hash:
+       // #xxyyzz
+-      if (NS_HexToRGB(tk->mIdent, &rgba)) {
++      // FIXME
++      if (NS_HexToRGBA(tk->mIdent, nsHexColorType::NoAlpha, &rgba)) {
+         MOZ_ASSERT(tk->mIdent.Length() == 3 || tk->mIdent.Length() == 6,
+                    "unexpected hex color length");
+         nsCSSUnit unit = tk->mIdent.Length() == 3 ?
+                            eCSSUnit_ShortHexColor :
+                            eCSSUnit_HexColor;
+         aValue.SetIntegerColorValue(rgba, unit);
+         return CSSParseResult::Ok;
+       }
+@@ -6765,17 +6766,18 @@ CSSParserImpl::ParseColor(nsCSSValue& aV
+           str.Append(tk->mIdent);
+         }
+         break;
+       default:
+         // There is a whole bunch of cases that are
+         // not handled by this switch.  Ignore them.
+         break;
+     }
+-    if (NS_HexToRGB(str, &rgba)) {
++    // FIXME
++    if (NS_HexToRGBA(str, nsHexColorType::NoAlpha, &rgba)) {
+       aValue.SetIntegerColorValue(rgba, eCSSUnit_HexColor);
+       return CSSParseResult::Ok;
+     }
+   }
+ 
+   // It's not a color
+   REPORT_UNEXPECTED_TOKEN(PEColorNotColor);
+   UngetToken();
+diff --git a/widget/gtk/nsColorPicker.cpp b/widget/gtk/nsColorPicker.cpp
+--- a/widget/gtk/nsColorPicker.cpp
++++ b/widget/gtk/nsColorPicker.cpp
+@@ -75,17 +75,17 @@ NS_IMETHODIMP nsColorPicker::Open(nsICol
+   // Input color string should be 7 length (i.e. a string representing a valid
+   // simple color)
+   if (mInitialColor.Length() != 7) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   const nsAString& withoutHash  = StringTail(mInitialColor, 6);
+   nscolor color;
+-  if (!NS_HexToRGB(withoutHash, &color)) {
++  if (!NS_HexToRGBA(withoutHash, nsHexColorType::NoAlpha, &color)) {
+     return NS_ERROR_FAILURE;
+   }
+ 
+   if (mCallback) {
+     // It means Open has already been called: this is not allowed
+     NS_WARNING("mCallback is already set. Open called twice?");
+     return NS_ERROR_FAILURE;
+   }
+diff --git a/widget/nsXPLookAndFeel.cpp b/widget/nsXPLookAndFeel.cpp
+--- a/widget/nsXPLookAndFeel.cpp
++++ b/widget/nsXPLookAndFeel.cpp
+@@ -328,17 +328,18 @@ nsXPLookAndFeel::ColorPrefChanged (unsig
+   nsAutoString colorStr;
+   nsresult rv = Preferences::GetString(prefName, &colorStr);
+   if (NS_FAILED(rv)) {
+     return;
+   }
+   if (!colorStr.IsEmpty()) {
+     nscolor thecolor;
+     if (colorStr[0] == char16_t('#')) {
+-      if (NS_HexToRGB(nsDependentString(colorStr, 1), &thecolor)) {
++      if (NS_HexToRGBA(nsDependentString(colorStr, 1),
++                       nsHexColorType::NoAlpha, &thecolor)) {
+         int32_t id = NS_PTR_TO_INT32(index);
+         CACHE_COLOR(id, thecolor);
+       }
+     } else if (NS_ColorNameToRGB(colorStr, &thecolor)) {
+       int32_t id = NS_PTR_TO_INT32(index);
+       CACHE_COLOR(id, thecolor);
+ #ifdef DEBUG_akkana
+       printf("====== Changed color pref %s to 0x%lx\n",
+@@ -382,17 +383,17 @@ nsXPLookAndFeel::InitColorFromPref(int32
+   nsresult rv = Preferences::GetString(sColorPrefs[i], &colorStr);
+   if (NS_FAILED(rv) || colorStr.IsEmpty()) {
+     return;
+   }
+   nscolor thecolor;
+   if (colorStr[0] == char16_t('#')) {
+     nsAutoString hexString;
+     colorStr.Right(hexString, colorStr.Length() - 1);
+-    if (NS_HexToRGB(hexString, &thecolor)) {
++    if (NS_HexToRGBA(hexString, nsHexColorType::NoAlpha, &thecolor)) {
+       CACHE_COLOR(i, thecolor);
+     }
+   } else if (NS_ColorNameToRGB(colorStr, &thecolor)) {
+     CACHE_COLOR(i, thecolor);
+   }
+ }
+ 
+ // static
