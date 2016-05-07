@@ -1,0 +1,222 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 567283 patch 4 - Support #rgba and #rrggbbaa colors in CSS.
+
+MozReview-Commit-ID: IFq4HxaRkil
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -6611,23 +6611,34 @@ CSSParserImpl::ParseColor(nsCSSValue& aV
+   }
+ 
+   nsCSSToken* tk = &mToken;
+   nscolor rgba;
+   switch (tk->mType) {
+     case eCSSToken_ID:
+     case eCSSToken_Hash:
+       // #xxyyzz
+-      // FIXME
+-      if (NS_HexToRGBA(tk->mIdent, nsHexColorType::NoAlpha, &rgba)) {
+-        MOZ_ASSERT(tk->mIdent.Length() == 3 || tk->mIdent.Length() == 6,
+-                   "unexpected hex color length");
+-        nsCSSUnit unit = tk->mIdent.Length() == 3 ?
+-                           eCSSUnit_ShortHexColor :
+-                           eCSSUnit_HexColor;
++      if (NS_HexToRGBA(tk->mIdent, nsHexColorType::AllowAlpha, &rgba)) {
++        nsCSSUnit unit;
++        switch (tk->mIdent.Length()) {
++          case 3:
++            unit = eCSSUnit_ShortHexColor;
++            break;
++          case 4:
++            unit = eCSSUnit_ShortHexColorAlpha;
++            break;
++          case 6:
++            unit = eCSSUnit_HexColor;
++            break;
++          default:
++            MOZ_FALLTHROUGH_ASSERT("unexpected hex color length");
++          case 8:
++            unit = eCSSUnit_HexColorAlpha;
++            break;
++        }
+         aValue.SetIntegerColorValue(rgba, unit);
+         return CSSParseResult::Ok;
+       }
+       break;
+ 
+     case eCSSToken_Ident:
+       if (NS_ColorNameToRGB(tk->mIdent, &rgba)) {
+         aValue.SetStringValue(tk->mIdent, eCSSUnit_Ident);
+@@ -6766,17 +6777,17 @@ CSSParserImpl::ParseColor(nsCSSValue& aV
+           str.Append(tk->mIdent);
+         }
+         break;
+       default:
+         // There is a whole bunch of cases that are
+         // not handled by this switch.  Ignore them.
+         break;
+     }
+-    // FIXME
++    // The hashless color quirk does not support 4 & 8 digit colors with alpha.
+     if (NS_HexToRGBA(str, nsHexColorType::NoAlpha, &rgba)) {
+       aValue.SetIntegerColorValue(rgba, eCSSUnit_HexColor);
+       return CSSParseResult::Ok;
+     }
+   }
+ 
+   // It's not a color
+   REPORT_UNEXPECTED_TOKEN(PEColorNotColor);
+diff --git a/layout/style/nsCSSValue.cpp b/layout/style/nsCSSValue.cpp
+--- a/layout/style/nsCSSValue.cpp
++++ b/layout/style/nsCSSValue.cpp
+@@ -1442,28 +1442,36 @@ nsCSSValue::AppendToString(nsCSSProperty
+         aResult.Append(comma);
+         aResult.AppendInt(NS_GET_B(color), 10);
+         if (showAlpha) {
+           aResult.Append(comma);
+           aResult.AppendFloat(nsStyleUtil::ColorComponentToFloat(a));
+         }
+         aResult.Append(char16_t(')'));
+       }
+-    } else if (eCSSUnit_HexColor == unit) {
++    } else if (eCSSUnit_HexColor == unit ||
++               eCSSUnit_HexColorAlpha == unit) {
+       nscolor color = GetColorValue();
+       aResult.Append('#');
+       aResult.AppendPrintf("%02x", NS_GET_R(color));
+       aResult.AppendPrintf("%02x", NS_GET_G(color));
+       aResult.AppendPrintf("%02x", NS_GET_B(color));
+-    } else if (eCSSUnit_ShortHexColor == unit) {
++      if (eCSSUnit_HexColorAlpha == unit) {
++        aResult.AppendPrintf("%02x", NS_GET_A(color));
++      }
++    } else if (eCSSUnit_ShortHexColor == unit ||
++               eCSSUnit_ShortHexColorAlpha == unit) {
+       nscolor color = GetColorValue();
+       aResult.Append('#');
+       aResult.AppendInt(NS_GET_R(color) / 0x11, 16);
+       aResult.AppendInt(NS_GET_G(color) / 0x11, 16);
+       aResult.AppendInt(NS_GET_B(color) / 0x11, 16);
++      if (eCSSUnit_ShortHexColorAlpha == unit) {
++        aResult.AppendInt(NS_GET_A(color) / 0x11, 16);
++      }
+     } else {
+       MOZ_ASSERT(IsFloatColorUnit());
+       mValue.mFloatColor->AppendToString(unit, aResult);
+     }
+   }
+   else if (eCSSUnit_URL == unit || eCSSUnit_Image == unit) {
+     aResult.AppendLiteral("url(");
+     nsStyleUtil::AppendEscapedCSSString(
+@@ -1749,16 +1757,18 @@ nsCSSValue::AppendToString(nsCSSProperty
+     case eCSSUnit_Calc_Divided: break;
+     case eCSSUnit_Integer:      break;
+     case eCSSUnit_Enumerated:   break;
+     case eCSSUnit_EnumColor:             break;
+     case eCSSUnit_RGBColor:              break;
+     case eCSSUnit_RGBAColor:             break;
+     case eCSSUnit_HexColor:              break;
+     case eCSSUnit_ShortHexColor:         break;
++    case eCSSUnit_HexColorAlpha:         break;
++    case eCSSUnit_ShortHexColorAlpha:    break;
+     case eCSSUnit_PercentageRGBColor:    break;
+     case eCSSUnit_PercentageRGBAColor:   break;
+     case eCSSUnit_HSLColor:              break;
+     case eCSSUnit_HSLAColor:             break;
+     case eCSSUnit_Percent:      aResult.Append(char16_t('%'));    break;
+     case eCSSUnit_Number:       break;
+     case eCSSUnit_Gradient:     break;
+     case eCSSUnit_TokenStream:  break;
+@@ -1927,16 +1937,18 @@ nsCSSValue::SizeOfExcludingThis(mozilla:
+     case eCSSUnit_EnumColor:
+       break;
+ 
+     // Integer Color: nothing extra to measure.
+     case eCSSUnit_RGBColor:
+     case eCSSUnit_RGBAColor:
+     case eCSSUnit_HexColor:
+     case eCSSUnit_ShortHexColor:
++    case eCSSUnit_HexColorAlpha:
++    case eCSSUnit_ShortHexColorAlpha:
+       break;
+ 
+     // Float Color
+     case eCSSUnit_PercentageRGBColor:
+     case eCSSUnit_PercentageRGBAColor:
+     case eCSSUnit_HSLColor:
+     case eCSSUnit_HSLAColor:
+       n += mValue.mFloatColor->SizeOfIncludingThis(aMallocSizeOf);
+diff --git a/layout/style/nsCSSValue.h b/layout/style/nsCSSValue.h
+--- a/layout/style/nsCSSValue.h
++++ b/layout/style/nsCSSValue.h
+@@ -327,23 +327,25 @@ enum nsCSSUnit {
+   eCSSUnit_Integer      = 70,     // (int) simple value
+   eCSSUnit_Enumerated   = 71,     // (int) value has enumerated meaning
+ 
+   eCSSUnit_EnumColor           = 80,   // (int) enumerated color (kColorKTable)
+   eCSSUnit_RGBColor            = 81,   // (nscolor) an opaque RGBA value specified as rgb()
+   eCSSUnit_RGBAColor           = 82,   // (nscolor) an RGBA value specified as rgba()
+   eCSSUnit_HexColor            = 83,   // (nscolor) an opaque RGBA value specified as #rrggbb
+   eCSSUnit_ShortHexColor       = 84,   // (nscolor) an opaque RGBA value specified as #rgb
+-  eCSSUnit_PercentageRGBColor  = 85,   // (nsCSSValueFloatColor*)
+-  eCSSUnit_PercentageRGBAColor = 86,   // (nsCSSValueFloatColor*)
+-  eCSSUnit_HSLColor            = 87,   // (nsCSSValueFloatColor*)
+-  eCSSUnit_HSLAColor           = 88,   // (nsCSSValueFloatColor*)
++  eCSSUnit_HexColorAlpha       = 85,   // (nscolor) an opaque RGBA value specified as #rrggbbaa
++  eCSSUnit_ShortHexColorAlpha  = 86,   // (nscolor) an opaque RGBA value specified as #rgba
++  eCSSUnit_PercentageRGBColor  = 87,   // (nsCSSValueFloatColor*)
++  eCSSUnit_PercentageRGBAColor = 88,   // (nsCSSValueFloatColor*)
++  eCSSUnit_HSLColor            = 89,   // (nsCSSValueFloatColor*)
++  eCSSUnit_HSLAColor           = 90,   // (nsCSSValueFloatColor*)
+ 
+-  eCSSUnit_Percent      = 90,     // (float) 1.0 == 100%) value is percentage of something
+-  eCSSUnit_Number       = 91,     // (float) value is numeric (usually multiplier, different behavior that percent)
++  eCSSUnit_Percent      = 100,     // (float) 1.0 == 100%) value is percentage of something
++  eCSSUnit_Number       = 101,     // (float) value is numeric (usually multiplier, different behavior that percent)
+ 
+   // Physical length units
+   eCSSUnit_PhysicalMillimeter = 200,   // (float) 1/25.4 inch
+ 
+   // Length units - relative
+   // Viewport relative measure
+   eCSSUnit_ViewportWidth  = 700,    // (float) 1% of the width of the initial containing block
+   eCSSUnit_ViewportHeight = 701,    // (float) 1% of the height of the initial containing block
+@@ -490,32 +492,34 @@ public:
+ 
+   // Checks for the nsCSSValue being of a particular type of color unit:
+   //
+   //   - IsIntegerColorUnit returns true for:
+   //       eCSSUnit_RGBColor             -- rgb(int,int,int)
+   //       eCSSUnit_RGBAColor            -- rgba(int,int,int,float)
+   //       eCSSUnit_HexColor             -- #rrggbb
+   //       eCSSUnit_ShortHexColor        -- #rgb
++  //       eCSSUnit_HexColorAlpha        -- #rrggbbaa
++  //       eCSSUnit_ShortHexColorAlpha   -- #rgba
+   //
+-  //   - IsFLoatColorUnit returns true for:
++  //   - IsFloatColorUnit returns true for:
+   //       eCSSUnit_PercentageRGBColor   -- rgb(%,%,%)
+   //       eCSSUnit_PercentageRGBAColor  -- rgba(%,%,%,float)
+   //       eCSSUnit_HSLColor             -- hsl(float,%,%)
+   //       eCSSUnit_HSLAColor            -- hsla(float,%,%,float)
+   //
+   //   - IsNumericColorUnit returns true for any of the above units.
+   //
+   // Note that color keywords and system colors are represented by
+   // eCSSUnit_EnumColor and eCSSUnit_Ident.
+   bool IsIntegerColorUnit() const { return IsIntegerColorUnit(mUnit); }
+   bool IsFloatColorUnit() const { return IsFloatColorUnit(mUnit); }
+   bool IsNumericColorUnit() const { return IsNumericColorUnit(mUnit); }
+   static bool IsIntegerColorUnit(nsCSSUnit aUnit)
+-  { return eCSSUnit_RGBColor <= aUnit && aUnit <= eCSSUnit_ShortHexColor; }
++  { return eCSSUnit_RGBColor <= aUnit && aUnit <= eCSSUnit_ShortHexColorAlpha; }
+   static bool IsFloatColorUnit(nsCSSUnit aUnit)
+   { return eCSSUnit_PercentageRGBColor <= aUnit &&
+            aUnit <= eCSSUnit_HSLAColor; }
+   static bool IsNumericColorUnit(nsCSSUnit aUnit)
+   { return IsIntegerColorUnit(aUnit) || IsFloatColorUnit(aUnit); }
+ 
+   int32_t GetIntValue() const
+   {
