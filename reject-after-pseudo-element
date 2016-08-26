@@ -1,0 +1,136 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1290825 - Reject various things that aren't user-action pseudo classes when they follow pseudo-elements.
+
+The existing code, from bug 922669, in ParsePseudoSelector that allows things
+to come after a pseudo-element requires that the first character after
+the pseudo-element be a colon.  However, this doesn't forbid things like
+::-moz-color-swatch:hover#foo, which need to be errors in ParseSelector.
+Furthermore, the error-checking in ParsePseudoSelector doesn't prevent
+the pseudo-element from being followed by a :not() or by an additional
+pseudo-element; to fix that this patch moves the test out of the
+pseudo-class condition and also has it test !isPseudoClass.
+
+MozReview-Commit-ID: KxAFSQtPVhu
+
+diff --git a/layout/style/nsCSSParser.cpp b/layout/style/nsCSSParser.cpp
+--- a/layout/style/nsCSSParser.cpp
++++ b/layout/style/nsCSSParser.cpp
+@@ -6017,47 +6017,48 @@ CSSParserImpl::ParsePseudoSelector(int32
+   if (parsingPseudoElement &&
+       !isPseudoElement &&
+       !isAnonBox) {
+     REPORT_UNEXPECTED_TOKEN(PEPseudoSelNotPE);
+     UngetToken();
+     return eSelectorParsingStatus_Error;
+   }
+ 
++  if (aSelector.IsPseudoElement()) {
++    CSSPseudoElementType type = aSelector.PseudoType();
++    if (!nsCSSPseudoElements::PseudoElementSupportsUserActionState(type)) {
++      // We only allow user action pseudo-classes on certain pseudo-elements.
++      REPORT_UNEXPECTED_TOKEN(PEPseudoSelNoUserActionPC);
++      UngetToken();
++      return eSelectorParsingStatus_Error;
++    }
++    if (!isPseudoClass || !pseudoClassIsUserAction) {
++      // CSS 4 Selectors says that pseudo-elements can only be followed by
++      // a user action pseudo-class.
++      REPORT_UNEXPECTED_TOKEN(PEPseudoClassNotUserAction);
++      UngetToken();
++      return eSelectorParsingStatus_Error;
++    }
++  }
++
+   if (!parsingPseudoElement &&
+       CSSPseudoClassType::negation == pseudoClassType) {
+     if (aIsNegated) { // :not() can't be itself negated
+       REPORT_UNEXPECTED_TOKEN(PEPseudoSelDoubleNot);
+       UngetToken();
+       return eSelectorParsingStatus_Error;
+     }
+     // CSS 3 Negation pseudo-class takes one simple selector as argument
+     nsSelectorParsingStatus parsingStatus =
+       ParseNegatedSimpleSelector(aDataMask, aSelector);
+     if (eSelectorParsingStatus_Continue != parsingStatus) {
+       return parsingStatus;
+     }
+   }
+   else if (!parsingPseudoElement && isPseudoClass) {
+-    if (aSelector.IsPseudoElement()) {
+-      CSSPseudoElementType type = aSelector.PseudoType();
+-      if (!nsCSSPseudoElements::PseudoElementSupportsUserActionState(type)) {
+-        // We only allow user action pseudo-classes on certain pseudo-elements.
+-        REPORT_UNEXPECTED_TOKEN(PEPseudoSelNoUserActionPC);
+-        UngetToken();
+-        return eSelectorParsingStatus_Error;
+-      }
+-      if (!pseudoClassIsUserAction) {
+-        // CSS 4 Selectors says that pseudo-elements can only be followed by
+-        // a user action pseudo-class.
+-        REPORT_UNEXPECTED_TOKEN(PEPseudoClassNotUserAction);
+-        UngetToken();
+-        return eSelectorParsingStatus_Error;
+-      }
+-    }
+     aDataMask |= SEL_MASK_PCLASS;
+     if (eCSSToken_Function == mToken.mType) {
+       nsSelectorParsingStatus parsingStatus;
+       if (nsCSSPseudoClasses::HasStringArg(pseudoClassType)) {
+         parsingStatus =
+           ParsePseudoClassWithIdentArg(aSelector, pseudoClassType);
+       }
+       else if (nsCSSPseudoClasses::HasNthPairArg(pseudoClassType)) {
+@@ -6489,23 +6490,17 @@ CSSParserImpl::ParseSelector(nsCSSSelect
+   nsAutoPtr<nsAtomList> pseudoElementArgs;
+   CSSPseudoElementType pseudoElementType = CSSPseudoElementType::NotPseudo;
+ 
+   int32_t dataMask = 0;
+   nsSelectorParsingStatus parsingStatus =
+     ParseTypeOrUniversalSelector(dataMask, *selector, false);
+ 
+   while (parsingStatus == eSelectorParsingStatus_Continue) {
+-    if (eCSSToken_ID == mToken.mType) { // #id
+-      parsingStatus = ParseIDSelector(dataMask, *selector);
+-    }
+-    else if (mToken.IsSymbol('.')) {    // .class
+-      parsingStatus = ParseClassSelector(dataMask, *selector);
+-    }
+-    else if (mToken.IsSymbol(':')) {    // :pseudo
++    if (mToken.IsSymbol(':')) {    // :pseudo
+       parsingStatus = ParsePseudoSelector(dataMask, *selector, false,
+                                           getter_AddRefs(pseudoElement),
+                                           getter_Transfers(pseudoElementArgs),
+                                           &pseudoElementType);
+       if (pseudoElement &&
+           pseudoElementType != CSSPseudoElementType::AnonBox) {
+         // Pseudo-elements other than anonymous boxes are represented with
+         // a special ':' combinator.
+@@ -6513,16 +6508,27 @@ CSSParserImpl::ParseSelector(nsCSSSelect
+         aList->mWeight += selector->CalcWeight();
+ 
+         selector = aList->AddSelector(':');
+ 
+         selector->mLowercaseTag.swap(pseudoElement);
+         selector->mClassList = pseudoElementArgs.forget();
+         selector->SetPseudoType(pseudoElementType);
+       }
++    } else if (selector->IsPseudoElement()) {
++      // Once we parsed a pseudo-element, we can only parse
++      // pseudo-classes (and only a limited set, which
++      // ParsePseudoSelector knows how to handle.
++      parsingStatus = eSelectorParsingStatus_Done;
++      UngetToken();
++      break;
++    } else if (eCSSToken_ID == mToken.mType) { // #id
++      parsingStatus = ParseIDSelector(dataMask, *selector);
++    } else if (mToken.IsSymbol('.')) {    // .class
++      parsingStatus = ParseClassSelector(dataMask, *selector);
+     }
+     else if (mToken.IsSymbol('[')) {    // [attribute
+       parsingStatus = ParseAttributeSelector(dataMask, *selector);
+       if (eSelectorParsingStatus_Error == parsingStatus) {
+         SkipUntil(']');
+       }
+     }
+     else {  // not a selector token, we're done
