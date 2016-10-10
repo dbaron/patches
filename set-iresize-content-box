@@ -1,0 +1,115 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1307853 - Set inline-resize flag when the content-box size is changing (in addition to border-box).
+
+MozReview-Commit-ID: FjUwuQB8g5j
+
+diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
+--- a/layout/generic/ReflowInput.cpp
++++ b/layout/generic/ReflowInput.cpp
+@@ -517,19 +517,35 @@ IsQuirkContainingBlockHeight(const Reflo
+   return true;
+ }
+ 
+ 
+ void
+ ReflowInput::InitResizeFlags(nsPresContext* aPresContext, nsIAtom* aFrameType)
+ {
+   const WritingMode wm = mWritingMode; // just a shorthand
++  // We should report that we have a resize in the inline dimension if
++  // *either* the border-box size or the content-box size in that
++  // dimension has changed.  It might not actually be necessary to do
++  // this if the border-box size has changed and the content-box size
++  // has not changed, but since we've historically used the flag to mean
++  // border-box size change, continue to do that.  (It's possible for
++  // the content-box size to change without a border-box size change or
++  // a style change given a fixed width, box-sizing:border-box, and
++  // percentage padding.
++  // FIXME: Note that this might produce some incorrect results (both
++  // false positives and false negatives) in the presence of style
++  // changes since the current concept of content-box width might
++  // reflect style changes if the UsedPaddingProperty() was not used.
++  // This is not currently a real problem since border and padding
++  // changes currently produce nsChangeHint_NeedDirtyReflow hints.
+   bool isIResize =
+     mFrame->ISize(wm) !=
+-      ComputedISize() + ComputedLogicalBorderPadding().IStartEnd(wm);
++      ComputedISize() + ComputedLogicalBorderPadding().IStartEnd(wm) ||
++    mFrame->ContentISize(wm) != ComputedISize();
+ 
+   if ((mFrame->GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT) &&
+       nsLayoutUtils::FontSizeInflationEnabled(aPresContext)) {
+     // Create our font inflation data if we don't have it already, and
+     // give it our current width information.
+     bool dirty = nsFontInflationData::UpdateFontInflationDataISizeFor(*this) &&
+                  // Avoid running this at the box-to-block interface
+                  // (where we shouldn't be inflating anyway, and where
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -799,16 +799,22 @@ public:
+   nscoord BStart(mozilla::WritingMode aWritingMode,
+                  const nsSize& aContainerSize) const {
+     return GetLogicalPosition(aWritingMode, aContainerSize).B(aWritingMode);
+   }
+   nscoord ISize() const { return ISize(GetWritingMode()); }
+   nscoord ISize(mozilla::WritingMode aWritingMode) const {
+     return GetLogicalSize(aWritingMode).ISize(aWritingMode);
+   }
++  nscoord ContentISize() const { return ContentISize(GetWritingMode()); }
++  nscoord ContentISize(mozilla::WritingMode aWritingMode) const {
++    auto bp = GetLogicalUsedBorderAndPadding(aWritingMode);
++    bp.ApplySkipSides(GetLogicalSkipSides());
++    return std::max(0, ISize(aWritingMode) - bp.IStartEnd(aWritingMode));
++  }
+   nscoord BSize() const { return BSize(GetWritingMode()); }
+   nscoord BSize(mozilla::WritingMode aWritingMode) const {
+     return GetLogicalSize(aWritingMode).BSize(aWritingMode);
+   }
+   nscoord ContentBSize() const { return ContentBSize(GetWritingMode()); }
+   nscoord ContentBSize(mozilla::WritingMode aWritingMode) const {
+     auto bp = GetLogicalUsedBorderAndPadding(aWritingMode);
+     bp.ApplySkipSides(GetLogicalSkipSides());
+diff --git a/layout/style/nsStyleStruct.cpp b/layout/style/nsStyleStruct.cpp
+--- a/layout/style/nsStyleStruct.cpp
++++ b/layout/style/nsStyleStruct.cpp
+@@ -431,16 +431,19 @@ nsStylePadding::CalcDifference(const nsS
+ {
+   if (mPadding == aNewData.mPadding) {
+     return nsChangeHint(0);
+   }
+   // Padding differences can't affect descendant intrinsic sizes, but do need
+   // to force children to reflow so that we can reposition them, since their
+   // offsets are from our frame bounds but our content rect's position within
+   // those bounds is moving.
++  // XXXdbaron: Note that not returning nsChangeHint_NeedDirtyReflow for
++  // mPadding differences would first require fixing the issue at the
++  // start of ReflowInput::InitResizeFlags.
+   return NS_STYLE_HINT_REFLOW & ~nsChangeHint_ClearDescendantIntrinsics;
+ }
+ 
+ nsStyleBorder::nsStyleBorder(StyleStructContext aContext)
+   : mBorderColors(nullptr)
+   , mBorderImageFill(NS_STYLE_BORDER_IMAGE_SLICE_NOFILL)
+   , mBorderImageRepeatH(NS_STYLE_BORDER_IMAGE_REPEAT_STRETCH)
+   , mBorderImageRepeatV(NS_STYLE_BORDER_IMAGE_REPEAT_STRETCH)
+@@ -567,16 +570,19 @@ nsStyleBorder::Destroy(nsPresContext* aC
+     FreeByObjectID(eArenaObjectID_nsStyleBorder, this);
+ }
+ 
+ nsChangeHint
+ nsStyleBorder::CalcDifference(const nsStyleBorder& aNewData) const
+ {
+   // XXXbz we should be able to return a more specific change hint for
+   // at least GetComputedBorder() differences...
++  // XXXdbaron: Note that not returning nsChangeHint_NeedDirtyReflow for
++  // GetComputedBorder() differences would first require fixing the
++  // issue at the start of ReflowInput::InitResizeFlags.
+   if (mTwipsPerPixel != aNewData.mTwipsPerPixel ||
+       GetComputedBorder() != aNewData.GetComputedBorder() ||
+       mFloatEdge != aNewData.mFloatEdge ||
+       mBorderImageOutset != aNewData.mBorderImageOutset ||
+       mBoxDecorationBreak != aNewData.mBoxDecorationBreak) {
+     return NS_STYLE_HINT_REFLOW;
+   }
+ 
