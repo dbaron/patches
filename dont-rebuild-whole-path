@@ -1,0 +1,105 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1305754 - Don't rebuild the whole path in the rule tree when resolving style with replacement.
+
+MozReview-Commit-ID: HdNhDBnOS3u
+
+diff --git a/layout/style/nsStyleSet.cpp b/layout/style/nsStyleSet.cpp
+--- a/layout/style/nsStyleSet.cpp
++++ b/layout/style/nsStyleSet.cpp
+@@ -1514,46 +1514,79 @@ nsStyleSet::RuleNodeWithReplacement(Elem
+                                  eRestyle_CSSAnimations |
+                                  eRestyle_SVGAttrAnimations |
+                                  eRestyle_StyleAttribute |
+                                  eRestyle_StyleAttribute_Animations |
+                                  eRestyle_Force |
+                                  eRestyle_ForceDescendants)),
+              "unexpected replacement bits");
+ 
+-  // FIXME (perf): This should probably not rebuild the whole path, but
+-  // only the path from the last change in the rule tree, like
+-  // ReplaceAnimationRule in nsStyleSet.cpp does.  (That could then
+-  // perhaps share this code, too?)
+-  // But if we do that, we'll need to pass whether we are rebuilding the
+-  // rule tree from ElementRestyler::RestyleSelf to avoid taking that
+-  // path when we're rebuilding the rule tree.
+-
+   // This array can be hot and often grows to ~20 elements, so inline storage
+   // is best.
+   AutoTArray<RuleNodeInfo, 30> rules;
+-  for (nsRuleNode* ruleNode = aOldRuleNode; !ruleNode->IsRoot();
+-       ruleNode = ruleNode->GetParent()) {
+-    RuleNodeInfo* curRule = rules.AppendElement();
+-    curRule->mRule = ruleNode->GetRule();
+-    curRule->mLevel = ruleNode->GetLevel();
+-    curRule->mIsImportant = ruleNode->IsImportantRule();
+-    curRule->mIsAnimationRule = ruleNode->IsAnimationRule();
++
++  CascadeLevel* startingLevel = gCascadeLevels;
++  nsRuleNode* startingNode = mRuleTree;
++  if (mInReconstruct) {
++    for (nsRuleNode* ruleNode = aOldRuleNode; !ruleNode->IsRoot();
++         ruleNode = ruleNode->GetParent()) {
++      RuleNodeInfo* curRule = rules.AppendElement();
++      curRule->mRule = ruleNode->GetRule();
++      curRule->mLevel = ruleNode->GetLevel();
++      curRule->mIsImportant = ruleNode->IsImportantRule();
++      curRule->mIsAnimationRule = ruleNode->IsAnimationRule();
++    }
++  } else {
++    MOZ_ASSERT(aReplacements != nsRestyleHint(0),
++               "should not be called (asking for the identity function)");
++
++    // Replace only part of the path in the rule tree.
++    nsRestyleHint remainingReplacements = aReplacements;
++    nsRuleNode* ruleNode = aOldRuleNode;
++    for (const CascadeLevel *level = ArrayEnd(gCascadeLevels) - 1;
++         level-- != gCascadeLevels; ) {
++      if (level->mLevelReplacementHint & aReplacements) {
++        remainingReplacements &= ~level->mLevelReplacementHint;
++        if (remainingReplacements == nsRestyleHint(0)) {
++          // We've found the part of the path in the rule tree we
++          // need to replace.
++          startingLevel = level;
++          startingNode = ruleNode;
++          break;
++        }
++      }
++      SheetType nodeLevel;
++      bool nodeIsImportant;
++      while (!ruleNode->IsRoot() &&
++             (nodeLevel = ruleNode->GetLevel()) == level->mLevel &&
++             (nodeIsImportant = ruleNode->IsImportantRule()) ==
++               level->mIsImportant) {
++        RuleNodeInfo* curRule = rules.AppendElement();
++        curRule->mRule = ruleNode->GetRule();
++        curRule->mLevel = nodeLevel;
++        curRule->mIsImportant = nodeIsImportant;
++        curRule->mIsAnimationRule = ruleNode->IsAnimationRule();
++
++        ruleNode = ruleNode->GetParent();
++      }
++    }
++    MOZ_ASSERT(remainingReplacements == nsRestyleHint(0)
+   }
+ 
+   nsRuleWalker ruleWalker(mRuleTree, mAuthorStyleDisabled);
++  ruleWalker.SetCurrentNode(startingNode);
+   auto rulesIndex = rules.Length();
+ 
+   // We need to transfer this information between the non-!important and
+   // !important phases for the style attribute level.
+   nsRuleNode* lastScopedRN = nullptr;
+   nsRuleNode* lastStyleAttrRN = nullptr;
+   bool haveImportantStyleAttrRules = false;
+ 
+-  for (const CascadeLevel *level = gCascadeLevels,
++  for (const CascadeLevel *level = startingLevel,
+                        *levelEnd = ArrayEnd(gCascadeLevels);
+        level != levelEnd; ++level) {
+ 
+     bool doReplace = level->mLevelReplacementHint & aReplacements;
+ 
+     ruleWalker.SetLevel(level->mLevel, level->mIsImportant,
+                         level->mCheckForImportantRules && doReplace);
+ 
