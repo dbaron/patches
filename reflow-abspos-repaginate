@@ -1,0 +1,63 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1308876 - Reflow absolutely positioned children when they need to be repaginated.  r?dholbert
+
+This (TEST THIS!) fixes the failure of
+layout/reftests/pagination/dynamic-abspos-overflow-01-cols.xhtml with
+the primary patch in this bug.  Like some of the other such failures, I
+believe it's a preexisting bug that could be tested independently, but I
+haven't attempted to write a separate testcase.
+
+MozReview-Commit-ID: 6ISgSEYyMiN
+
+diff --git a/layout/generic/nsAbsoluteContainingBlock.cpp b/layout/generic/nsAbsoluteContainingBlock.cpp
+--- a/layout/generic/nsAbsoluteContainingBlock.cpp
++++ b/layout/generic/nsAbsoluteContainingBlock.cpp
+@@ -108,33 +108,46 @@ nsAbsoluteContainingBlock::RemoveFrame(n
+   }
+ 
+   mAbsoluteFrames.DestroyFrame(aOldFrame);
+ }
+ 
+ void
+ nsAbsoluteContainingBlock::Reflow(nsContainerFrame*        aDelegatingFrame,
+                                   nsPresContext*           aPresContext,
+-                                  const ReflowInput& aReflowInput,
++                                  const ReflowInput&       aReflowInput,
+                                   nsReflowStatus&          aReflowStatus,
+                                   const nsRect&            aContainingBlock,
+                                   AbsPosReflowFlags        aFlags,
+                                   nsOverflowAreas*         aOverflowAreas)
+ {
+   nsReflowStatus reflowStatus;
+ 
+   const bool reflowAll = aReflowInput.ShouldReflowAllKids();
+   const bool isGrid = !!(aFlags & AbsPosReflowFlags::eIsGridContainerCB);
+   nsIFrame* kidFrame;
+   nsOverflowContinuationTracker tracker(aDelegatingFrame, true);
+   for (kidFrame = mAbsoluteFrames.FirstChild(); kidFrame; kidFrame = kidFrame->GetNextSibling()) {
+     bool kidNeedsReflow = reflowAll || NS_SUBTREE_DIRTY(kidFrame) ||
+       FrameDependsOnContainer(kidFrame,
+                               !!(aFlags & AbsPosReflowFlags::eCBWidthChanged),
+                               !!(aFlags & AbsPosReflowFlags::eCBHeightChanged));
++    if (!kidNeedsReflow) {
++      // If we need to redo pagination on the kid, we need to reflow it.
++      // This can happen either if the available height shrunk and the
++      // kid is now too large to fit in the available height, or if the
++      // available height has increased and the kid has a next-in-flow
++      // that we might need to pull from.
++      nscoord availBSize = aReflowInput.AvailableBSize();
++      nscoord kidBEnd = kid->GetLogicalRect().BEnd(aReflowInput.GetWritingMode());
++      if (kidBEnd != availBSize &&
++          (kidBEnd > availBSize || kid->GetNextInFlow())) {
++        kidNeedsReflow = true;
++      }
++    }
+     if (kidNeedsReflow && !aPresContext->HasPendingInterrupt()) {
+       // Reflow the frame
+       nsReflowStatus kidStatus;
+       const nsRect& cb = isGrid ? nsGridContainerFrame::GridItemCB(kidFrame)
+                                 : aContainingBlock;
+       ReflowAbsoluteFrame(aDelegatingFrame, aPresContext, aReflowInput, cb,
+                           aFlags, kidFrame, kidStatus, aOverflowAreas);
+       nsIFrame* nextFrame = kidFrame->GetNextInFlow();
