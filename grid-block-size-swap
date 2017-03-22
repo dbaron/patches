@@ -1,0 +1,85 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1308876 - Make nsGridContainerFrame call ReflowInput::SetBResize(true) because of auto-block-size swapping between measuring reflows and regular reflows.  r?mats
+
+This fixes (TEST THIS!) the failure of
+layout/reftests/css-grid/grid-min-max-content-sizing-002.html with the
+primary patch in this bug (which causes a child whose parent is dirty to
+pick up the dirty bit from the parent only the first reflow of the child
+if the parent reflows the child multiple times).
+
+The failure was caused by an error in height calculation of the first
+<x> in the test.  The div that is the parent of that x has a definite
+height (presumably due to rules in grid), and the x has a specified
+height.  The div gets three reflows:  two measuring reflows (from
+MinContentContribution and then from MaxContentContribution) and then a
+final reflow from nsGridContainerFrame::ReflowInFlowChild.  Prior to the
+primary patch in this bug, the div was marked dirty on all three
+reflows, but with it it is marked dirty only on the first.  This means
+that, without the block-resize flag, the div optimizes away the reflow
+of its children, since ShouldReflowAllKids returns false because
+IsBResize() is false, even though NS_FRAME_CONTAINS_RELATIVE_BSIZE is
+correctly set.
+
+In order to fix this, we need to make sure the BResize flag on the
+reflow state in at least some cases (see the comments in the patch for
+when, and for how the cases could be optimized in the future).
+
+MozReview-Commit-ID: JQOdVTQIkU0
+
+diff --git a/layout/generic/nsGridContainerFrame.cpp b/layout/generic/nsGridContainerFrame.cpp
+--- a/layout/generic/nsGridContainerFrame.cpp
++++ b/layout/generic/nsGridContainerFrame.cpp
+@@ -3707,16 +3707,26 @@ MeasuringReflow(nsIFrame*           aChi
+   if (aBMinSizeClamp != NS_MAXSIZE) {
+     riFlags |= ReflowInput::B_CLAMP_MARGIN_BOX_MIN_SIZE;
+     aChild->Properties().Set(nsIFrame::BClampMarginBoxMinSizeProperty(),
+                              aBMinSizeClamp);
+   } else {
+     aChild->Properties().Delete(nsIFrame::BClampMarginBoxMinSizeProperty());
+   }
+   ReflowInput childRI(pc, *rs, aChild, aAvailableSize, &aCBSize, riFlags);
++
++  // Because we pass ReflowInput::COMPUTE_SIZE_USE_AUTO_BSIZE, and the
++  // previous reflow of the child might not have, set the child's
++  // block-resize flag to true.
++  // FIXME (perf): It would be faster to do this only if the previous
++  // reflow of the child was not a measuring reflow, and only if the
++  // child does some of the things that are affected by
++  // ReflowInput::COMPUTE_SIZE_USE_AUTO_BSIZE.
++  childRI.SetBResize(true);
++
+   ReflowOutput childSize(childRI);
+   nsReflowStatus childStatus;
+   const uint32_t flags = NS_FRAME_NO_MOVE_FRAME | NS_FRAME_NO_SIZE_VIEW;
+   WritingMode wm = childRI.GetWritingMode();
+   parent->ReflowChild(aChild, pc, childSize, childRI, wm,
+                       LogicalPoint(wm), nsSize(), flags, childStatus);
+   parent->FinishReflowChild(aChild, pc, childSize, &childRI, wm,
+                             LogicalPoint(wm), nsSize(), flags);
+@@ -5236,16 +5246,25 @@ nsGridContainerFrame::ReflowInFlowChild(
+   if (!isConstrainedBSize) {
+     childCBSize.BSize(childWM) = NS_UNCONSTRAINEDSIZE;
+   }
+   LogicalSize percentBasis(cb.Size(wm).ConvertTo(childWM, wm));
+   ReflowInput childRI(pc, *aState.mReflowInput, aChild, childCBSize,
+                       &percentBasis, flags);
+   childRI.mFlags.mIsTopOfPage = aFragmentainer ? aFragmentainer->mIsTopOfPage : false;
+ 
++  // Because we pass ReflowInput::COMPUTE_SIZE_USE_AUTO_BSIZE, and the
++  // previous reflow of the child might not have, set the child's
++  // block-resize flag to true.
++  // FIXME (perf): It would be faster to do this only if the previous
++  // reflow of the child was a measuring reflow, and only if the child
++  // does some of the things that are affected by
++  // ReflowInput::COMPUTE_SIZE_USE_AUTO_BSIZE.
++  childRI.SetBResize(true);
++
+   // A table-wrapper needs to propagate the CB size we give it to its
+   // inner table frame later.  @see nsTableWrapperFrame::InitChildReflowInput.
+   if (childType == nsGkAtoms::tableWrapperFrame) {
+     const auto& props = aChild->Properties();
+     LogicalSize* cb = props.Get(nsTableWrapperFrame::GridItemCBSizeProperty());
+     if (!cb) {
+       cb = new LogicalSize(childWM);
+       props.Set(nsTableWrapperFrame::GridItemCBSizeProperty(), cb);
