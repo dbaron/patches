@@ -1,0 +1,264 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1352056 - Call nsIFrame::StyleDisplay less from nsFrame::FinishAndStoreOverflow.
+
+MozReview-Commit-ID: 5zuNLfyPv8o
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -1300,20 +1300,20 @@ nsIFrame::GetMarginRectRelativeToSelf() 
+   nsMargin m = GetUsedMargin();
+   m.ApplySkipSides(GetSkipSides());
+   nsRect r(0, 0, mRect.width, mRect.height);
+   r.Inflate(m);
+   return r;
+ }
+ 
+ bool
+-nsIFrame::IsTransformed() const
++nsIFrame::IsTransformed(const nsStyleDisplay* aStyleDisplay) const
+ {
+   return ((mState & NS_FRAME_MAY_BE_TRANSFORMED) &&
+-          (StyleDisplay()->HasTransform(this) ||
++          (StyleDisplayWithOptionalParam(aStyleDisplay)->HasTransform(this) ||
+            IsSVGTransformed() ||
+            (mContent &&
+             nsLayoutUtils::HasAnimationOfProperty(this,
+                                                   eCSSProperty_transform) &&
+             IsFrameOfType(eSupportsCSSTransforms) &&
+             mContent->GetPrimaryFrame() == this)));
+ }
+ 
+@@ -1355,22 +1355,22 @@ nsIFrame::Extend3DContext() const
+ 
+   const nsStyleEffects* effects = StyleEffects();
+   return !nsFrame::ShouldApplyOverflowClipping(this, disp) &&
+          !GetClipPropClipRect(disp, effects, GetSize()) &&
+          !nsSVGIntegrationUtils::UsingEffectsForFrame(this);
+ }
+ 
+ bool
+-nsIFrame::Combines3DTransformWithAncestors() const
++nsIFrame::Combines3DTransformWithAncestors(nsStyleDisplay* aStyleDisplay) const
+ {
+   if (!GetParent() || !GetParent()->Extend3DContext()) {
+     return false;
+   }
+-  return IsTransformed() || BackfaceIsHidden();
++  return IsTransformed(aStyleDisplay) || BackfaceIsHidden(aStyleDisplay);
+ }
+ 
+ bool
+ nsIFrame::In3DContextAndBackfaceIsHidden() const
+ {
+   return Combines3DTransformWithAncestors() && BackfaceIsHidden();
+ }
+ 
+@@ -2376,17 +2376,17 @@ nsIFrame::BuildDisplayListForStackingCon
+   }
+ 
+   // For preserves3d, use the dirty rect already installed on the
+   // builder, since aDirtyRect maybe distorted for transforms along
+   // the chain.
+   nsRect dirtyRect = aDirtyRect;
+ 
+   bool inTransform = aBuilder->IsInTransform();
+-  bool isTransformed = IsTransformed();
++  bool isTransformed = IsTransformed(disp);
+   bool hasPerspective = HasPerspective();
+   // reset blend mode so we can keep track if this stacking context needs have
+   // a nsDisplayBlendContainer. Set the blend mode back when the routine exits
+   // so we keep track if the parent stacking context needs a container too.
+   AutoSaveRestoreContainsBlendMode autoRestoreBlendMode(*aBuilder);
+   aBuilder->SetContainsBlendMode(false);
+  
+   nsRect dirtyRectOutsideTransform = dirtyRect;
+@@ -2995,17 +2995,17 @@ nsIFrame::BuildDisplayListForChild(nsDis
+   }
+ 
+   // Child is composited if it's transformed, partially transparent, or has
+   // SVG effects or a blend mode..
+   const nsStyleDisplay* disp = child->StyleDisplay();
+   const nsStyleEffects* effects = child->StyleEffects();
+   const nsStylePosition* pos = child->StylePosition();
+   bool isVisuallyAtomic = child->HasOpacity()
+-    || child->IsTransformed()
++    || child->IsTransformed(disp)
+     // strictly speaking, 'perspective' doesn't require visual atomicity,
+     // but the spec says it acts like the rest of these
+     || disp->mChildPerspective.GetUnit() == eStyleUnit_Coord
+     || effects->mMixBlendMode != NS_STYLE_BLEND_NORMAL
+     || nsSVGIntegrationUtils::UsingEffectsForFrame(child);
+ 
+   bool isPositioned = disp->IsAbsPosContainingBlock(child);
+   bool isStackingContext =
+@@ -8900,20 +8900,23 @@ ComputeAndIncludeOutlineArea(nsIFrame* a
+ 
+ bool
+ nsIFrame::FinishAndStoreOverflow(nsOverflowAreas& aOverflowAreas,
+                                  nsSize aNewSize, nsSize* aOldSize)
+ {
+   MOZ_ASSERT(FrameMaintainsOverflow(),
+              "Don't call - overflow rects not maintained on these SVG frames");
+ 
++  const nsStyleDisplay* disp = StyleDisplay();
++  bool hasTransform = IsTransformed(disp);
++
+   nsRect bounds(nsPoint(0, 0), aNewSize);
+   // Store the passed in overflow area if we are a preserve-3d frame or we have
+   // a transform, and it's not just the frame bounds.
+-  if (Combines3DTransformWithAncestors() || IsTransformed()) {
++  if (Combines3DTransformWithAncestors(disp) || hasTransform) {
+     if (!aOverflowAreas.VisualOverflow().IsEqualEdges(bounds) ||
+         !aOverflowAreas.ScrollableOverflow().IsEqualEdges(bounds)) {
+       nsOverflowAreas* initial =
+         Properties().Get(nsIFrame::InitialOverflowProperty());
+       if (!initial) {
+         Properties().Set(nsIFrame::InitialOverflowProperty(),
+                          new nsOverflowAreas(aOverflowAreas));
+       } else if (initial != &aOverflowAreas) {
+@@ -8947,17 +8950,16 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+                  r->Contains(nsRect(nsPoint(0,0), aNewSize)),
+                  "Computed overflow area must contain frame bounds");
+   }
+ 
+   // If we clip our children, clear accumulated overflow area. The
+   // children are actually clipped to the padding-box, but since the
+   // overflow area should include the entire border-box, just set it to
+   // the border-box here.
+-  const nsStyleDisplay* disp = StyleDisplay();
+   NS_ASSERTION((disp->mOverflowY == NS_STYLE_OVERFLOW_CLIP) ==
+                (disp->mOverflowX == NS_STYLE_OVERFLOW_CLIP),
+                "If one overflow is clip, the other should be too");
+   if (nsFrame::ShouldApplyOverflowClipping(this, disp)) {
+     // The contents are actually clipped to the padding area 
+     aOverflowAreas.SetAllTo(bounds);
+   }
+ 
+@@ -9001,17 +9003,16 @@ nsIFrame::FinishAndStoreOverflow(nsOverf
+   if (clipPropClipRect) {
+     NS_FOR_FRAME_OVERFLOW_TYPES(otype) {
+       nsRect& o = aOverflowAreas.Overflow(otype);
+       o.IntersectRect(o, *clipPropClipRect);
+     }
+   }
+ 
+   /* If we're transformed, transform the overflow rect by the current transformation. */
+-  bool hasTransform = IsTransformed();
+   nsSize oldSize = mRect.Size();
+   bool sizeChanged = ((aOldSize ? *aOldSize : oldSize) != aNewSize);
+ 
+   /* Since our size might not actually have been computed yet, we need to make sure that we use the
+    * correct dimensions by overriding the stored bounding rectangle with the value the caller has
+    * ensured us we'll use.
+    */
+   SetSize(aNewSize);
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -760,21 +760,32 @@ public:
+    * Define typesafe getter functions for each style struct by
+    * preprocessing the list of style structs.  These functions are the
+    * preferred way to get style data.  The macro creates functions like:
+    *   const nsStyleBorder* StyleBorder();
+    *   const nsStyleColor* StyleColor();
+    *
+    * Callers outside of libxul should use nsIDOMWindow::GetComputedStyle()
+    * instead of these accessors.
++   *
++   * Callers can use Style*WithOptionalParam if they're in a function that
++   * has an optional parameter to pass the style struct.
+    */
+   #define STYLE_STRUCT(name_, checkdata_cb_)                                  \
+     const nsStyle##name_ * Style##name_ () const {                            \
+       NS_ASSERTION(mStyleContext, "No style context found!");                 \
+       return mStyleContext->Style##name_ ();                                  \
++    }                                                                         \
++    const nsStyle##name_ * Style##name_##WithOptionalParam(                   \
++                             const nsStyle##name_ * aStyleStruct)             \
++      if (aStyleStruct) {                                                     \
++        MOZ_ASSERT(aStyleStruct == Style##name_());                           \
++        return aStyleStruct;                                                  \
++      }                                                                       \
++      return Style##name_();                                                  \
+     }
+   #include "nsStyleStructList.h"
+   #undef STYLE_STRUCT
+ 
+   /** Also forward GetVisitedDependentColor to the style context */
+   template<typename T, typename S>
+   nscolor GetVisitedDependentColor(T S::* aField)
+     { return mStyleContext->GetVisitedDependentColor(aField); }
+@@ -1633,18 +1644,21 @@ public:
+     return Properties().Get(RefusedAsyncAnimationProperty());
+   }
+ 
+   /**
+    * Returns true if this frame is transformed (e.g. has CSS or SVG transforms)
+    * or if its parent is an SVG frame that has children-only transforms (e.g.
+    * an SVG viewBox attribute) or if its transform-style is preserve-3d or
+    * the frame has transform animations.
++   *
++   * @param aStyleDisplay:  If the caller has this->StyleDisplay(), providing
++   *   it here will improve performance.
+    */
+-  bool IsTransformed() const;
++  bool IsTransformed(const nsStyleDisplay* aStyleDisplay) const;
+ 
+   /**
+    * Returns true if the frame is translucent or the frame has opacity
+    * animations for the purposes of creating a stacking context.
+    */
+   bool HasOpacity() const
+   {
+     return HasOpacityInternal(1.0f);
+@@ -1683,18 +1697,22 @@ public:
+    * or svg effects.
+    */
+   bool Extend3DContext() const;
+ 
+   /**
+    * Returns whether this frame has a parent that Extend3DContext() and has
+    * its own transform (or hidden backface) to be combined with the parent's
+    * transform.
++   *
++   * @param aStyleDisplay:  If the caller has this->StyleDisplay(), providing
++   *   it here will improve performance.
+    */
+-  bool Combines3DTransformWithAncestors() const;
++  bool Combines3DTransformWithAncestors(const nsStyleDisplay* aStyleDisplay
++                                          = nullptr) const;
+ 
+   /**
+    * Returns whether this frame has a hidden backface and has a parent that
+    * Extend3DContext(). This is useful because in some cases the hidden
+    * backface can safely be ignored if it could not be visible anyway.
+    */
+   bool In3DContextAndBackfaceIsHidden() const;
+ 
+@@ -3620,18 +3638,22 @@ public:
+   /**
+    * Returns the content node within the anonymous content that this frame
+    * generated and which corresponds to the specified pseudo-element type,
+    * or nullptr if there is no such anonymous content.
+    */
+   virtual mozilla::dom::Element*
+   GetPseudoElement(mozilla::CSSPseudoElementType aType);
+ 
+-  bool BackfaceIsHidden() const {
+-    return StyleDisplay()->BackfaceIsHidden();
++  /*
++   * @param aStyleDisplay:  If the caller has this->StyleDisplay(), providing
++   *   it here will improve performance.
++   */
++  bool BackfaceIsHidden(const nsStyleDisplay* aStyleDisplay = nullptr) const {
++    return StyleDisplayWithOptionalParam(aStyleDisplay)->BackfaceIsHidden();
+   }
+ 
+   /**
+    * Returns true if the frame is scrolled out of view.
+    */
+   bool IsScrolledOutOfView();
+ 
+   /**
