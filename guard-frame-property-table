@@ -1,0 +1,143 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Guard access to the frame property table with a frame state bit.
+
+MozReview-Commit-ID: BScmDUlWq65
+
+diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable.cpp
+--- a/layout/base/FramePropertyTable.cpp
++++ b/layout/base/FramePropertyTable.cpp
+@@ -17,16 +17,17 @@ FramePropertyTable::SetInternal(
+ {
+   MOZ_ASSERT(NS_IsMainThread());
+   NS_ASSERTION(aFrame, "Null frame?");
+   NS_ASSERTION(aProperty, "Null property?");
+ 
+   if (mLastFrame != aFrame || !mLastEntry) {
+     mLastFrame = aFrame;
+     mLastEntry = mEntries.PutEntry(aFrame);
++    aFrame->AddStateBits(NS_FRAME_HAS_PROPERTIES);
+   }
+   Entry* entry = mLastEntry;
+ 
+   if (!entry->mProp.IsArray()) {
+     if (!entry->mProp.mProperty) {
+       // Empty entry, so we can just store our property in the empty slot
+       entry->mProp.mProperty = aProperty;
+       entry->mProp.mValue = aValue;
+@@ -67,26 +68,31 @@ FramePropertyTable::GetInternal(
+ {
+   NS_ASSERTION(aFrame, "Null frame?");
+   NS_ASSERTION(aProperty, "Null property?");
+ 
+   if (aFoundResult) {
+     *aFoundResult = false;
+   }
+ 
++  if (!(aFrame->GetStateBits() & NS_FRAME_HAS_PROPERTIES)) {
++    return nullptr;
++  }
++
+   // We can end up here during parallel style traversal, in which case the main
+   // thread is blocked. Reading from the cache is fine on any thread, but we
+   // only want to write to it in the main-thread case.
+   bool cacheHit = mLastFrame == aFrame;
+   Entry* entry = cacheHit ? mLastEntry : mEntries.GetEntry(aFrame);
+   if (!cacheHit && !ServoStyleSet::IsInServoTraversal()) {
+     mLastFrame = aFrame;
+     mLastEntry = entry;
+   }
+ 
++  MOZ_ASSERT(entry, "frame has NS_FRAME_HAS_PROPERTIES set");
+   if (!entry)
+     return nullptr;
+ 
+   if (entry->mProp.mProperty == aProperty) {
+     if (aFoundResult) {
+       *aFoundResult = true;
+     }
+     return entry->mProp.mValue;
+@@ -116,31 +122,37 @@ FramePropertyTable::RemoveInternal(
+   MOZ_ASSERT(NS_IsMainThread());
+   NS_ASSERTION(aFrame, "Null frame?");
+   NS_ASSERTION(aProperty, "Null property?");
+ 
+   if (aFoundResult) {
+     *aFoundResult = false;
+   }
+ 
++  if (!(aFrame->GetStateBits() & NS_FRAME_HAS_PROPERTIES)) {
++    return nullptr;
++  }
++
+   if (mLastFrame != aFrame) {
+     mLastFrame = aFrame;
+     mLastEntry = mEntries.GetEntry(aFrame);
+   }
+   Entry* entry = mLastEntry;
++  MOZ_ASSERT(entry, "frame has NS_FRAME_HAS_PROPERTIES set");
+   if (!entry)
+     return nullptr;
+ 
+   if (entry->mProp.mProperty == aProperty) {
+     // There's only one entry and it's the one we want
+     void* value = entry->mProp.mValue;
+ 
+     // Here it's ok to use RemoveEntry() -- which may resize mEntries --
+     // because we null mLastEntry at the same time.
+     mEntries.RemoveEntry(entry);
++    aFrame->RemoveStateBits(NS_FRAME_HAS_PROPERTIES);
+     mLastEntry = nullptr;
+     if (aFoundResult) {
+       *aFoundResult = true;
+     }
+     return value;
+   }
+   if (!entry->mProp.IsArray()) {
+     // There's just one property and it's not the one we want, bail
+@@ -205,17 +217,22 @@ FramePropertyTable::DeleteAllForEntry(En
+   array->~nsTArray<PropertyValue>();
+ }
+ 
+ void
+ FramePropertyTable::DeleteAllFor(const nsIFrame* aFrame)
+ {
+   NS_ASSERTION(aFrame, "Null frame?");
+ 
++  if (!(aFrame->GetStateBits() & NS_FRAME_HAS_PROPERTIES)) {
++    return nullptr;
++  }
++
+   Entry* entry = mEntries.GetEntry(aFrame);
++  MOZ_ASSERT(entry, "frame has NS_FRAME_HAS_PROPERTIES set");
+   if (!entry)
+     return;
+ 
+   if (mLastFrame == aFrame) {
+     // Flush cache. We assume DeleteAllForEntry will be called before
+     // a frame is destroyed.
+     mLastFrame = nullptr;
+     mLastEntry = nullptr;
+diff --git a/layout/generic/nsFrameStateBits.h b/layout/generic/nsFrameStateBits.h
+--- a/layout/generic/nsFrameStateBits.h
++++ b/layout/generic/nsFrameStateBits.h
+@@ -265,16 +265,19 @@ FRAME_STATE_BIT(Generic, 53, NS_FRAME_IS
+ 
+ // Frame has a LayerActivityProperty property
+ FRAME_STATE_BIT(Generic, 54, NS_FRAME_HAS_LAYER_ACTIVITY_PROPERTY)
+ 
+ // Frame owns anonymous boxes whose style contexts it will need to update during
+ // a stylo tree traversal.
+ FRAME_STATE_BIT(Generic, 55, NS_FRAME_OWNS_ANON_BOXES)
+ 
++// Frame has properties in the properties hash.
++FRAME_STATE_BIT(Generic, 56, NS_FRAME_HAS_PROPERTIES)
++
+ // Set for all descendants of MathML sub/supscript elements (other than the
+ // base frame) to indicate that the SSTY font feature should be used.
+ FRAME_STATE_BIT(Generic, 58, NS_FRAME_MATHML_SCRIPT_DESCENDANT)
+ 
+ // This state bit is set on frames within token MathML elements if the
+ // token represents an <mi> tag whose inner HTML consists of a single
+ // non-whitespace character to allow special rendering behaviour.
+ FRAME_STATE_BIT(Generic, 59, NS_FRAME_IS_IN_SINGLE_CHAR_MI)
