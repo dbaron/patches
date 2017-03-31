@@ -25,7 +25,18 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
        // Empty entry, so we can just store our property in the empty slot
        entry->mProp.mProperty = aProperty;
        entry->mProp.mValue = aValue;
-@@ -67,26 +68,31 @@ FramePropertyTable::GetInternal(
+@@ -58,35 +59,41 @@ FramePropertyTable::SetInternal(
+     return;
+   }
+ 
+   array->AppendElement(PropertyValue(aProperty, aValue));
+ }
+ 
+ void*
+ FramePropertyTable::GetInternal(
+-  const nsIFrame* aFrame, UntypedDescriptor aProperty, bool* aFoundResult)
++  const nsIFrame* aFrame, UntypedDescriptor aProperty, bool aSkipBitCheck,
++  bool* aFoundResult)
  {
    NS_ASSERTION(aFrame, "Null frame?");
    NS_ASSERTION(aProperty, "Null property?");
@@ -34,7 +45,7 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
      *aFoundResult = false;
    }
  
-+  if (!(aFrame->GetStateBits() & NS_FRAME_HAS_PROPERTIES)) {
++  if (!aSkipBitCheck && !(aFrame->GetStateBits() & NS_FRAME_HAS_PROPERTIES)) {
 +    return nullptr;
 +  }
 +
@@ -48,7 +59,7 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
      mLastEntry = entry;
    }
  
-+  MOZ_ASSERT(entry, "frame has NS_FRAME_HAS_PROPERTIES set");
++  MOZ_ASSERT(entry || aSkipBitCheck, "frame has NS_FRAME_HAS_PROPERTIES set");
    if (!entry)
      return nullptr;
  
@@ -57,7 +68,7 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
        *aFoundResult = true;
      }
      return entry->mProp.mValue;
-@@ -116,31 +122,37 @@ FramePropertyTable::RemoveInternal(
+@@ -116,31 +123,37 @@ FramePropertyTable::RemoveInternal(
    MOZ_ASSERT(NS_IsMainThread());
    NS_ASSERTION(aFrame, "Null frame?");
    NS_ASSERTION(aProperty, "Null property?");
@@ -95,7 +106,7 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
    }
    if (!entry->mProp.IsArray()) {
      // There's just one property and it's not the one we want, bail
-@@ -205,32 +217,39 @@ FramePropertyTable::DeleteAllForEntry(En
+@@ -205,32 +218,39 @@ FramePropertyTable::DeleteAllForEntry(En
    array->~nsTArray<PropertyValue>();
  }
  
@@ -135,6 +146,129 @@ diff --git a/layout/base/FramePropertyTable.cpp b/layout/base/FramePropertyTable
    mLastFrame = nullptr;
    mLastEntry = nullptr;
  
+diff --git a/layout/base/FramePropertyTable.h b/layout/base/FramePropertyTable.h
+--- a/layout/base/FramePropertyTable.h
++++ b/layout/base/FramePropertyTable.h
+@@ -183,22 +183,35 @@ public:
+    * property is set. Legitimate non-assertion uses include:
+    *
+    *   - Checking if a frame property is set in cases where that's all we want
+    *     to know (i.e., we don't intend to read the actual value or remove the
+    *     property).
+    *
+    *   - Calling Has() before Set() in cases where we don't want to overwrite
+    *     an existing value for the frame property.
++   *
++   * The HasSkippingBitCheck variant doesn't test NS_FRAME_HAS_PROPERTIES
++   * on aFrame, so it is safe to call after aFrame has been destroyed as
++   * long as, since that destruction happened, it isn't possible for a
++   * new frame to have been created and the same property added.
+    */
+   template<typename T>
+   bool Has(const nsIFrame* aFrame, Descriptor<T> aProperty)
+   {
+     bool foundResult = false;
+-    mozilla::Unused << GetInternal(aFrame, aProperty, &foundResult);
++    mozilla::Unused << GetInternal(aFrame, aProperty, false, &foundResult);
++    return foundResult;
++  }
++
++  template<typename T>
++  bool HasSkippingBitCheck(const nsIFrame* aFrame, Descriptor<T> aProperty)
++  {
++    bool foundResult = false;
++    mozilla::Unused << GetInternal(aFrame, aProperty, true, &foundResult);
+     return foundResult;
+   }
+ 
+   /**
+    * Get a property value for a frame. This requires one hashtable
+    * lookup (using the frame as the key) and a linear search through
+    * the properties of that frame. If the frame has no such property,
+    * returns zero-filled result, which means null for pointers and
+@@ -207,17 +220,17 @@ public:
+    * the frame has a value for the property. This lets callers
+    * disambiguate a null result, which can mean 'no such property' or
+    * 'property value is null'.
+    */
+   template<typename T>
+   PropertyType<T> Get(const nsIFrame* aFrame, Descriptor<T> aProperty,
+                       bool* aFoundResult = nullptr)
+   {
+-    void* ptr = GetInternal(aFrame, aProperty, aFoundResult);
++    void* ptr = GetInternal(aFrame, aProperty, false, aFoundResult);
+     return ReinterpretHelper<T>::FromPointer(ptr);
+   }
+   /**
+    * Remove a property value for a frame. This requires one hashtable
+    * lookup (using the frame as the key) and a linear search through
+    * the properties of that frame. The old property value is returned
+    * (and not destroyed). If the frame has no such property,
+    * returns zero-filled result, which means null for pointers and
+@@ -257,17 +270,17 @@ public:
+ 
+   size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+ 
+ protected:
+   void SetInternal(const nsIFrame* aFrame, UntypedDescriptor aProperty,
+                    void* aValue);
+ 
+   void* GetInternal(const nsIFrame* aFrame, UntypedDescriptor aProperty,
+-                    bool* aFoundResult);
++                    bool aSkipBitCheck, bool* aFoundResult);
+ 
+   void* RemoveInternal(const nsIFrame* aFrame, UntypedDescriptor aProperty,
+                        bool* aFoundResult);
+ 
+   void DeleteInternal(const nsIFrame* aFrame, UntypedDescriptor aProperty);
+ 
+   template<typename T>
+   struct ReinterpretHelper
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -1422,17 +1422,18 @@ RestyleManager::ProcessRestyledFrames(ns
+     nsChangeHint hint = data.mHint;
+     bool didReflowThisFrame = false;
+ 
+     NS_ASSERTION(!(hint & nsChangeHint_AllReflowHints) ||
+                  (hint & nsChangeHint_NeedReflow),
+                  "Reflow hint bits set without actually asking for a reflow");
+ 
+     // skip any frame that has been destroyed due to a ripple effect
+-    if (frame && !propTable->Get(frame, ChangeListProperty())) {
++    if (frame && !propTable->HasSkippingBitCheck(frame, ChangeListProperty())) {
++      data.mFrame = nullptr;
+       continue;
+     }
+ 
+     if (frame && frame->GetContent() != content) {
+       // XXXbz this is due to image maps messing with the primary frame of
+       // <area>s.  See bug 135040.  Remove this block once that's fixed.
+       frame = nullptr;
+       if (!(hint & nsChangeHint_ReconstructFrame)) {
+@@ -1490,16 +1491,21 @@ RestyleManager::ProcessRestyledFrames(ns
+         }
+         // Don't remove NS_FRAME_MAY_BE_TRANSFORMED since it may still be
+         // transformed by other means. It's OK to have the bit even if it's
+         // not needed.
+       }
+     }
+ 
+     if (hint & nsChangeHint_ReconstructFrame) {
++      // We're about to destroy data.mFrame, so null out the pointer.
++      // This is important so we don't try to delete its
++      // ChangeListProperty() below.
++      data.mFrame = nullptr;
++
+       // If we ever start passing true here, be careful of restyles
+       // that involve a reframe and animations.  In particular, if the
+       // restyle we're processing here is an animation restyle, but
+       // the style resolution we will do for the frame construction
+       // happens async when we're not in an animation restyle already,
+       // problems could arise.
+       // We could also have problems with triggering of CSS transitions
+       // on elements whose frames are reconstructed, since we depend on
 diff --git a/layout/generic/nsFrameStateBits.h b/layout/generic/nsFrameStateBits.h
 --- a/layout/generic/nsFrameStateBits.h
 +++ b/layout/generic/nsFrameStateBits.h
