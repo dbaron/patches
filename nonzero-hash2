@@ -1,0 +1,77 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Ensure that PLDHashTable's second hash doesn't have padding with 0 bits for tables with capacity larger than 2^16.
+
+PLDHashTable takes the result of the hash function and multiplies it by
+kGoldenRatio to ensure that it has a good distribution of bits across
+the 32-bit hash value, and then zeroes out the low bit so that it can be
+used for the collision flag).  This result is called hash0.  From hash0
+it computes two different numbers used to find entries in the table
+storage:  hash1 is used to find an initial position in the table to
+begin searching for an entry; hash2 is then used to repeatedly offset
+that position (mod the size of the table) to build a chain of positions
+to search.
+
+In a table with capacity 2^c entries, hash1 is simply the upper c bits
+of hash0.  This patch does not change this.
+
+Prior to this patch, hash2 was the c bits below hash1, padded at the low
+end with zeroes when c > 16.  (Note that bug 927705, changeset
+1a02bec165e16f370cace3da21bb2b377a0a7242, increased the maximum capacity
+from 2^23 to 2^26 since 2^23 was sometimes insufficient!)  This manner
+of computing hash2 is problematic because it increases the risk of long
+chains for very large tables, since there is less variation in the hash2
+result due to the zero padding.
+
+So this patch changes the hash2 computation by using the low bits of
+hash0 instead of shifting it around, thus avoiding 0 bits in parts of
+the hash2 value that are significant.
+
+MozReview-Commit-ID: JvnxAMBY711
+
+diff --git a/xpcom/ds/PLDHashTable.cpp b/xpcom/ds/PLDHashTable.cpp
+--- a/xpcom/ds/PLDHashTable.cpp
++++ b/xpcom/ds/PLDHashTable.cpp
+@@ -248,25 +248,37 @@ PLDHashTable::operator=(PLDHashTable&& a
+ }
+ 
+ PLDHashNumber
+ PLDHashTable::Hash1(PLDHashNumber aHash0)
+ {
+   return aHash0 >> mHashShift;
+ }
+ 
+-// Double hashing needs the second hash code to be relatively prime to table
+-// size, so we simply make hash2 odd.
+ void
+-PLDHashTable::Hash2(PLDHashNumber aHash,
++PLDHashTable::Hash2(PLDHashNumber aHash0,
+                     uint32_t& aHash2Out, uint32_t& aSizeMaskOut)
+ {
+   uint32_t sizeLog2 = kHashBits - mHashShift;
+-  aHash2Out = ((aHash << sizeLog2) >> mHashShift) | 1;
+-  aSizeMaskOut = (PLDHashNumber(1) << sizeLog2) - 1;
++  uint32_t sizeMask = (PLDHashNumber(1) << sizeLog2) - 1;
++  aSizeMaskOut = sizeMask;
++
++  // The incoming aHash0 always has the low bit unset (since we leave it
++  // free for the collision flag), and should have reasonably random
++  // data in the other 31 bits.  We used the high bits of aHash0 for
++  // Hash1, so we use the low bits here.  If the table size is large,
++  // the bits we use may overlap, but that's still more random than
++  // filling with 0s.
++  //
++  // Double hashing needs the second hash code to be relatively prime to table
++  // size, so we simply make hash2 odd.
++  //
++  // This also conveniently covers up the fact that we have the low bit
++  // unset since aHash0 has the low bit unset.
++  aHash2Out = (aHash0 & sizeMask) | 1;
+ }
+ 
+ // Reserve mKeyHash 0 for free entries and 1 for removed-entry sentinels. Note
+ // that a removed-entry sentinel need be stored only if the removed entry had
+ // a colliding entry added after it. Therefore we can use 1 as the collision
+ // flag in addition to the removed-entry sentinel value. Multiplicative hash
+ // uses the high order bits of mKeyHash, so this least-significant reservation
+ // should not hurt the hash function's effectiveness much.

@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Keep PLDHashTable's second hash small to reduce the size of jumps across memory and improve cache behavior, and also ensure it doesn't have multiple 0 bits for tables with capacity larger than 2^16.
+Keep PLDHashTable's second hash small to reduce the size of jumps across memory and improve cache behavior.
 
 PLDHashTable takes the result of the hash function and multiplies it by
 kGoldenRatio to ensure that it has a good distribution of bits across
@@ -15,60 +15,32 @@ to search.
 In a table with capacity 2^c entries, hash1 is simply the upper c bits
 of hash0.  This patch does not change this.
 
-Prior to this patch, hash2 was the c bits below hash1, padded at the low
-end with zeroes when c > 16.  (Note that bug 927705, changeset
-1a02bec165e16f370cace3da21bb2b377a0a7242, increased the maximum capacity
-from 2^23 to 2^26 since 2^23 was sometimes insufficient!)  This manner
-of computing hash2 is problematic for two reasons.  First, it increases
-the risk of long chains for very large tables, since there is less
-variation in the hash2 result due to the zero padding.  Second, the
+Prior to this patch (but only since bug NNNNNNN), hash2 was the low c
+bits of hash0.  This manner of computing hash2 is problematic because
 chain can jump across very large areas of memory in a way that is
 unfriendly to CPU caches.
 
-So this patch changes the hash2 computation in 2 ways:
-
- * It uses low bits of hash0 instead of shifting it around, thus
-   avoiding 0 bits in parts of the hash2 value that are significant.
-
- * It caps the size of hash2 to try to make it more cache-friendly.
+So this patch changes the hash2 computation by capping the size of hash2
+to try to make it more cache-friendly.
 
 TODO: Measure to find an optimal value of kHash2MaskMaxBits, or whether
 we should have a maximum at all!
 
-MozReview-Commit-ID: JvnxAMBY711
+
+MozReview-Commit-ID: 7FgybeBgjLF
 
 diff --git a/xpcom/ds/PLDHashTable.cpp b/xpcom/ds/PLDHashTable.cpp
 --- a/xpcom/ds/PLDHashTable.cpp
 +++ b/xpcom/ds/PLDHashTable.cpp
-@@ -248,25 +248,48 @@ PLDHashTable::operator=(PLDHashTable&& a
- }
+@@ -263,22 +263,33 @@ PLDHashTable::Hash2(PLDHashNumber aHash0
  
- PLDHashNumber
- PLDHashTable::Hash1(PLDHashNumber aHash0)
- {
-   return aHash0 >> mHashShift;
- }
- 
--// Double hashing needs the second hash code to be relatively prime to table
--// size, so we simply make hash2 odd.
- void
--PLDHashTable::Hash2(PLDHashNumber aHash,
-+PLDHashTable::Hash2(PLDHashNumber aHash0,
-                     uint32_t& aHash2Out, uint32_t& aSizeMaskOut)
- {
-   uint32_t sizeLog2 = kHashBits - mHashShift;
--  aHash2Out = ((aHash << sizeLog2) >> mHashShift) | 1;
--  aSizeMaskOut = (PLDHashNumber(1) << sizeLog2) - 1;
-+  uint32_t sizeMask = (PLDHashNumber(1) << sizeLog2) - 1;
-+  aSizeMaskOut = sizeMask;
-+
-+  // The incoming aHash0 always has the low bit unset (since we leave it
-+  // free for the collision flag), and should have reasonably random
-+  // data in the other 31 bits.  We used the high bits of aHash0 for
-+  // Hash1, so we use the low bits here.  If the table size is large,
-+  // the bits we use may overlap, but that's still more random than
-+  // filling with 0s.
-+  //
+   // The incoming aHash0 always has the low bit unset (since we leave it
+   // free for the collision flag), and should have reasonably random
+   // data in the other 31 bits.  We used the high bits of aHash0 for
+   // Hash1, so we use the low bits here.  If the table size is large,
+   // the bits we use may overlap, but that's still more random than
+   // filling with 0s.
+   //
 +  // Since the result of Hash2 controls how far we jump around the table
 +  // to build a chain after starting at a location determined by Hash1,
 +  // we'd like to keep it small, to improve cache behavior.
@@ -80,11 +52,12 @@ diff --git a/xpcom/ds/PLDHashTable.cpp b/xpcom/ds/PLDHashTable.cpp
 +  } else {
 +    hash2Mask = sizeMask;
 +  }
-+  // Double hashing needs the second hash code to be relatively prime to table
-+  // size, so we simply make hash2 odd.
-+  //
-+  // This also conveniently covers up the fact that we have the low bit
-+  // unset since aHash0 has the low bit unset.
+   // Double hashing needs the second hash code to be relatively prime to table
+   // size, so we simply make hash2 odd.
+   //
+   // This also conveniently covers up the fact that we have the low bit
+   // unset since aHash0 has the low bit unset.
+-  aHash2Out = (aHash0 & sizeMask) | 1;
 +  aHash2Out = (aHash0 & hash2Mask) | 1;
  }
  
