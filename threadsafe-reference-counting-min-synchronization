@@ -2,6 +2,14 @@ From: L. David Baron <dbaron@dbaron.org>
 
 Bug 1277709 - Make threadsafe reference counting use the minimum memory sychronization needed.
 
+This uses std::atomic rather than mozilla::Atomic since mozilla::Atomic
+does not support using different memory synchronization for different
+atomic operations on the same variable.
+
+The added comments could use careful review since, while they reflect my
+understanding of the issue, I don't consider myself an expert on the
+topic.
+
 MozReview-Commit-ID: 7xByCXt17Dr
 
 diff --git a/modules/libpref/Preferences.h b/modules/libpref/Preferences.h
@@ -47,7 +55,7 @@ diff --git a/xpcom/base/nsISupportsImpl.h b/xpcom/base/nsISupportsImpl.h
  #include "mozilla/MacroForEach.h"
  #include "mozilla/TypeTraits.h"
  
-@@ -302,34 +302,52 @@ class ThreadSafeAutoRefCnt
+@@ -302,34 +302,65 @@ class ThreadSafeAutoRefCnt
  public:
    ThreadSafeAutoRefCnt() : mValue(0) {}
    explicit ThreadSafeAutoRefCnt(nsrefcnt aValue) : mValue(aValue) {}
@@ -60,15 +68,28 @@ diff --git a/xpcom/base/nsISupportsImpl.h b/xpcom/base/nsISupportsImpl.h
 -  MOZ_ALWAYS_INLINE nsrefcnt operator--() { return --mValue; }
 +  MOZ_ALWAYS_INLINE nsrefcnt operator++()
 +  {
++    // Memory synchronization is not required when incrementing a
++    // reference count.  The first increment of a reference count on a
++    // thread is not important, since the first use of the object on a
++    // thread can happen before it.  What is important is the transfer
++    // of the pointer to that thread, which may happen prior to the
++    // first increment on that thread.  The necessary memory
++    // synchronization is done by the mechanism that transfers the
++    // pointer between threads.
 +    return mValue.fetch_add(1, std::memory_order_relaxed) + 1;
 +  }
 +  MOZ_ALWAYS_INLINE nsrefcnt operator--()
 +  {
++    // Since this may be the last release on this thread, we need
++    // release semantics so that prior writes on this thread are visible
++    // to the thread that destroys the object when it reads mValue with
++    // acquire semantics.
 +    nsrefcnt result = mValue.fetch_sub(1, std::memory_order_release) - 1;
 +    if (result == 0) {
-+      // We're going to destroy the object on this thread, so we need an
-+      // acquire to synchronize with the memory released by the last
-+      // release on other threads.
++      // We're going to destroy the object on this thread, so we need
++      // acquire semantics to synchronize with the memory released by
++      // the last release on other threads, that is, to ensure that
++      // writes prior to that release are now visible on this thread.
 +      result = mValue.load(std::memory_order_acquire);
 +    }
 +    return result;
