@@ -1,0 +1,101 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Make nsStringBuffer's reference count be a ThreadSafeAutoRefCnt.
+
+This allows it to benefit from the optimizations in ThreadSafeAutoRefCnt
+such as bug 1277709.
+
+MozReview-Commit-ID: LpB3xaYbaEE
+
+diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
+--- a/xpcom/string/nsStringBuffer.h
++++ b/xpcom/string/nsStringBuffer.h
+@@ -2,17 +2,17 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef nsStringBuffer_h__
+ #define nsStringBuffer_h__
+ 
+-#include "mozilla/Atomics.h"
++#include "nsISupportsImpl.h"
+ #include "mozilla/MemoryReporting.h"
+ 
+ template<class T> struct already_AddRefed;
+ 
+ /**
+  * This structure precedes the string buffers "we" allocate.  It may be the
+  * case that nsTAString::mData does not point to one of these special
+  * buffers.  The mFlags member variable distinguishes the buffer type.
+@@ -21,17 +21,17 @@ template<class T> struct already_AddRefe
+  * tracking.  NOTE: A string buffer can be modified only if its reference
+  * count is 1.
+  */
+ class nsStringBuffer
+ {
+ private:
+   friend class CheckStaticAtomSizes;
+ 
+-  mozilla::Atomic<int32_t> mRefCount;
++  ThreadSafeAutoRefCnt mRefCount;
+   uint32_t mStorageSize;
+ 
+ public:
+ 
+   /**
+    * Allocates a new string buffer, with given size in bytes and a
+    * reference count of one.  When the string buffer is no longer needed,
+    * it should be released via Release.
+@@ -104,16 +104,18 @@ public:
+    * reference to the string buffer is the only reference to the string
+    * buffer, and therefore it has exclusive access to the string buffer and
+    * associated data.  However, if this function returns true, then other
+    * consumers may rely on the data in this buffer being immutable and
+    * other threads may access this buffer simultaneously.
+    */
+   bool IsReadonly() const
+   {
++    // FIXME: This uses acquire memory synchronization, which is
++    // unnecessary here.
+     return mRefCount > 1;
+   }
+ 
+   /**
+    * The FromString methods return a string buffer for the given string
+    * object or null if the string object does not have a string buffer.
+    * The reference count of the string buffer is NOT incremented by these
+    * methods.  If the caller wishes to hold onto the returned value, then
+diff --git a/xpcom/string/nsSubstring.cpp b/xpcom/string/nsSubstring.cpp
+--- a/xpcom/string/nsSubstring.cpp
++++ b/xpcom/string/nsSubstring.cpp
+@@ -181,25 +181,25 @@ public:
+   }
+ };
+ 
+ // ---------------------------------------------------------------------------
+ 
+ void
+ nsStringBuffer::AddRef()
+ {
+-  ++mRefCount;
++  nsrefcnt count = ++mRefCount;
+   STRING_STAT_INCREMENT(Share);
+-  NS_LOG_ADDREF(this, mRefCount, "nsStringBuffer", sizeof(*this));
++  NS_LOG_ADDREF(this, count, "nsStringBuffer", sizeof(*this));
+ }
+ 
+ void
+ nsStringBuffer::Release()
+ {
+-  int32_t count = --mRefCount;
++  nsrefcnt count = --mRefCount;
+   NS_LOG_RELEASE(this, count, "nsStringBuffer");
+   if (count == 0) {
+     STRING_STAT_INCREMENT(Free);
+     free(this); // we were allocated with |malloc|
+   }
+ }
+ 
+ /**
