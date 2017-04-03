@@ -1,0 +1,268 @@
+
+# HG changeset patch
+# User Kris Maglione <maglione.k@gmail.com>
+# Date 1491183970 25200
+# Node ID de7a6af789d8b0f32fa51a9877989ccc1418b557
+# Parent  edfb3b0fc079dd1bf4346dba9f94d2b8964a82d7
+Bug 1352893: Handle non-UTF-8 data in Unix environment variables. r=mstange
+
+MozReview-Commit-ID: 5aRVYQICc7O
+
+diff --git a/toolkit/modules/subprocess/Subprocess.jsm b/toolkit/modules/subprocess/Subprocess.jsm
+--- a/toolkit/modules/subprocess/Subprocess.jsm
++++ b/toolkit/modules/subprocess/Subprocess.jsm
+@@ -13,28 +13,43 @@
+ "use strict";
+ 
+ let EXPORTED_SYMBOLS = ["Subprocess"];
+ 
+ /* exported Subprocess */
+ 
+ var {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ 
++Cu.importGlobalProperties(["TextEncoder"]);
++
+ Cu.import("resource://gre/modules/AppConstants.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/subprocess/subprocess_common.jsm");
+ 
+ if (AppConstants.platform == "win") {
+   XPCOMUtils.defineLazyModuleGetter(this, "SubprocessImpl",
+                                     "resource://gre/modules/subprocess/subprocess_win.jsm");
+ } else {
+   XPCOMUtils.defineLazyModuleGetter(this, "SubprocessImpl",
+                                     "resource://gre/modules/subprocess/subprocess_unix.jsm");
+ }
+ 
++function encodeEnvVar(name, value) {
++  if (typeof name === "string" && typeof value === "string") {
++    return `${name}=${value}`;
++  }
++
++  let encoder = new TextEncoder("utf-8");
++  function encode(val) {
++    return typeof val === "string" ? encoder.encode(val) : val;
++  }
++
++  return Uint8Array.of(...encode(name), ...encode("="), ...encode(value), 0);
++}
++
+ /**
+  * Allows for creation of and communication with OS-level sub-processes.
+  * @namespace
+  */
+ var Subprocess = {
+   /**
+    * Launches a process, and returns a handle to it.
+    *
+@@ -97,18 +112,18 @@ var Subprocess = {
+     if (!options.environment || options.environmentAppend) {
+       environment = this.getEnvironment();
+     }
+ 
+     if (options.environment) {
+       Object.assign(environment, options.environment);
+     }
+ 
+-    options.environment = Object.keys(environment)
+-                                .map(key => `${key}=${environment[key]}`);
++    options.environment = Object.entries(environment)
++                                .map(([key, val]) => encodeEnvVar(key, val));
+ 
+     options.arguments = Array.from(options.arguments || []);
+ 
+     return Promise.resolve(SubprocessImpl.isExecutableFile(options.command)).then(isExecutable => {
+       if (!isExecutable) {
+         let error = new Error(`File at path "${options.command}" does not exist, or is not executable`);
+         error.errorCode = SubprocessConstants.ERROR_BAD_EXECUTABLE;
+         throw error;
+diff --git a/toolkit/modules/subprocess/subprocess_shared_unix.js b/toolkit/modules/subprocess/subprocess_shared_unix.js
+--- a/toolkit/modules/subprocess/subprocess_shared_unix.js
++++ b/toolkit/modules/subprocess/subprocess_shared_unix.js
+@@ -36,16 +36,24 @@ var libc = new Library("libc", LIBC_CHOI
+   environ: [ctypes.char.ptr.ptr],
+ 
+   // Darwin-only.
+   _NSGetEnviron: [
+     ctypes.default_abi,
+     ctypes.char.ptr.ptr.ptr,
+   ],
+ 
++  setenv: [
++    ctypes.default_abi,
++    ctypes.int,
++    ctypes.char.ptr,
++    ctypes.char.ptr,
++    ctypes.int,
++  ],
++
+   chdir: [
+     ctypes.default_abi,
+     ctypes.int,
+     ctypes.char.ptr, /* path */
+   ],
+ 
+   close: [
+     ctypes.default_abi,
+diff --git a/toolkit/modules/subprocess/subprocess_unix.jsm b/toolkit/modules/subprocess/subprocess_unix.jsm
+--- a/toolkit/modules/subprocess/subprocess_unix.jsm
++++ b/toolkit/modules/subprocess/subprocess_unix.jsm
+@@ -8,16 +8,18 @@
+ /* eslint-disable mozilla/balanced-listeners */
+ 
+ /* exported SubprocessImpl */
+ 
+ /* globals BaseProcess, PromiseWorker */
+ 
+ var {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ 
++Cu.importGlobalProperties(["TextDecoder"]);
++
+ var EXPORTED_SYMBOLS = ["SubprocessImpl"];
+ 
+ Cu.import("resource://gre/modules/ctypes.jsm");
+ Cu.import("resource://gre/modules/osfile.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/Task.jsm");
+ Cu.import("resource://gre/modules/subprocess/subprocess_common.jsm");
+ 
+@@ -71,38 +73,66 @@ class Process extends BaseProcess {
+     return "resource://gre/modules/subprocess/subprocess_worker_unix.js";
+   }
+ 
+   static get WorkerClass() {
+     return UnixPromiseWorker;
+   }
+ }
+ 
++// Convert a null-terminated char pointer into a sized char array, and then
++// convert that into a JS typed array.
++// The resulting array will not be null-terminated.
++function ptrToUint8Array(input) {
++  let {cast, uint8_t} = ctypes;
++
++  let len = 0;
++  for (let ptr = cast(input, uint8_t.ptr); ptr.contents; ptr = ptr.increment()) {
++    len++;
++  }
++
++  let aryPtr = cast(input, uint8_t.array(len).ptr);
++  return new Uint8Array(aryPtr.contents);
++}
++
+ var SubprocessUnix = {
+   Process,
+ 
+   call(options) {
+     return Process.create(options);
+   },
+ 
+   * getEnvironment() {
+     let environ;
+     if (OS.Constants.Sys.Name == "Darwin") {
+       environ = libc._NSGetEnviron().contents;
+     } else {
+       environ = libc.environ;
+     }
+ 
+-    for (let envp = environ; !envp.contents.isNull(); envp = envp.increment()) {
+-      let str = envp.contents.readString();
++    const EQUAL = "=".charCodeAt(0);
++    let decoder = new TextDecoder("utf-8", {fatal: true});
+ 
+-      let idx = str.indexOf("=");
+-      if (idx >= 0) {
+-        yield [str.slice(0, idx),
+-               str.slice(idx + 1)];
++    function decode(array) {
++      try {
++        return decoder.decode(array);
++      } catch (e) {
++        return array;
++      }
++    }
++
++    for (let envp = environ; !envp.contents.isNull(); envp = envp.increment()) {
++      let buf = ptrToUint8Array(envp.contents);
++
++      for (let i = 0; i < buf.length; i++) {
++        if (buf[i] == EQUAL) {
++          yield [decode(buf.subarray(0, i)),
++                 decode(buf.subarray(i + 1))];
++          break;
++        }
+       }
+     }
+   },
+ 
+   isExecutableFile: Task.async(function* isExecutable(path) {
+     if (!OS.Path.split(path).absolute) {
+       return false;
+     }
+@@ -141,17 +171,17 @@ var SubprocessUnix = {
+         return bin;
+       }
+       let error = new Error(`File at path "${bin}" does not exist, or is not executable`);
+       error.errorCode = SubprocessConstants.ERROR_BAD_EXECUTABLE;
+       throw error;
+     }
+ 
+     let dirs = [];
+-    if (environment.PATH) {
++    if (typeof environment.PATH === "string") {
+       dirs = environment.PATH.split(":");
+     }
+ 
+     for (let dir of dirs) {
+       let path = OS.Path.join(dir, bin);
+ 
+       if (yield this.isExecutableFile(path)) {
+         return path;
+diff --git a/toolkit/modules/subprocess/test/xpcshell/test_subprocess.js b/toolkit/modules/subprocess/test/xpcshell/test_subprocess.js
+--- a/toolkit/modules/subprocess/test/xpcshell/test_subprocess.js
++++ b/toolkit/modules/subprocess/test/xpcshell/test_subprocess.js
+@@ -711,16 +711,43 @@ add_task(function* test_subprocess_envir
+   equal(path, env.get("PATH"), "Got expected $PATH value");
+   equal(foo, "", "Got expected $FOO value");
+ 
+   ({exitCode} = yield proc.wait());
+ 
+   equal(exitCode, 0, "Got expected exit code");
+ });
+ 
++if (AppConstants.platform !== "win") {
++  add_task(function* test_subprocess_nonASCII() {
++    const {libc} = Cu.import("resource://gre/modules/subprocess/subprocess_unix.jsm", {});
++
++    // Use TextDecoder rather than a string with a \xff escape, since
++    // the latter will automatically be normalized to valid UTF-8.
++    let val = new TextDecoder().decode(Uint8Array.of(1, 255));
++
++    libc.setenv("FOO", Uint8Array.from(val + "\0", c => c.charCodeAt(0)), 1);
++
++    let proc = yield Subprocess.call({
++      command: PYTHON,
++      arguments: ["-u", TEST_SCRIPT, "env", "FOO"],
++    });
++
++    let foo = yield read(proc.stdout);
++
++    equal(foo, val, "Got expected $FOO value");
++
++    env.set("FOO", "");
++
++    let {exitCode} = yield proc.wait();
++
++    equal(exitCode, 0, "Got expected exit code");
++  });
++}
++
+ 
+ add_task(function* test_bad_executable() {
+   // Test with a non-executable file.
+ 
+   let textFile = do_get_file("data_text_file.txt").path;
+ 
+   let promise = Subprocess.call({
+     command: textFile,
+
