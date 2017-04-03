@@ -1,44 +1,13 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Make nsStringBuffer's reference count be a ThreadSafeAutoRefCnt.
+Make nsStringBuffer's reference count use the minimum memory synchronization needed.
 
-This allows it to benefit from the optimizations in ThreadSafeAutoRefCnt
-such as bug 1277709.
+This is the same optimization made for ThreadSafeAutoRefCnt in bug
+1277709.  However, nsStringBuffer uses a 32-bit reference count all the
+time, so it can't easily use ThreadSafeAutoRefCnt.
 
 MozReview-Commit-ID: LpB3xaYbaEE
 
-diff --git a/xpcom/base/nsISupportsImpl.h b/xpcom/base/nsISupportsImpl.h
---- a/xpcom/base/nsISupportsImpl.h
-+++ b/xpcom/base/nsISupportsImpl.h
-@@ -339,21 +339,24 @@ public:
-   MOZ_ALWAYS_INLINE nsrefcnt operator=(nsrefcnt aValue)
-   {
-     // Use release semantics since we're not sure what the caller is
-     // doing.
-     mValue.store(aValue, std::memory_order_release);
-     return aValue;
-   }
-   MOZ_ALWAYS_INLINE operator nsrefcnt() const { return get(); }
--  MOZ_ALWAYS_INLINE nsrefcnt get() const
-+
-+
-+  // Default to acquire memory synchronization since we're not sure what
-+  // the caller is doing.
-+  MOZ_ALWAYS_INLINE nsrefcnt get(std::memory_order aOrder =
-+                                   std::memory_order_acquire) const
-   {
--    // Use acquire semantics since we're not sure what the caller is
--    // doing.
--    return mValue.load(std::memory_order_acquire);
-+    return mValue.load(aOrder);
-   }
- 
-   static const bool isThreadSafe = true;
- private:
-   nsrefcnt operator++(int) = delete;
-   nsrefcnt operator--(int) = delete;
-   std::atomic<nsrefcnt> mValue;
- };
 diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
 --- a/xpcom/string/nsStringBuffer.h
 +++ b/xpcom/string/nsStringBuffer.h
@@ -52,7 +21,7 @@ diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
  #define nsStringBuffer_h__
  
 -#include "mozilla/Atomics.h"
-+#include "nsISupportsImpl.h"
++#include <atomic>
  #include "mozilla/MemoryReporting.h"
  
  template<class T> struct already_AddRefed;
@@ -71,7 +40,7 @@ diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
    friend class CheckStaticAtomSizes;
  
 -  mozilla::Atomic<int32_t> mRefCount;
-+  mozilla::ThreadSafeAutoRefCnt mRefCount;
++  std::atomic<uint32_t> mRefCount;
    uint32_t mStorageSize;
  
  public:
@@ -110,7 +79,7 @@ diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
 +    // sort of higher level memory synchronization to protect against
 +    // the string object being mutated at the same time on multiple
 +    // threads.
-+    return mRefCount.get(std::memory_order_relaxed) > 1;
++    return mRefCount.load(std::memory_order_relaxed) > 1;
    }
  
    /**
@@ -122,7 +91,7 @@ diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
 diff --git a/xpcom/string/nsSubstring.cpp b/xpcom/string/nsSubstring.cpp
 --- a/xpcom/string/nsSubstring.cpp
 +++ b/xpcom/string/nsSubstring.cpp
-@@ -181,25 +181,25 @@ public:
+@@ -181,27 +181,45 @@ public:
    }
  };
  
@@ -132,7 +101,15 @@ diff --git a/xpcom/string/nsSubstring.cpp b/xpcom/string/nsSubstring.cpp
  nsStringBuffer::AddRef()
  {
 -  ++mRefCount;
-+  nsrefcnt count = ++mRefCount;
++  // Memory synchronization is not required when incrementing a
++  // reference count.  The first increment of a reference count on a
++  // thread is not important, since the first use of the object on a
++  // thread can happen before it.  What is important is the transfer
++  // of the pointer to that thread, which may happen prior to the
++  // first increment on that thread.  The necessary memory
++  // synchronization is done by the mechanism that transfers the
++  // pointer between threads.
++  uint32_t count = mRefCount.fetch_add(1, std::memory_order_relaxed) + 1;
    STRING_STAT_INCREMENT(Share);
 -  NS_LOG_ADDREF(this, mRefCount, "nsStringBuffer", sizeof(*this));
 +  NS_LOG_ADDREF(this, count, "nsStringBuffer", sizeof(*this));
@@ -142,12 +119,24 @@ diff --git a/xpcom/string/nsSubstring.cpp b/xpcom/string/nsSubstring.cpp
  nsStringBuffer::Release()
  {
 -  int32_t count = --mRefCount;
-+  nsrefcnt count = --mRefCount;
++  // Since this may be the last release on this thread, we need
++  // release semantics so that prior writes on this thread are visible
++  // to the thread that destroys the object when it reads mValue with
++  // acquire semantics.
++  uint32_t count = mRefCount.fetch_sub(1, std::memory_order_release) - 1;
    NS_LOG_RELEASE(this, count, "nsStringBuffer");
    if (count == 0) {
++    // We're going to destroy the object on this thread, so we need
++    // acquire semantics to synchronize with the memory released by
++    // the last release on other threads, that is, to ensure that
++    // writes prior to that release are now visible on this thread.
++    count = mRefCount.load(std::memory_order_acquire);
++
      STRING_STAT_INCREMENT(Free);
      free(this); // we were allocated with |malloc|
    }
  }
  
  /**
+  * Alloc returns a pointer to a new string header with set capacity.
+  */
