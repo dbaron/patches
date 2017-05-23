@@ -1,0 +1,176 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1367190 patch 3 - Store nsPresArena::mFreeLists as an array.
+
+MozReview-Commit-ID: DDJetJaJMb4
+
+diff --git a/layout/base/nsPresArena.cpp b/layout/base/nsPresArena.cpp
+--- a/layout/base/nsPresArena.cpp
++++ b/layout/base/nsPresArena.cpp
+@@ -10,32 +10,32 @@
+ #include "nsPresArena.h"
+ 
+ #include "mozilla/Poison.h"
+ #include "nsDebug.h"
+ #include "nsArenaMemoryStats.h"
+ #include "nsPrintfCString.h"
+ #include "nsStyleContext.h"
+ #include "FrameLayerBuilder.h"
++#include "mozilla/ArrayUtils.h"
+ 
+ #include <inttypes.h>
+ 
+ using namespace mozilla;
+ 
+ nsPresArena::nsPresArena()
+ {
+ }
+ 
+ nsPresArena::~nsPresArena()
+ {
+   ClearArenaRefPtrs();
+ 
+ #if defined(MOZ_HAVE_MEM_CHECKS)
+-  for (auto iter = mFreeLists.Iter(); !iter.Done(); iter.Next()) {
+-    FreeList* entry = iter.Get();
++  for (FreeList *entry = mFreeLists; entry != ArrayEnd(mFreeLists); ++entry) {
+     nsTArray<void*>::index_type len;
+     while ((len = entry->mEntries.Length())) {
+       void* result = entry->mEntries.ElementAt(len - 1);
+       entry->mEntries.RemoveElementAt(len - 1);
+       MOZ_MAKE_MEM_UNDEFINED(result, entry->mEntrySize);
+     }
+   }
+ #endif
+@@ -92,23 +92,24 @@ nsPresArena::ClearArenaRefPtrs(ArenaObje
+     }
+   }
+ }
+ 
+ void*
+ nsPresArena::Allocate(uint32_t aCode, size_t aSize)
+ {
+   MOZ_ASSERT(aSize > 0, "PresArena cannot allocate zero bytes");
++  MOZ_ASSERT(aCode < ArrayLength(mFreeLists));
+ 
+   // We only hand out aligned sizes
+   aSize = mPool.AlignedSize(aSize);
+ 
+   // If there is no free-list entry for this type already, we have
+   // to create one now, to record its size.
+-  FreeList* list = mFreeLists.PutEntry(aCode);
++  FreeList* list = &mFreeLists[aCode];
+ 
+   nsTArray<void*>::index_type len = list->mEntries.Length();
+   if (list->mEntrySize == 0) {
+     MOZ_ASSERT(len == 0, "list with entries but no recorded size");
+     list->mEntrySize = aSize;
+   } else {
+     MOZ_ASSERT(list->mEntrySize == aSize,
+                "different sizes for same object type code");
+@@ -148,20 +149,21 @@ nsPresArena::Allocate(uint32_t aCode, si
+   // Allocate a new chunk from the arena
+   list->mEntriesEverAllocated++;
+   return mPool.Allocate(aSize);
+ }
+ 
+ void
+ nsPresArena::Free(uint32_t aCode, void* aPtr)
+ {
++  MOZ_ASSERT(aCode < ArrayLength(mFreeLists));
++
+   // Try to recycle this entry.
+-  FreeList* list = mFreeLists.GetEntry(aCode);
+-  MOZ_ASSERT(list, "no free list for pres arena object");
+-  MOZ_ASSERT(list->mEntrySize > 0, "PresArena cannot free zero bytes");
++  FreeList* list = &mFreeLists[aCode];
++  MOZ_ASSERT(list->mEntrySize > 0, "object of this type was never allocated");
+ 
+   mozWritePoison(aPtr, list->mEntrySize);
+ 
+   MOZ_MAKE_MEM_NOACCESS(aPtr, list->mEntrySize);
+   list->mEntries.AppendElement(aPtr);
+ }
+ 
+ void
+@@ -175,21 +177,20 @@ nsPresArena::AddSizeOfExcludingThis(mozi
+   // allocated out of malloc'd chunks of memory.  So we compute the
+   // size of the arena as known by malloc and we add up the sizes of
+   // all the objects that we care about.  Subtracting these two
+   // quantities gives us a catch-all "other" number, which includes
+   // slop in the arena itself as well as the size of objects that
+   // we've not measured explicitly.
+ 
+   size_t mallocSize = mPool.SizeOfExcludingThis(aMallocSizeOf);
+-  mallocSize += mFreeLists.SizeOfExcludingThis(aMallocSizeOf);
+ 
+   size_t totalSizeInFreeLists = 0;
+-  for (auto iter = mFreeLists.Iter(); !iter.Done(); iter.Next()) {
+-    FreeList* entry = iter.Get();
++  for (FreeList *entry = mFreeLists; entry != ArrayEnd(mFreeLists); ++entry) {
++    mallocSize += entry->SizeOfExcludingThis(aMallocSizeOf);
+ 
+     // Note that we're not measuring the size of the entries on the free
+     // list here.  The free list knows how many objects we've allocated
+     // ever (which includes any objects that may be on the FreeList's
+     // |mEntries| at this point) and we're using that to determine the
+     // total size of objects allocated with a given ID.
+     size_t totalSize = entry->mEntrySize * entry->mEntriesEverAllocated;
+     size_t* p;
+diff --git a/layout/base/nsPresArena.h b/layout/base/nsPresArena.h
+--- a/layout/base/nsPresArena.h
++++ b/layout/base/nsPresArena.h
+@@ -104,46 +104,32 @@ public:
+ private:
+   void* Allocate(uint32_t aCode, size_t aSize);
+   void Free(uint32_t aCode, void* aPtr);
+ 
+   inline void ClearArenaRefPtrWithoutDeregistering(
+       void* aPtr,
+       mozilla::ArenaObjectID aObjectID);
+ 
+-  // All keys to this hash table fit in 32 bits (see below) so we do not
+-  // bother actually hashing them.
+-  class FreeList : public PLDHashEntryHdr
++  class FreeList
+   {
+   public:
+-    typedef uint32_t KeyType;
+     nsTArray<void *> mEntries;
+     size_t mEntrySize;
+     size_t mEntriesEverAllocated;
+ 
+-    typedef const void* KeyTypePointer;
+-    KeyTypePointer mKey;
+-
+-    explicit FreeList(KeyTypePointer aKey)
+-    : mEntrySize(0), mEntriesEverAllocated(0), mKey(aKey) {}
++    FreeList()
++      : mEntrySize(0)
++      , mEntriesEverAllocated(0)
++    {
++    }
+     // Default copy constructor and destructor are ok.
+ 
+-    bool KeyEquals(KeyTypePointer const aKey) const
+-    { return mKey == aKey; }
+-
+-    static KeyTypePointer KeyToPointer(KeyType aKey)
+-    { return NS_INT32_TO_PTR(aKey); }
+-
+-    static PLDHashNumber HashKey(KeyTypePointer aKey)
+-    { return NS_PTR_TO_INT32(aKey); }
+-
+     size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const
+     { return mEntries.ShallowSizeOfExcludingThis(aMallocSizeOf); }
+-
+-    enum { ALLOW_MEMMOVE = false };
+   };
+ 
+-  nsTHashtable<FreeList> mFreeLists;
++  FreeList mFreeLists[mozilla::eArenaObjectID_COUNT];
+   mozilla::ArenaAllocator<8192, 8> mPool;
+   nsDataHashtable<nsPtrHashKey<void>, mozilla::ArenaObjectID> mArenaRefPtrs;
+ };
+ 
+ #endif
