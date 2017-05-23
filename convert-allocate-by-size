@@ -1,0 +1,192 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1367190 patch 1 - Convert the 4 objects that use nsPresArena::AllocateBySize to use AllocateByObjectID.
+
+MozReview-Commit-ID: 3LaG8Daon6V
+
+diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
+--- a/layout/base/PresShell.cpp
++++ b/layout/base/PresShell.cpp
+@@ -3922,17 +3922,18 @@ PresShell::UnsuppressPainting()
+   else
+     UnsuppressAndInvalidate();
+ }
+ 
+ // Post a request to handle an arbitrary callback after reflow has finished.
+ nsresult
+ PresShell::PostReflowCallback(nsIReflowCallback* aCallback)
+ {
+-  void* result = AllocateMisc(sizeof(nsCallbackEventRequest));
++  void* result = AllocateByObjectID(eArenaObjectID_nsCallbackEventRequest,
++                                    sizeof(nsCallbackEventRequest));
+   nsCallbackEventRequest* request = (nsCallbackEventRequest*)result;
+ 
+   request->callback = aCallback;
+   request->next = nullptr;
+ 
+   if (mLastCallbackEventRequest) {
+     mLastCallbackEventRequest = mLastCallbackEventRequest->next = request;
+   } else {
+@@ -3963,17 +3964,17 @@ PresShell::CancelReflowCallback(nsIReflo
+           node = node->next;
+           before->next = node;
+         }
+ 
+         if (toFree == mLastCallbackEventRequest) {
+           mLastCallbackEventRequest = before;
+         }
+ 
+-        FreeMisc(sizeof(nsCallbackEventRequest), toFree);
++        FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, toFree);
+       } else {
+         before = node;
+         node = node->next;
+       }
+    }
+ }
+ 
+ void
+@@ -3981,17 +3982,17 @@ PresShell::CancelPostedReflowCallbacks()
+ {
+   while (mFirstCallbackEventRequest) {
+     nsCallbackEventRequest* node = mFirstCallbackEventRequest;
+     mFirstCallbackEventRequest = node->next;
+     if (!mFirstCallbackEventRequest) {
+       mLastCallbackEventRequest = nullptr;
+     }
+     nsIReflowCallback* callback = node->callback;
+-    FreeMisc(sizeof(nsCallbackEventRequest), node);
++    FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, node);
+     if (callback) {
+       callback->ReflowCallbackCanceled();
+     }
+   }
+ }
+ 
+ void
+ PresShell::HandlePostedReflowCallbacks(bool aInterruptible)
+@@ -4000,17 +4001,17 @@ PresShell::HandlePostedReflowCallbacks(b
+ 
+    while (mFirstCallbackEventRequest) {
+      nsCallbackEventRequest* node = mFirstCallbackEventRequest;
+      mFirstCallbackEventRequest = node->next;
+      if (!mFirstCallbackEventRequest) {
+        mLastCallbackEventRequest = nullptr;
+      }
+      nsIReflowCallback* callback = node->callback;
+-     FreeMisc(sizeof(nsCallbackEventRequest), node);
++     FreeByObjectID(eArenaObjectID_nsCallbackEventRequest, node);
+      if (callback) {
+        if (callback->ReflowFinished()) {
+          shouldFlush = true;
+        }
+      }
+    }
+ 
+    FlushType flushType =
+diff --git a/layout/base/nsPresArenaObjectList.h b/layout/base/nsPresArenaObjectList.h
+--- a/layout/base/nsPresArenaObjectList.h
++++ b/layout/base/nsPresArenaObjectList.h
+@@ -51,16 +51,20 @@ PRES_ARENA_OBJECT_WITH_ARENAREFPTR_SUPPO
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(DisplayItemData)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsInheritedStyleData)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsResetStyleData)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsConditionalResetStyleData)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsConditionalResetStyleDataEntry)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsFrameList)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(CustomCounterStyle)
+ PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(DependentBuiltinCounterStyle)
++PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsCallbackEventRequest)
++PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsIntervalSet_Interval)
++PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(CellData)
++PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(BCCellData)
+ 
+ #define STYLE_STRUCT(name_, checkdata_cb_) \
+   PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT(nsStyle##name_)
+ #include "nsStyleStructList.h"
+ #undef STYLE_STRUCT
+ 
+ #ifdef DEFINED_PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT
+ #undef PRES_ARENA_OBJECT_WITHOUT_ARENAREFPTR_SUPPORT
+diff --git a/layout/generic/nsFloatManager.cpp b/layout/generic/nsFloatManager.cpp
+--- a/layout/generic/nsFloatManager.cpp
++++ b/layout/generic/nsFloatManager.cpp
+@@ -23,24 +23,28 @@ int32_t nsFloatManager::sCachedFloatMana
+ void* nsFloatManager::sCachedFloatManagers[NS_FLOAT_MANAGER_CACHE_SIZE];
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ 
+ // PresShell Arena allocate callback (for nsIntervalSet use below)
+ static void*
+ PSArenaAllocCB(size_t aSize, void* aClosure)
+ {
+-  return static_cast<nsIPresShell*>(aClosure)->AllocateMisc(aSize);
++  MOZ_ASSERT(aSize == sizeof(nsIntervalSet::Interval));
++  return static_cast<nsIPresShell*>(aClosure)->
++    AllocateByObjectID(eArenaObjectID_nsIntervalSet_Interval, aSize);
+ }
+ 
+ // PresShell Arena free callback (for nsIntervalSet use below)
+ static void
+ PSArenaFreeCB(size_t aSize, void* aPtr, void* aClosure)
+ {
+-  static_cast<nsIPresShell*>(aClosure)->FreeMisc(aSize, aPtr);
++  MOZ_ASSERT(aSize == sizeof(nsIntervalSet::Interval));
++  static_cast<nsIPresShell*>(aClosure)->
++    FreeByObjectID(eArenaObjectID_nsIntervalSet_Interval, aPtr);
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ // nsFloatManager
+ 
+ nsFloatManager::nsFloatManager(nsIPresShell* aPresShell,
+                                mozilla::WritingMode aWM)
+   :
+diff --git a/layout/tables/nsCellMap.cpp b/layout/tables/nsCellMap.cpp
+--- a/layout/tables/nsCellMap.cpp
++++ b/layout/tables/nsCellMap.cpp
+@@ -2575,36 +2575,40 @@ void nsCellMap::DestroyCellData(CellData
+ {
+   if (!aData) {
+     return;
+   }
+ 
+   if (mIsBC) {
+     BCCellData* bcData = static_cast<BCCellData*>(aData);
+     bcData->~BCCellData();
+-    mPresContext->FreeToShell(sizeof(BCCellData), bcData);
++    mPresContext->PresShell()->
++      FreeByObjectID(eArenaObjectID_BCCellData, bcData);
+   } else {
+     aData->~CellData();
+-    mPresContext->FreeToShell(sizeof(CellData), aData);
++    mPresContext->PresShell()->
++      FreeByObjectID(eArenaObjectID_CellData, aData);
+   }
+ }
+ 
+ CellData* nsCellMap::AllocCellData(nsTableCellFrame* aOrigCell)
+ {
+   if (mIsBC) {
+     BCCellData* data = (BCCellData*)
+-      mPresContext->AllocateFromShell(sizeof(BCCellData));
++      mPresContext->PresShell()->
++        AllocateByObjectID(eArenaObjectID_BCCellData, sizeof(BCCellData));
+     if (data) {
+       new (data) BCCellData(aOrigCell);
+     }
+     return data;
+   }
+ 
+   CellData* data = (CellData*)
+-    mPresContext->AllocateFromShell(sizeof(CellData));
++    mPresContext->PresShell()->
++      AllocateByObjectID(eArenaObjectID_CellData, sizeof(CellData));
+   if (data) {
+     new (data) CellData(aOrigCell);
+   }
+   return data;
+ }
+ 
+ void
+ nsCellMapColumnIterator::AdvanceRowGroup()
