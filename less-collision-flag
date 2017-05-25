@@ -1,0 +1,65 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1352888 - Don't set the collision flag when adding to PLDHashTable if we've already found the entry we're going to add.  r=njn
+
+PLDHashTable's entry store has two types of unoccupied entries:  free
+entries and removed entries.  The search of a chain of entries
+(determined by the hash value) in the entry store to search for an entry
+can stop at free entries, but it continues across removed entries,
+because removed entries are entries that may have been skipped over when
+we were adding the value we're searching for to the hash, but have since
+been removed.  For live entries, we also maintain this distinction by
+using one bit of storage for a collision flag, which notes that if the
+hashtable entry is removed, its place in the entry store must become a
+removed entry rather than a free entry.
+
+When we add a new entry to the table, Add's semantics require that we
+return an existing entry if there is one, and only create a new entry if
+no existing entry exists.  (Bug 1352198 suggests the possibility of a
+faster alternative Add API where the caller guarantees that the key is
+not already in the hashtable.)  When we search for the existing entry,
+we must thus continue the search across removed entries, even though we
+record the first removed entry found to return if the search for an
+existing entry fails.
+
+The existing code adds the collision flag through the entire table
+search during an Add.  This patch changes that behavior so that we only
+add the collision flag prior to finding the first removed entry.  Adding
+it after we find the first removed entry is unnecessary, since we are
+not making that entry part of a path to a new entry.  If it is part of a
+path to an existing entry, it will already have the collision flag set.
+
+This patch effectively puts an if (!firstRemoved) around the else branch
+of the if (MOZ_UNLIKELY(EntryIsRemoved(entry))), and then refactors that
+condition outwards since it is now around the contents of both the if
+and else branches.
+
+MozReview-Commit-ID: CsXnMYttHVy
+
+diff --git a/xpcom/ds/PLDHashTable.cpp b/xpcom/ds/PLDHashTable.cpp
+--- a/xpcom/ds/PLDHashTable.cpp
++++ b/xpcom/ds/PLDHashTable.cpp
+@@ -361,21 +361,19 @@ PLDHashTable::SearchTable(const void* aK
+   uint32_t sizeMask;
+   Hash2(aKeyHash, hash2, sizeMask);
+ 
+   // Save the first removed entry pointer so Add() can recycle it. (Only used
+   // if Reason==ForAdd.)
+   PLDHashEntryHdr* firstRemoved = nullptr;
+ 
+   for (;;) {
+-    if (Reason == ForAdd) {
++    if (Reason == ForAdd && !firstRemoved) {
+       if (MOZ_UNLIKELY(EntryIsRemoved(entry))) {
+-        if (!firstRemoved) {
+-          firstRemoved = entry;
+-        }
++        firstRemoved = entry;
+       } else {
+         entry->mKeyHash |= kCollisionFlag;
+       }
+     }
+ 
+     hash1 -= hash2;
+     hash1 &= sizeMask;
+ 
