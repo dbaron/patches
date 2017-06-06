@@ -5,12 +5,59 @@ Bug 1367576 - Cache results of getting GTK widget borders.  r?karlt
 See comments in the header file.
 
 This also clears out mSafeWidgetStates in ThemeChanged since that seems
-like a good thing to do, and marks nsNativeThemeGTK as final to avoid
-the cost of the virtual function call to ThemeChanged in the
-constructor.
+like a good thing to do, and marks nsNativeThemeGTK as final.
 
 MozReview-Commit-ID: 5Zne4eGbGlh
 
+diff --git a/widget/gtk/gtk3drawing.cpp b/widget/gtk/gtk3drawing.cpp
+--- a/widget/gtk/gtk3drawing.cpp
++++ b/widget/gtk/gtk3drawing.cpp
+@@ -2069,17 +2069,20 @@ GetMarginBorderPadding(GtkStyleContext* 
+     result.right = right;
+     result.top = top;
+     result.bottom = bottom;
+     return result;
+ }
+ 
+ gint
+ moz_gtk_get_widget_border(WidgetNodeType widget, gint* left, gint* top,
+-                          gint* right, gint* bottom, GtkTextDirection direction)
++                          gint* right, gint* bottom,
++                          // NOTE: callers depend on direction being used
++                          // only for MOZ_GTK_DROPDOWN widgets.
++                          GtkTextDirection direction)
+ {
+     GtkWidget* w;
+     GtkStyleContext* style;
+     *left = *top = *right = *bottom = 0;
+ 
+     switch (widget) {
+     case MOZ_GTK_BUTTON:
+     case MOZ_GTK_TOOLBAR_BUTTON:
+diff --git a/widget/gtk/gtkdrawing.h b/widget/gtk/gtkdrawing.h
+--- a/widget/gtk/gtkdrawing.h
++++ b/widget/gtk/gtkdrawing.h
+@@ -351,17 +351,19 @@ moz_gtk_widget_paint(WidgetNodeType widg
+ #endif
+ 
+ 
+ /*** Widget metrics ***/
+ /**
+  * Get the border size of a widget
+  * left/right:  [OUT] the widget's left/right border
+  * top/bottom:  [OUT] the widget's top/bottom border
+- * direction:   the text direction for the widget
++ * direction:   the text direction for the widget.  Callers depend on this
++ *              being used only for MOZ_GTK_DROPDOWN widgets, and cache
++ *              results for other widget types across direction values.
+  *
+  * returns:    MOZ_GTK_SUCCESS if there was no error, an error code otherwise
+  */
+ gint moz_gtk_get_widget_border(WidgetNodeType widget, gint* left, gint* top,
+                                gint* right, gint* bottom, GtkTextDirection direction);
+ 
+ /**
+  * Get the border size of a notebook tab
 diff --git a/widget/gtk/nsNativeThemeGTK.cpp b/widget/gtk/nsNativeThemeGTK.cpp
 --- a/widget/gtk/nsNativeThemeGTK.cpp
 +++ b/widget/gtk/nsNativeThemeGTK.cpp
@@ -34,7 +81,7 @@ diff --git a/widget/gtk/nsNativeThemeGTK.cpp b/widget/gtk/nsNativeThemeGTK.cpp
  NS_IMETHODIMP
  nsNativeThemeGTK::Observe(nsISupports *aSubject, const char *aTopic,
                            const char16_t *aData)
-@@ -1264,19 +1263,29 @@ nsNativeThemeGTK::GetCachedWidgetBorder(
+@@ -1264,18 +1263,30 @@ nsNativeThemeGTK::GetCachedWidgetBorder(
                                          nsIntMargin* aResult)
  {
    aResult->SizeTo(0, 0, 0, 0);
@@ -44,8 +91,7 @@ diff --git a/widget/gtk/nsNativeThemeGTK.cpp b/widget/gtk/nsNativeThemeGTK.cpp
    if (GetGtkWidgetAndState(aWidgetType, aFrame, gtkWidgetType, nullptr,
                             &unusedFlags)) {
 -    moz_gtk_get_widget_border(gtkWidgetType, &aResult->left, &aResult->top,
--                              &aResult->right, &aResult->bottom, aDirection,
--                              IsFrameContentNodeInNamespace(aFrame, kNameSpaceID_XHTML));
+-                              &aResult->right, &aResult->bottom, aDirection);
 +    MOZ_ASSERT(0 <= gtkWidgetType && gtkWidgetType < MOZ_GTK_WIDGET_NODE_COUNT);
 +    uint8_t cacheIndex = gtkWidgetType / 8;
 +    uint8_t cacheBit = 1u << (gtkWidgetType % 8);
@@ -54,10 +100,11 @@ diff --git a/widget/gtk/nsNativeThemeGTK.cpp b/widget/gtk/nsNativeThemeGTK.cpp
 +      *aResult = mBorderCache[gtkWidgetType];
 +    } else {
 +      moz_gtk_get_widget_border(gtkWidgetType, &aResult->left, &aResult->top,
-+                                &aResult->right, &aResult->bottom, aDirection,
-+                                IsFrameContentNodeInNamespace(aFrame, kNameSpaceID_XHTML));
-+      mBorderCacheValid[cacheIndex] |= cacheBit;
-+      mBorderCache[gtkWidgetType] = *aResult;
++                                &aResult->right, &aResult->bottom, aDirection);
++      if (aWidgetType != MOZ_GTK_DROPDOWN) { // depends on aDirection
++        mBorderCacheValid[cacheIndex] |= cacheBit;
++        mBorderCache[gtkWidgetType] = *aResult;
++      }
 +    }
    }
  }
@@ -67,7 +114,7 @@ diff --git a/widget/gtk/nsNativeThemeGTK.cpp b/widget/gtk/nsNativeThemeGTK.cpp
                                    uint8_t aWidgetType, nsIntMargin* aResult)
  {
    GtkTextDirection direction = GetTextDirection(aFrame);
-@@ -1776,16 +1785,18 @@ nsNativeThemeGTK::WidgetStateChanged(nsI
+@@ -1775,16 +1786,18 @@ nsNativeThemeGTK::WidgetStateChanged(nsI
  
    return NS_OK;
  }
