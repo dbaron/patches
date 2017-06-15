@@ -1,0 +1,90 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1308876 - Avoid initiating special-height reflow as a result of new paginated non-dirty reflows.
+
+Previously, in paginated mode, all reflows were dirty reflows, since
+tables do not split outside of printing, and prior to the primary patch
+in bug 1308876, all reflows during printing are dirty reflows.  (The
+isPaginated test here is actually for real pages, not fragmentation in
+general.  However, the use here is appropriate for the meaning of
+whether it's possible for the table to fragment.)
+
+The fact that all reflows were dirty reflows meant that the
+NS_FRAME_CONTAINS_RELATIVE_BSIZE flag was always cleared immediately
+before reflow in ReflowInput::InitResizeFlags (which might also have set
+the flag on *ancestors*).  This meant that, prior to the primary patch
+in bug 1308876, the initial value of needToInitiateSpecialReflow that
+was initialized from the presence of the
+NS_FRAME_CONTAINS_RELATIVE_BSIZE flag was always false.  This patch
+preserves that initialization in the presence of the change in the
+primary patch in bug 1308876.
+
+This caused a failure in a single test in our test suite, and in a
+rather complicated way.  The test was
+layout/base/crashtests/470851-1.xhtml, in which there was both a
+difference in assertion count (due to the bogus assertion "data loss -
+incomplete row needed more height than available, on top of page" in
+nsTableRowGroupFrame::SplitRowGroup, whose companion assertion "data
+loss - complete row needed more height than available, on top of page"
+is already just an NS_WARNING) that caused a test failure, and a
+difference in layout (the test split across 3 pages rather than 2) that
+did not cause a test failure.
+
+This patch fixes the difference in layout.  The immediate cause of the
+layout difference was that a cell (the second outermost) on the second
+page had a height, computed in CalcUnpaginatedBSize, that was large
+enough to cause it to need to continue onto the third page.  This height
+came (via nsTableRowFrame::GetUnpaginatedBSize) from the
+UnpaginatedHeightProperty stored on the first-in-flow of its row, on the
+first page, stored by CacheRowBSizesForPrinting called in
+nsTableRowGroupFrame::ReflowChildren during the reflow of its row group
+on the first page, in a special height reflow initiated during the
+second-pass constrained-height reflow of the table (still,
+second-outermost) on the first page, due to the change being fixed in
+this patch.
+
+MozReview-Commit-ID: 3E84VwdXuPs
+
+diff --git a/layout/tables/nsTableFrame.cpp b/layout/tables/nsTableFrame.cpp
+--- a/layout/tables/nsTableFrame.cpp
++++ b/layout/tables/nsTableFrame.cpp
+@@ -2068,25 +2068,30 @@ nsTableFrame::Reflow(nsPresContext*     
+       // frame bsizes as they are before they ever had any extra bsize
+       // distributed to them.  In the meantime, this reflows all the
+       // internal table frames, which restores them to their state before
+       // DistributeBSizeToRows was called.
+       SetGeometryDirty();
+     }
+ 
+     bool needToInitiateSpecialReflow =
+-      HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE);
+-    // see if an extra reflow will be necessary in pagination mode
+-    // when there is a specified table bsize
+-    if (isPaginated && !GetPrevInFlow() && (NS_UNCONSTRAINEDSIZE != aReflowInput.AvailableBSize())) {
+-      nscoord tableSpecifiedBSize = CalcBorderBoxBSize(aReflowInput);
+-      if ((tableSpecifiedBSize > 0) &&
+-          (tableSpecifiedBSize != NS_UNCONSTRAINEDSIZE)) {
+-        needToInitiateSpecialReflow = true;
+-      }
++    if (isPaginated) {
++      // see if an extra reflow will be necessary in pagination mode
++      // when there is a specified table bsize
++      if (!GetPrevInFlow() &&
++          NS_UNCONSTRAINEDSIZE != aReflowInput.AvailableBSize()) {
++        nscoord tableSpecifiedBSize = CalcBorderBoxBSize(aReflowInput);
++        if ((tableSpecifiedBSize > 0) &&
++            (tableSpecifiedBSize != NS_UNCONSTRAINEDSIZE)) {
++          needToInitiateSpecialReflow = true;
++        }
++      }
++    } else {
++      needToInitiateSpecialReflow =
++        HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE);
+     }
+     nsIFrame* lastChildReflowed = nullptr;
+ 
+     NS_ASSERTION(!aReflowInput.mFlags.mSpecialBSizeReflow,
+                  "Shouldn't be in special bsize reflow here!");
+ 
+     // do the pass 2 reflow unless this is a special bsize reflow and we will be
+     // initiating a special bsize reflow
