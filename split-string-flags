@@ -1,0 +1,1384 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1343715 - Split nsTSubstring::mFlags into separate variables for class and data flags.
+
+MozReview-Commit-ID: JW1p5BxpHKA
+
+diff --git a/xpcom/string/nsStringBuffer.h b/xpcom/string/nsStringBuffer.h
+--- a/xpcom/string/nsStringBuffer.h
++++ b/xpcom/string/nsStringBuffer.h
+@@ -10,17 +10,17 @@
+ #include <atomic>
+ #include "mozilla/MemoryReporting.h"
+ 
+ template<class T> struct already_AddRefed;
+ 
+ /**
+  * This structure precedes the string buffers "we" allocate.  It may be the
+  * case that nsTAString::mData does not point to one of these special
+- * buffers.  The mFlags member variable distinguishes the buffer type.
++ * buffers.  The mDataFlags member variable distinguishes the buffer type.
+  *
+  * When this header is in use, it enables reference counting, and capacity
+  * tracking.  NOTE: A string buffer can be modified only if its reference
+  * count is 1.
+  */
+ class nsStringBuffer
+ {
+ private:
+diff --git a/xpcom/string/nsSubstring.cpp b/xpcom/string/nsSubstring.cpp
+--- a/xpcom/string/nsSubstring.cpp
++++ b/xpcom/string/nsSubstring.cpp
+@@ -102,21 +102,21 @@ static nsStringStats gStringStats;
+ #define STRING_STAT_INCREMENT(_s) (gStringStats.m ## _s ## Count)++
+ #else
+ #define STRING_STAT_INCREMENT(_s)
+ #endif
+ 
+ // ---------------------------------------------------------------------------
+ 
+ void
+-ReleaseData(void* aData, uint32_t aFlags)
++ReleaseData(void* aData, nsAString::DataFlags aFlags)
+ {
+-  if (aFlags & nsAString::F_SHARED) {
++  if (aFlags & nsAString::DataFlags::SHARED) {
+     nsStringBuffer::FromData(aData)->Release();
+-  } else if (aFlags & nsAString::F_OWNED) {
++  } else if (aFlags & nsAString::DataFlags::OWNED) {
+     free(aData);
+     STRING_STAT_INCREMENT(AdoptFree);
+     // Treat this as destruction of a "StringAdopt" object for leak
+     // tracking purposes.
+     MOZ_LOG_DTOR(aData, "StringAdopt", 1);
+   }
+   // otherwise, nothing to do.
+ }
+@@ -134,27 +134,27 @@ public:
+   char_type* data() const
+   {
+     return mData;
+   }
+   size_type length() const
+   {
+     return mLength;
+   }
+-  uint32_t flags() const
++  DataFlags flags() const
+   {
+-    return mFlags;
++    return mDataFlags;
+   }
+ 
+   void set(char_type* aData, size_type aLen, uint32_t aFlags)
+   {
+-    ReleaseData(mData, mFlags);
++    ReleaseData(mData, mDataFlags);
+     mData = aData;
+     mLength = aLen;
+-    mFlags = aFlags;
++    mDataFlags = aFlags;
+   }
+ };
+ 
+ class nsACStringAccessor : public nsACString
+ {
+ private:
+   nsACStringAccessor(); // NOT IMPLEMENTED
+ 
+@@ -162,27 +162,27 @@ public:
+   char_type* data() const
+   {
+     return mData;
+   }
+   size_type length() const
+   {
+     return mLength;
+   }
+-  uint32_t flags() const
++  DataFlags flags() const
+   {
+-    return mFlags;
++    return mDataFlags;
+   }
+ 
+   void set(char_type* aData, size_type aLen, uint32_t aFlags)
+   {
+-    ReleaseData(mData, mFlags);
++    ReleaseData(mData, mDataFlags);
+     mData = aData;
+     mLength = aLen;
+-    mFlags = aFlags;
++    mDataFlags = aFlags;
+   }
+ };
+ 
+ // ---------------------------------------------------------------------------
+ 
+ void
+ nsStringBuffer::AddRef()
+ {
+@@ -278,49 +278,47 @@ nsStringBuffer::Realloc(nsStringBuffer* 
+ }
+ 
+ nsStringBuffer*
+ nsStringBuffer::FromString(const nsAString& aStr)
+ {
+   const nsAStringAccessor* accessor =
+     static_cast<const nsAStringAccessor*>(&aStr);
+ 
+-  if (!(accessor->flags() & nsAString::F_SHARED)) {
++  if (!(accessor->flags() & nsAString::DataFlags::SHARED)) {
+     return nullptr;
+   }
+ 
+   return FromData(accessor->data());
+ }
+ 
+ nsStringBuffer*
+ nsStringBuffer::FromString(const nsACString& aStr)
+ {
+   const nsACStringAccessor* accessor =
+     static_cast<const nsACStringAccessor*>(&aStr);
+ 
+-  if (!(accessor->flags() & nsACString::F_SHARED)) {
++  if (!(accessor->flags() & nsACString::DataFlags::SHARED)) {
+     return nullptr;
+   }
+ 
+   return FromData(accessor->data());
+ }
+ 
+ void
+ nsStringBuffer::ToString(uint32_t aLen, nsAString& aStr,
+                          bool aMoveOwnership)
+ {
+   char16_t* data = static_cast<char16_t*>(Data());
+ 
+   nsAStringAccessor* accessor = static_cast<nsAStringAccessor*>(&aStr);
+   MOZ_DIAGNOSTIC_ASSERT(data[aLen] == char16_t(0),
+                         "data should be null terminated");
+ 
+-  // preserve class flags
+-  uint32_t flags = accessor->flags();
+-  flags = (flags & 0xFFFF0000) | nsAString::F_SHARED | nsAString::F_TERMINATED;
++  DataFlags flags = nsAString::DataFlags::SHARED | nsAString::DataFlags::TERMINATED;
+ 
+   if (!aMoveOwnership) {
+     AddRef();
+   }
+   accessor->set(data, aLen, flags);
+ }
+ 
+ void
+@@ -328,19 +326,17 @@ nsStringBuffer::ToString(uint32_t aLen, 
+                          bool aMoveOwnership)
+ {
+   char* data = static_cast<char*>(Data());
+ 
+   nsACStringAccessor* accessor = static_cast<nsACStringAccessor*>(&aStr);
+   MOZ_DIAGNOSTIC_ASSERT(data[aLen] == char(0),
+                         "data should be null terminated");
+ 
+-  // preserve class flags
+-  uint32_t flags = accessor->flags();
+-  flags = (flags & 0xFFFF0000) | nsACString::F_SHARED | nsACString::F_TERMINATED;
++  DataFlags flags = nsACString::DataFlags::SHARED | nsACString::DataFlags::TERMINATED;
+ 
+   if (!aMoveOwnership) {
+     AddRef();
+   }
+   accessor->set(data, aLen, flags);
+ }
+ 
+ size_t
+diff --git a/xpcom/string/nsTDependentString.cpp b/xpcom/string/nsTDependentString.cpp
+--- a/xpcom/string/nsTDependentString.cpp
++++ b/xpcom/string/nsTDependentString.cpp
+@@ -2,40 +2,40 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ nsTDependentString_CharT::nsTDependentString_CharT(const char_type* aStart,
+                                                    const char_type* aEnd)
+   : string_type(const_cast<char_type*>(aStart),
+-                uint32_t(aEnd - aStart), F_TERMINATED)
++                uint32_t(aEnd - aStart), DataFlags::TERMINATED)
+ {
+   MOZ_RELEASE_ASSERT(aStart <= aEnd, "Overflow!");
+   AssertValidDependentString();
+ }
+ 
+ void
+ nsTDependentString_CharT::Rebind(const string_type& str, uint32_t startPos)
+ {
+-  MOZ_ASSERT(str.Flags() & F_TERMINATED, "Unterminated flat string");
++  MOZ_ASSERT(str.Flags() & DataFlags::TERMINATED, "Unterminated flat string");
+ 
+   // If we currently own a buffer, release it.
+   Finalize();
+ 
+   size_type strLength = str.Length();
+ 
+   if (startPos > strLength) {
+     startPos = strLength;
+   }
+ 
+   mData = const_cast<char_type*>(static_cast<const char_type*>(str.Data())) + startPos;
+   mLength = strLength - startPos;
+ 
+-  SetDataFlags(str.Flags() & (F_TERMINATED | F_LITERAL));
++  SetDataFlags(str.Flags() & (DataFlags::TERMINATED | DataFlags::LITERAL));
+ }
+ 
+ void
+ nsTDependentString_CharT::Rebind(const char_type* aStart, const char_type* aEnd)
+ {
+   MOZ_RELEASE_ASSERT(aStart <= aEnd, "Overflow!");
+   Rebind(aStart, uint32_t(aEnd - aStart));
+ }
+diff --git a/xpcom/string/nsTDependentString.h b/xpcom/string/nsTDependentString.h
+--- a/xpcom/string/nsTDependentString.h
++++ b/xpcom/string/nsTDependentString.h
+@@ -26,32 +26,32 @@ public:
+ 
+   /**
+    * constructors
+    */
+ 
+   nsTDependentString_CharT(const char_type* aStart, const char_type* aEnd);
+ 
+   nsTDependentString_CharT(const char_type* aData, uint32_t aLength)
+-    : string_type(const_cast<char_type*>(aData), aLength, F_TERMINATED)
++    : string_type(const_cast<char_type*>(aData), aLength, DataFlags::TERMINATED)
+   {
+     AssertValidDependentString();
+   }
+ 
+ #if defined(CharT_is_PRUnichar) && defined(MOZ_USE_CHAR16_WRAPPER)
+   nsTDependentString_CharT(char16ptr_t aData, uint32_t aLength)
+     : nsTDependentString_CharT(static_cast<const char16_t*>(aData), aLength)
+   {
+   }
+ #endif
+ 
+   explicit
+   nsTDependentString_CharT(const char_type* aData)
+     : string_type(const_cast<char_type*>(aData),
+-                  uint32_t(char_traits::length(aData)), F_TERMINATED)
++                  uint32_t(char_traits::length(aData)), DataFlags::TERMINATED)
+   {
+     AssertValidDependentString();
+   }
+ 
+ #if defined(CharT_is_PRUnichar) && defined(MOZ_USE_CHAR16_WRAPPER)
+   explicit
+   nsTDependentString_CharT(char16ptr_t aData)
+     : nsTDependentString_CharT(static_cast<const char16_t*>(aData))
+diff --git a/xpcom/string/nsTDependentSubstring.cpp b/xpcom/string/nsTDependentSubstring.cpp
+--- a/xpcom/string/nsTDependentSubstring.cpp
++++ b/xpcom/string/nsTDependentSubstring.cpp
+@@ -15,43 +15,43 @@ nsTDependentSubstring_CharT::Rebind(cons
+ 
+   if (startPos > strLength) {
+     startPos = strLength;
+   }
+ 
+   mData = const_cast<char_type*>(static_cast<const char_type*>(str.Data())) + startPos;
+   mLength = XPCOM_MIN(length, strLength - startPos);
+ 
+-  SetDataFlags(F_NONE);
++  SetDataFlags(DataFlags::NONE);
+ }
+ 
+ void
+ nsTDependentSubstring_CharT::Rebind(const char_type* data, size_type length)
+ {
+   NS_ASSERTION(data, "nsTDependentSubstring must wrap a non-NULL buffer");
+ 
+   // If we currently own a buffer, release it.
+   Finalize();
+ 
+   mData = const_cast<char_type*>(static_cast<const char_type*>(data));
+   mLength = length;
+-  SetDataFlags(F_NONE);
++  SetDataFlags(DataFlags::NONE);
+ }
+ 
+ void
+ nsTDependentSubstring_CharT::Rebind(const char_type* aStart, const char_type* aEnd)
+ {
+   MOZ_RELEASE_ASSERT(aStart <= aEnd, "Overflow!");
+   Rebind(aStart, size_type(aEnd - aStart));
+ }
+ 
+ nsTDependentSubstring_CharT::nsTDependentSubstring_CharT(const char_type* aStart,
+                                                          const char_type* aEnd)
+   : substring_type(const_cast<char_type*>(aStart), uint32_t(aEnd - aStart),
+-                   F_NONE)
++                   DataFlags::NONE)
+ {
+   MOZ_RELEASE_ASSERT(aStart <= aEnd, "Overflow!");
+ }
+ 
+ #if defined(CharT_is_PRUnichar) && defined(MOZ_USE_CHAR16_WRAPPER)
+ nsTDependentSubstring_CharT::nsTDependentSubstring_CharT(char16ptr_t aStart,
+                                                          char16ptr_t aEnd)
+   : nsTDependentSubstring_CharT(static_cast<const char16_t*>(aStart),
+@@ -61,17 +61,17 @@ nsTDependentSubstring_CharT::nsTDependen
+                      static_cast<const char16_t*>(aEnd),
+                      "Overflow!");
+ }
+ #endif
+ 
+ nsTDependentSubstring_CharT::nsTDependentSubstring_CharT(const const_iterator& aStart,
+                                                          const const_iterator& aEnd)
+   : substring_type(const_cast<char_type*>(aStart.get()),
+-                   uint32_t(aEnd.get() - aStart.get()), F_NONE)
++                   uint32_t(aEnd.get() - aStart.get()), DataFlags::NONE)
+ {
+   MOZ_RELEASE_ASSERT(aStart.get() <= aEnd.get(), "Overflow!");
+ }
+ 
+ const nsTDependentSubstring_CharT
+ Substring(const CharT* aStart, const CharT* aEnd)
+ {
+   MOZ_RELEASE_ASSERT(aStart <= aEnd, "Overflow!");
+diff --git a/xpcom/string/nsTDependentSubstring.h b/xpcom/string/nsTDependentSubstring.h
+--- a/xpcom/string/nsTDependentSubstring.h
++++ b/xpcom/string/nsTDependentSubstring.h
+@@ -34,17 +34,17 @@ public:
+   nsTDependentSubstring_CharT(const substring_type& aStr, uint32_t aStartPos,
+                               uint32_t aLength = size_type(-1))
+     : substring_type()
+   {
+     Rebind(aStr, aStartPos, aLength);
+   }
+ 
+   nsTDependentSubstring_CharT(const char_type* aData, size_type aLength)
+-    : substring_type(const_cast<char_type*>(aData), aLength, F_NONE)
++    : substring_type(const_cast<char_type*>(aData), aLength, DataFlags::NONE)
+   {
+   }
+ 
+   nsTDependentSubstring_CharT(const char_type* aStart, const char_type* aEnd);
+ 
+ #if defined(CharT_is_PRUnichar) && defined(MOZ_USE_CHAR16_WRAPPER)
+   nsTDependentSubstring_CharT(char16ptr_t aData, size_type aLength)
+     : nsTDependentSubstring_CharT(static_cast<const char16_t*>(aData), aLength)
+diff --git a/xpcom/string/nsTLiteralString.h b/xpcom/string/nsTLiteralString.h
+--- a/xpcom/string/nsTLiteralString.h
++++ b/xpcom/string/nsTLiteralString.h
+@@ -24,17 +24,17 @@ public:
+ public:
+ 
+   /**
+    * constructor
+    */
+ 
+   template<size_type N>
+   explicit nsTLiteralString_CharT(const char_type (&aStr)[N])
+-    : base_string_type(const_cast<char_type*>(aStr), N - 1, F_TERMINATED | F_LITERAL)
++    : base_string_type(const_cast<char_type*>(aStr), N - 1, DataFlags::TERMINATED | DataFlags::LITERAL)
+   {
+   }
+ 
+   /**
+    * For compatibility with existing code that requires const ns[C]String*.
+    * Use sparingly. If possible, rewrite code to use const ns[C]String&
+    * and the implicit cast will just work.
+    */
+diff --git a/xpcom/string/nsTPromiseFlatString.cpp b/xpcom/string/nsTPromiseFlatString.cpp
+--- a/xpcom/string/nsTPromiseFlatString.cpp
++++ b/xpcom/string/nsTPromiseFlatString.cpp
+@@ -5,14 +5,14 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ void
+ nsTPromiseFlatString_CharT::Init(const substring_type& str)
+ {
+   if (str.IsTerminated()) {
+     mData = const_cast<char_type*>(static_cast<const char_type*>(str.Data()));
+     mLength = str.Length();
+-    mFlags = str.Flags() & (F_TERMINATED | F_LITERAL);
+-    // does not promote F_VOIDED
++    mDataFlags = str.Flags() & (DataFlags::TERMINATED | DataFlags::LITERAL);
++    // does not promote DataFlags::VOIDED
+   } else {
+     Assign(str);
+   }
+ }
+diff --git a/xpcom/string/nsTString.cpp b/xpcom/string/nsTString.cpp
+--- a/xpcom/string/nsTString.cpp
++++ b/xpcom/string/nsTString.cpp
+@@ -6,26 +6,26 @@
+ 
+ nsTAdoptingString_CharT&
+ nsTAdoptingString_CharT::operator=(const self_type& str)
+ {
+   // This'll violate the constness of this argument, that's just
+   // the nature of this class...
+   self_type* mutable_str = const_cast<self_type*>(&str);
+ 
+-  if (str.mFlags & F_OWNED) {
++  if (str.mDataFlags & DataFlags::OWNED) {
+     // We want to do what Adopt() does, but without actually incrementing
+     // the Adopt count.  Note that we can be a little more straightforward
+     // about this than Adopt() is, because we know that str.mData is
+     // non-null.  Should we be able to assert that str is not void here?
+     NS_ASSERTION(str.mData, "String with null mData?");
+     Finalize();
+     mData = str.mData;
+     mLength = str.mLength;
+-    SetDataFlags(F_TERMINATED | F_OWNED);
++    SetDataFlags(DataFlags::TERMINATED | DataFlags::OWNED);
+ 
+     // Make str forget the buffer we just took ownership of.
+     new (mutable_str) self_type();
+   } else {
+     Assign(str);
+ 
+     mutable_str->Truncate();
+   }
+@@ -36,12 +36,12 @@ nsTAdoptingString_CharT::operator=(const
+ void
+ nsTString_CharT::Rebind(const char_type* data, size_type length)
+ {
+   // If we currently own a buffer, release it.
+   Finalize();
+ 
+   mData = const_cast<char_type*>(data);
+   mLength = length;
+-  SetDataFlags(F_TERMINATED);
++  SetDataFlags(DataFlags::TERMINATED);
+   AssertValidDependentString();
+ }
+ 
+diff --git a/xpcom/string/nsTString.h b/xpcom/string/nsTString.h
+--- a/xpcom/string/nsTString.h
++++ b/xpcom/string/nsTString.h
+@@ -459,18 +459,19 @@ public:
+                  "nsTDependentString must wrap only null-terminated strings. "
+                  "You are probably looking for nsTDependentSubstring.");
+   }
+ 
+ 
+ protected:
+ 
+   // allow subclasses to initialize fields directly
+-  nsTString_CharT(char_type* aData, size_type aLength, uint32_t aFlags)
+-    : substring_type(aData, aLength, aFlags)
++  nsTString_CharT(char_type* aData, size_type aLength, DataFlags aDataFlags,
++                  ClassFlags aClassFlags)
++    : substring_type(aData, aLength, aDataFlags, aClassFlags)
+   {
+   }
+ 
+   struct Segment {
+     uint32_t mBegin, mLength;
+     Segment(uint32_t aBegin, uint32_t aLength)
+       : mBegin(aBegin)
+       , mLength(aLength)
+@@ -495,25 +496,27 @@ public:
+    * @param aStorageSize
+    *        the size of the fixed buffer
+    * @param aLength (optional)
+    *        the length of the string already contained in the buffer
+    */
+ 
+   nsTFixedString_CharT(char_type* aData, size_type aStorageSize)
+     : string_type(aData, uint32_t(char_traits::length(aData)),
+-                  F_TERMINATED | F_FIXED | F_CLASS_FIXED)
++                  DataFlags::TERMINATED | DataFlags::FIXED,
++                  ClassFlags::FIXED)
+     , mFixedCapacity(aStorageSize - 1)
+     , mFixedBuf(aData)
+   {
+   }
+ 
+   nsTFixedString_CharT(char_type* aData, size_type aStorageSize,
+                        size_type aLength)
+-    : string_type(aData, aLength, F_TERMINATED | F_FIXED | F_CLASS_FIXED)
++    : string_type(aData, aLength, DataFlags::TERMINATED | DataFlags::FIXED,
++                  ClassFlags::FIXED)
+     , mFixedCapacity(aStorageSize - 1)
+     , mFixedBuf(aData)
+   {
+     // null-terminate
+     mFixedBuf[aLength] = char_type(0);
+   }
+ 
+   // |operator=| does not inherit, so we must define our own
+@@ -709,35 +712,35 @@ class nsTXPIDLString_CharT : public nsTS
+ {
+ public:
+ 
+   typedef nsTXPIDLString_CharT self_type;
+ 
+ public:
+ 
+   nsTXPIDLString_CharT()
+-    : string_type(char_traits::sEmptyBuffer, 0, F_TERMINATED | F_VOIDED)
++    : string_type(char_traits::sEmptyBuffer, 0, DataFlags::TERMINATED | DataFlags::VOIDED)
+   {
+   }
+ 
+   // copy-constructor required to avoid default
+   nsTXPIDLString_CharT(const self_type& aStr)
+-    : string_type(char_traits::sEmptyBuffer, 0, F_TERMINATED | F_VOIDED)
++    : string_type(char_traits::sEmptyBuffer, 0, DataFlags::TERMINATED | DataFlags::VOIDED)
+   {
+     Assign(aStr);
+   }
+ 
+   // return nullptr if we are voided
+ #if defined(CharT_is_PRUnichar) && defined(MOZ_USE_CHAR16_WRAPPER)
+   char16ptr_t get() const
+ #else
+   const char_type* get() const
+ #endif
+   {
+-    return (mFlags & F_VOIDED) ? nullptr : mData;
++    return (mDataFlags & DataFlags::VOIDED) ? nullptr : mData;
+   }
+ 
+   // this case operator is the reason why this class cannot just be a
+   // typedef for nsTString
+   operator const char_type*() const
+   {
+     return get();
+   }
+diff --git a/xpcom/string/nsTStringObsolete.cpp b/xpcom/string/nsTStringObsolete.cpp
+--- a/xpcom/string/nsTStringObsolete.cpp
++++ b/xpcom/string/nsTStringObsolete.cpp
+@@ -470,17 +470,17 @@ nsTString_CharT::ReplaceChar( const char
+       break;
+ 
+     data[i++] = aNewChar;
+     data += i;
+     lenRemaining -= i;
+   }
+ }
+ 
+-void ReleaseData(void* aData, uint32_t aFlags);
++void ReleaseData(void* aData, nsAString::DataFlags aFlags);
+ 
+ void
+ nsTString_CharT::ReplaceSubstring(const char_type* aTarget,
+                                   const char_type* aNewValue)
+ {
+   ReplaceSubstring(nsTDependentString_CharT(aTarget),
+                    nsTDependentString_CharT(aNewValue));
+ }
+@@ -550,17 +550,17 @@ nsTString_CharT::ReplaceSubstring(const 
+     return true;
+   }
+ 
+   // Make sure that we can mutate our buffer.
+   // Note that we always allocate at least an mLength sized buffer, because the
+   // rest of the algorithm relies on having access to all of the original
+   // string.  In other words, we over-allocate in the shrinking case.
+   char_type* oldData;
+-  uint32_t oldFlags;
++  DataFlags oldFlags;
+   if (!MutatePrep(XPCOM_MAX(mLength, newLength.value()), &oldData, &oldFlags))
+     return false;
+   if (oldData) {
+     // Copy all of the old data to the new buffer.
+     char_traits::copy(mData, oldData, mLength);
+     ::ReleaseData(oldData, oldFlags);
+   }
+ 
+diff --git a/xpcom/string/nsTSubstring.cpp b/xpcom/string/nsTSubstring.cpp
+--- a/xpcom/string/nsTSubstring.cpp
++++ b/xpcom/string/nsTSubstring.cpp
+@@ -14,22 +14,23 @@ using double_conversion::DoubleToStringC
+ 
+ const nsTSubstring_CharT::size_type nsTSubstring_CharT::kMaxCapacity =
+     (nsTSubstring_CharT::size_type(-1) /
+         2 - sizeof(nsStringBuffer)) /
+     sizeof(nsTSubstring_CharT::char_type) - 2;
+ 
+ #ifdef XPCOM_STRING_CONSTRUCTOR_OUT_OF_LINE
+ nsTSubstring_CharT::nsTSubstring_CharT(char_type* aData, size_type aLength,
+-                                       uint32_t aFlags)
+-  : nsTStringRepr_CharT(aData, aLength, aFlags)
++                                       DataFlags aDataFlags,
++                                       ClassFlags aClassFlags)
++  : nsTStringRepr_CharT(aData, aLength, aDataFlags, aClassFlags)
+ {
+   MOZ_RELEASE_ASSERT(CheckCapacity(aLength), "String is too large.");
+ 
+-  if (aFlags & F_OWNED) {
++  if (aDataFlags & DataFlags::OWNED) {
+     STRING_STAT_INCREMENT(Adopt);
+     MOZ_LOG_CTOR(mData, "StringAdopt", 1);
+   }
+ }
+ #endif /* XPCOM_STRING_CONSTRUCTOR_OUT_OF_LINE */
+ 
+ /**
+  * helper function for down-casting a nsTSubstring to a nsTFixedString.
+@@ -44,21 +45,21 @@ AsFixedString(const nsTSubstring_CharT* 
+  * this function is called to prepare mData for writing.  the given capacity
+  * indicates the required minimum storage size for mData, in sizeof(char_type)
+  * increments.  this function returns true if the operation succeeds.  it also
+  * returns the old data and old flags members if mData is newly allocated.
+  * the old data must be released by the caller.
+  */
+ bool
+ nsTSubstring_CharT::MutatePrep(size_type aCapacity, char_type** aOldData,
+-                               uint32_t* aOldFlags)
++                               DataFlags* aOldDataFlags)
+ {
+   // initialize to no old data
+   *aOldData = nullptr;
+-  *aOldFlags = 0;
++  *aOldDataFlags = DataFlags(0);
+ 
+   size_type curCapacity = Capacity();
+ 
+   // If |aCapacity > kMaxCapacity|, then our doubling algorithm may not be
+   // able to allocate it.  Just bail out in cases like that.  We don't want
+   // to be allocating 2GB+ strings anyway.
+   static_assert((sizeof(nsStringBuffer) & 0x1) == 0,
+                 "bad size for nsStringBuffer");
+@@ -67,17 +68,17 @@ nsTSubstring_CharT::MutatePrep(size_type
+   }
+ 
+   // |curCapacity == 0| means that the buffer is immutable or 0-sized, so we
+   // need to allocate a new buffer. We cannot use the existing buffer even
+   // though it might be large enough.
+ 
+   if (curCapacity != 0) {
+     if (aCapacity <= curCapacity) {
+-      mFlags &= ~F_VOIDED;  // mutation clears voided flag
++      mDataFlags &= ~DataFlags::VOIDED;  // mutation clears voided flag
+       return true;
+     }
+   }
+ 
+   if (curCapacity < aCapacity) {
+     // We increase our capacity so that the allocated buffer grows
+     // exponentially, which gives us amortized O(1) appending. Below the
+     // threshold, we use powers-of-two. Above the threshold, we grow by at
+@@ -108,87 +109,87 @@ nsTSubstring_CharT::MutatePrep(size_type
+     MOZ_ASSERT(XPCOM_MIN(temp, kMaxCapacity) >= aCapacity,
+                "should have hit the early return at the top");
+     aCapacity = XPCOM_MIN(temp, kMaxCapacity);
+   }
+ 
+   //
+   // several cases:
+   //
+-  //  (1) we have a shared buffer (mFlags & F_SHARED)
+-  //  (2) we have an owned buffer (mFlags & F_OWNED)
+-  //  (3) we have a fixed buffer (mFlags & F_FIXED)
++  //  (1) we have a shared buffer (mDataFlags & DataFlags::SHARED)
++  //  (2) we have an owned buffer (mDataFlags & DataFlags::OWNED)
++  //  (3) we have a fixed buffer (mDataFlags & DataFlags::FIXED)
+   //  (4) we have a readonly buffer
+   //
+   // requiring that we in some cases preserve the data before creating
+   // a new buffer complicates things just a bit ;-)
+   //
+ 
+   size_type storageSize = (aCapacity + 1) * sizeof(char_type);
+ 
+   // case #1
+-  if (mFlags & F_SHARED) {
++  if (mDataFlags & DataFlags::SHARED) {
+     nsStringBuffer* hdr = nsStringBuffer::FromData(mData);
+     if (!hdr->IsReadonly()) {
+       nsStringBuffer* newHdr = nsStringBuffer::Realloc(hdr, storageSize);
+       if (!newHdr) {
+         return false;  // out-of-memory (original header left intact)
+       }
+ 
+       hdr = newHdr;
+       mData = (char_type*)hdr->Data();
+-      mFlags &= ~F_VOIDED;  // mutation clears voided flag
++      mDataFlags &= ~DataFlags::VOIDED;  // mutation clears voided flag
+       return true;
+     }
+   }
+ 
+   char_type* newData;
+   uint32_t newDataFlags;
+ 
+   // if we have a fixed buffer of sufficient size, then use it.  this helps
+   // avoid heap allocations.
+-  if ((mFlags & F_CLASS_FIXED) &&
++  if ((mClassFlags & ClassFlags::FIXED) &&
+       (aCapacity < AsFixedString(this)->mFixedCapacity)) {
+     newData = AsFixedString(this)->mFixedBuf;
+-    newDataFlags = F_TERMINATED | F_FIXED;
++    newDataFlags = DataFlags::TERMINATED | DataFlags::FIXED;
+   } else {
+     // if we reach here then, we must allocate a new buffer.  we cannot
+-    // make use of our F_OWNED or F_FIXED buffers because they are not
++    // make use of our DataFlags::OWNED or DataFlags::FIXED buffers because they are not
+     // large enough.
+ 
+     nsStringBuffer* newHdr =
+       nsStringBuffer::Alloc(storageSize).take();
+     if (!newHdr) {
+       return false;  // we are still in a consistent state
+     }
+ 
+     newData = (char_type*)newHdr->Data();
+-    newDataFlags = F_TERMINATED | F_SHARED;
++    newDataFlags = DataFlags::TERMINATED | DataFlags::SHARED;
+   }
+ 
+   // save old data and flags
+   *aOldData = mData;
+-  *aOldFlags = mFlags;
++  *aOldDataFlags = mDataFlags;
+ 
+   mData = newData;
+   SetDataFlags(newDataFlags);
+ 
+   // mLength does not change
+ 
+   // though we are not necessarily terminated at the moment, now is probably
+-  // still the best time to set F_TERMINATED.
++  // still the best time to set DataFlags::TERMINATED.
+ 
+   return true;
+ }
+ 
+ void
+ nsTSubstring_CharT::Finalize()
+ {
+-  ::ReleaseData(mData, mFlags);
+-  // mData, mLength, and mFlags are purposefully left dangling
++  ::ReleaseData(mData, mDataFlags);
++  // mData, mLength, and mDataFlags are purposefully left dangling
+ }
+ 
+ bool
+ nsTSubstring_CharT::ReplacePrep(index_type aCutStart,
+                                 size_type aCutLength,
+                                 size_type aNewLength)
+ {
+   aCutLength = XPCOM_MIN(aCutLength, mLength - aCutStart);
+@@ -196,32 +197,32 @@ nsTSubstring_CharT::ReplacePrep(index_ty
+   mozilla::CheckedInt<size_type> newTotalLen = mLength;
+   newTotalLen += aNewLength;
+   newTotalLen -= aCutLength;
+   if (!newTotalLen.isValid()) {
+     return false;
+   }
+ 
+   if (aCutStart == mLength && Capacity() > newTotalLen.value()) {
+-    mFlags &= ~F_VOIDED;
++    mDataFlags &= ~DataFlags::VOIDED;
+     mData[newTotalLen.value()] = char_type(0);
+     mLength = newTotalLen.value();
+     return true;
+   }
+ 
+   return ReplacePrepInternal(aCutStart, aCutLength, aNewLength,
+                              newTotalLen.value());
+ }
+ 
+ bool
+ nsTSubstring_CharT::ReplacePrepInternal(index_type aCutStart, size_type aCutLen,
+                                         size_type aFragLen, size_type aNewLen)
+ {
+   char_type* oldData;
+-  uint32_t oldFlags;
++  DataFlags oldFlags;
+   if (!MutatePrep(aNewLen, &oldData, &oldFlags)) {
+     return false;  // out-of-memory
+   }
+ 
+   if (oldData) {
+     // determine whether or not we need to copy part of the old string
+     // over to the new string.
+ 
+@@ -261,47 +262,47 @@ nsTSubstring_CharT::ReplacePrepInternal(
+ }
+ 
+ nsTSubstring_CharT::size_type
+ nsTSubstring_CharT::Capacity() const
+ {
+   // return 0 to indicate an immutable or 0-sized buffer
+ 
+   size_type capacity;
+-  if (mFlags & F_SHARED) {
++  if (mDataFlags & DataFlags::SHARED) {
+     // if the string is readonly, then we pretend that it has no capacity.
+     nsStringBuffer* hdr = nsStringBuffer::FromData(mData);
+     if (hdr->IsReadonly()) {
+       capacity = 0;
+     } else {
+       capacity = (hdr->StorageSize() / sizeof(char_type)) - 1;
+     }
+-  } else if (mFlags & F_FIXED) {
++  } else if (mDataFlags & DataFlags::FIXED) {
+     capacity = AsFixedString(this)->mFixedCapacity;
+-  } else if (mFlags & F_OWNED) {
++  } else if (mDataFlags & DataFlags::OWNED) {
+     // we don't store the capacity of an adopted buffer because that would
+     // require an additional member field.  the best we can do is base the
+     // capacity on our length.  remains to be seen if this is the right
+     // trade-off.
+     capacity = mLength;
+   } else {
+     capacity = 0;
+   }
+ 
+   return capacity;
+ }
+ 
+ bool
+ nsTSubstring_CharT::EnsureMutable(size_type aNewLen)
+ {
+   if (aNewLen == size_type(-1) || aNewLen == mLength) {
+-    if (mFlags & (F_FIXED | F_OWNED)) {
++    if (mDataFlags & (DataFlags::FIXED | DataFlags::OWNED)) {
+       return true;
+     }
+-    if ((mFlags & F_SHARED) &&
++    if ((mDataFlags & DataFlags::SHARED) &&
+         !nsStringBuffer::FromData(mData)->IsReadonly()) {
+       return true;
+     }
+ 
+     aNewLen = mLength;
+   }
+   return SetLength(aNewLen, mozilla::fallible);
+ }
+@@ -404,20 +405,20 @@ nsTSubstring_CharT::AssignASCII(const ch
+ 
+   char_traits::copyASCII(mData, aData, aLength);
+   return true;
+ }
+ 
+ void
+ nsTSubstring_CharT::AssignLiteral(const char_type* aData, size_type aLength)
+ {
+-  ::ReleaseData(mData, mFlags);
++  ::ReleaseData(mData, mDataFlags);
+   mData = const_cast<char_type*>(aData);
+   mLength = aLength;
+-  SetDataFlags(F_TERMINATED | F_LITERAL);
++  SetDataFlags(DataFlags::TERMINATED | DataFlags::LITERAL);
+ }
+ 
+ void
+ nsTSubstring_CharT::Assign(const self_type& aStr)
+ {
+   if (!Assign(aStr, mozilla::fallible)) {
+     AllocFailed(aStr.Length());
+   }
+@@ -430,37 +431,37 @@ nsTSubstring_CharT::Assign(const self_ty
+   // deal with it.
+ 
+   if (&aStr == this) {
+     return true;
+   }
+ 
+   if (!aStr.mLength) {
+     Truncate();
+-    mFlags |= aStr.mFlags & F_VOIDED;
++    mDataFlags |= aStr.mDataFlags & DataFlags::VOIDED;
+     return true;
+   }
+ 
+-  if (aStr.mFlags & F_SHARED) {
++  if (aStr.mDataFlags & DataFlags::SHARED) {
+     // nice! we can avoid a string copy :-)
+ 
+     // |aStr| should be null-terminated
+-    NS_ASSERTION(aStr.mFlags & F_TERMINATED, "shared, but not terminated");
++    NS_ASSERTION(aStr.mDataFlags & DataFlags::TERMINATED, "shared, but not terminated");
+ 
+-    ::ReleaseData(mData, mFlags);
++    ::ReleaseData(mData, mDataFlags);
+ 
+     mData = aStr.mData;
+     mLength = aStr.mLength;
+-    SetDataFlags(F_TERMINATED | F_SHARED);
++    SetDataFlags(DataFlags::TERMINATED | DataFlags::SHARED);
+ 
+     // get an owning reference to the mData
+     nsStringBuffer::FromData(mData)->AddRef();
+     return true;
+-  } else if (aStr.mFlags & F_LITERAL) {
+-    MOZ_ASSERT(aStr.mFlags & F_TERMINATED, "Unterminated literal");
++  } else if (aStr.mDataFlags & DataFlags::LITERAL) {
++    MOZ_ASSERT(aStr.mDataFlags & DataFlags::TERMINATED, "Unterminated literal");
+ 
+     AssignLiteral(aStr.mData, aStr.mLength);
+     return true;
+   }
+ 
+   // else, treat this like an ordinary assignment.
+   return Assign(aStr.Data(), aStr.Length(), aFallible);
+ }
+@@ -481,17 +482,17 @@ nsTSubstring_CharT::Assign(const substri
+     // take advantage of sharing here...
+     return Assign(string_type(aTuple), aFallible);
+   }
+ 
+   size_type length = aTuple.Length();
+ 
+   // don't use ReplacePrep here because it changes the length
+   char_type* oldData;
+-  uint32_t oldFlags;
++  DataFlags oldFlags;
+   if (!MutatePrep(length, &oldData, &oldFlags)) {
+     return false;
+   }
+ 
+   if (oldData) {
+     ::ReleaseData(oldData, oldFlags);
+   }
+ 
+@@ -500,27 +501,27 @@ nsTSubstring_CharT::Assign(const substri
+   mLength = length;
+   return true;
+ }
+ 
+ void
+ nsTSubstring_CharT::Adopt(char_type* aData, size_type aLength)
+ {
+   if (aData) {
+-    ::ReleaseData(mData, mFlags);
++    ::ReleaseData(mData, mDataFlags);
+ 
+     if (aLength == size_type(-1)) {
+       aLength = char_traits::length(aData);
+     }
+ 
+     MOZ_RELEASE_ASSERT(CheckCapacity(aLength), "adopting a too-long string");
+ 
+     mData = aData;
+     mLength = aLength;
+-    SetDataFlags(F_TERMINATED | F_OWNED);
++    SetDataFlags(DataFlags::TERMINATED | DataFlags::OWNED);
+ 
+     STRING_STAT_INCREMENT(Adopt);
+     // Treat this as construction of a "StringAdopt" object for leak
+     // tracking purposes.
+     MOZ_LOG_CTOR(mData, "StringAdopt", 1);
+   } else {
+     SetIsVoid(true);
+   }
+@@ -681,25 +682,25 @@ nsTSubstring_CharT::SetCapacity(size_typ
+ 
+ bool
+ nsTSubstring_CharT::SetCapacity(size_type aCapacity, const fallible_t&)
+ {
+   // capacity does not include room for the terminating null char
+ 
+   // if our capacity is reduced to zero, then free our buffer.
+   if (aCapacity == 0) {
+-    ::ReleaseData(mData, mFlags);
++    ::ReleaseData(mData, mDataFlags);
+     mData = char_traits::sEmptyBuffer;
+     mLength = 0;
+-    SetDataFlags(F_TERMINATED);
++    SetDataFlags(DataFlags::TERMINATED);
+     return true;
+   }
+ 
+   char_type* oldData;
+-  uint32_t oldFlags;
++  DataFlags oldFlags;
+   if (!MutatePrep(aCapacity, &oldData, &oldFlags)) {
+     return false;  // out-of-memory
+   }
+ 
+   // compute new string length
+   size_type newLen = XPCOM_MIN(mLength, aCapacity);
+ 
+   if (oldData) {
+@@ -741,19 +742,19 @@ nsTSubstring_CharT::SetLength(size_type 
+   return true;
+ }
+ 
+ void
+ nsTSubstring_CharT::SetIsVoid(bool aVal)
+ {
+   if (aVal) {
+     Truncate();
+-    mFlags |= F_VOIDED;
++    mDataFlags |= DataFlags::VOIDED;
+   } else {
+-    mFlags &= ~F_VOIDED;
++    mDataFlags &= ~DataFlags::VOIDED;
+   }
+ }
+ 
+ namespace mozilla {
+ namespace detail {
+ 
+ nsTStringRepr_CharT::char_type
+ nsTStringRepr_CharT::First() const
+@@ -1110,46 +1111,46 @@ nsTSubstring_CharT::AppendFloat(double a
+   int length = FormatWithoutTrailingZeros(buf, aFloat, 15);
+   AppendASCII(buf, length);
+ }
+ 
+ size_t
+ nsTSubstring_CharT::SizeOfExcludingThisIfUnshared(
+     mozilla::MallocSizeOf aMallocSizeOf) const
+ {
+-  if (mFlags & F_SHARED) {
++  if (mDataFlags & DataFlags::SHARED) {
+     return nsStringBuffer::FromData(mData)->
+       SizeOfIncludingThisIfUnshared(aMallocSizeOf);
+   }
+-  if (mFlags & F_OWNED) {
++  if (mDataFlags & DataFlags::OWNED) {
+     return aMallocSizeOf(mData);
+   }
+ 
+   // If we reach here, exactly one of the following must be true:
+-  // - F_VOIDED is set, and mData points to sEmptyBuffer;
+-  // - F_FIXED is set, and mData points to a buffer within a string
++  // - DataFlags::VOIDED is set, and mData points to sEmptyBuffer;
++  // - DataFlags::FIXED is set, and mData points to a buffer within a string
+   //   object (e.g. nsAutoString);
+-  // - None of F_SHARED, F_OWNED, F_FIXED is set, and mData points to a buffer
++  // - None of DataFlags::SHARED, DataFlags::OWNED, DataFlags::FIXED is set, and mData points to a buffer
+   //   owned by something else.
+   //
+   // In all three cases, we don't measure it.
+   return 0;
+ }
+ 
+ size_t
+ nsTSubstring_CharT::SizeOfExcludingThisEvenIfShared(
+     mozilla::MallocSizeOf aMallocSizeOf) const
+ {
+   // This is identical to SizeOfExcludingThisIfUnshared except for the
+-  // F_SHARED case.
+-  if (mFlags & F_SHARED) {
++  // DataFlags::SHARED case.
++  if (mDataFlags & DataFlags::SHARED) {
+     return nsStringBuffer::FromData(mData)->
+       SizeOfIncludingThisEvenIfShared(aMallocSizeOf);
+   }
+-  if (mFlags & F_OWNED) {
++  if (mDataFlags & DataFlags::OWNED) {
+     return aMallocSizeOf(mData);
+   }
+   return 0;
+ }
+ 
+ size_t
+ nsTSubstring_CharT::SizeOfIncludingThisIfUnshared(
+     mozilla::MallocSizeOf aMallocSizeOf) const
+diff --git a/xpcom/string/nsTSubstring.h b/xpcom/string/nsTSubstring.h
+--- a/xpcom/string/nsTSubstring.h
++++ b/xpcom/string/nsTSubstring.h
+@@ -157,39 +157,34 @@ public:
+     return mData;
+   }
+ 
+   size_type Length() const
+   {
+     return mLength;
+   }
+ 
+-  uint32_t Flags() const
+-  {
+-    return mFlags;
+-  }
+-
+   bool IsEmpty() const
+   {
+     return mLength == 0;
+   }
+ 
+   bool IsLiteral() const
+   {
+-    return (mFlags & F_LITERAL) != 0;
++    return (mDataFlags & DataFlags::LITERAL) != 0;
+   }
+ 
+   bool IsVoid() const
+   {
+-    return (mFlags & F_VOIDED) != 0;
++    return (mDataFlags & DataFlags::VOIDED) != 0;
+   }
+ 
+   bool IsTerminated() const
+   {
+-    return (mFlags & F_TERMINATED) != 0;
++    return (mDataFlags & DataFlags::TERMINATED) != 0;
+   }
+ 
+   char_type CharAt(index_type aIndex) const
+   {
+     NS_ASSERTION(aIndex < mLength, "index exceeds allowable range");
+     return mData[aIndex];
+   }
+ 
+@@ -293,54 +288,57 @@ public:
+      *
+      *   !(f2.begin >= f1.aEnd || f2.aEnd <= f1.begin)
+      *
+      * Simplified, that gives us:
+      */
+     return (aStart < (mData + mLength) && aEnd > mData);
+   }
+ 
++  // NOTE: these flags are declared public _only_ for convenience inside
++  // the string implementation.
++
++  // bits for mDataFlags
++  enum class DataFlags : uint16_t
++  {
++    TERMINATED   = 1 << 0,  // IsTerminated returns true
++    VOIDED       = 1 << 1,  // IsVoid returns true
++    SHARED       = 1 << 2,  // mData points to a heap-allocated, shared buffer
++    OWNED        = 1 << 3,  // mData points to a heap-allocated, raw buffer
++    FIXED        = 1 << 4,  // mData points to a fixed-size writable, dependent buffer
++    LITERAL      = 1 << 5   // mData points to a string literal; DataFlags::TERMINATED will also be set
++  };
++  MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(DataFlags)
++
++  // bits for mClassFlags
++  enum class ClassFlags : uint16_t
++  {
++    FIXED  = 1 << 0   // indicates that |this| is of type nsTFixedString
++  };
++  MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ClassFlags)
++
+ protected:
+   nsTStringRepr_CharT() = delete; // Never instantiate directly
+ 
+   constexpr
+-  nsTStringRepr_CharT(char_type* aData, size_type aLength, uint32_t aFlags)
++  nsTStringRepr_CharT(char_type* aData, size_type aLength,
++                      DataFlags aDataFlags, ClassFlags aClassFlags)
+     : mData(aData)
+     , mLength(aLength)
+-    , mFlags(aFlags)
++    , mDataFlags(aDataFlags)
++    , mClassFlags(aClassFlags)
+   {
+   }
+ 
+   char_type*  mData;
+   size_type   mLength;
+-  uint32_t    mFlags;
++  DataFlags   mDataFlags;
++  ClassFlags  mClassFlags;
+ 
+ public:
+-  // mFlags is a bitwise combination of the following flags.  the meaning
+-  // and interpretation of these flags is an implementation detail.
+-  //
+-  // NOTE: these flags are declared public _only_ for convenience inside
+-  // the string implementation.
+-
+-  enum
+-  {
+-    F_NONE         = 0,       // no flags
+-
+-    // data flags are in the lower 16-bits
+-    F_TERMINATED   = 1 << 0,  // IsTerminated returns true
+-    F_VOIDED       = 1 << 1,  // IsVoid returns true
+-    F_SHARED       = 1 << 2,  // mData points to a heap-allocated, shared buffer
+-    F_OWNED        = 1 << 3,  // mData points to a heap-allocated, raw buffer
+-    F_FIXED        = 1 << 4,  // mData points to a fixed-size writable, dependent buffer
+-    F_LITERAL      = 1 << 5,  // mData points to a string literal; F_TERMINATED will also be set
+-
+-    // class flags are in the upper 16-bits
+-    F_CLASS_FIXED  = 1 << 16   // indicates that |this| is of type nsTFixedString
+-  };
+-
+   //
+   // Some terminology:
+   //
+   //   "dependent buffer"    A dependent buffer is one that the string class
+   //                         does not own.  The string class relies on some
+   //                         external code to ensure the lifetime of the
+   //                         dependent buffer.
+   //
+@@ -350,29 +348,29 @@ public:
+   //                         the beginning of the buffer for additional
+   //                         fields, including a reference count and a
+   //                         buffer length.  See nsStringHeader.
+   //
+   //   "adopted buffer"      An adopted buffer is a raw string buffer
+   //                         allocated on the heap (using moz_xmalloc)
+   //                         of which the string class subsumes ownership.
+   //
+-  // Some comments about the string flags:
++  // Some comments about the string data flags:
+   //
+-  //   F_SHARED, F_OWNED, and F_FIXED are all mutually exlusive.  They
++  //   SHARED, OWNED, and FIXED are all mutually exlusive.  They
+   //   indicate the allocation type of mData.  If none of these flags
+   //   are set, then the string buffer is dependent.
+   //
+-  //   F_SHARED, F_OWNED, or F_FIXED imply F_TERMINATED.  This is because
++  //   SHARED, OWNED, or FIXED imply TERMINATED.  This is because
+   //   the string classes always allocate null-terminated buffers, and
+   //   non-terminated substrings are always dependent.
+   //
+-  //   F_VOIDED implies F_TERMINATED, and moreover it implies that mData
+-  //   points to char_traits::sEmptyBuffer.  Therefore, F_VOIDED is
+-  //   mutually exclusive with F_SHARED, F_OWNED, and F_FIXED.
++  //   VOIDED implies TERMINATED, and moreover it implies that mData
++  //   points to char_traits::sEmptyBuffer.  Therefore, VOIDED is
++  //   mutually exclusive with SHARED, OWNED, and FIXED.
+   //
+ };
+ 
+ } // namespace detail
+ } // namespace mozilla
+ 
+ /**
+  * nsTSubstring is an abstract string class. From an API perspective, this
+@@ -1037,31 +1035,31 @@ public:
+   void StripCRLF();
+ 
+   /**
+    * If the string uses a shared buffer, this method
+    * clears the pointer without releasing the buffer.
+    */
+   void ForgetSharedBuffer()
+   {
+-    if (mFlags & nsAString::F_SHARED) {
++    if (mDataFlags & DataFlags::SHARED) {
+       mData = char_traits::sEmptyBuffer;
+       mLength = 0;
+-      mFlags = F_TERMINATED;
++      mDataFlags = DataFlags::TERMINATED;
+     }
+   }
+ 
+ public:
+ 
+   /**
+    * this is public to support automatic conversion of tuple to string
+    * base type, which helps avoid converting to nsTAString.
+    */
+   MOZ_IMPLICIT nsTSubstring_CharT(const substring_tuple_type& aTuple)
+-    : nsTStringRepr_CharT(nullptr, 0, F_NONE)
++    : nsTStringRepr_CharT(nullptr, 0, DataFlags::NONE)
+   {
+     Assign(aTuple);
+   }
+ 
+   size_t SizeOfExcludingThisIfUnshared(mozilla::MallocSizeOf aMallocSizeOf)
+   const;
+   size_t SizeOfIncludingThisIfUnshared(mozilla::MallocSizeOf aMallocSizeOf)
+   const;
+@@ -1090,39 +1088,40 @@ public:
+   {
+     ::NS_ABORT_OOM(aLength * sizeof(char_type));
+   }
+ 
+ protected:
+ 
+   // default initialization
+   nsTSubstring_CharT()
+-    : nsTStringRepr_CharT(char_traits::sEmptyBuffer, 0, F_TERMINATED)
++    : nsTStringRepr_CharT(char_traits::sEmptyBuffer, 0, DataFlags::TERMINATED)
+   {
+   }
+ 
+   // copy-constructor, constructs as dependent on given object
+   // (NOTE: this is for internal use only)
+   nsTSubstring_CharT(const self_type& aStr)
+     : nsTStringRepr_CharT(aStr.mData, aStr.mLength,
+-                          aStr.mFlags & (F_TERMINATED | F_VOIDED))
++                          aStr.mDataFlags & (DataFlags::TERMINATED | DataFlags::VOIDED))
+   {
+   }
+ 
+  /**
+    * allows for direct initialization of a nsTSubstring object.
+    */
+   // XXXbz or can I just include nscore.h and use NS_BUILD_REFCNT_LOGGING?
+ #if defined(DEBUG) || defined(FORCE_BUILD_REFCNT_LOGGING)
++  nsTSubstring_CharT(char_type* aData, size_type aLength,
++                     DataFlags aDataFlags, ClassFlags aClassFlags)
+ #define XPCOM_STRING_CONSTRUCTOR_OUT_OF_LINE
+-  nsTSubstring_CharT(char_type* aData, size_type aLength, uint32_t aFlags);
++    ;
+ #else
+ #undef XPCOM_STRING_CONSTRUCTOR_OUT_OF_LINE
+-  nsTSubstring_CharT(char_type* aData, size_type aLength, uint32_t aFlags)
+-    : nsTStringRepr_CharT(aData, aLength, aFlags)
++    : nsTStringRepr_CharT(aData, aLength, aDataFlags, aClassFlags)
+   {
+     MOZ_RELEASE_ASSERT(CheckCapacity(aLength), "String is too large.");
+   }
+ #endif /* DEBUG || FORCE_BUILD_REFCNT_LOGGING */
+ 
+   /**
+    * this function releases mData and does not change the value of
+    * any of its member variables.  in other words, this function acts
+@@ -1130,31 +1129,31 @@ protected:
+    */
+   void NS_FASTCALL Finalize();
+ 
+   /**
+    * this function prepares mData to be mutated.
+    *
+    * @param aCapacity    specifies the required capacity of mData
+    * @param aOldData     returns null or the old value of mData
+-   * @param aOldFlags    returns 0 or the old value of mFlags
++   * @param aOldFlags    returns 0 or the old value of mDataFlags
+    *
+    * if mData is already mutable and of sufficient capacity, then this
+    * function will return immediately.  otherwise, it will either resize
+    * mData or allocate a new shared buffer.  if it needs to allocate a
+    * new buffer, then it will return the old buffer and the corresponding
+    * flags.  this allows the caller to decide when to free the old data.
+    *
+    * this function returns false if is unable to allocate sufficient
+    * memory.
+    *
+    * XXX we should expose a way for subclasses to free old_data.
+    */
+   bool NS_FASTCALL MutatePrep(size_type aCapacity,
+-                              char_type** aOldData, uint32_t* aOldFlags);
++                              char_type** aOldData, DataFlags* aOldDataFlags);
+ 
+   /**
+    * this function prepares a section of mData to be modified.  if
+    * necessary, this function will reallocate mData and possibly move
+    * existing data to open up the specified section.
+    *
+    * @param aCutStart    specifies the starting offset of the section
+    * @param aCutLength   specifies the length of the section to be replaced
+@@ -1207,22 +1206,21 @@ protected:
+       NS_ASSERTION(aCapacity != size_type(-1), "Bogus capacity");
+       return false;
+     }
+ 
+     return true;
+   }
+ 
+   /**
+-   * this helper function stores the specified dataFlags in mFlags
++   * this helper function stores the specified dataFlags in mDataFlags
+    */
+-  void SetDataFlags(uint32_t aDataFlags)
++  void SetDataFlags(DataFlags aDataFlags)
+   {
+-    NS_ASSERTION((aDataFlags & 0xFFFF0000) == 0, "bad flags");
+-    mFlags = aDataFlags | (mFlags & 0xFFFF0000);
++    mDataFlags = aDataFlags;
+   }
+ 
+   void NS_FASTCALL ReplaceLiteral(index_type aCutStart, size_type aCutLength,
+                                   const char_type* aData, size_type aLength);
+ 
+   static const size_type kMaxCapacity;
+ public:
+ 
