@@ -1,6 +1,6 @@
 From: L. David Baron <dbaron@dbaron.org>
 
-Bug 1343715 - Split nsTSubstring::mFlags into separate variables for class and data flags (rust bindings changes).  r?mystor
+Bug 1343715 - Split nsTSubstring::mFlags into separate variables for class and data flags (rust bindings changes).  r=mystor
 
 Thanks to Manish for help in reflecting this idiomatically in rust.
 
@@ -154,7 +154,7 @@ diff --git a/xpcom/rust/nsstring/gtest/Test.cpp b/xpcom/rust/nsstring/gtest/Test
 diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
 --- a/xpcom/rust/nsstring/src/lib.rs
 +++ b/xpcom/rust/nsstring/src/lib.rs
-@@ -110,44 +110,59 @@
+@@ -110,44 +110,64 @@
  //!
  //! If this type is dropped in rust, it will not free its backing storage. This
  //! can be useful when implementing FFI types which contain `ns[C]String` members
@@ -183,9 +183,10 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
  //////////////////////////////////
  
 -const F_NONE: u32 = 0; // no flags
-+#[allow(non_snake_case)]
-+mod DataFlags {
++mod data_flags {
 +    bitflags! {
++        // While this has the same layout as u16, it cannot be passed
++        // over FFI safely as a u16.
 +        #[repr(C)]
 +        pub flags DataFlags : u16 {
 +            const TERMINATED = 1 << 0, // IsTerminated returns true
@@ -205,18 +206,21 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
 -const F_OWNED: u32 = 1 << 3; // mData points to a heap-allocated, raw buffer
 -const F_FIXED: u32 = 1 << 4; // mData points to a fixed-size writable, dependent buffer
 -const F_LITERAL: u32 = 1 << 5; // mData points to a string literal; F_TERMINATED will also be set
--
--// class flags are in the upper 16-bits
--const F_CLASS_FIXED: u32 = 1 << 16; // indicates that |this| is of type nsTFixedString
-+#[allow(non_snake_case)]
-+mod ClassFlags {
++mod class_flags {
 +    bitflags! {
++        // While this has the same layout as u16, it cannot be passed
++        // over FFI safely as a u16.
 +        #[repr(C)]
 +        pub flags ClassFlags : u16 {
 +            const FIXED = 1 << 0, // indicates that |this| is of type nsTFixedString
 +        }
 +    }
 +}
+ 
+-// class flags are in the upper 16-bits
+-const F_CLASS_FIXED: u32 = 1 << 16; // indicates that |this| is of type nsTFixedString
++use data_flags::DataFlags;
++use class_flags::ClassFlags;
  
  ////////////////////////////////////
  // Generic String Bindings Macros //
@@ -225,7 +229,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
  macro_rules! define_string_types {
      {
          char_t = $char_t: ty;
-@@ -177,17 +192,18 @@ macro_rules! define_string_types {
+@@ -177,17 +197,18 @@ macro_rules! define_string_types {
          ///
          /// This struct will leak its data if dropped from rust. See the module
          /// documentation for more information on this type.
@@ -235,8 +239,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
              data: *const $char_t,
              length: u32,
 -            flags: u32,
-+            dataflags: DataFlags::DataFlags,
-+            classflags: ClassFlags::ClassFlags,
++            dataflags: DataFlags,
++            classflags: ClassFlags,
          }
  
          impl Deref for $StringRepr {
@@ -245,7 +249,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                  unsafe {
                      mem::transmute(self)
                  }
-@@ -382,17 +398,18 @@ macro_rules! define_string_types {
+@@ -382,17 +403,18 @@ macro_rules! define_string_types {
          }
  
          impl $String<'static> {
@@ -255,8 +259,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                          data: ptr::null(),
                          length: 0,
 -                        flags: F_NONE,
-+                        dataflags: DataFlags::DataFlags::empty(),
-+                        classflags: ClassFlags::ClassFlags::empty(),
++                        dataflags: DataFlags::empty(),
++                        classflags: ClassFlags::empty(),
                      },
                      _marker: PhantomData,
                  }
@@ -265,7 +269,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
  
          impl<'a> Drop for $String<'a> {
              fn drop(&mut self) {
-@@ -435,46 +452,48 @@ macro_rules! define_string_types {
+@@ -435,46 +457,48 @@ macro_rules! define_string_types {
  
          impl<'a> From<&'a [$char_t]> for $String<'a> {
              fn from(s: &'a [$char_t]) -> $String<'a> {
@@ -275,8 +279,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                          data: if s.is_empty() { ptr::null() } else { s.as_ptr() },
                          length: s.len() as u32,
 -                        flags: F_NONE,
-+                        dataflags: DataFlags::DataFlags::empty(),
-+                        classflags: ClassFlags::ClassFlags::empty(),
++                        dataflags: DataFlags::empty(),
++                        classflags: ClassFlags::empty(),
                      },
                      _marker: PhantomData,
                  }
@@ -295,7 +299,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
 -                // tree, we use the same allocator for Rust code as for C++
 -                // code, meaning that our box can be legally freed with
 -                // libc::free().
-+                // SAFETY NOTE: This method produces an DataFlags::OWNED
++                // SAFETY NOTE: This method produces an data_flags::OWNED
 +                // ns[C]String from a Box<[$char_t]>. this is only safe
 +                // because in the Gecko tree, we use the same allocator for
 +                // Rust code as for C++ code, meaning that our box can be
@@ -311,8 +315,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                          data: ptr,
                          length: length,
 -                        flags: F_OWNED,
-+                        dataflags: DataFlags::OWNED,
-+                        classflags: ClassFlags::ClassFlags::empty(),
++                        dataflags: data_flags::OWNED,
++                        classflags: ClassFlags::empty(),
                      },
                      _marker: PhantomData,
                  }
@@ -321,7 +325,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
  
          impl From<Vec<$char_t>> for $String<'static> {
              fn from(s: Vec<$char_t>) -> $String<'static> {
-@@ -554,17 +573,18 @@ macro_rules! define_string_types {
+@@ -554,17 +578,18 @@ macro_rules! define_string_types {
                  let len = buf.len();
                  assert!(len < (u32::MAX as usize));
                  let buf_ptr = buf.as_mut_ptr();
@@ -331,8 +335,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                              data: ptr::null(),
                              length: 0,
 -                            flags: F_CLASS_FIXED,
-+                            dataflags: DataFlags::DataFlags::empty(),
-+                            classflags: ClassFlags::FIXED,
++                            dataflags: DataFlags::empty(),
++                            classflags: class_flags::FIXED,
                          },
                          _marker: PhantomData,
                      },
@@ -341,7 +345,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
                      _marker: PhantomData,
                  }
              }
-@@ -993,24 +1013,18 @@ pub mod test_helpers {
+@@ -993,24 +1018,18 @@ pub mod test_helpers {
  
      use super::{
          nsFixedCString,
@@ -358,8 +362,8 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
 -        F_FIXED,
 -        F_LITERAL,
 -        F_CLASS_FIXED,
-+        DataFlags,
-+        ClassFlags,
++        data_flags,
++        class_flags,
      };
      use std::mem;
  
@@ -368,7 +372,7 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
      macro_rules! size_align_check {
          ($T:ty, $fname:ident) => {
              #[no_mangle]
-@@ -1094,39 +1108,39 @@ pub mod test_helpers {
+@@ -1094,39 +1113,39 @@ pub mod test_helpers {
                      mem::forget(tmp);
                  }
              }
@@ -416,13 +420,13 @@ diff --git a/xpcom/rust/nsstring/src/lib.rs b/xpcom/rust/nsstring/src/lib.rs
 -            *f_fixed = F_FIXED;
 -            *f_literal = F_LITERAL;
 -            *f_class_fixed = F_CLASS_FIXED;
-+            *f_terminated = DataFlags::TERMINATED.bits();
-+            *f_voided = DataFlags::VOIDED.bits();
-+            *f_shared = DataFlags::SHARED.bits();
-+            *f_owned = DataFlags::OWNED.bits();
-+            *f_fixed = DataFlags::FIXED.bits();
-+            *f_literal = DataFlags::LITERAL.bits();
-+            *f_class_fixed = ClassFlags::FIXED.bits();
++            *f_terminated = data_flags::TERMINATED.bits();
++            *f_voided = data_flags::VOIDED.bits();
++            *f_shared = data_flags::SHARED.bits();
++            *f_owned = data_flags::OWNED.bits();
++            *f_fixed = data_flags::FIXED.bits();
++            *f_literal = data_flags::LITERAL.bits();
++            *f_class_fixed = class_flags::FIXED.bits();
          }
      }
  }
