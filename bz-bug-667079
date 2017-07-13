@@ -7,7 +7,43 @@ Bug 667079.  Make sure to set the right containing block size for inner tables n
 diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
 --- a/layout/generic/ReflowInput.cpp
 +++ b/layout/generic/ReflowInput.cpp
-@@ -2125,17 +2125,20 @@ ReflowInput::ComputeContainingBlockRecta
+@@ -56,16 +56,17 @@ static eNormalLineHeightControl sNormalL
+ ReflowInput::ReflowInput(nsPresContext*       aPresContext,
+                                      nsIFrame*            aFrame,
+                                      gfxContext*          aRenderingContext,
+                                      const LogicalSize&   aAvailableSpace,
+                                      uint32_t             aFlags)
+   : SizeComputationInput(aFrame, aRenderingContext)
+   , mBlockDelta(0)
+   , mOrthogonalLimit(NS_UNCONSTRAINEDSIZE)
++  , mContainingBlockSize(mWritingMode)
+   , mReflowDepth(0)
+ {
+   NS_PRECONDITION(aRenderingContext, "no rendering context");
+   MOZ_ASSERT(aPresContext, "no pres context");
+   MOZ_ASSERT(aFrame, "no frame");
+   MOZ_ASSERT(aPresContext == aFrame->PresContext(), "wrong pres context");
+   mParentReflowInput = nullptr;
+   AvailableISize() = aAvailableSpace.ISize(mWritingMode);
+@@ -187,16 +188,17 @@ ReflowInput::ReflowInput(
+                      const ReflowInput& aParentReflowInput,
+                      nsIFrame*                aFrame,
+                      const LogicalSize&       aAvailableSpace,
+                      const LogicalSize*       aContainingBlockSize,
+                      uint32_t                 aFlags)
+   : SizeComputationInput(aFrame, aParentReflowInput.mRenderingContext)
+   , mBlockDelta(0)
+   , mOrthogonalLimit(NS_UNCONSTRAINEDSIZE)
++  , mContainingBlockSize(mWritingMode)
+   , mFlags(aParentReflowInput.mFlags)
+   , mReflowDepth(aParentReflowInput.mReflowDepth + 1)
+ {
+   MOZ_ASSERT(aPresContext, "no pres context");
+   MOZ_ASSERT(aFrame, "no frame");
+   MOZ_ASSERT(aPresContext == aFrame->PresContext(), "wrong pres context");
+   NS_PRECONDITION(!mFlags.mSpecialBSizeReflow ||
+                   !NS_SUBTREE_DIRTY(aFrame),
+@@ -2125,17 +2127,20 @@ ReflowInput::ComputeContainingBlockRecta
    } else {
      // an element in quirks mode gets a containing block based on looking for a
      // parent with a non-auto height if the element has a percent height
@@ -18,8 +54,8 @@ diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
        if (eCompatibility_NavQuirks == aPresContext->CompatibilityMode() &&
 -          mStylePosition->mHeight.GetUnit() == eStyleUnit_Percent) {
 +          (mStylePosition->mHeight.GetUnit() == eStyleUnit_Percent ||
-+           (frame->GetType() == nsGkAtoms::tableOuterFrame &&
-+            frame->PrincipalChildList().FirstChild()->StylePosition()->
++           (mFrame->IsTableWrapperFrame() &&
++            mFrame->PrincipalChildList().FirstChild()->StylePosition()->
 +              mHeight.GetUnit() == eStyleUnit_Percent))) {
          cbSize.BSize(wm) = CalcQuirkContainingBlockHeight(aContainingBlockRI);
        }
@@ -29,7 +65,7 @@ diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
    return cbSize.ConvertTo(GetWritingMode(), wm);
  }
  
-@@ -2506,16 +2509,20 @@ ReflowInput::InitConstraints(nsPresConte
+@@ -2506,16 +2511,19 @@ ReflowInput::InitConstraints(nsPresConte
        // margin calculations.
        if (isBlock && !IsSideCaption(mFrame, mStyleDisplay, cbwm) &&
            mStyleDisplay->mDisplay != StyleDisplay::InlineTable &&
@@ -40,8 +76,7 @@ diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
    }
 +
 +  // Save our containing block dimensions
-+  mContainingBlockWidth = aContainingBlockWidth;
-+  mContainingBlockHeight = aContainingBlockHeight;
++  mContainingBlockSize = aContainingBlockSize;
  }
  
  static void
@@ -64,7 +99,7 @@ diff --git a/layout/generic/ReflowInput.h b/layout/generic/ReflowInput.h
  public:
 +  // Our saved containing block dimensions.
 +  MOZ_INIT_OUTSIDE_CTOR
-+  nscoord          mContainingBlockWidth, mContainingBlockHeight;
++  LogicalSize      mContainingBlockSize;
 +
    // Cached pointers to the various style structs used during intialization
    MOZ_INIT_OUTSIDE_CTOR
@@ -178,7 +213,7 @@ diff --git a/layout/tables/nsTableWrapperFrame.cpp b/layout/tables/nsTableWrappe
    nsMargin* pCollapsePadding = nullptr;
    Maybe<LogicalSize> cbSize;
    if (aReflowInput.mFrame == InnerTableFrame()) {
-@@ -251,16 +252,23 @@ nsTableWrapperFrame::InitChildReflowInpu
+@@ -251,16 +252,21 @@ nsTableWrapperFrame::InitChildReflowInpu
      // Propagate our stored CB size if present, minus any margins.
      if (!HasAnyStateBits(NS_FRAME_OUT_OF_FLOW)) {
        LogicalSize* cb = GetProperty(GridItemCBSizeProperty());
@@ -190,9 +225,7 @@ diff --git a/layout/tables/nsTableWrapperFrame.cpp b/layout/tables/nsTableWrappe
 +    if (!cbSize) {
 +      // For inner table frames, the containing block is the same as for
 +      // the outer table frame.
-+      cbSize.emplace(LogicalSize(aOuterRI.mWritingMode,
-+                                 nsSize(aOuterRI.mContainingBlockWidth,
-+                                        aOuterRI.mContainingBlockHeight)));
++      cbSize.emplace(aOuterRI.mContainingBlockSize);
 +    }
    }
    aReflowInput.Init(&aPresContext, cbSize.ptrOr(nullptr), pCollapseBorder,
@@ -202,7 +235,7 @@ diff --git a/layout/tables/nsTableWrapperFrame.cpp b/layout/tables/nsTableWrappe
  // get the margin and padding data. ReflowInput doesn't handle the
  // case of auto margins
  void
-@@ -277,17 +285,17 @@ nsTableWrapperFrame::GetChildMargin(nsPr
+@@ -277,17 +283,17 @@ nsTableWrapperFrame::GetChildMargin(nsPr
    // will not be computed at this time.
  
    // create and init the child reflow state
@@ -221,7 +254,7 @@ diff --git a/layout/tables/nsTableWrapperFrame.cpp b/layout/tables/nsTableWrappe
  GetContainingBlockSize(const ReflowInput& aOuterRI)
  {
    nsSize size(0,0);
-@@ -787,17 +795,17 @@ nsTableWrapperFrame::OuterBeginReflowChi
+@@ -787,17 +793,17 @@ nsTableWrapperFrame::OuterBeginReflowChi
        availBSize -= margin.BEnd(wm);
      }
    }
