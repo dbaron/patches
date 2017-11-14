@@ -1,0 +1,153 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1417180 - Improve error messages for not-found paths in jar.mn files.
+
+This improves the error message for a file that isn't present from:
+> ValueError: Object directory paths are not allowed
+to:
+> Exception: /home/dbaron/builds/mozilla-central/mozilla/browser/branding/official/content/jar.mn: Object directory paths are not allowed: !../mozicon128.png
+by using one of the reraising techniques from
+http://www.ianbicking.org/blog/2007/09/re-raising-exceptions.html
+
+It uses obj.path.full_path rather than just obj.path because obj.path is
+just "jar.mn", which is not useful.
+
+diff --git a/python/mozbuild/mozbuild/backend/common.py b/python/mozbuild/mozbuild/backend/common.py
+--- a/python/mozbuild/mozbuild/backend/common.py
++++ b/python/mozbuild/mozbuild/backend/common.py
+@@ -2,16 +2,17 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ from __future__ import absolute_import, unicode_literals
+ 
+ import itertools
+ import json
+ import os
++import sys
+ 
+ import mozpack.path as mozpath
+ 
+ from mozbuild.backend.base import BuildBackend
+ 
+ from mozbuild.frontend.context import (
+     Context,
+     ObjDirPath,
+@@ -469,53 +470,59 @@ class CommonBackend(BuildBackend):
+                     mozpath.join(install_target, jarinfo.base))
+             jar_context['FINAL_TARGET'] = install_target
+             if obj.defines:
+                 jar_context['DEFINES'] = obj.defines.defines
+             files = jar_context['FINAL_TARGET_FILES']
+             files_pp = jar_context['FINAL_TARGET_PP_FILES']
+ 
+             for e in jarinfo.entries:
+-                if e.is_locale:
+-                    if jarinfo.relativesrcdir:
+-                        src = '/%s' % jarinfo.relativesrcdir
+-                    else:
+-                        src = ''
+-                    src = mozpath.join(src, 'en-US', e.source)
+-                else:
+-                    src = e.source
+-
+-                src = Path(jar_context, src)
+-
+-                if '*' not in e.source and not os.path.exists(src.full_path):
++                try:
+                     if e.is_locale:
+-                        raise Exception(
+-                            '%s: Cannot find %s' % (obj.path, e.source))
+-                    if e.source.startswith('/'):
+-                        src = Path(jar_context, '!' + e.source)
++                        if jarinfo.relativesrcdir:
++                            src = '/%s' % jarinfo.relativesrcdir
++                        else:
++                            src = ''
++                        src = mozpath.join(src, 'en-US', e.source)
+                     else:
+-                        # This actually gets awkward if the jar.mn is not
+-                        # in the same directory as the moz.build declaring
+-                        # it, but it's how it works in the recursive make,
+-                        # not that anything relies on that, but it's simpler.
+-                        src = Path(obj._context, '!' + e.source)
++                        src = e.source
++
++                    src = Path(jar_context, src)
++
++                    if '*' not in e.source and not os.path.exists(src.full_path):
++                        if e.is_locale:
++                            raise Exception(
++                                '%s: Cannot find %s' % (obj.path, e.source))
++                        if e.source.startswith('/'):
++                            src = Path(jar_context, '!' + e.source)
++                        else:
++                            # This actually gets awkward if the jar.mn is not
++                            # in the same directory as the moz.build declaring
++                            # it, but it's how it works in the recursive make,
++                            # not that anything relies on that, but it's simpler.
++                            src = Path(obj._context, '!' + e.source)
+ 
+-                output_basename = mozpath.basename(e.output)
+-                if output_basename != src.target_basename:
+-                    src = RenamedSourcePath(jar_context,
+-                                            (src, output_basename))
+-                path = mozpath.dirname(mozpath.join(jarinfo.name, e.output))
++                    output_basename = mozpath.basename(e.output)
++                    if output_basename != src.target_basename:
++                        src = RenamedSourcePath(jar_context,
++                                                (src, output_basename))
++                    path = mozpath.dirname(mozpath.join(jarinfo.name, e.output))
+ 
+-                if e.preprocess:
+-                    if '*' in e.source:
+-                        raise Exception('%s: Wildcards are not supported with '
+-                                        'preprocessing' % obj.path)
+-                    files_pp[path] += [src]
+-                else:
+-                    files[path] += [src]
++                    if e.preprocess:
++                        if '*' in e.source:
++                            raise Exception('Wildcards are not supported with '
++                                            'preprocessing')
++                        files_pp[path] += [src]
++                    else:
++                        files[path] += [src]
++                except:
++                    exc_class, exc, tb = sys.exc_info()
++                    new_exc = Exception("%s: %s"
++                                        % (obj.path.full_path, exc or exc_class))
++                    raise new_exc.__class__, new_exc, tb
+ 
+             if files:
+                 self.consume_object(FinalTargetFiles(jar_context, files))
+             if files_pp:
+                 self.consume_object(
+                     FinalTargetPreprocessedFiles(jar_context, files_pp))
+ 
+             for m in jarinfo.chrome_manifests:
+diff --git a/python/mozbuild/mozbuild/frontend/context.py b/python/mozbuild/mozbuild/frontend/context.py
+--- a/python/mozbuild/mozbuild/frontend/context.py
++++ b/python/mozbuild/mozbuild/frontend/context.py
+@@ -613,19 +613,19 @@ class Path(ContextDerivedValue, unicode)
+     def target_basename(self):
+         return mozpath.basename(self.full_path)
+ 
+ 
+ class SourcePath(Path):
+     """Like Path, but limited to paths in the source directory."""
+     def __init__(self, context, value):
+         if value.startswith('!'):
+-            raise ValueError('Object directory paths are not allowed')
++            raise ValueError('Object directory paths are not allowed: %s' % (value))
+         if value.startswith('%'):
+-            raise ValueError('Filesystem absolute paths are not allowed')
++            raise ValueError('Filesystem absolute paths are not allowed: %s' % (value))
+         super(SourcePath, self).__init__(context, value)
+ 
+         if value.startswith('/'):
+             path = None
+             # If the path starts with a '/' and is actually relative to an
+             # external source dir, use that as base instead of topsrcdir.
+             if context.config.external_source_dir:
+                 path = mozpath.join(context.config.external_source_dir,
