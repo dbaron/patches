@@ -5,7 +5,7 @@ Bug 1089417 patch 11 - Flush pending media feature value changes where needed.
 diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
 --- a/dom/base/nsDocument.cpp
 +++ b/dom/base/nsDocument.cpp
-@@ -12577,18 +12577,26 @@ nsIDocument::FlushUserFontSet()
+@@ -12380,18 +12380,26 @@ nsIDocument::FlushUserFontSet()
  
    if (!mFontFaceSetDirty) {
      return;
@@ -33,57 +33,10 @@ diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
  
      if (!mFontFaceSet && !rules.IsEmpty()) {
        nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(GetScopeObject());
-diff --git a/layout/base/GeckoRestyleManager.cpp b/layout/base/GeckoRestyleManager.cpp
---- a/layout/base/GeckoRestyleManager.cpp
-+++ b/layout/base/GeckoRestyleManager.cpp
-@@ -288,16 +288,21 @@ GeckoRestyleManager::ContentStateChanged
-   // XXXbz it would be good if this function only took Elements, but
-   // we'd have to make ESM guarantee that usefully.
-   if (!aContent->IsElement()) {
-     return;
-   }
- 
-   Element* aElement = aContent->AsElement();
- 
-+  // We have to flush pending media feature values changes before doing
-+  // something that might rebuild CSS rule processors.
-+  // FIXME: Should this be in RestyleManagerBase?
-+  mPresContext->FlushPendingMediaFeatureValuesChanged();
-+
-   nsChangeHint changeHint;
-   ContentStateChangedInternal(aElement, aStateMask, &changeHint);
- 
-   // Assemble what we'll need to calculate the nsRestyleHint.
-   nsIFrame* primaryFrame = aElement->GetPrimaryFrame();
-   CSSPseudoElementType pseudoType = CSSPseudoElementType::NotPseudo;
-   if (primaryFrame) {
-     pseudoType = primaryFrame->StyleContext()->GetPseudoType();
-@@ -362,16 +367,20 @@ GeckoRestyleManager::AttributeChanged(El
-   MOZ_ASSERT(!mInStyleRefresh);
- 
-   // Hold onto the PresShell to prevent ourselves from being destroyed.
-   // XXXbz how, exactly, would this attribute change cause us to be
-   // destroyed from inside this function?
-   nsCOMPtr<nsIPresShell> shell = PresContext()->GetPresShell();
-   mozilla::Unused << shell; // Unused within this function
- 
-+  // We have to flush pending media feature values changes before doing
-+  // something that might rebuild CSS rule processors.
-+  mPresContext->FlushPendingMediaFeatureValuesChanged();
-+
-   // Get the frame associated with the content which is the highest in the frame tree
-   nsIFrame* primaryFrame = aElement->GetPrimaryFrame();
- 
- #if 0
-   NS_FRAME_LOG(NS_FRAME_TRACE_CALLS,
-      ("RestyleManager::AttributeChanged: content=%p[%s] frame=%p",
-       aContent, ContentTag(aElement, 0), frame));
- #endif
 diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
 --- a/layout/base/PresShell.cpp
 +++ b/layout/base/PresShell.cpp
-@@ -4363,16 +4363,20 @@ PresShell::ContentStateChanged(nsIDocume
- void
+@@ -4408,16 +4408,20 @@ void
  PresShell::DocumentStatesChanged(nsIDocument* aDocument, EventStates aStateMask)
  {
    NS_PRECONDITION(!mIsDocumentGone, "Unexpected DocumentStatesChanged");
@@ -91,15 +44,41 @@ diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
    MOZ_ASSERT(!aStateMask.IsEmpty());
  
    if (mDidInitialize) {
+     mStyleSet->InvalidateStyleForDocumentStateChanges(aStateMask);
++
 +    // We have to flush pending media feature values changes before doing
 +    // something that might rebuild CSS rule processors.
 +    mPresContext->FlushPendingMediaFeatureValuesChanged();
+   }
+ 
+   if (aStateMask.HasState(NS_DOCUMENT_STATE_WINDOW_INACTIVE)) {
+     if (nsIFrame* root = mFrameConstructor->GetRootFrame()) {
+       root->SchedulePaint();
+     }
+   }
+ }
+diff --git a/layout/base/RestyleManager.cpp b/layout/base/RestyleManager.cpp
+--- a/layout/base/RestyleManager.cpp
++++ b/layout/base/RestyleManager.cpp
+@@ -469,16 +469,21 @@ RestyleManager::ContentRemoved(nsINode* 
+ void
+ RestyleManager::ContentStateChangedInternal(Element* aElement,
+                                             EventStates aStateMask,
+                                             nsChangeHint* aOutChangeHint)
+ {
+   MOZ_ASSERT(!mInStyleRefresh);
+   MOZ_ASSERT(aOutChangeHint);
+ 
++  // We have to flush pending media feature values changes before doing
++  // something that might rebuild CSS rule processors.
++  // FIXME:  similar for attribute changes?
++  mPresContext->FlushPendingMediaFeatureValuesChanged();
 +
-     if (mStyleSet->IsServo()) {
-       mStyleSet->AsServo()->InvalidateStyleForDocumentStateChanges(aStateMask);
-     } else {
- #ifdef MOZ_OLD_STYLE
-       if (Element* rootElement = aDocument->GetRootElement()) {
-         const bool needRestyle =
-           mStyleSet->AsGecko()->HasDocumentStateDependentStyle(
-             rootElement, aStateMask);
+   *aOutChangeHint = nsChangeHint(0);
+   // Any change to a content state that affects which frames we construct
+   // must lead to a frame reconstruct here if we already have a frame.
+   // Note that we never decide through non-CSS means to not create frames
+   // based on content states, so if we already don't have a frame we don't
+   // need to force a reframe -- if it's needed, the HasStateDependentStyle
+   // call will handle things.
+   nsIFrame* primaryFrame = aElement->GetPrimaryFrame();
