@@ -1,0 +1,230 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Add flag to restrict CSS properties to secure contexts.
+
+FIXME: Finish this, and then test all the parts!
+
+MozReview-Commit-ID: J364MAM5ZrR
+
+diff --git a/dom/bindings/GenerateCSS2PropertiesWebIDL.py b/dom/bindings/GenerateCSS2PropertiesWebIDL.py
+--- a/dom/bindings/GenerateCSS2PropertiesWebIDL.py
++++ b/dom/bindings/GenerateCSS2PropertiesWebIDL.py
+@@ -21,16 +21,19 @@ def generate(output, idlFilename, dataFi
+             continue
+         # Unfortunately, even some of the getters here are fallible
+         # (e.g. on nsComputedDOMStyle).
+         extendedAttrs = ["CEReactions", "Throws", "TreatNullAs=EmptyString",
+                          "SetterNeedsSubjectPrincipal=NonSystem"]
+         if pref is not "":
+             extendedAttrs.append('Pref="%s"' % pref)
+ 
++        if "CSS_PROPERTY_SECURE_CONTEXTS_ONLY" in flags:
++            extendedAttrs.append('SecureContext')
++
+         # webkit properties get a camelcase "webkitFoo" accessor
+         # as well as a capitalized "WebkitFoo" alias (added here).
+         if (prop.startswith("Webkit")):
+             extendedAttrs.append('BindingAlias="%s"' % prop)
+ 
+         # Generate a name with camelCase spelling of property-name (or capitalized,
+         # for Moz-prefixed properties):
+         if not prop.startswith("Moz"):
+diff --git a/layout/style/ServoCSSPropList.mako.py b/layout/style/ServoCSSPropList.mako.py
+--- a/layout/style/ServoCSSPropList.mako.py
++++ b/layout/style/ServoCSSPropList.mako.py
+@@ -36,16 +36,18 @@ def flags(prop):
+     if is_internal(prop):
+         result.append("CSS_PROPERTY_INTERNAL")
+     if prop.enabled_in == "":
+         result.append("CSS_PROPERTY_PARSE_INACCESSIBLE")
+     if "GETCS_NEEDS_LAYOUT_FLUSH" in prop.flags:
+         result.append("CSS_PROPERTY_GETCS_NEEDS_LAYOUT_FLUSH")
+     if "CAN_ANIMATE_ON_COMPOSITOR" in prop.flags:
+         result.append("CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR")
++    if "SECURE_CONTEXTS_ONLY" in prop.flags:
++        result.append("CSS_PROPERTY_SECURE_CONTEXTS_ONLY")
+     return ", ".join('"{}"'.format(flag) for flag in result)
+ 
+ def pref(prop):
+     if prop.gecko_pref:
+         return '"' + prop.gecko_pref + '"'
+     return '""'
+ %>
+ 
+diff --git a/layout/style/nsCSSProps.h b/layout/style/nsCSSProps.h
+--- a/layout/style/nsCSSProps.h
++++ b/layout/style/nsCSSProps.h
+@@ -169,16 +169,19 @@ static_assert((CSS_PROPERTY_PARSE_PROPER
+ // This property can be animated on the compositor.
+ #define CSS_PROPERTY_CAN_ANIMATE_ON_COMPOSITOR    (1<<27)
+ 
+ // This property is an internal property that is not represented
+ // in the DOM.  Properties with this flag must be defined in an #ifndef
+ // CSS_PROP_LIST_EXCLUDE_INTERNAL section of nsCSSPropList.h.
+ #define CSS_PROPERTY_INTERNAL                     (1<<28)
+ 
++// This property is restricted to secure contexts.
++#define CSS_PROPERTY_SECURE_CONTEXTS_ONLY         (1<<29)
++
+ class nsCSSProps {
+ public:
+   typedef mozilla::CSSEnabledState EnabledState;
+ 
+   struct KTableEntry
+   {
+     // KTableEntry objects can be initialized either with an int16_t value
+     // or a value of an enumeration type that can fit within an int16_t.
+@@ -374,16 +377,18 @@ public:
+   static int32_t PropertyIDLNameSortPosition(nsCSSPropertyID aProperty)
+   {
+     MOZ_ASSERT(0 <= aProperty && aProperty < eCSSProperty_COUNT,
+                "out of range");
+     return kIDLNameSortPositionTable[aProperty];
+   }
+ 
+   static bool IsEnabled(nsCSSPropertyID aProperty) {
++    // FIXME: This also needs to check the property's secure context flag.
++
+     MOZ_ASSERT(0 <= aProperty && aProperty < eCSSProperty_COUNT_with_aliases,
+                "out of range");
+     // In the child process, assert that we're not trying to parse stylesheets
+     // before we've gotten all our prefs.
+     MOZ_ASSERT_IF(!XRE_IsParentProcess(),
+                   mozilla::Preferences::ArePrefsInitedInContentProcess());
+     return gPropertyEnabled[aProperty];
+   }
+diff --git a/servo/components/style/properties/properties.mako.rs b/servo/components/style/properties/properties.mako.rs
+--- a/servo/components/style/properties/properties.mako.rs
++++ b/servo/components/style/properties/properties.mako.rs
+@@ -174,16 +174,18 @@ pub mod shorthands {
+     // when there is one, whatever that is.
+     <%
+         logical_longhands = []
+         other_longhands = []
+ 
+         for p in data.longhands:
+             if p.name in ['direction', 'unicode-bidi']:
+                 continue;
++            // FIXME: Shouldn't 'all' in a UA sheet include properties that
++            // aren't enabled in content?
+             if not p.enabled_in_content() and not p.experimental(product):
+                 continue;
+             if p.logical:
+                 logical_longhands.append(p.name)
+             else:
+                 other_longhands.append(p.name)
+ 
+         data.declare_shorthand(
+@@ -429,16 +431,19 @@ impl NonCustomPropertyId {
+             % endfor
+         ];
+ 
+         MAP[self.0]
+     }
+ 
+     #[inline]
+     fn enabled_for_all_content(self) -> bool {
++        // FIXME: Should this return false for properties with secure context
++        // flag, or should this *check* the secure context flag (and be
++        // renamed), or should it do neither and be renamed?
+         ${static_non_custom_property_id_set(
+             "EXPERIMENTAL",
+             lambda p: p.experimental(product)
+         )}
+ 
+         ${static_non_custom_property_id_set(
+             "ALWAYS_ENABLED",
+             lambda p: (not p.experimental(product)) and p.enabled_in_content()
+@@ -499,16 +504,18 @@ impl NonCustomPropertyId {
+                 return false;
+             }
+             CssRuleType::Page if DISALLOWED_IN_PAGE_RULE.contains(self) => {
+                 return false;
+             }
+             _ => {}
+         }
+ 
++        // FIXME: Check the secure-context flag here?
++
+         // The semantics of these are kinda hard to reason about, what follows
+         // is a description of the different combinations that can happen with
+         // these three sets.
+         //
+         // Experimental properties are generally controlled by prefs, but an
+         // experimental property explicitly enabled in certain context (UA or
+         // chrome sheets) is always usable in the context regardless of the
+         // pref value.
+@@ -776,16 +783,18 @@ bitflags! {
+         /// absolutely positioned elements.
+         const ABSPOS_CB = 1 << 2;
+         /// This longhand property applies to ::first-letter.
+         const APPLIES_TO_FIRST_LETTER = 1 << 3;
+         /// This longhand property applies to ::first-line.
+         const APPLIES_TO_FIRST_LINE = 1 << 4;
+         /// This longhand property applies to ::placeholder.
+         const APPLIES_TO_PLACEHOLDER = 1 << 5;
++        /// This property is supported only in secure contexts.
++        const SECURE_CONTEXTS_ONLY = 1 << 6;
+ 
+         /* The following flags are currently not used in Rust code, they
+          * only need to be listed in corresponding properties so that
+          * they can be checked in the C++ side via ServoCSSPropList.h. */
+         /// This property's getComputedStyle implementation requires layout
+         /// to be flushed.
+         const GETCS_NEEDS_LAYOUT_FLUSH = 0;
+         /// This property can be animated on the compositor.
+@@ -872,16 +881,18 @@ impl LonghandId {
+             static ${property.ident.upper()}: &'static [ShorthandId] = &[
+                 % for shorthand in longhand_to_shorthand_map.get(property.ident, []):
+                     ShorthandId::${shorthand},
+                 % endfor
+             ];
+         % endfor
+ 
+         NonCustomPropertyIterator {
++            // FIXME: Check secure contexts flag?  And also support
++            // subproperties enabled in this context, if chrome or UA?
+             filter: NonCustomPropertyId::from(*self).enabled_for_all_content(),
+             iter: match *self {
+                 % for property in data.longhands:
+                     LonghandId::${property.camel_case} => ${property.ident.upper()},
+                 % endfor
+             }.iter(),
+         }
+     }
+@@ -1131,16 +1142,17 @@ impl<Item> Iterator for NonCustomPropert
+ where
+     Item: 'static + Copy + Into<NonCustomPropertyId>,
+ {
+     type Item = Item;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
+         loop {
+             let id = *self.iter.next()?;
++            // FIXME: ???
+             if !self.filter || id.into().enabled_for_all_content() {
+                 return Some(id)
+             }
+         }
+     }
+ }
+ 
+ /// An identifier for a given shorthand property.
+@@ -1184,16 +1196,17 @@ impl ShorthandId {
+         % for property in data.shorthands:
+             static ${property.ident.upper()}: &'static [LonghandId] = &[
+                 % for sub in property.sub_properties:
+                     LonghandId::${sub.camel_case},
+                 % endfor
+             ];
+         % endfor
+         NonCustomPropertyIterator {
++            // FIXME: ???
+             filter: NonCustomPropertyId::from(*self).enabled_for_all_content(),
+             iter: match *self {
+                 % for property in data.shorthands:
+                     ShorthandId::${property.camel_case} => ${property.ident.upper()},
+                 % endfor
+             }.iter()
+         }
+     }
