@@ -1,0 +1,263 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1479859 - Send nsChangeHint_UpdateContainingBlock when containing block-ness changes due to one property change, while another property that might trigger containing block-ness doesn't do so because of the frame type.
+
+diff --git a/layout/style/ComputedStyle.cpp b/layout/style/ComputedStyle.cpp
+--- a/layout/style/ComputedStyle.cpp
++++ b/layout/style/ComputedStyle.cpp
+@@ -234,24 +234,31 @@ ComputedStyle::CalcStyleDifference(Compu
+ 
+     // This depends on data in nsStyleDisplay and nsStyleEffects, so we do it
+     // here
+ 
+     // Note that it's perhaps good for this test to be last because it
+     // doesn't use Peek* functions to get the structs on the old
+     // context.  But this isn't a big concern because these struct
+     // getters should be called during frame construction anyway.
+-    if (ThreadsafeStyleDisplay()->IsAbsPosContainingBlockForAppropriateFrame(*this) ==
+-        aNewContext->ThreadsafeStyleDisplay()->
+-          IsAbsPosContainingBlockForAppropriateFrame(*aNewContext) &&
+-        ThreadsafeStyleDisplay()->IsFixedPosContainingBlockForAppropriateFrame(*this) ==
+-        aNewContext->ThreadsafeStyleDisplay()->
+-          IsFixedPosContainingBlockForAppropriateFrame(*aNewContext)) {
++    const nsStyleDisplay *oldDisp = ThreadsafeStyleDisplay();
++    const nsStyleDisplay *newDisp = aNewContext->ThreadsafeStyleDisplay();
++    if (oldDisp->IsAbsPosContainingBlockForNonSVGTextFrames(*this) ==
++        newDisp->IsAbsPosContainingBlockForNonSVGTextFrames(*aNewContext) &&
++        oldDisp->IsAbsPosContainingBlockForTransformSupportingFrames(*this) ==
++        newDisp->
++          IsAbsPosContainingBlockForTransformSupportingFrames(*aNewContext) &&
++        oldDisp->IsFixedPosContainingBlockForNonSVGTextFrames(*this) ==
++        newDisp->IsFixedPosContainingBlockForNonSVGTextFrames(*aNewContext) &&
++        oldDisp->IsFixedPosContainingBlockForTransformSupportingFrames(*this) ==
++        newDisp->
++          IsFixedPosContainingBlockForTransformSupportingFrames(*aNewContext)) {
+       // While some styles that cause the frame to be a containing block
+-      // has changed, the overall result hasn't.
++      // has changed, the overall result cannot have changed (no matter
++      // what the frame type is).
+       hint &= ~nsChangeHint_UpdateContainingBlock;
+     }
+   }
+ 
+   MOZ_ASSERT(NS_IsHintSubset(hint, nsChangeHint_AllHints),
+              "Added a new hint without bumping AllHints?");
+   return hint & ~nsChangeHint_NeutralChange;
+ }
+diff --git a/layout/style/nsStyleStruct.h b/layout/style/nsStyleStruct.h
+--- a/layout/style/nsStyleStruct.h
++++ b/layout/style/nsStyleStruct.h
+@@ -2393,77 +2393,85 @@ struct MOZ_NEEDS_MEMMOVABLE_MEMBERS nsSt
+   inline mozilla::StyleDisplay GetDisplay(const nsIFrame* aContextFrame) const;
+   inline bool IsFloating(const nsIFrame* aContextFrame) const;
+   inline bool IsRelativelyPositioned(const nsIFrame* aContextFrame) const;
+   inline bool IsAbsolutelyPositioned(const nsIFrame* aContextFrame) const;
+ 
+   // These methods are defined in nsStyleStructInlines.h.
+ 
+   /**
+-   * Returns whether the element is a containing block for its
+-   * absolutely positioned descendants.
+-   * aContextFrame is the frame for which this is the nsStyleDisplay.
+-   */
+-  inline bool IsAbsPosContainingBlock(const nsIFrame* aContextFrame) const;
+-
+-  /**
+-   * The same as IsAbsPosContainingBlock, except skipping the tests that
+-   * are based on the frame rather than the ComputedStyle (thus
+-   * potentially returning a false positive).
+-   */
+-  inline bool IsAbsPosContainingBlockForAppropriateFrame(
+-    mozilla::ComputedStyle&) const;
+-
+-  /**
+    * Returns true when the element has the transform property
+    * or a related property, and supports CSS transforms.
+    * aContextFrame is the frame for which this is the nsStyleDisplay.
+    */
+   inline bool HasTransform(const nsIFrame* aContextFrame) const;
+ 
+   /**
+    * Returns true when the element has the perspective property,
+    * and supports CSS transforms. aContextFrame is the frame for
+    * which this is the nsStyleDisplay.
+    */
+   inline bool HasPerspective(const nsIFrame* aContextFrame) const;
+ 
+   /**
++   * Returns whether the element is a containing block for its
++   * absolutely positioned descendants.
++   * aContextFrame is the frame for which this is the nsStyleDisplay.
++   */
++  inline bool IsAbsPosContainingBlock(const nsIFrame* aContextFrame) const;
++
++  /**
++   * Tests for only the sub-parts of IsAbsPosContainingBlock that apply
++   * to:
++   *  - nearly all frames, except those that are SVG text frames.
++   *  - frames that support CSS transforms and are not SVG text frames.
++   *
++   * This should be used only when the caller has the style but not the
++   * frame (i.e., when calculating style changes).
++   */
++  inline bool IsAbsPosContainingBlockForNonSVGTextFrames(
++    mozilla::ComputedStyle&) const;
++  inline bool IsAbsPosContainingBlockStyleForTransformSupportingFrames() const;
++
++  /**
+    * Returns true when the element is a containing block for its fixed-pos
+    * descendants.
+    * aContextFrame is the frame for which this is the nsStyleDisplay.
+    */
+   inline bool IsFixedPosContainingBlock(const nsIFrame* aContextFrame) const;
+ 
+   /**
+-   * The same as IsFixedPosContainingBlock, except skipping the tests that
+-   * are based on the frame rather than the ComputedStyle (thus
+-   * potentially returning a false positive).
++   * Tests for only the sub-parts of IsFixedPosContainingBlock that apply
++   * to:
++   *  - nearly all frames, except those that are SVG text frames.
++   *  - frames that support CSS transforms and are not SVG text frames.
++   *
++   * This should be used only when the caller has the style but not the
++   * frame (i.e., when calculating style changes).
+    */
+-  inline bool IsFixedPosContainingBlockForAppropriateFrame(
++  inline bool IsFixedPosContainingBlockForNonSVGTextFrames(
+     mozilla::ComputedStyle&) const;
++  inline bool IsFixedPosContainingBlockStyleForTransformSupportingFrames()
++    const;
+ 
+   /**
+    * Returns the final combined transform.
+    **/
+   already_AddRefed<nsCSSValueSharedList> GetCombinedTransform() const {
+     if (mCombinedTransform) {
+       return do_AddRef(mCombinedTransform);
+     }
+ 
+     // backward compatible to gecko-backed style system.
+     return mSpecifiedTransform ? do_AddRef(mSpecifiedTransform) : nullptr;
+   }
+ 
+ private:
+   // Helpers for above functions, which do some but not all of the tests
+   // for them (since transform must be tested separately for each).
+-  inline bool HasAbsPosContainingBlockStyleInternal() const;
+-  inline bool HasFixedPosContainingBlockStyleInternal(
+-    mozilla::ComputedStyle&) const;
+   void GenerateCombinedTransform();
+ };
+ 
+ struct MOZ_NEEDS_MEMMOVABLE_MEMBERS nsStyleTable
+ {
+   explicit nsStyleTable(const nsPresContext* aContext);
+   nsStyleTable(const nsStyleTable& aOther);
+   ~nsStyleTable();
+diff --git a/layout/style/nsStyleStructInlines.h b/layout/style/nsStyleStructInlines.h
+--- a/layout/style/nsStyleStructInlines.h
++++ b/layout/style/nsStyleStructInlines.h
+@@ -149,17 +149,17 @@ nsStyleDisplay::HasTransform(const nsIFr
+ bool
+ nsStyleDisplay::HasPerspective(const nsIFrame* aContextFrame) const
+ {
+   MOZ_ASSERT(aContextFrame->StyleDisplay() == this, "unexpected aContextFrame");
+   return HasPerspectiveStyle() && aContextFrame->IsFrameOfType(nsIFrame::eSupportsCSSTransforms);
+ }
+ 
+ bool
+-nsStyleDisplay::HasFixedPosContainingBlockStyleInternal(
++nsStyleDisplay::IsFixedPosContainingBlockForNonSVGTextFrames(
+   mozilla::ComputedStyle& aStyle) const
+ {
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the FIXPOS_CB flag set on them.
+   NS_ASSERTION(aStyle.ThreadsafeStyleDisplay() == this, "unexpected aStyle");
+ 
+   if (IsContainPaint()) {
+     return true;
+@@ -168,69 +168,66 @@ nsStyleDisplay::HasFixedPosContainingBlo
+   if (mWillChangeBitField & NS_STYLE_WILL_CHANGE_FIXPOS_CB) {
+     return true;
+   }
+ 
+   return aStyle.ThreadsafeStyleEffects()->HasFilters();
+ }
+ 
+ bool
+-nsStyleDisplay::IsFixedPosContainingBlockForAppropriateFrame(
+-  mozilla::ComputedStyle& aStyle) const
++nsStyleDisplay::IsFixedPosContainingBlockForTransformSupportingFrames() const
+ {
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the FIXPOS_CB flag set on them.
+-  return HasFixedPosContainingBlockStyleInternal(aStyle) ||
+-         HasTransformStyle() || HasPerspectiveStyle();
++  return HasTransformStyle() || HasPerspectiveStyle();
+ }
+ 
+ bool
+ nsStyleDisplay::IsFixedPosContainingBlock(const nsIFrame* aContextFrame) const
+ {
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the FIXPOS_CB flag set on them.
+-  if (!HasFixedPosContainingBlockStyleInternal(*aContextFrame->Style()) &&
+-      !HasTransform(aContextFrame) && !HasPerspective(aContextFrame)) {
++  if (!IsFixedPosContainingBlockForNonSVGTextFrames(*aContextFrame->Style()) &&
++      (!IsFixedPosContainingBlockForTransformSupportingFrames() ||
++       !aContextFrame->IsFrameOfType(nsIFrame::eSupportsCSSTransforms))) {
+     return false;
+   }
+   return !nsSVGUtils::IsInSVGTextSubtree(aContextFrame);
+ }
+ 
+ bool
+-nsStyleDisplay::HasAbsPosContainingBlockStyleInternal() const
++nsStyleDisplay::IsAbsPosContainingBlockForNonSVGTextFrames(
++  mozilla::ComputedStyle& aStyle) const
+ {
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the ABSPOS_CB set on them.
+   return IsAbsolutelyPositionedStyle() ||
+          IsRelativelyPositionedStyle() ||
+-         (mWillChangeBitField & NS_STYLE_WILL_CHANGE_ABSPOS_CB);
++         (mWillChangeBitField & NS_STYLE_WILL_CHANGE_ABSPOS_CB) ||
++         IsFixedPosContainingBlockForNonSVGTextFrames(aStyle);
+ }
+ 
+ bool
+-nsStyleDisplay::IsAbsPosContainingBlockForAppropriateFrame(
+-  mozilla::ComputedStyle& aStyle) const
++nsStyleDisplay::IsAbsPosContainingBlockForTransformSupportingFrames() const
+ {
+-  NS_ASSERTION(aStyle.ThreadsafeStyleDisplay() == this, "unexpected aStyle");
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the ABSPOS_CB set on them.
+-  return HasAbsPosContainingBlockStyleInternal() ||
+-         IsFixedPosContainingBlockForAppropriateFrame(aStyle);
++  return IsFixedPosContainingBlockForTransformSupportingFrames();
+ }
+ 
+ bool
+ nsStyleDisplay::IsAbsPosContainingBlock(const nsIFrame* aContextFrame) const
+ {
+   NS_ASSERTION(aContextFrame->Style()->ThreadsafeStyleDisplay() == this,
+                "unexpected aContextFrame");
+   // NOTE: Any CSS properties that influence the output of this function
+   // should have the ABSPOS_CB set on them.
+-  if (!HasAbsPosContainingBlockStyleInternal() &&
+-      !HasFixedPosContainingBlockStyleInternal(*aContextFrame->Style()) &&
+-      !HasTransform(aContextFrame) &&
+-      !HasPerspective(aContextFrame)) {
++  if (!IsAbsPosContainingBlockStyleForNonSVGTextFrames() &&
++      (!IsAbsPosContainingBlockForTransformSupportingFrames() ||
++       !aContextFrame->IsFrameOfType(nsIFrame::eSupportsCSSTransforms))) {
+     return false;
+   }
+   return !nsSVGUtils::IsInSVGTextSubtree(aContextFrame);
+ }
+ 
+ bool
+ nsStyleDisplay::IsRelativelyPositioned(const nsIFrame* aContextFrame) const
+ {
