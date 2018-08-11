@@ -1,0 +1,177 @@
+From: L. David Baron <dbaron@dbaron.org>
+
+Bug 1388840 patch 1
+
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -17,16 +17,17 @@
+ #include "mozilla/gfx/PathHelpers.h"
+ #include "mozilla/layers/PAPZ.h"
+ #include "mozilla/Likely.h"
+ #include "mozilla/Maybe.h"
+ #include "mozilla/MemoryReporting.h"
+ #include "mozilla/dom/ContentChild.h"
+ #include "mozilla/ServoStyleSetInlines.h"
+ #include "mozilla/StaticPrefs.h"
++#include "mozilla/TypedEnumBits.h"
+ #include "mozilla/Unused.h"
+ #include "nsCharTraits.h"
+ #include "nsDocument.h"
+ #include "nsFontMetrics.h"
+ #include "nsPresContext.h"
+ #include "nsIContent.h"
+ #include "nsFrameList.h"
+ #include "nsGenericHTMLElement.h"
+@@ -4717,22 +4718,38 @@ nsLayoutUtils::IsViewportScrollbarFrame(
+   if (!IsProperAncestorFrame(rootScrollFrame, aFrame))
+     return false;
+ 
+   nsIFrame* rootScrolledFrame = rootScrollableFrame->GetScrolledFrame();
+   return !(rootScrolledFrame == aFrame ||
+            IsProperAncestorFrame(rootScrolledFrame, aFrame));
+ }
+ 
++enum class GetAbsoluteCoordFlags : uint32_t {
++  Default = 0,
++  // https://drafts.csswg.org/css-sizing-3/#percentage-sizing says that
++  // for intrinsic size handling of min-width/height for all elements,
++  // and for width/height and max-width/height for replaced elements,
++  // calc()s containing percentages should be used and resolved against
++  // zero, whereas for width/height and max-width/height for
++  // non-replaced elements they should be treated as the property's
++  // initial value.
++  UseCalcWithPercent = 1 << 0,
++};
++
++MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(GetAbsoluteCoordFlags);
++
+ // Use only for widths/heights (or their min/max), since it clamps
+ // negative calc() results to 0.
+-static bool GetAbsoluteCoord(const nsStyleCoord& aStyle, nscoord& aResult)
++static bool GetAbsoluteCoord(const nsStyleCoord& aStyle, nscoord& aResult,
++                             GetAbsoluteCoordFlags aFlags)
+ {
+   if (aStyle.IsCalcUnit()) {
+-    if (aStyle.CalcHasPercent()) {
++    if (aStyle.CalcHasPercent() &&
++        !(aFlags & GetAbsoluteCoordFlags::UseCalcWithPercent)) {
+       return false;
+     }
+     // If it has no percents, we can pass 0 for the percentage basis.
+     aResult = aStyle.ComputeComputedCalc(0);
+     if (aResult < 0)
+       aResult = 0;
+     return true;
+   }
+@@ -4776,17 +4793,17 @@ GetPercentBSize(const nsStyleCoord& aSty
+     return false;
+   }
+ 
+   WritingMode wm = f->GetWritingMode();
+ 
+   const nsStylePosition *pos = f->StylePosition();
+   const nsStyleCoord& bSizeCoord = pos->BSize(wm);
+   nscoord h;
+-  if (!GetAbsoluteCoord(bSizeCoord, h) &&
++  if (!GetAbsoluteCoord(bSizeCoord, h, GetAbsoluteCoordFlags::None) &&
+       !GetPercentBSize(bSizeCoord, f, aHorizontalAxis, h)) {
+     NS_ASSERTION(bSizeCoord.GetUnit() == eStyleUnit_Auto ||
+                  bSizeCoord.HasPercent(),
+                  "unknown block-size unit");
+     LayoutFrameType fType = f->Type();
+     if (fType != LayoutFrameType::Viewport &&
+         fType != LayoutFrameType::Canvas &&
+         fType != LayoutFrameType::PageContent) {
+@@ -4807,30 +4824,30 @@ GetPercentBSize(const nsStyleCoord& aSty
+       // We don't have a percentage basis after all
+       return false;
+     }
+   }
+ 
+   const nsStyleCoord& maxBSizeCoord = pos->MaxBSize(wm);
+ 
+   nscoord maxh;
+-  if (GetAbsoluteCoord(maxBSizeCoord, maxh) ||
++  if (GetAbsoluteCoord(maxBSizeCoord, maxh, GetAbsoluteCoordFlags::None) ||
+       GetPercentBSize(maxBSizeCoord, f, aHorizontalAxis, maxh)) {
+     if (maxh < h)
+       h = maxh;
+   } else {
+     NS_ASSERTION(maxBSizeCoord.GetUnit() == eStyleUnit_None ||
+                  maxBSizeCoord.HasPercent(),
+                  "unknown max block-size unit");
+   }
+ 
+   const nsStyleCoord& minBSizeCoord = pos->MinBSize(wm);
+ 
+   nscoord minh;
+-  if (GetAbsoluteCoord(minBSizeCoord, minh) ||
++  if (GetAbsoluteCoord(minBSizeCoord, minh, GetAbsoluteCoordFlags::None) ||
+       GetPercentBSize(minBSizeCoord, f, aHorizontalAxis, minh)) {
+     if (minh > h)
+       h = minh;
+   } else {
+     NS_ASSERTION(minBSizeCoord.HasPercent() ||
+                  minBSizeCoord.GetUnit() == eStyleUnit_Auto,
+                  "unknown min block-size unit");
+   }
+@@ -4933,21 +4950,21 @@ GetBSizeTakenByBoxSizing(StyleBoxSizing 
+       const nsStyleCoord& paddingEnd =
+         stylePadding.Get(aHorizontalAxis ? eSideBottom : eSideRight);
+       nscoord pad;
+       // XXXbz Calling GetPercentBSize on padding values looks bogus, since
+       // percent padding is always a percentage of the inline-size of the
+       // containing block.  We should perhaps just treat non-absolute paddings
+       // here as 0 instead, except that in some cases the width may in fact be
+       // known.  See bug 1231059.
+-      if (GetAbsoluteCoord(paddingStart, pad) ||
++      if (GetAbsoluteCoord(paddingStart, pad, GetAbsoluteCoordFlags::None) ||
+           GetPercentBSize(paddingStart, aFrame, aHorizontalAxis, pad)) {
+         bSizeTakenByBoxSizing += pad;
+       }
+-      if (GetAbsoluteCoord(paddingEnd, pad) ||
++      if (GetAbsoluteCoord(paddingEnd, pad, GetAbsoluteCoordFlags::None) ||
+           GetPercentBSize(paddingEnd, aFrame, aHorizontalAxis, pad)) {
+         bSizeTakenByBoxSizing += pad;
+       }
+     }
+   }
+   return bSizeTakenByBoxSizing;
+ }
+ 
+@@ -5288,30 +5305,32 @@ nsLayoutUtils::IntrinsicForAxis(Physical
+   //   * that we don't let a value of 'box-sizing' specifying a width
+   //     smaller than the padding/border inside the box-sizing box give
+   //     a content width less than zero
+   //   * that we prevent tables from becoming smaller than their
+   //     intrinsic minimum width
+   nscoord result = 0, min = 0;
+ 
+   nscoord maxISize;
+-  bool haveFixedMaxISize = GetAbsoluteCoord(styleMaxISize, maxISize);
++  bool haveFixedMaxISize =
++    GetAbsoluteCoord(styleMaxISize, maxISize, GetAbsoluteCoordFlags::None);
+   nscoord minISize;
+ 
+   // Treat "min-width: auto" as 0.
+   bool haveFixedMinISize;
+   if (eStyleUnit_Auto == styleMinISize.GetUnit()) {
+     // NOTE: Technically, "auto" is supposed to behave like "min-content" on
+     // flex items. However, we don't need to worry about that here, because
+     // flex items' min-sizes are intentionally ignored until the flex
+     // container explicitly considers them during space distribution.
+     minISize = 0;
+     haveFixedMinISize = true;
+   } else {
+-    haveFixedMinISize = GetAbsoluteCoord(styleMinISize, minISize);
++    haveFixedMinISize =
++      GetAbsoluteCoord(styleMinISize, minISize, GetAbsoluteCoordFlags::None);
+   }
+ 
+   PhysicalAxis ourInlineAxis =
+     aFrame->GetWritingMode().PhysicalAxis(eLogicalAxisInline);
+   const bool isInlineAxis = aAxis == ourInlineAxis;
+   // If we have a specified width (or a specified 'min-width' greater
+   // than the specified 'max-width', which works out to the same thing),
+   // don't even bother getting the frame's intrinsic width, because in
